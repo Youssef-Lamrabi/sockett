@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genomeer"
+version = "0.1.0"
+description = "Agentic metagenomics pipeline assistant"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Genereux Akotenou" }]
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "pydantic>=2",
+  "httpx",
+  "orjson",
+  "tenacity",
+  "typing-extensions",
+  "jinja2",
+  # rpy2 is optional; fallback to Rscript if absent
+]
+
+[project.optional-dependencies]
+r = ["rpy2"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy"]
+
+[project.scripts]
+genomeer-serve = "genomeer.adapters.server:main"

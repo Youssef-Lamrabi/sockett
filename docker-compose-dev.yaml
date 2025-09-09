@@ -1,0 +1,47 @@
+services:
+  # ollama:
+  #   volumes:
+  #     - ollama:/root/.ollama
+  #   container_name: genomeer-ollama
+  #   pull_policy: always
+  #   tty: true
+  #   restart: unless-stopped
+  #   image: ollama/ollama:${OLLAMA_DOCKER_TAG-latest}
+
+  # FRONTEND (SvelteKit/Vite dev server with HMR)
+    genomeer-ui:
+      image: node:24-bookworm
+      container_name: genomeer-ui
+      working_dir: /workspace
+      command: bash -lc "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0 --port 5173"
+      ports:
+        - "5050:5173"                 # open http://localhost:5050
+      environment:
+        # UI will call backend via Vite proxy (see vite.config.ts below)
+        - OLLAMA_BASE_URL=http://backend:8080/ollama
+      volumes:
+        - ./agent-ui:/workspace       # bind source (frontend + backend repo)
+        - /workspace/node_modules     # keep deps inside container
+      # depends_on:
+      #   - backend
+      restart: unless-stopped
+
+  # BACKEND (Uvicorn autoreload)
+  # backend:
+  #   image: python:3.11-slim-bookworm
+  #   container_name: genomeer-backend
+  #   working_dir: /workspace
+  #   command: bash -lc "pip install --no-cache-dir -r backend/requirements.txt && uvicorn open_webui.main:app --host 0.0.0.0 --port 8080 --reload"
+  #   ports:
+  #     - "8080:8080"                 # backend API
+  #   environment:
+  #     - OLLAMA_BASE_URL=http://10.52.88.30:11434   # or http://ollama:11434 if you add an ollama service
+  #     - WEBUI_SECRET_KEY=
+  #   volumes:
+  #     - ./agent-ui:/workspace
+  #     - open-webui:/workspace/backend/data         # persistent app data
+  #   restart: unless-stopped
+
+volumes:
+  ollama: {}
+  open-webui: {}
