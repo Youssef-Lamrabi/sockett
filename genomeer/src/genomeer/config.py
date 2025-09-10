@@ -1,11 +1,31 @@
-from pydantic import BaseSettings, Field
+import os
+from dataclasses import dataclass
 
-class Settings(BaseSettings):
-    ollama_host: str = Field(default="http://localhost:11434")
-    model: str = Field(default="llama3.1:70b")
-    tool_timeout_s: int = 600
-    work_dir: str = ".genomeer_runs"
-    rscript_path: str = "Rscript"   # fallback if no rpy2
-    allow_network_tools: bool = False
+@dataclass
+class GenomeerConfig:
+    path: str = "./data"
+    run_dir: str = ".genomeer_runs"
+    timeout_seconds: int = 600
+    llm: str = "ollama/llama3.1"  # placeholder
+    temperature: float = 0.7
+    use_tool_retriever: bool = True
+    base_url: str | None = None
+    api_key: str | None = None
+    source: str | None = None
 
-settings = Settings()
+    def __post_init__(self):
+        self.path = os.getenv("GENOMEER_DATA_PATH", self.path)
+        self.run_dir = os.getenv("GENOMEER_RUN_DIR", self.run_dir)
+        self.llm = os.getenv("GENOMEER_LLM", self.llm)
+        self.timeout_seconds = int(os.getenv("GENOMEER_TIMEOUT_SECONDS", self.timeout_seconds))
+        
+        if os.getenv("GENOMEER_USE_TOOL_RETRIEVER"):
+            self.use_tool_retriever = os.getenv("GENOMEER_USE_TOOL_RETRIEVER").lower() == "true"
+        if os.getenv("GENOMEER_MODEL_TEMPERATURE"):
+            self.temperature = float(os.getenv("GENOMEER_MODEL_TEMPERATURE"))
+            
+        self.base_url = os.getenv("CUSTOM_MODEL_BASE_URL", self.base_url)
+        self.api_key  = os.getenv("CUSTOM_MODEL_API_KEY", self.api_key)
+        self.source   = os.getenv("GENOMEER_MODEL_SOURCE", self.source)
+
+settings = GenomeerConfig()
