@@ -58,14 +58,14 @@ def _run_in_env(
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(code: str, *, env_name: Optional[str] = None) -> str:
+def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         with tempfile.NamedTemporaryFile(suffix=".R", mode="w", dir=settings.run_dir, delete=False) as f:
             f.write(code); path = f.name
             
         if env_name:
-            if not ensure_env(env_name, auto_install=True):
+            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available." 
             proc = _run_in_env(env_name, ["Rscript", path], timeout=settings.timeout_seconds)
             os.unlink(path)
@@ -90,7 +90,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None) -> str:
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(script: str, *, env_name: Optional[str] = None) -> str:
+def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         script = (script or "").strip()
@@ -103,7 +103,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None) -> str:
         os.chmod(path, 0o755)
         
         if env_name:
-            if not ensure_env(env_name, auto_install=True):
+            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available."
             # run bash from env; pass the script path as arg
             proc = _run_in_env(env_name, ["bash", path], timeout=settings.timeout_seconds)
@@ -131,7 +131,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None) -> str:
 # Desc: Helper function for LLM to run command in shell while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_cli_command(command: str, *, env_name: Optional[str] = None) -> str:
+def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         command = (command or "").strip()
@@ -140,7 +140,7 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None) -> str:
         argv = shlex.split(command)
         
         if env_name:
-            if not ensure_env(env_name, auto_install=True):
+            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available."
             proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
             return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
@@ -156,7 +156,7 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None) -> str:
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
 # ------------------------------------------------------------------------------------------
-def run_python_code(code: str, *, env_name: Optional[str] = None) -> str:
+def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     """
     Executes the provided Python code.
     - If env_name is provided: runs it in that micromamba env (fresh process).
@@ -167,7 +167,7 @@ def run_python_code(code: str, *, env_name: Optional[str] = None) -> str:
 
     # --- Case 1: run in a micromamba environment ---
     if env_name:
-        if not ensure_env(env_name, auto_install=True):
+        if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
             return f"Environment '{env_name}' is not available."
 
         # Write the code to a temp file

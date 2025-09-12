@@ -36,7 +36,10 @@ if os.path.exists(".env"):
 
 class AgentState(TypedDict):
     messages: list[BaseMessage]
-    next_step: Literal["generate", "execute", "end"]
+    next_step: Literal["generate", "ensure_env", "execute", "end"]
+    env_name: str | None
+    env_ready: bool
+    pending_code: str | None
 
 class BioAgent:
     def __init__(
@@ -162,6 +165,9 @@ class BioAgent:
             self.tool_registry = ToolRegistry(self.module2api)
             self.retriever = ToolRetriever()
 
+        # per-env streaming installers
+        self._install_iters = {}
+        
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds
         self.configure()
@@ -1194,9 +1200,9 @@ class BioAgent:
 
         # Define routing funtion for graph
         # -------------------------------------------------------------------------------
-        def routing_function(state: AgentState,) -> Literal["execute", "generate", "end"]:
+        def routing_function(state: AgentState,) -> Literal["execute", "ensure_env", "generate", "end"]:
             next_step = state.get("next_step")
-            if next_step in ["execute", "generate", "end"]:
+            if next_step in ["execute", "ensure_env", "generate", "end"]:
                 return next_step
             else:
                 raise ValueError(f"Unexpected next_step: {next_step}")
@@ -1236,7 +1242,18 @@ class BioAgent:
             if answer_match:
                 state["next_step"] = "end"
             elif execute_match:
-                state["next_step"] = "execute"
+                code = execute_match.group(1)
+                state["pending_code"] = code
+                # TODO: decide env first
+                env_name = state.get("env_name") or "bio-agent-env1"
+                from genomeer.runtime.env_manager import has_env
+                if not has_env(env_name):
+                    # Tell user we're about to set it up
+                    state["messages"].append(AIMessage(content=f"<observation>Environment '{env_name}' not found. Installing now — this can take a while on first run.</observation>"))
+                    state["next_step"] = "ensure_env"
+                else:
+                    state["env_ready"] = True
+                    state["next_step"] = "execute"
             elif think_match:
                 state["next_step"] = "generate"
             else:
@@ -1267,31 +1284,34 @@ class BioAgent:
             return state
 
         def execute(state: AgentState) -> AgentState:
-            # TODO: ((ENV SELECTION: "bin", "py", "r"))
-            last_message = state["messages"][-1].content
-            # Only add the closing tag if it's not already there
-            if "<execute>" in last_message and "</execute>" not in last_message:
-                last_message += "</execute>"
+            timeout = self.timeout_seconds
+            if not state.get("env_ready", False):
+                state["next_step"] = "ensure_env"
+                return state
 
-            execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
-            if execute_match:
-                code = execute_match.group(1)
+            code = state.get("pending_code")
+            if not code:
+                # fallback: try to extract from last message
+                last_message = state["messages"][-1].content
+                if "<execute>" in last_message and "</execute>" not in last_message:
+                    last_message += "</execute>"
+                m = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
+                code = m.group(1) if m else ""
 
-                # Set timeout duration (10 minutes = 600 seconds)
-                timeout = self.timeout_seconds
-
-                # Check if the code is R code
+            if not code:
+                state["messages"].append(AIMessage(content="<observation>No code to execute.</observation>"))
+                state["next_step"] = "end"
+                return state
+            else:
+                env_name = state["env_name"]
                 if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
-                    # Remove the R marker and run as R code
                     r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
                     result = run_with_timeout(run_r_code, 
                         args=[r_code], 
-                        kwargs={"env_name": "bio-agent-env1"}, 
+                        kwargs={"env_name": env_name,}, 
                         timeout=timeout
                     )
-                # Check if the code is a Bash script or CLI command
                 elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
-                    # Handle both Bash scripts and CLI commands with the same function
                     if code.strip().startswith("#!CLI"):
                         # For CLI commands, extract the command and run it as a simple bash script
                         cli_command = re.sub(r"^#!CLI", "", code, 1).strip()  # noqa: B034
@@ -1299,7 +1319,7 @@ class BioAgent:
                         cli_command = cli_command.replace("\n", " ")
                         result = run_with_timeout(run_cli_command, 
                             args=[cli_command], 
-                            kwargs={"env_name": "bio-agent-env1"}, 
+                            kwargs={"env_name": env_name,}, 
                             timeout=timeout
                         )
                     else:
@@ -1307,16 +1327,15 @@ class BioAgent:
                         bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
                         result = run_with_timeout(run_bash_script, 
                             args=[bash_script], 
-                            kwargs={"env_name": "bio-agent-env1"}, 
+                            kwargs={"env_name": env_name,}, 
                             timeout=timeout
                         )
-                # Otherwise, run as Python code
                 else:
                     # Inject custom functions into the Python execution environment
                     self._inject_custom_functions_to_repl()
                     result = run_with_timeout(run_python_code, 
                         args=[code], 
-                        kwargs={"env_name": "bio-agent-env1"}, 
+                        kwargs={"env_name": env_name,}, 
                         timeout=timeout
                     )
 
@@ -1356,11 +1375,67 @@ class BioAgent:
                 state["next_step"] = "end"
             return state
 
+        def ensure_env_node(state: AgentState) -> AgentState:
+            from genomeer.runtime.env_manager import load_registry, spec_path, install_env_iter, env_prefix, has_env
+            env_name = state.get("env_name") or "bio-agent-env1"
+
+            # Already available? proceed
+            if has_env(env_name):
+                state["env_ready"] = True
+                state["next_step"] = "execute"
+                return state
+
+            # Create or resume streaming installer
+            it = self._install_iters.get(env_name)
+            if it is None:
+                reg = load_registry()
+                rec = next((e for e in reg.get("envs", []) if e.get("name") == env_name), None)
+                if not rec:
+                    state["messages"].append(AIMessage(
+                        content=f"<observation>Error: Env '{env_name}' not found in registry.</observation>"
+                    ))
+                    state["next_step"] = "end"
+                    return state
+                spec = spec_path(rec["spec"])
+                channels = rec.get("channels")
+                it = install_env_iter(env_name, spec, channels)
+                self._install_iters[env_name] = it
+
+            # Stream a small batch of lines each tick
+            lines_this_tick = 0
+            max_lines_per_tick = 30
+            try:
+                while lines_this_tick < max_lines_per_tick:
+                    line = next(it)  # StopIteration when done
+                    state["messages"].append(AIMessage(content=f"<logs>{line}</logs>"))
+                    lines_this_tick += 1
+            except StopIteration:
+                # Finished
+                self._install_iters.pop(env_name, None)
+                prefix = str(env_prefix(env_name))
+                state["messages"].append(
+                    AIMessage(content=f"<observation>Environment '{env_name}' ready at {prefix}</observation>")
+                )
+                state["env_ready"] = True
+                state["next_step"] = "execute"
+                return state
+            except Exception as e:
+                self._install_iters.pop(env_name, None)
+                state["messages"].append(AIMessage(content=f"<observation>Env install failed: {e}</observation>"))
+                state["next_step"] = "end"
+                return state
+
+            # Not done yet — schedule another pass to keep streaming
+            state["next_step"] = "ensure_env"
+            return state
+
+
         # Create the workflow
         # --------------------------------------------------------------------------------
         workflow = StateGraph(AgentState)
         workflow.add_node("generate", generate)
         workflow.add_node("execute", execute)
+        workflow.add_node("ensure_env", ensure_env_node)
 
         if self_critic:
             workflow.add_node("self_critic", execute_self_critic)
@@ -1369,6 +1444,7 @@ class BioAgent:
                 routing_function,
                 path_map={
                     "execute": "execute",
+                    "ensure_env": "ensure_env",
                     "generate": "generate",
                     "end": "self_critic",
                 },
@@ -1382,8 +1458,15 @@ class BioAgent:
             workflow.add_conditional_edges(
                 "generate",
                 routing_function,
-                path_map={"execute": "execute", "generate": "generate", "end": END},
+                path_map={
+                    "execute": "execute", 
+                    "ensure_env": "ensure_env", 
+                    "generate": "generate", 
+                    "end": END
+                },
             )
+
+        workflow.add_edge("ensure_env", "ensure_env")
         workflow.add_edge("execute", "generate")
         workflow.add_edge(START, "generate")
 
@@ -1764,7 +1847,7 @@ class BioAgent:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
-        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
+        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None, "env_name": "bio-agent-env1", "env_ready": False, "pending_code": None,}
         config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
         self.log = []
 
@@ -1792,7 +1875,7 @@ class BioAgent:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
-        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
+        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None, "env_name": "bio-agent-env1", "env_ready": False, "pending_code": None,}
         config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
         self.log = []
 
