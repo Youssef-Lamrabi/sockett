@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 @dataclass
 class GenomeerConfig:
@@ -28,8 +28,4 @@ class GenomeerConfig:
         self.api_key  = os.getenv("CUSTOM_MODEL_API_KEY", self.api_key)
         self.source   = os.getenv("GENOMEER_MODEL_SOURCE", self.source)
 
-    def to_dict(self) -> dict:
-        """Convert config to dictionary for easy access."""
-        return asdict(self)
-    
 settings = GenomeerConfig()

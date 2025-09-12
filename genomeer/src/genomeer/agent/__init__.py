@@ -1,1 +1,1 @@
-from genomeer.agent.a1 import A1 
+from genomeer.agent.BA1 import BioAgent

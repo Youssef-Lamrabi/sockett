@@ -1,18 +1,84 @@
-import os, tempfile, subprocess, traceback, shlex, threading
-from genomeer.config import settings
+from io import StringIO
+import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys
 from typing import Any, Callable, Iterable, Mapping, Optional
+from pydantic import BaseModel, Field, ValidationError
+from langchain_core.messages.base import get_msg_title_repr
+from langchain_core.utils.interactive_env import is_interactive_env
 
+from genomeer.config import settings
+from genomeer.runtime.env_manager import (
+    ensure_micromamba,
+    ensure_env,
+    ENVS_DIR
+)
+_persistent_namespace = {} 
+class api_schema(BaseModel):
+    """api schema specification."""
+    api_schema: str | None = Field(description="The api schema as a dictionary")
+
+# ------------------------------------------------------------------------------------------
+# internal utility to run in env
+# ------------------------------------------------------------------------------------------
+def _run_in_env(
+    env_name: str,
+    argv: list[str],
+    *,
+    timeout: float,
+    extra_env: Optional[Mapping[str, str]] = None,
+    check: bool = False,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Run argv inside micromamba env <env_name> and capture output.
+    """
+    exe = ensure_micromamba()
+    prefix = ENVS_DIR / env_name
+
+    # micromamba run -p <prefix> -- <argv...>
+    cmd = [str(exe), "run", "-p", str(prefix), "--", *argv]
+
+    env = dict(os.environ)
+    env.pop("CONDA_PREFIX", None)
+    env["MAMBA_ROOT_PREFIX"] = str(ENVS_DIR.parent.parent)
+    if extra_env:
+        env.update(extra_env)
+
+    return subprocess.run(
+        cmd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=timeout,
+    )
+    
+    
 # ------------------------------------------------------------------------------------------
 # Function: run_r_code
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(code: str) -> str:
+def run_r_code(code: str, *, env_name: Optional[str] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         with tempfile.NamedTemporaryFile(suffix=".R", mode="w", dir=settings.run_dir, delete=False) as f:
             f.write(code); path = f.name
-        res = subprocess.run(["Rscript", path], capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
+            
+        if env_name:
+            if not ensure_env(env_name, auto_install=True):
+                return f"Environment '{env_name}' is not available." 
+            proc = _run_in_env(env_name, ["Rscript", path], timeout=settings.timeout_seconds)
+            os.unlink(path)
+            return proc.stdout if proc.returncode == 0 else f"Error running R code in '{env_name}':\n{proc.stderr}"
+
+        # fallback: host R
+        res = subprocess.run(
+            ["Rscript", path],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=settings.timeout_seconds,
+        )
         os.unlink(path)
         return res.stdout if res.returncode == 0 else f"Error running R code:\n{res.stderr}"
     except Exception as e:
@@ -24,17 +90,35 @@ def run_r_code(code: str) -> str:
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(script: str) -> str:
+def run_bash_script(script: str, *, env_name: Optional[str] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         script = (script or "").strip()
-        if not script: return "Error: Empty script"
+        if not script: 
+            return "Error: Empty script"
         with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
             if not script.startswith("#!/"): f.write("#!/bin/bash\n")
             if "set -e" not in script: f.write("set -e\n")
             f.write(script); path = f.name
         os.chmod(path, 0o755)
-        res = subprocess.run([path], shell=True, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
+        
+        if env_name:
+            if not ensure_env(env_name, auto_install=True):
+                return f"Environment '{env_name}' is not available."
+            # run bash from env; pass the script path as arg
+            proc = _run_in_env(env_name, ["bash", path], timeout=settings.timeout_seconds)
+            os.unlink(path)
+            return proc.stdout if proc.returncode == 0 else f"Error running Bash script in '{env_name}' (exit {proc.returncode}):\n{proc.stderr}"
+
+        # fallback: host bash
+        res = subprocess.run(
+            [path],
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=settings.timeout_seconds,
+        )
         os.unlink(path)
         return res.stdout if res.returncode == 0 else f"Error running Bash script (exit {res.returncode}):\n{res.stderr}"
     except Exception as e:
@@ -47,16 +131,78 @@ def run_bash_script(script: str) -> str:
 # Desc: Helper function for LLM to run command in shell while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_cli_command(command: str) -> str:
+def run_cli_command(command: str, *, env_name: Optional[str] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         command = (command or "").strip()
-        if not command: return "Error: Empty command"
-        args = shlex.split(command)
-        res = subprocess.run(args, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
+        if not command: 
+            return "Error: Empty command"
+        argv = shlex.split(command)
+        
+        if env_name:
+            if not ensure_env(env_name, auto_install=True):
+                return f"Environment '{env_name}' is not available."
+            proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
+            return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
+
+        # fallback: host
+        res = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
         return res.stdout if res.returncode == 0 else f"Error running command '{command}':\n{res.stderr}"
     except Exception as e:
         return f"Error running command '{command}': {e}"
+    
+    
+# ------------------------------------------------------------------------------------------
+# Function: run_python_code
+# Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
+# ------------------------------------------------------------------------------------------
+def run_python_code(code: str, *, env_name: Optional[str] = None) -> str:
+    """
+    Executes the provided Python code.
+    - If env_name is provided: runs it in that micromamba env (fresh process).
+    - If no env_name: runs in a persistent REPL namespace in the current process.
+    """
+
+    code = code.strip("```").strip()
+
+    # --- Case 1: run in a micromamba environment ---
+    if env_name:
+        if not ensure_env(env_name, auto_install=True):
+            return f"Environment '{env_name}' is not available."
+
+        # Write the code to a temp file
+        os.makedirs(settings.run_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
+            f.write(code)
+            path = f.name
+
+        try:
+            proc = _run_in_env(env_name, ["python", path], timeout=settings.timeout_seconds)
+            return proc.stdout if proc.returncode == 0 else f"Error running Python code in '{env_name}':\n{proc.stderr}"
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    # --- Case 2: run in persistent in-process REPL ---
+    else:
+        def execute_in_repl(command: str) -> str:
+            """Helper to execute inside persistent namespace."""
+            old_stdout = sys.stdout
+            sys.stdout = mystdout = StringIO()
+
+            global _persistent_namespace
+            try:
+                exec(command, _persistent_namespace)
+                output = mystdout.getvalue()
+            except Exception as e:
+                output = f"Error: {str(e)}"
+            finally:
+                sys.stdout = old_stdout
+            return output
+
+        return execute_in_repl(code)
     
     
 # ------------------------------------------------------------------------------------------
@@ -97,6 +243,151 @@ def run_with_timeout(
             raise TimeoutErrorWithContext(f"Timed out after {timeout} seconds") from e
 
 
+# ------------------------------------------------------------------------------------------
+# Function: read_module2api
+# Desc: This helper helps user to retrieve the tool description
+# ------------------------------------------------------------------------------------------
+def read_module2api():
+    fields = [
+        # "literature",
+        # "biochemistry",
+        # "bioengineering",
+        # "biophysics",
+        # "cancer_biology",
+        # "cell_biology",
+        # "molecular_biology",
+        # "genetics",
+        "genomics",
+        # "immunology",
+        # "microbiology",
+        # "pathology",
+        # "pharmacology",
+        # "physiology",
+        # "synthetic_biology",
+        # "systems_biology",
+        # "support_tools",
+        # "database",
+    ]
+
+    module2api = {}
+    for field in fields:
+        module_name = f"genomeer.tools.description.{field}"
+        module = importlib.import_module(module_name)
+        module2api[f"biomni.tool.{field}"] = module.description
+    return module2api
+
+
+# ------------------------------------------------------------------------------------------
+# Function: function_to_api_schema
+# Desc: This helper writes an API docstring for a giving  code snippet
+# ------------------------------------------------------------------------------------------
+def function_to_api_schema(function_string, llm):
+    prompt = """
+    Based on a code snippet and help me write an API docstring in the format like this:
+
+    {{'name': 'get_gene_set_enrichment',
+    'description': 'Given a list of genes, identify a pathway that is enriched for this gene set. Return a list of pathway name, p-value, z-scores.',
+    'required_parameters': [{{'name': 'genes', 'type': 'List[str]', 'description': 'List of gene symbols to analyze', 'default': None}}],
+    'optional_parameters': [
+        {{'name': 'top_k', 'type': 'int', 'description': 'Top K pathways to return', 'default': 10}},  
+        {{'name': 'database', 'type': 'str', 'description': 'Name of the database to use for enrichment analysis', 'default': "gene_ontology"}}
+    ]}}
+
+    Strictly follow the input from the function - don't create fake optional parameters.
+    For variable without default values, set them as None, not null.
+    For variable with boolean values, use capitalized True or False, not true or false.
+    Do not add any return type in the docstring.
+    Be as clear and succint as possible for the descriptions. Please do not make it overly verbose.
+    Here is the code snippet:
+    {code}
+    """
+    llm = llm.with_structured_output(api_schema)
+
+    for _ in range(7):
+        try:
+            api = llm.invoke(prompt.format(code=function_string)).dict()["api_schema"]
+            return ast.literal_eval(api)  # -> prefer "default": None
+            # return json.loads(api) # -> prefer "default": null
+        except Exception as e:
+            print("API string:", api)
+            print("Error parsing the API string:", e)
+            continue
+    return "Error: Could not parse the API schema"
+    
+
+# ------------------------------------------------------------------------------------------
+# Function: textify_api_dict
+# Desc: Convert a nested API dictionary to a nicely formatted string.
+# ------------------------------------------------------------------------------------------
+def textify_api_dict(api_dict):
+    """Convert a nested API dictionary to a nicely formatted string."""
+    lines = []
+    for category, methods in api_dict.items():
+        lines.append(f"Import file: {category}")
+        lines.append("=" * (len("Import file: ") + len(category)))
+        for method in methods:
+            lines.append(f"Method: {method.get('name', 'N/A')}")
+            lines.append(f"  Description: {method.get('description', 'No description provided.')}")
+
+            # Process required parameters
+            req_params = method.get("required_parameters", [])
+            if req_params:
+                lines.append("  Required Parameters:")
+                for param in req_params:
+                    param_name = param.get("name", "N/A")
+                    param_type = param.get("type", "N/A")
+                    param_desc = param.get("description", "No description")
+                    param_default = param.get("default", "None")
+                    lines.append(f"    - {param_name} ({param_type}): {param_desc} [Default: {param_default}]")
+
+            # Process optional parameters
+            opt_params = method.get("optional_parameters", [])
+            if opt_params:
+                lines.append("  Optional Parameters:")
+                for param in opt_params:
+                    param_name = param.get("name", "N/A")
+                    param_type = param.get("type", "N/A")
+                    param_desc = param.get("description", "No description")
+                    param_default = param.get("default", "None")
+                    lines.append(f"    - {param_name} ({param_type}): {param_desc} [Default: {param_default}]")
+
+            lines.append("")  # Empty line between methods
+        lines.append("")  # Extra empty line after each category
+    return "\n".join(lines)
+
+# ------------------------------------------------------------------------------------------
+# Function: pretty_print
+# Desc: TRIVIAL
+# ------------------------------------------------------------------------------------------
+def pretty_print(message, printout=True):
+    if isinstance(message, tuple):
+        title = message
+    elif isinstance(message.content, list):
+        title = get_msg_title_repr(message.type.title().upper() + " Message", bold=is_interactive_env())
+        if message.name is not None:
+            title += f"\nName: {message.name}"
+
+        for i in message.content:
+            if i["type"] == "text":
+                title += f"\n{i['text']}\n"
+            elif i["type"] == "tool_use":
+                title += f"\nTool: {i['name']}"
+                title += f"\nInput: {i['input']}"
+        if printout:
+            print(f"{title}")
+    else:
+        title = get_msg_title_repr(message.type.title() + " Message", bold=is_interactive_env())
+        if message.name is not None:
+            title += f"\nName: {message.name}"
+        title += f"\n\n{message.content}"
+        if printout:
+            print(f"{title}")
+    return title
+
+# ------------------------------------------------------------------------------------------
+# Function: get_tool_decorated_functions
+# Desc: TODO: To be docuemented
+# ------------------------------------------------------------------------------------------
 def get_tool_decorated_functions(relative_path):
     import ast
     import importlib.util
@@ -139,3 +430,4 @@ def get_tool_decorated_functions(relative_path):
     tool_functions = [getattr(module, name) for name in tool_function_names]
 
     return tool_functions
+

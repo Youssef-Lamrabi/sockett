@@ -5,51 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "genomeer"
 dynamic = ["version"]
-description = "Agentic metagenomic assistant"
+description = "Agentic metagenomics pipeline assistant"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Genereux Akotenou" }
 ]
-classifiers = [
-  "License :: OSI Approved :: MIT License",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
-]
-dependencies = [
-    "numpy==2.1",
-    "pandas",
-    "matplotlib",
-    "scipy",
-    "statsmodels",
-    "scikit-learn",
-    "gradio",
-    "langchain",
-    "langgraph==0.3.18",
-    "langchain-openai",
-    "langchain-anthropic",
-    "langchain-ollama",
-    "langchain-community",
-    "openai",
-    "beautifulsoup4",
-    "lxml",
-    "tqdm",
-    "seaborn",
-    "networkx",
-    "requests",
-    "pyyaml",
-    "jupyter",
-    "notebook",
-    "ipykernel",
-    "pytest",
-    "transformers",
-    "sentencepiece",
-    "mcp",
-    "tooluniverse",
-    "python-dotenv",
-    "pydantic", 
-]
+requires-python = ">=3.11"
+dependencies = ["pydantic", "langchain", "python-dotenv"]
 
 [project.urls]
 Homepage = "https://github.com/genereux-akotenou/genomeer"
@@ -61,11 +25,7 @@ include-package-data = true
 [tool.setuptools.dynamic]
 version = {attr = "genomeer.version.__version__"}
 
-[tool.setuptools.package-dir]
-"" = "src"
-
 [tool.setuptools.packages.find]
-where = ["src"]
 exclude = ["test*"]
 
 [tool.ruff]

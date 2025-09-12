@@ -22,7 +22,7 @@ class ToolRetriever:
         
         # Create a prompt for the LLM to select relevant resources
         prompt = f"""
-            You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.
+            You are a   n expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.
 
             USER QUERY: {query}
 
