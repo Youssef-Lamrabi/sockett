@@ -3,7 +3,7 @@
 
 	const i18n = getContext('i18n');
 
-	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { WEBUI_BASE_URL, WEBUI_SRC_URL } from '$lib/constants';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import PinSlash from '$lib/components/icons/PinSlash.svelte';
@@ -37,7 +37,7 @@
 			<div class="self-center shrink-0">
 				<img
 					crossorigin="anonymous"
-					src={model?.info?.meta?.profile_image_url ?? `${WEBUI_BASE_URL}/static/favicon.png`}
+					src={model?.info?.meta?.profile_image_url ?? `${WEBUI_SRC_URL}/static/favicon.png`}
 					class=" size-5 rounded-full -translate-x-[0.5px]"
 					alt="logo"
 				/>

@@ -15,7 +15,7 @@
 
 	import { settings, user, shortCodesToEmojis } from '$lib/stores';
 
-	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { WEBUI_BASE_URL, WEBUI_SRC_URL } from '$lib/constants';
 
 	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
 	import ProfileImage from '$lib/components/chat/Messages/ProfileImage.svelte';
@@ -146,7 +146,7 @@
 							src={message.user?.profile_image_url ??
 								($i18n.language === 'dg-DG'
 									? `${WEBUI_BASE_URL}/doge.png`
-									: `${WEBUI_BASE_URL}/static/favicon.png`)}
+									: `${WEBUI_SRC_URL}/static/favicon.png`)}
 							className={'size-8 translate-y-1 ml-0.5'}
 						/>
 					</ProfilePreview>

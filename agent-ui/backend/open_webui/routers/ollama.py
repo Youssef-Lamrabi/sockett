@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime
 
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
 from urllib.parse import urlparse
 import aiohttp
 from aiocache import cached
@@ -66,6 +66,7 @@ from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
 )
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.agent.adapter import OllamaBioAgent
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OLLAMA"])
@@ -126,7 +127,46 @@ async def send_post_request(
     user: UserModel = None,
     metadata: Optional[dict] = None,
 ):
-
+    use_agentic_framework = True
+    if use_agentic_framework:
+        # prepare url
+        # --------------------------------------------------------------------------------
+        url  = url.split('api')[0] + 'v1'
+        
+        # payload
+        # --------------------------------------------------------------------------------
+        try:
+            parsed_payload: Dict[str, Any]
+            if isinstance(payload, (str, bytes)):
+                parsed_payload = json.loads(payload)
+                model = parsed_payload.get("model", "gpt-oss:20b")
+            else:
+                parsed_payload = payload
+                model = parsed_payload.get("model", "gpt-oss:20b")
+        except Exception:
+            parsed_payload = {}
+            
+        # agent
+        # --------------------------------------------------------------------------------
+        agent = OllamaBioAgent(path="./data",
+            llm=model,
+            source="Custom",
+            use_tool_retriever=True,
+            timeout_seconds=600,
+            base_url=url,
+            api_key=None
+        )
+        
+        # run agent
+        # --------------------------------------------------------------------------------
+        try:
+            if stream:
+                return await agent.run_stream(parsed_payload)
+            else:
+                return await agent.run(parsed_payload)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Genomeer Agent error: {e}")
+    
     r = None
     try:
         session = aiohttp.ClientSession(

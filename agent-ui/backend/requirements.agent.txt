@@ -1,0 +1,3 @@
+
+## AGENTIC LIBRARY: BIOAGENT PROJECT BETA v1.0
+./open_webui/agent/genomeer

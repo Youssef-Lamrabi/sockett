@@ -50,7 +50,7 @@
 	import { generateAutoCompletion } from '$lib/apis';
 	import { deleteFileById } from '$lib/apis/files';
 
-	import { WEBUI_BASE_URL, WEBUI_API_BASE_URL, PASTED_TEXT_CHARACTER_LIMIT } from '$lib/constants';
+	import { WEBUI_BASE_URL, WEBUI_API_BASE_URL, PASTED_TEXT_CHARACTER_LIMIT, WEBUI_SRC_URL } from '$lib/constants';
 
 	import InputMenu from './MessageInput/InputMenu.svelte';
 	import VoiceRecording from './MessageInput/VoiceRecording.svelte';
@@ -931,7 +931,7 @@
 											?.profile_image_url ??
 											($i18n.language === 'dg-DG'
 												? `${WEBUI_BASE_URL}/doge.png`
-												: `${WEBUI_BASE_URL}/static/favicon.png`)}
+												: `${WEBUI_SRC_URL}/static/favicon.png`)}
 									/>
 									<div class="translate-y-[0.5px]">
 										{$i18n.t('Talk to model')}:

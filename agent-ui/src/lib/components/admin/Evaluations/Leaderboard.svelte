@@ -15,7 +15,7 @@
 
 	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
-	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { WEBUI_BASE_URL, WEBUI_SRC_URL } from '$lib/constants';
 
 	const i18n = getContext('i18n');
 
@@ -521,7 +521,7 @@
 							<div class="flex items-center gap-2">
 								<div class="shrink-0">
 									<img
-										src={model?.info?.meta?.profile_image_url ?? `${WEBUI_BASE_URL}/favicon.png`}
+										src={model?.info?.meta?.profile_image_url ?? `${WEBUI_SRC_URL}/static/favicon.png`}
 										alt={model.name}
 										class="size-5 rounded-full object-cover shrink-0"
 									/>

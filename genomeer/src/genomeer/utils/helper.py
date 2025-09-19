@@ -35,7 +35,10 @@ def _run_in_env(
     prefix = ENVS_DIR / env_name
 
     # micromamba run -p <prefix> -- <argv...>
-    cmd = [str(exe), "run", "-p", str(prefix), "--", *argv]
+    cmd = [str(exe), "run", "-p", str(prefix), *argv]
+    print('---------------------------------')
+    print(cmd)
+    print('---------------------------------')
 
     env = dict(os.environ)
     env.pop("CONDA_PREFIX", None)
@@ -249,6 +252,7 @@ def run_with_timeout(
 # ------------------------------------------------------------------------------------------
 def read_module2api():
     fields = [
+        "basic"
         # "literature",
         # "biochemistry",
         # "bioengineering",
@@ -257,7 +261,7 @@ def read_module2api():
         # "cell_biology",
         # "molecular_biology",
         # "genetics",
-        "genomics",
+        # "genomics",
         # "immunology",
         # "microbiology",
         # "pathology",
@@ -273,7 +277,7 @@ def read_module2api():
     for field in fields:
         module_name = f"genomeer.tools.description.{field}"
         module = importlib.import_module(module_name)
-        module2api[f"biomni.tool.{field}"] = module.description
+        module2api[f"genomeer.tools.function.{field}"] = module.description
     return module2api
 
 

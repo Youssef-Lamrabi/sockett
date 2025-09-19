@@ -1461,6 +1461,8 @@ async def process_chat_response(
                 content = ""
 
                 for block in content_blocks:
+                    print(">>>>>>>>>>>>>>>>>>>>")
+                    print(block)
                     if block["type"] == "text":
                         block_content = block["content"].strip()
                         if block_content:
