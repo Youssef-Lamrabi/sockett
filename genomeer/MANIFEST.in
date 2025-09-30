@@ -1,0 +1,2 @@
+recursive-include src/genomeer/runtime/registry *.yaml
+recursive-include src/genomeer/runtime/pkgs *.txt

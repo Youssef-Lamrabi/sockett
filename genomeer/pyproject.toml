@@ -49,6 +49,7 @@ dependencies = [
     "tooluniverse",
     "python-dotenv",
     "pydantic", 
+    "ipython"
 ]
 
 [project.urls]
@@ -67,6 +68,10 @@ version = {attr = "genomeer.version.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = ["test*"]
+
+[tool.setuptools.package-data]
+"genomeer.runtime.registry" = ["*.yaml"]
+"genomeer.runtime.pkgs" = ["*.txt"]
 
 [tool.ruff]
 src = ["src"]

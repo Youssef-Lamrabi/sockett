@@ -8,6 +8,7 @@ dependencies:
   - ncbi-genome-download  
   - pip
   - pip:
+      - -e /home/biolab-office-1/DATALAB/2025/Genomeer/genomeer
       - numpy==2.1
       - pandas
       - matplotlib

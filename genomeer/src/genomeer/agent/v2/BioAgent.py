@@ -1,23 +1,23 @@
-import glob, inspect, os, re, threading
-from collections.abc import Generator
+# -----------------------------------------------
+# LIBRARY
+# -----------------------------------------------
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+import glob, inspect, os, re, threading, types, traceback
+from collections.abc import Generator
+from typing import Any, List, Dict
+from typing_extensions import TypedDict, Literal, Annotated
+import shutil
 
-import pandas as pd
-from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.checkpoint.memory import MemorySaver
+from dotenv import load_dotenv, find_dotenv
+from langgraph.graph.message import add_messages
 from langgraph.graph import END, START, StateGraph
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage 
+from langgraph.checkpoint.memory import MemorySaver
 
 from genomeer.config import settings
 from genomeer.tools.software.resources import data_lake_dict, library_content_dict, runtime_envs_dicts
 from genomeer.utils.llm import SourceType, get_llm
-from genomeer.model.retriever import ToolRetriever
-from genomeer.tools.registry import ToolRegistry
-from genomeer.utils.stream.shared import REGISTRY
 from genomeer.utils.helper import (
-    # check_and_download_s3_files,
     pretty_print,
     run_r_code,
     run_bash_script,
@@ -28,19 +28,62 @@ from genomeer.utils.helper import (
     read_module2api,
     textify_api_dict,
 )
+from genomeer.model.retriever import ToolRetriever
+from genomeer.tools.registry import ToolRegistry
+from genomeer.utils.stream.shared import REGISTRY
+from genomeer.agent.v2.utils import instructions
+from genomeer.agent.v2.utils.state_graph import StateGraphHelper
 
+# -----------------------------------------------
+# UTILS
+# -----------------------------------------------
+dotenv_path = find_dotenv()
+if dotenv_path:
+    load_dotenv(dotenv_path, override=False)
+    print(f"Loaded environment variables from {dotenv_path}")
 
-if os.path.exists(".env"):
-    load_dotenv(".env", override=False)
-    print("Loaded environment variables from .env")
+from genomeer.agent.v2.utils.tempdir import run_workdir
 
+class Step(TypedDict):
+    title: str
+    status: Literal["todo","done","blocked"]
+    notes: str
+    
 class AgentState(TypedDict):
-    messages: list[BaseMessage]
-    next_step: Literal["generate", "ensure_env", "execute", "end"]
-    env_name: str | None
-    env_ready: bool
+    messages: Annotated[List[BaseMessage], add_messages] # List[BaseMessage]
+    next_step: Literal[
+        "qa",
+        "planner",
+        "orchestrator",
+        "input_guard",
+        "generator",
+        "ensure_env",
+        "executor",
+        "observer",
+        "diagnostics",
+        "finalizer",
+        "end"
+    ]
+    plan: List[Step]
+    current_idx: int
+    manifest: Dict[str, Any]
     pending_code: str | None
-
+    last_prompt: str | None
+    last_result: str | None
+    missing: List[str] | None
+    env_name: str
+    env_ready: bool
+    run_id: str
+    run_temp_dir: str
+    retry_counts: Dict[int, int]
+    diagnostic_mode: bool
+    diagnostic_code: str | None
+    diagnostic_observation: str | None
+    
+    
+# -----------------------------------------------
+# CORE AGENT CLASS
+# -----------------------------------------------
 class BioAgent:
     def __init__(
         self,
@@ -80,23 +123,23 @@ class BioAgent:
         if api_key is None:
             api_key = settings.api_key if settings.api_key else "EMPTY"
 
-        # Display configuration in a nice, readable format
+        # display configuration in a nice, readable format
         print("\n" + "=" * 50)
-        print("🔧 BioAgent_v1 CONFIGURATION")
+        print("BioAgent_v1 CONFIGURATION")
         print("=" * 50)
 
-        # Get the actual LLM values that will be used by the agent
+        # get the actual LLM values that will be used by the agent
         agent_llm = llm if llm is not None else settings.llm
         agent_source = source if source is not None else settings.source
 
-        # Show default config (database LLM)
-        print("📋 DEFAULT CONFIG :")
+        # show default config (database LLM)
+        print("DEFAULT CONFIG :")
         config_dict = settings.to_dict()
         for key, value in config_dict.items():
             if value is not None:
                 print(f"  {key.replace('_', ' ').title()}: {value}")
 
-        # Show agent-specific LLM if different from default
+        # show agent-specific LLM if different from default
         if agent_llm != settings.llm or agent_source != settings.source:
             print("\n🤖 AGENT LLM (Constructor Override):")
             print(f"  LLM Model: {agent_llm}")
@@ -108,49 +151,10 @@ class BioAgent:
                 print(f"  API Key: {'*' * 8 + api_key[-4:] if len(api_key) > 8 else '***'}")
         print("=" * 50 + "\n")
 
-        # Initialize the data directory path
-        self.path = path
-        if not os.path.exists(path):
-            os.makedirs(path)
-            print(f"Created directory: {path}")
 
-        # --- Begin custom folder/file checks ---
-        benchmark_dir = os.path.join(path, "bioagent_data", "benchmark")
-        data_lake_dir = os.path.join(path, "bioagent_data", "data_lake")
-        os.makedirs(benchmark_dir, exist_ok=True)
-        os.makedirs(data_lake_dir, exist_ok=True)
-
-        # TODO: FOR REVIEW
-        # Check and download missing data lake files
-        # if expected_data_lake_files is None:
-        #     expected_data_lake_files = list(data_lake_dict.keys())
-        # print("Checking and downloading missing data lake files...")
-        # check_and_download_s3_files(
-        #     s3_bucket_url="https://genomeer-release.s3.amazonaws.com",
-        #     local_data_lake_path=data_lake_dir,
-        #     expected_files=expected_data_lake_files,
-        #     folder="data_lake",
-        # )
-
-        # TODO: FOR REVIEW
-        # Check if benchmark directory structure is complete
-        # benchmark_ok = False
-        # if os.path.isdir(benchmark_dir):
-        #     patient_gene_detection_dir = os.path.join(benchmark_dir, "hle")
-        #     if os.path.isdir(patient_gene_detection_dir):
-        #         benchmark_ok = True
-        # if not benchmark_ok:
-        #     print("Checking and downloading benchmark files...")
-        #     check_and_download_s3_files(
-        #         s3_bucket_url="https://genomeer-release.s3.amazonaws.com",
-        #         local_data_lake_path=benchmark_dir,
-        #         expected_files=[],  # Empty list - will download entire folder
-        #         folder="benchmark",
-        #     )
-
+        # [helper] to import tools-mapper, llm
         self.path = os.path.join(path, "bioagent_data")
         self.module2api = read_module2api()
-
         self.llm = get_llm(
             llm,
             stop_sequences=["</execute>", "</solution>"],
@@ -159,8 +163,8 @@ class BioAgent:
             api_key=api_key,
             config=settings,
         )
+        
         self.use_tool_retriever = use_tool_retriever
-
         if self.use_tool_retriever:
             self.tool_registry = ToolRegistry(self.module2api)
             self.retriever = ToolRetriever()
@@ -173,613 +177,57 @@ class BioAgent:
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds
         self.configure()
-
-
-    # TOOLS HELPER
-    def add_tool(self, api):
-        """Add a new tool to the agent's tool registry and make it available for retrieval.
-        Args:
-            api: A callable function to be added as a tool
-        """
-        try:
-            # Get function information
-            function_code = inspect.getsource(api)
-            module_name = api.__module__ if hasattr(api, "__module__") else "custom_tools"
-            function_name = api.__name__ if hasattr(api, "__name__") else str(api)
-
-            # Generate API schema using the existing utility function
-            schema = function_to_api_schema(function_code, self.llm)
-            if not isinstance(schema, dict):
-                raise ValueError("Generated schema is not a dictionary")
-
-            # Validate and enhance the schema
-            if "name" not in schema:
-                schema["name"] = function_name
-            if "description" not in schema:
-                schema["description"] = f"Custom tool: {function_name}"
-            if "required_parameters" not in schema:
-                if "parameters" in schema and isinstance(schema["parameters"], dict):
-                    required_params = []
-                    params = schema["parameters"]
-                    if "properties" in params:
-                        for param_name in params["properties"]:
-                            if param_name in params.get("required", []):
-                                required_params.append(param_name)
-                    schema["required_parameters"] = required_params
-                else:
-                    schema["required_parameters"] = []
-            schema["module"] = module_name
-
-            # Add the tool to the tool registry if it exists
-            if hasattr(self, "tool_registry") and self.tool_registry is not None:
-                try:
-                    self.tool_registry.register_tool(schema)
-                    print(f"Successfully registered tool '{schema['name']}' in tool registry")
-                except Exception as e:
-                    print(f"Warning: Failed to register tool in registry: {e}")
-                    # Continue with adding to module2api even if registry fails
-
-            # Add the tool to module2api structure for system prompt generation
-            if not hasattr(self, "module2api") or self.module2api is None:
-                self.module2api = {}
-            if module_name not in self.module2api:
-                self.module2api[module_name] = []
-
-            # Check if tool already exists in module2api to avoid duplicates
-            existing_tool = None
-            for existing in self.module2api[module_name]:
-                if existing.get("name") == schema["name"]:
-                    existing_tool = existing
-                    break
-            if existing_tool:
-                existing_tool.update(schema)
-                print(f"Updated existing tool '{schema['name']}' in module '{module_name}'")
-            else:
-                # Add new tool
-                self.module2api[module_name].append(schema)
-                print(f"Added new tool '{schema['name']}' to module '{module_name}'")
-
-            # Update the tool registry's document dataframe if it exists
-            if hasattr(self, "tool_registry") and self.tool_registry is not None:
-                try:
-                    # Rebuild the document dataframe
-                    docs = []
-                    for tool_id in range(len(self.tool_registry.tools)):
-                        docs.append(
-                            [
-                                int(tool_id),
-                                self.tool_registry.get_tool_by_id(int(tool_id)),
-                            ]
-                        )
-                    self.tool_registry.document_df = pd.DataFrame(docs, columns=["docid", "document_content"])
-                except Exception as e:
-                    print(f"Warning: Failed to update tool registry document dataframe: {e}")
-
-            # Store the original function for potential future use
-            if not hasattr(self, "_custom_functions"):
-                self._custom_functions = {}
-            self._custom_functions[schema["name"]] = api
-
-            # Also store in _custom_tools for highlighting
-            if not hasattr(self, "_custom_tools"):
-                self._custom_tools = {}
-            self._custom_tools[schema["name"]] = {
-                "name": schema["name"],
-                "description": schema["description"],
-                "module": module_name,
-            }
-
-            # Make the function available in the global namespace for execution
-            import builtins
-            
-            if not hasattr(builtins, "_bioagent_custom_functions"):
-                builtins._bioagent_custom_functions = {}
-            builtins._bioagent_custom_functions[schema["name"]] = api
-            print(
-                f"Tool '{schema['name']}' successfully added and ready for use in both direct execution and retrieval"
-            )
-            self.configure()
-            return schema
-
-        except Exception as e:
-            print(f"Error adding tool: {e}")
-            import traceback
-
-            traceback.print_exc()
-            raise
-
-    def add_mcp(self, config_path: str | Path = "./tutorials/examples/mcp_config.yaml") -> None:
-        pass
-        # """
-        # Add MCP (Model Context Protocol) tools from configuration file.
-
-        # This method dynamically registers MCP server tools as callable functions within
-        # the genomeer agent system. Each MCP server is loaded as an independent module
-        # with its tools exposed as synchronous wrapper functions.
-
-        # Supports both manual tool definitions and automatic tool discovery from MCP servers.
-
-        # Args:
-        #     config_path: Path to the MCP configuration YAML file containing server
-        #                 definitions and tool specifications.
-
-        # Raises:
-        #     FileNotFoundError: If the config file doesn't exist
-        #     yaml.YAMLError: If the config file is malformed
-        #     RuntimeError: If MCP server initialization fails
-        # """
-        # import asyncio
-        # import os
-        # import sys
-        # import types
-        # from pathlib import Path
-
-        # import nest_asyncio
-        # import yaml
-        # from mcp import ClientSession
-        # from mcp.client.stdio import StdioServerParameters, stdio_client
-
-        # nest_asyncio.apply()
-
-        # def discover_mcp_tools_sync(server_params: StdioServerParameters) -> list[dict]:
-        #     """Discover available tools from MCP server synchronously."""
-        #     try:
-
-        #         async def _discover_async():
-        #             async with stdio_client(server_params) as (reader, writer):
-        #                 async with ClientSession(reader, writer) as session:
-        #                     await session.initialize()
-
-        #                     # Get available tools
-        #                     tools_result = await session.list_tools()
-        #                     tools = tools_result.tools if hasattr(tools_result, "tools") else tools_result
-
-        #                     discovered_tools = []
-        #                     for tool in tools:
-        #                         if hasattr(tool, "name"):
-        #                             discovered_tools.append(
-        #                                 {
-        #                                     "name": tool.name,
-        #                                     "description": tool.description,
-        #                                     "inputSchema": tool.inputSchema,
-        #                                 }
-        #                             )
-        #                         else:
-        #                             print(f"Warning: Skipping tool with no name attribute: {tool}")
-
-        #                     return discovered_tools
-
-        #         return asyncio.run(_discover_async())
-        #     except Exception as e:
-        #         print(f"Failed to discover tools: {e}")
-        #         return []
-
-        # def make_mcp_wrapper(cmd: str, args: list[str], tool_name: str, doc: str, env_vars: dict = None):
-        #     """Create a synchronous wrapper for an async MCP tool call."""
-
-        #     def sync_tool_wrapper(**kwargs):
-        #         """Synchronous wrapper for MCP tool execution."""
-        #         try:
-        #             server_params = StdioServerParameters(command=cmd, args=args, env=env_vars)
-
-        #             async def async_tool_call():
-        #                 async with stdio_client(server_params) as (reader, writer):
-        #                     async with ClientSession(reader, writer) as session:
-        #                         await session.initialize()
-        #                         result = await session.call_tool(tool_name, kwargs)
-        #                         content = result.content[0]
-        #                         if hasattr(content, "json"):
-        #                             return content.json()
-        #                         return content.text
-
-        #             try:
-        #                 loop = asyncio.get_running_loop()
-        #                 return loop.create_task(async_tool_call())
-        #             except RuntimeError:
-        #                 return asyncio.run(async_tool_call())
-
-        #         except Exception as e:
-        #             raise RuntimeError(f"MCP tool execution failed for '{tool_name}': {e}") from e
-
-        #     sync_tool_wrapper.__name__ = tool_name
-        #     sync_tool_wrapper.__doc__ = doc
-        #     return sync_tool_wrapper
-
-        # # Initialize registries if they don't exist
-        # self._custom_functions = getattr(self, "_custom_functions", {})
-        # self._custom_tools = getattr(self, "_custom_tools", {})
-
-        # # Load and validate configuration
-        # try:
-        #     config_content = Path(config_path).read_text(encoding="utf-8")
-        #     cfg: dict[str, Any] = yaml.safe_load(config_content) or {}
-        # except FileNotFoundError:
-        #     raise FileNotFoundError(f"MCP config file not found: {config_path}") from None
-        # except yaml.YAMLError as e:
-        #     raise yaml.YAMLError(f"Invalid YAML in MCP config: {e}") from e
-
-        # mcp_servers: dict[str, Any] = cfg.get("mcp_servers", {})
-        # if not mcp_servers:
-        #     print("Warning: No MCP servers found in configuration")
-        #     return
-
-        # # Process each MCP server configuration
-        # for server_name, server_meta in mcp_servers.items():
-        #     if not server_meta.get("enabled", True):
-        #         continue
-
-        #     # Validate command configuration
-        #     cmd_list = server_meta.get("command", [])
-        #     if not cmd_list or not isinstance(cmd_list, list):
-        #         print(f"Warning: Invalid command configuration for server '{server_name}'")
-        #         continue
-
-        #     cmd, *args = cmd_list
-
-        #     # Process environment variables
-        #     env_vars = server_meta.get("env", {})
-        #     if env_vars:
-        #         processed_env = {}
-        #         for key, value in env_vars.items():
-        #             if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
-        #                 var_name = value[2:-1]
-        #                 processed_env[key] = os.getenv(var_name, "")
-        #             else:
-        #                 processed_env[key] = value
-        #         env_vars = processed_env
-
-        #     # Create module namespace for this MCP server
-        #     mcp_module_name = f"mcp_servers.{server_name}"
-        #     if mcp_module_name not in sys.modules:
-        #         sys.modules[mcp_module_name] = types.ModuleType(mcp_module_name)
-        #     server_module = sys.modules[mcp_module_name]
-
-        #     tools_config = server_meta.get("tools", [])
-
-        #     if not tools_config:
-        #         try:
-        #             server_params = StdioServerParameters(command=cmd, args=args, env=env_vars)
-        #             tools_config = discover_mcp_tools_sync(server_params)
-
-        #             if tools_config:
-        #                 print(f"Discovered {len(tools_config)} tools from {server_name} MCP server")
-        #             else:
-        #                 print(f"Warning: No tools discovered from {server_name} MCP server")
-        #                 continue
-
-        #         except Exception as e:
-        #             print(f"Failed to discover tools for {server_name}: {e}")
-        #             continue
-
-        #     # Register each tool
-        #     for tool_meta in tools_config:
-        #         if isinstance(tool_meta, dict) and "genomeer_name" in tool_meta:
-        #             # Manual tool definition
-        #             tool_name = tool_meta.get("genomeer_name")
-        #             description = tool_meta.get("description", f"MCP tool: {tool_name}")
-        #             parameters = tool_meta.get("parameters", {})
-        #         else:
-        #             # Auto-discovered tool
-        #             tool_name = tool_meta.get("name")
-        #             description = tool_meta.get("description", f"MCP tool: {tool_name}")
-        #             parameters = tool_meta.get("inputSchema", {}).get("properties", {})
-
-        #         if not tool_name:
-        #             print(f"Warning: Skipping tool with no name in {server_name}")
-        #             continue
-
-        #         # Create wrapper function
-        #         wrapper_function = make_mcp_wrapper(cmd, args, tool_name, description, env_vars)
-
-        #         # Add to module namespace
-        #         setattr(server_module, tool_name, wrapper_function)
-
-        #         # Build parameter lists
-        #         required_params, optional_params = [], []
-        #         for param_name, param_spec in parameters.items():
-        #             param_info = {
-        #                 "name": param_name,
-        #                 "type": str(param_spec.get("type", "string")),
-        #                 "description": param_spec.get("description", ""),
-        #                 "default": param_spec.get("default", None),
-        #             }
-
-        #             if param_spec.get("required", False):
-        #                 required_params.append(param_info)
-        #             else:
-        #                 optional_params.append(param_info)
-
-        #         # Create tool schema
-        #         tool_schema = {
-        #             "name": tool_name,
-        #             "description": description,
-        #             "parameters": parameters,
-        #             "required_parameters": required_params,
-        #             "optional_parameters": optional_params,
-        #             "module": mcp_module_name,
-        #             "fn": wrapper_function,
-        #         }
-
-        #         # Register in tool registry
-        #         self.tool_registry.register_tool(tool_schema)
-
-        #         # Add to module2api mapping
-        #         if mcp_module_name not in self.module2api:
-        #             self.module2api[mcp_module_name] = []
-        #         self.module2api[mcp_module_name].append(tool_schema)
-
-        #         # Add to instance registries
-        #         self._custom_functions[tool_name] = wrapper_function
-        #         self._custom_tools[tool_name] = {
-        #             "name": tool_name,
-        #             "description": description,
-        #             "module": mcp_module_name,
-        #         }
-
-        # # Update agent configuration
-        # self.configure()
-
-    def get_custom_tool(self, name):
-        """Get a custom tool by name.
-        Args:
-            name: The name of the custom tool
-        Returns:
-            The custom tool function if found, None otherwise
-        """
-        if hasattr(self, "_custom_functions") and name in self._custom_functions:
-            return self._custom_functions[name]
-        return None
-
-    def list_custom_tools(self):
-        """List all custom tools that have been added.
-        Returns:
-            A list of custom tool names
-        """
-        if hasattr(self, "_custom_functions"):
-            return list(self._custom_functions.keys())
-        return []
-
-    def remove_custom_tool(self, name):
-        """Remove a custom tool.
-        Args:
-            name: The name of the custom tool to remove
-        Returns:
-            True if the tool was removed, False if it wasn't found
-        """
-        removed = False
-
-        # Remove from custom functions
-        if hasattr(self, "_custom_functions") and name in self._custom_functions:
-            del self._custom_functions[name]
-            removed = True
-
-        # Remove from custom tools (for highlighting)
-        if hasattr(self, "_custom_tools") and name in self._custom_tools:
-            del self._custom_tools[name]
-            removed = True
-
-        # Remove from global namespace
-        import builtins
-        if hasattr(builtins, "_bioagent_custom_functions") and name in builtins._bioagent_custom_functions:
-            del builtins._bioagent_custom_functions[name]
-
-        # Remove from tool registry
-        if hasattr(self, "tool_registry") and self.tool_registry is not None:
-            if self.tool_registry.remove_tool_by_name(name):
-                removed = True
-                # Rebuild the document dataframe
-                try:
-                    docs = []
-                    for tool_id in range(len(self.tool_registry.tools)):
-                        docs.append(
-                            [
-                                int(tool_id),
-                                self.tool_registry.get_tool_by_id(int(tool_id)),
-                            ]
-                        )
-                    self.tool_registry.document_df = pd.DataFrame(docs, columns=["docid", "document_content"])
-                except Exception as e:
-                    print(f"Warning: Failed to update tool registry document dataframe: {e}")
-
-        # Remove from module2api
-        if hasattr(self, "module2api"):
-            for tools in self.module2api.values():
-                for i, tool in enumerate(tools):
-                    if tool.get("name") == name:
-                        del tools[i]
-                        removed = True
-                        break
-
-        if removed:
-            print(f"Custom tool '{name}' has been removed")
-        else:
-            print(f"Custom tool '{name}' was not found")
-        return removed
-
-
-    # DATALAKE HELPER
-    def add_data(self, data):
-        """Add new data to the data lake.
-        Args:
-            data: Dictionary with file path as key and description as value
-                  e.g., {'my_dataset.csv': 'A dataset containing gene expression data'}
-                  or {'path/to/file.txt': 'Description of the file'}
-        """
-        try:
-            if not isinstance(data, dict):
-                raise ValueError("Data must be a dictionary with file path as key and description as value")
-
-            # Initialize custom data storage if it doesn't exist
-            if not hasattr(self, "_custom_data"):
-                self._custom_data = {}
-
-            # Add each data item
-            for file_path, description in data.items():
-                if not isinstance(file_path, str) or not isinstance(description, str):
-                    print("Warning: Skipping invalid data entry - file_path and description must be strings")
-                    continue
-
-                # Extract filename from path for storage
-                filename = os.path.basename(file_path) if "/" in file_path else file_path
-
-                # Store the data with both the full path and description
-                self._custom_data[filename] = {
-                    "path": file_path,
-                    "description": description,
-                }
-
-                # Also add to the data_lake_dict for consistency
-                self.data_lake_dict[filename] = description
-
-                print(f"Added data item '{filename}': {description}")
-            self.configure()
-            print(f"Successfully added {len(data)} data item(s) to the data lake")
-            return True
-
-        except Exception as e:
-            print(f"Error adding data: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    def get_custom_data(self, name):
-        """Get a custom data item by name.
-        Args:
-            name: The name of the custom data item
-        Returns:
-            The custom data item info if found, None otherwise
-        """
-        if hasattr(self, "_custom_data") and name in self._custom_data:
-            return self._custom_data[name]
-        return None
-
-    def list_custom_data(self):
-        """List all custom data items that have been added.
-        Returns:
-            A list of custom data item names and descriptions
-        """
-        if hasattr(self, "_custom_data"):
-            return [(name, info["description"]) for name, info in self._custom_data.items()]
-        return []
-
-    def remove_custom_data(self, name):
-        """Remove a custom data item.
-        Args:
-            name: The name of the custom data item to remove
-        Returns:
-            True if the data item was removed, False if it wasn't found
-        """
-        removed = False
-
-        # Remove from custom data
-        if hasattr(self, "_custom_data") and name in self._custom_data:
-            del self._custom_data[name]
-            removed = True
-
-        # Remove from data_lake_dict
-        if hasattr(self, "data_lake_dict") and name in self.data_lake_dict:
-            del self.data_lake_dict[name]
-            removed = True
-
-        if removed:
-            print(f"Custom data item '{name}' has been removed")
-        else:
-            print(f"Custom data item '{name}' was not found")
-        return removed
-
-
-    # SOFTWARE HELPER
-    def add_software(self, software):
-        """Add new software to the software library.
-        Args:
-            software: Dictionary with software name as key and description as value
-                     e.g., {'custom_tool': 'A custom analysis tool for processing data'}
-                     or {'my_package': 'Description of the package functionality'}
-        """
-        try:
-            if not isinstance(software, dict):
-                raise ValueError("Software must be a dictionary with software name as key and description as value")
-
-            # Initialize custom software storage if it doesn't exist
-            if not hasattr(self, "_custom_software"):
-                self._custom_software = {}
-
-            # Add each software item
-            for software_name, description in software.items():
-                if not isinstance(software_name, str) or not isinstance(description, str):
-                    print("Warning: Skipping invalid software entry - software_name and description must be strings")
-                    continue
-
-                # Store the software with description
-                self._custom_software[software_name] = {
-                    "name": software_name,
-                    "description": description,
-                }
-
-                # Also add to the library_content_dict for consistency
-                self.library_content_dict[software_name] = description
-                print(f"Added software '{software_name}': {description}")
-
-            print(f"Successfully added {len(software)} software item(s) to the library")
-            self.configure()
-            return True
-
-        except Exception as e:
-            print(f"Error adding software: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    def get_custom_software(self, name):
-        """Get a custom software item by name.
-        Args:
-            name: The name of the custom software item
-        Returns:
-            The custom software item info if found, None otherwise
-        """
-        if hasattr(self, "_custom_software") and name in self._custom_software:
-            return self._custom_software[name]
-        return None
-
-    def list_custom_software(self):
-        """List all custom software items that have been added.
-        Returns:
-            A list of custom software item names and descriptions
-        """
-        if hasattr(self, "_custom_software"):
-            return [(name, info["description"]) for name, info in self._custom_software.items()]
-        return []
-
-    def remove_custom_software(self, name):
-        """Remove a custom software item.
-        Args:
-            name: The name of the custom software item to remove
-        Returns:
-            True if the software item was removed, False if it wasn't found
-        """
-        removed = False
-
-        # Remove from custom software
-        if hasattr(self, "_custom_software") and name in self._custom_software:
-            del self._custom_software[name]
-            removed = True
-
-        # Remove from library_content_dict
-        if hasattr(self, "library_content_dict") and name in self.library_content_dict:
-            del self.library_content_dict[name]
-            removed = True
-
-        if removed:
-            print(f"Custom software item '{name}' has been removed")
-        else:
-            print(f"Custom software item '{name}' was not found")
-
-        return removed
-
-
+        
+        # [DEV-ONLY] logs
+        self._set_debug_log("/home/biolab-office-1/DATALAB/2025/Genomeer/genomeer/src/genomeer/agent/v2/agent_debug.log")
+        
+        # CONSTANTS
+        self.MAX_STEP_RETRIES = 3          # retries before diagnostics
+        self.MAX_DIAG_ROUNDS_PER_STEP = 2  # how many times we allow re-entering diagnostics for the same step
+
+
+    # LOGS UTILS [DEV-ONLY]
+    def _set_debug_log(self, path: str | None = None):
+        """Call once to set a log file. If None, uses ./bioagent_debug.log"""
+        self.debug_log_path = path or os.path.abspath("./bioagent_debug.log")
+        os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
+        with open(self.debug_log_path, "w", encoding="utf-8") as f:
+            f.write("\n===== NEW SESSION =====\n")
+
+    def _log(self, title: str, body: str = "", node: str | None = None, type: str = 'file'):
+        """Append a structured block to the debug log."""
+        line = ""
+        if title == "ENTER NODE":
+            line += "\n" + (">"*60)
+        line += f"\n[{node or '-'}] {title}\n{body}\n" + ("-"*60) + "\n"
+        if type == 'file':
+            with open(getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log")), "a", encoding="utf-8") as f:
+                f.write(line)
+        elif type == 'stdout':
+            print(line)
+
+    def _fmt_msgs(self, msgs):
+        """Pretty format a LangChain message list for logging."""
+        parts = []
+        for m in msgs:
+            role = getattr(m, "type", m.__class__.__name__)
+            content = getattr(m, "content", str(m))
+            parts.append(f"--- {role.upper()} ---\n{content}")
+        return "\n".join(parts)
+
+    
     # SYSTEM SETUP
+    def _llm_invoke(self, node: str, purpose: str, msgs, verbose=True):
+        """
+        Central LLM call: logs the full prompt and the raw LLM text response.
+        Use this instead of self.llm.invoke(...) everywhere.
+        """
+        if verbose: prompt_txt = self._fmt_msgs(msgs)
+        if verbose: self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
+        resp = self.llm.invoke(msgs)
+        if verbose: self._log(f"LLM RESPONSE ({purpose})", getattr(resp, "content", str(resp)), node=node)
+        return resp
+    
     def _generate_system_prompt(
         self,
         tool_desc,
@@ -841,11 +289,11 @@ class BioAgent:
             else:
                 return f"{name}: {description}"
 
-        # Separate custom and default resources
+        # separate custom and default resources
         default_data_lake_content = []
         default_library_content_list = []
 
-        # Filter out custom items from default lists
+        # filter out custom items from default lists
         custom_data_names = set()
         custom_software_names = set()
 
@@ -854,7 +302,7 @@ class BioAgent:
         if custom_software:
             custom_software_names = {item.get("name") if isinstance(item, dict) else item for item in custom_software}
 
-        # Separate default data lake items
+        # separate default data lake items
         for item in data_lake_content:
             if isinstance(item, dict):
                 name = item.get("name", "")
@@ -863,7 +311,7 @@ class BioAgent:
             elif item not in custom_data_names:
                 default_data_lake_content.append(item)
 
-        # Separate default library items
+        # separate default library items
         for lib in library_content_list:
             if isinstance(lib, dict):
                 name = lib.get("name", "")
@@ -876,31 +324,31 @@ class BioAgent:
         if isinstance(default_data_lake_content, list) and all(
             isinstance(item, str) for item in default_data_lake_content
         ):
-            # Simple list of strings - check if they already have descriptions
+            # simple list of strings - check if they already have descriptions
             data_lake_formatted = []
             for item in default_data_lake_content:
-                # Check if the item already has a description (contains a colon)
+                # check if the item already has a description (contains a colon)
                 if ": " in item:
                     data_lake_formatted.append(item)
                 else:
                     description = self.data_lake_dict.get(item, f"Data lake item: {item}")
                     data_lake_formatted.append(format_item_with_description(item, description))
         else:
-            # List with descriptions
+            # list with descriptions
             data_lake_formatted = []
             for item in default_data_lake_content:
                 if isinstance(item, dict):
                     name = item.get("name", "")
                     description = self.data_lake_dict.get(name, f"Data lake item: {name}")
                     data_lake_formatted.append(format_item_with_description(name, description))
-                # Check if the item already has a description (contains a colon)
+                # check if the item already has a description (contains a colon)
                 elif isinstance(item, str) and ": " in item:
                     data_lake_formatted.append(item)
                 else:
                     description = self.data_lake_dict.get(item, f"Data lake item: {item}")
                     data_lake_formatted.append(format_item_with_description(item, description))
 
-        # Format the default library content
+        # format the default library content
         if isinstance(default_library_content_list, list) and all(
             isinstance(item, str) for item in default_library_content_list
         ):
@@ -909,16 +357,16 @@ class BioAgent:
                 and isinstance(default_library_content_list[0], str)
                 and "," not in default_library_content_list[0]
             ):
-                # Simple list of strings
+                # simple list of strings
                 libraries_formatted = []
                 for lib in default_library_content_list:
                     description = self.library_content_dict.get(lib, f"Software library: {lib}")
                     libraries_formatted.append(format_item_with_description(lib, description))
             else:
-                # Already formatted string
+                # already formatted string
                 libraries_formatted = default_library_content_list
         else:
-            # List with descriptions
+            # list with descriptions
             libraries_formatted = []
             for lib in default_library_content_list:
                 if isinstance(lib, dict):
@@ -929,7 +377,7 @@ class BioAgent:
                     description = self.library_content_dict.get(lib, f"Software library: {lib}")
                     libraries_formatted.append(format_item_with_description(lib, description))
 
-        # Format custom resources with highlighting
+        # format custom resources with highlighting
         custom_tools_formatted = []
         if custom_tools:
             for tool in custom_tools:
@@ -964,133 +412,26 @@ class BioAgent:
                     custom_software_formatted.append(f"⚙️ {format_item_with_description(item, desc)}")
 
         # Base prompt
-        prompt_modifier = """
-You are a helpful MetaGenomics assistant assigned with the task of problem-solving.
-To achieve this, you will be using an interactive coding environment equipped with a variety of tool functions, data, and softwares to assist you throughout the process.
-
-Given a task, make a plan first. The plan should be a numbered list of steps that you will take to solve the task. Be specific and detailed.
-Format your plan as a checklist with empty checkboxes like this:
-1. [ ] First step
-2. [ ] Second step
-3. [ ] Third step
-
-Follow the plan step by step. After completing each step, update the checklist by replacing the empty checkbox with a checkmark:
-1. [✓] First step (completed)
-2. [ ] Second step
-3. [ ] Third step
-
-If a step fails or needs modification, mark it with an X and explain why:
-1. [✓] First step (completed)
-2. [✗] Second step (failed because...)
-3. [ ] Modified second step
-4. [ ] Third step
-
-Always show the updated plan after each step so the user can track progress.
-
-At each turn, you should first provide your thinking and reasoning given the conversation history.
-After that, you have two options:
-
-1) Interact with a programming environment and receive the corresponding output within <observe></observe>. Your code should be enclosed using "<execute>" tag, for example: <execute> print("Hello World!") </execute>. IMPORTANT: You must end the code block with </execute> tag.
-- For Python code (default): <execute> print("Hello World!") </execute>
-- For R code: <execute> #!R\nlibrary(ggplot2)\nprint("Hello from R") </execute>
-- For Bash scripts and commands: <execute> #!BASH\necho "Hello from Bash"\nls -la </execute>
-- For CLI softwares, use Bash scripts.
-
-2) When you think it is ready, directly provide a solution that adheres to the required format for the given task to the user. Your solution should be enclosed using "<solution>" tag, for example: The answer is <solution> A </solution>. IMPORTANT: You must end the solution block with </solution> tag.
-
-You have many chances to interact with the environment to receive the observation. So you can decompose your code into multiple steps.
-Don't overcomplicate the code. Keep it simple and easy to understand.
-When writing the code, please print out the steps and results in a clear and concise manner, like a research log.
-When calling the existing python functions in the function dictionary, YOU MUST SAVE THE OUTPUT and PRINT OUT the result.
-For example, result = understand_scRNA(XXX) print(result)
-Otherwise the system will not be able to know what has been done.
-
-For R code, use the #!R marker at the beginning of your code block to indicate it's R code.
-For Bash scripts and commands, use the #!BASH marker at the beginning of your code block. This allows for both simple commands and multi-line scripts with variables, loops, conditionals, loops, and other Bash features.
-
-In each response, you must include EITHER <execute></execute> or <solution></solution> tag. Not both at the same time. Do not respond with messages without any tags. No empty messages.
-
-        """
-        # You can add in each prompt <think></think> tag if you havce re  soning text otherwise dont add.
-        # PLease dont include user inital question or request in <solution></solution> include only your response. 
-
-        # When you need information from the user, DO NOT use <execute>. Ask questions in <solution> only. Reserve <execute> strictly for non-trivial computation (running code, tools, or commands).
-        # If required inputs are missing, respond with <solution> that asks clarifying questions. Do not emit <execute> in that case. 
-        # Only include <execute> if the code performs real computation/tool use (e.g., file I/O, alignment, calling provided functions). Pure prints, input prompts, or echoing questions are NOT allowed in <execute>.
-
-
-        # Add self-critic instructions if needed
-        if self_critic:
-            prompt_modifier += """
-You may or may not receive feedbacks from human. If so, address the feedbacks by following the same procedure of multiple rounds of thinking, execution, and then coming up with a new solution.
-"""
+        base_prompt = instructions.GLOBAL_SYSTEM       
+        base_prompt = base_prompt.format(
+            SELF_CRITIC_INSTRUCTION= '---\n'+instructions.SELF_CRITIC_INSTRUCTION.strip()+'\n---' if self_critic else ""
+        )
 
         # Add custom resources section first (highlighted)
         has_custom_resources = any([custom_tools_formatted, custom_data_formatted, custom_software_formatted])
+        custom_resources = ""
         if has_custom_resources:
-            prompt_modifier += """
-
-PRIORITY CUSTOM RESOURCES
-===============================
-IMPORTANT: The following custom resources have been specifically added for your use.
-    PRIORITIZE using these resources as they are directly relevant to your task.
-    Always consider these FIRST and in the meantime using default resources.
-
-            """
-
-            if custom_tools_formatted:
-                prompt_modifier += """
-CUSTOM TOOLS (USE THESE FIRST):
-{custom_tools}
-
-                """
-
-            if custom_data_formatted:
-                prompt_modifier += """
-CUSTOM DATA (PRIORITIZE THESE DATASETS):
-{custom_data}
-
-                """
-
-            if custom_software_formatted:
-                prompt_modifier += """
-CUSTOM SOFTWARE (USE THESE LIBRARIES):
-{custom_software}
-
-                """
-            prompt_modifier += """==============================="""
+            custom_resources = instructions.UTILS_CUSTOM_RESOURCES.format(
+                custom_tools="CUSTOM TOOLS (USE THESE FIRST):" + "\n".join(custom_tools_formatted) if custom_tools_formatted else ""
+            )
+            custom_resources = custom_resources.format(
+                custom_data="CUSTOM DATA (PRIORITIZE THESE DATASETS):" + "\n".join(custom_data_formatted) if custom_data_formatted else ""
+            )
+            custom_resources = custom_resources.format(
+                custom_software="CUSTOM SOFTWARE (USE THESE LIBRARIES):" + "\n".join(custom_software_formatted) if custom_software_formatted else ""
+            )
 
         # Add environment resources
-        prompt_modifier += """
-Environment Resources:
-- Function Dictionary:
-{function_intro}
----
-{tool_desc}
----
-{import_instruction}
-
-- Biological data lake
-You can access a biological data lake at the following path: {data_lake_path}.
-{data_lake_intro}
-Each item is listed with its description to help you understand its contents.
-----
-{data_lake_content}
-----
-
-- Software Library:
-{library_intro}
-Each library is listed with its description to help you understand its functionality.
-----
-{library_content_formatted}
-----
-
-- Note on using R packages and Bash scripts:
-- R packages: Use subprocess.run(['Rscript', '-e', 'your R code here']) in Python, or use the #!R marker in your execute block.
-- Bash scripts and commands: Use the #!BASH marker in your execute block for both simple commands and complex shell scripts with variables, loops, conditionals, etc.
-        """
-
-        # Set appropriate text based on whether this is initial configuration or after retrieval
         if is_retrieval:
             function_intro = "Based on your query, I've identified the following most relevant functions that you can use in your code:"
             data_lake_intro = "Based on your query, I've identified the following most relevant datasets:"
@@ -1104,38 +445,18 @@ Each library is listed with its description to help you understand its functiona
             library_intro = "The environment supports a list of libraries that can be directly used. Do not forget the import statement:"
             import_instruction = ""
 
-        # Format the content consistently for both initial and retrieval cases
-        library_content_formatted = "\n".join(libraries_formatted)
-        data_lake_content_formatted = "\n".join(data_lake_formatted)
-
-        # Format the prompt with the appropriate values
-        format_dict = {
-            "function_intro": function_intro,
+        env_resources = instructions.UTILS_ENV_RESOURCES.format(**{
+            "function_intro":function_intro,
             "tool_desc": textify_api_dict(tool_desc) if isinstance(tool_desc, dict) else tool_desc,
             "import_instruction": import_instruction,
             "data_lake_path": self.path + "/data_lake",
             "data_lake_intro": data_lake_intro,
-            "data_lake_content": data_lake_content_formatted,
+            "data_lake_content": "\n".join(data_lake_formatted),
             "library_intro": library_intro,
-            "library_content_formatted": library_content_formatted,
-        }
-
-        # Add custom resources to format dict if they exist
-        if custom_tools_formatted:
-            format_dict["custom_tools"] = "\n".join(custom_tools_formatted)
-        if custom_data_formatted:
-            format_dict["custom_data"] = "\n".join(custom_data_formatted)
-        if custom_software_formatted:
-            format_dict["custom_software"] = "\n".join(custom_software_formatted)
-
-        # Fnally format the system prompt
-        formatted_prompt = prompt_modifier.format(**format_dict)
-        # formatted_prompt += """
-        # Important: In each response, you must include EITHER <execute> or <solution> tag. Not both at the same time. Do not respond with messages without any opening add closing tags. No empty messages. Dont try to call automatically any tools. for tools call always genrate code in <execute></execute> tag.
-        # Important: Never ever try to invoke tools automatically from the model. use <execute></execute> in case.
-        # Important: for your response use <execute> CODE_INSIDE </execute>, <solution> TEXT </solution>, <think> TEXT </think>. I don't considere any text ouside.
-        # """
-        return formatted_prompt
+            "library_content_formatted": "\n".join(libraries_formatted),
+        })
+        sys_prompt = base_prompt + custom_resources + env_resources
+        return sys_prompt
 
     def configure(self, self_critic=False, test_time_scale_round=0):
         """Configure the agent with the initial system prompt and workflow.
@@ -1143,20 +464,13 @@ Each library is listed with its description to help you understand its functiona
             self_critic: Whether to enable self-critic mode
             test_time_scale_round: Number of rounds for test time scaling
         """
-        # Store self_critic for later use
         self.self_critic = self_critic
-
-        # Get data lake content
         data_lake_path = self.path + "/data_lake"
         data_lake_content = glob.glob(data_lake_path + "/*")
         data_lake_items = [x.split("/")[-1] for x in data_lake_content]
-
-        # Store data_lake_dict as instance variable for use in retrieval
+        
         self.data_lake_dict = data_lake_dict
-        # Store library_content_dict directly without library_content
         self.library_content_dict = library_content_dict
-
-        # Prepare tool descriptions
         tool_desc = {i: [x for x in j] for i, j in self.module2api.items()}
 
         # Prepare data lake items with descriptions
@@ -1174,7 +488,7 @@ Each library is listed with its description to help you understand its functiona
         library_content_list = list(self.library_content_dict.keys())
         if hasattr(self, "_custom_software") and self._custom_software:
             for name in self._custom_software:
-                if name not in library_content_list:  # Avoid duplicates
+                if name not in library_content_list:
                     library_content_list.append(name)
 
         # Generate the system prompt for initial configuration (is_retrieval=False)
@@ -1210,223 +524,285 @@ Each library is listed with its description to help you understand its functiona
             custom_data=custom_data if custom_data else None,
             custom_software=custom_software if custom_software else None,
         )
-
-        # Define routing funtion for graph
-        # -------------------------------------------------------------------------------
-        def routing_function(state: AgentState,) -> Literal["execute", "ensure_env", "generate", "end"]:
-            next_step = state.get("next_step")
-            if next_step in ["execute", "ensure_env", "generate", "end"]:
-                return next_step
-            else:
-                raise ValueError(f"Unexpected next_step: {next_step}")
-
-        def routing_function_self_critic(state: AgentState,) -> Literal["generate", "end"]:
-            next_step = state.get("next_step")
-            if next_step in ["generate", "end"]:
-                return next_step
-            else:
-                raise ValueError(f"Unexpected next_step: {next_step}")
-
+        
+        
         # Define the nodes(functions)
         # -------------------------------------------------------------------------------
-        def generate(state: AgentState) -> AgentState:
-            messages = [SystemMessage(content=self.system_prompt)] + state["messages"]
-            response = self.llm.invoke(messages)
+        def _planner(self, state: AgentState) -> AgentState:
+            node = "planner"
+            self._log("ENTER NODE", body=f"state keys: {list(state.keys())}", node=node)
+    
+            user_prompt = state["messages"][0].content
+            msgs = [
+                self.system_prompt,
+                HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
+                HumanMessage(content=user_prompt),
+            ]
+            resp = self._llm_invoke(node, "plan_route", msgs)
+            
+            steps, route = StateGraphHelper.parse_checklist_and_route(resp.content)
+            updates = {
+                "plan": steps,
+                "current_idx": 0,
+                "next_step": route,
+                "messages": [AIMessage(content=resp.content)],
+                "last_prompt": user_prompt
+            }
+            # state["plan"] = steps
+            # state["current_idx"] = 0
+            # state["messages"].append(AIMessage(content=resp.content))
+            # state["next_step"] = route
+            
+            self._log("EXIT NODE", body=f"route={route}\nsteps={steps}", node=node)
+            return updates
 
-            # Parse the response
-            msg = str(response.content)
+        def _qa(self, state: AgentState) -> AgentState:
+            node = "qa"
+            self._log("ENTER NODE", body=f"route_hint={state['manifest'].get('route_hint')}", node=node)
 
-            # Check for incomplete tags and fix them
-            if "<execute>" in msg and "</execute>" not in msg:
-                msg += "</execute>"
-            if "<solution>" in msg and "</solution>" not in msg:
-                msg += "</solution>"
-            if "<think>" in msg and "</think>" not in msg:
-                msg += "</think>"
-
-            think_match = re.search(r"<think>(.*?)</think>", msg, re.DOTALL)
-            execute_match = re.search(r"<execute>(.*?)</execute>", msg, re.DOTALL)
-            answer_match = re.search(r"<solution>(.*?)</solution>", msg, re.DOTALL)
-
-            # Add the message to the state before checking for errors
-            state["messages"].append(AIMessage(content=msg.strip()))
-
-            if answer_match:
-                state["next_step"] = "end"
-            elif execute_match:
-                code = execute_match.group(1)
-                state["pending_code"] = code
-                # TODO: decide env first
-                env_name = state.get("env_name") or "bio-agent-env1"
-                from genomeer.runtime.env_manager import has_env
-                if not has_env(env_name):
-                    # Tell user we're about to set it up
-                    state["messages"].append(AIMessage(content=f"<observation>Environment '{env_name}' not found. Installing now — this can take a while on first run.</observation>"))
-                    state["next_step"] = "ensure_env"
-                else:
-                    state["env_ready"] = True
-                    state["next_step"] = "execute"
-            elif think_match:
-                state["next_step"] = "generate"
+            route_hint = state["manifest"].get("route_hint")
+            payload = state["manifest"].get("qa_payload","")
+            last_prompt = state["last_prompt"]
+            msgs = [self.system_prompt, HumanMessage(content=instructions.QA_PROMPT)]
+            if route_hint == "ask_for_missing":
+                msgs.append(HumanMessage(content=f"Ask user for these missing items only:\n{payload}"))
+            elif route_hint == "finalize":
+                msgs.append(HumanMessage(content=f"Summarize and answer:\n{payload}"))
             else:
-                print("parsing error...")
-                # Check if we already added an error message to avoid infinite loops
-                error_count = sum(
-                    1 for m in state["messages"] if isinstance(m, HumanMessage) and "there are no tags" in m.content
+                msgs.append(HumanMessage(content=payload or f"Please be generous and Answer clearly to the user's question or request: '{last_prompt}'"))
+            
+            resp = self._llm_invoke(node, "qa", msgs)
+            next_step = "end" if route_hint == "finalize" else "orchestrator"
+            updates = {
+                "next_step": next_step,
+                "messages": [AIMessage(content=resp.content)],
+            }
+            # state["messages"].append(AIMessage(content=resp.content))
+            # state["next_step"] = "end" if route_hint == "finalize" else "orchestrator"
+
+            self._log("EXIT NODE", body=f"next_step={state['next_step']}", node=node)
+            return updates
+
+        def _orchestrator(self, state: AgentState) -> AgentState:
+            node = "orchestrator"
+            self._log("ENTER NODE", body=f"current_idx={state.get('current_idx')}\nplan_len={len(state.get('plan', []))}", node=node)
+
+            idx = state["current_idx"]
+            plan = state["plan"]
+            while idx < len(plan) and plan[idx]["status"] != "todo":
+                idx += 1
+            state["current_idx"] = idx
+            
+            if idx >= len(plan):
+                # all steps are done -> hand off to FINALIZER
+                # initially this was QA's responsibility, but we'll ease that up for this
+                # new_manifest = {
+                #     **state["manifest"],
+                #     "route_hint": "finalize",
+                #     "qa_payload": "All steps completed. Provide a clean final answer.",
+                # }
+                self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
+                return {
+                    "current_idx": idx,
+                    "next_step": "finalizer",
+                    "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
+                }
+            
+            # otherwise go check inputs
+            self._log("EXIT NODE", body=f"all_done=False\ncurrent_idx={idx}\nnext_step=input_guard", node=node)
+            return {
+                "current_idx": idx,
+                "next_step": "input_guard",
+                "messages": [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
+            }
+        
+        def _input_guard(self, state: AgentState) -> AgentState:
+            node = "input_guard"
+            step = state["plan"][state["current_idx"]]
+            current_step_title = step["title"].strip()
+            user_goal = state.get("last_prompt") or (state["messages"][0].content if state.get("messages") else "")
+            manifest = dict(state.get("manifest") or {})
+
+            # current run storage home lsdir
+            temp_dir = state.get("run_temp_dir", "")
+            files = self._list_ctx_files(temp_dir)
+            files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
+
+            # step-scoped retrieval (tools/data/libs) before we call the validator
+            # so the SYSTEM prompt only advertises the most relevant resources.
+            if self.use_tool_retriever:
+                step_query = f"{user_goal}\nCURRENT_STEP: {current_step_title}"
+                try:
+                    selected_resources_names = self._prepare_resources_for_retrieval(step_query)
+                    if selected_resources_names:
+                        self.update_system_prompt_with_selected_resources(selected_resources_names)
+                        self._log("STEP-SCOPED RETRIEVAL", body=str(selected_resources_names), node=node)
+                except Exception as e:
+                    self._log("RETRIEVAL ERROR (non-fatal)", body=str(e), node=node)
+
+            context_block = instructions.INPUT_VALIDATOR_CTX_PROMPT.format(
+                user_goal=user_goal,
+                current_step_title=current_step_title,
+                temp_dir=temp_dir,
+                files_str=files_str,
+                observation_state=manifest.get("observations", [])
+            ).strip()
+
+            msgs = [
+                self.system_prompt,
+                HumanMessage(content=instructions.INPUT_VALIDATOR_PROMPT),
+                HumanMessage(content=context_block),
+            ]
+            self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nstep_title={step['title']}", node=node)
+            resp = self._llm_invoke(node, "input_guard_check", msgs)
+            
+            items, ok = StateGraphHelper.parse_missing_ok(resp.content)
+            if not ok:
+                new_manifest = {
+                    **state["manifest"],
+                    "route_hint": "ask_for_missing",
+                    "qa_payload": "\n".join(f"- {m}" for m in items),
+                }
+                self._log("MISSING INPUTS", body="\n".join(items), node=node)
+                self._log("EXIT NODE", body="next_step=qa (ask_for_missing)", node=node)
+                return {
+                    "messages": [AIMessage(content=resp.content)],
+                    "missing": items,
+                    "manifest": new_manifest,
+                    "next_step": "qa",
+                }
+            else:
+                new_manifest = {
+                    **state["manifest"],
+                    "input_state": {
+                        "summary": [m for m in items],
+                        "root_dir": temp_dir,
+                        "files": files,
+                        "guidance": (
+                            "Use either the initial user prompt or the 'files' list "
+                            "to decide what inputs to use for code generation in this step."
+                        ),
+                    }
+                }
+                self._log("INPUTS OK", body="No missing items", node=node)
+                self._log("EXIT NODE", body="next_step=generator", node=node)
+                return {
+                    "manifest": new_manifest,
+                    "next_step": "generator",
+                    "messages": [AIMessage(content=resp.content)],
+                }
+        
+        def _generator(self, state: AgentState) -> AgentState:
+            node = "generator"
+            step = state["plan"][state["current_idx"]]
+            env_name = state["env_name"]
+            
+            # detect repair mode
+            manifest = state.get("manifest", {}) or {}
+            repair_feedback = manifest.get("repair_feedback")
+            is_diagnostic = isinstance(repair_feedback, str) and repair_feedback.strip().upper().startswith("DIAGNOSTICS_REQUEST:")
+            temp_dir = state.get("run_temp_dir", "")
+            files = self._list_ctx_files(temp_dir)
+            files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
+
+            if repair_feedback:
+                if is_diagnostic:
+                    prompt = instructions.GENERATOR_PROMPT
+                    content = instructions.GENERATOR_DIAGNOSTICS_MODE_PROMPT.format(
+                        diagnostics_feedback=repair_feedback,
+                    )
+                else:
+                    prompt = instructions.GENERATOR_PROMPT_REPAIR
+                    content = instructions.GENERATOR_REPAIR_CTX_PROMPT.format(
+                        user_goal=state['last_prompt'],
+                        current_step_title=step['title'],
+                        manifest=manifest.get("input_state"),
+                        run_temp_dir=temp_dir,
+                        repair_feedback=repair_feedback,
+                        previous_code=(state.get("pending_code") or "").strip(),
+                        last_result=(state.get("last_result") or "").strip(),
+                        files_str=files_str,
+                    )
+            else:
+                prompt = instructions.GENERATOR_PROMPT
+                content = instructions.GENERATOR_CTX_PROMPT.format(
+                    user_goal=state['last_prompt'],
+                    current_step_title=step['title'],
+                    manifest=state['manifest'].get("input_state"),
+                    run_temp_dir=state['run_temp_dir'],
                 )
-
-                if error_count >= 2:
-                    # If we've already tried to correct the model twice, just end the conversation
-                    print("Detected repeated parsing errors, ending conversation")
-                    state["next_step"] = "end"
-                    # Add a final message explaining the termination
-                    state["messages"].append(
-                        AIMessage(
-                            content="Execution terminated due to repeated parsing errors. Please check your input and try again."
-                        )
-                    )
-                else:
-                    # Try to correct it
-                    state["messages"].append(
-                        HumanMessage(
-                            content="Each response must include either <execute></execute> or <solution></solution> but there are no tags in the current response. Please follow the instruction, fix and regenerate the response again."
-                        )
-                    )
-                    state["next_step"] = "generate"
-            return state
-
-        def execute(state: AgentState) -> AgentState:
-            timeout = self.timeout_seconds
-            if not state.get("env_ready", False):
-                state["next_step"] = "ensure_env"
-                return state
-
-            code = state.get("pending_code")
-            if not code:
-                # fallback: try to extract from last message
-                last_message = state["messages"][-1].content
-                if "<execute>" in last_message and "</execute>" not in last_message:
-                    last_message += "</execute>"
-                m = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
-                code = m.group(1) if m else ""
-
-            if not code:
-                state["messages"].append(AIMessage(content="<observation>No code to execute.</observation>"))
-                state["next_step"] = "end"
-                return state
-            else:
-                env_name = state["env_name"]
-                if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
-                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
-                    result = run_with_timeout(run_r_code, 
-                        args=[r_code], 
-                        kwargs={"env_name": env_name,}, 
-                        timeout=timeout
-                    )
-                elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
-                    if code.strip().startswith("#!CLI"):
-                        # For CLI commands, extract the command and run it as a simple bash script
-                        cli_command = re.sub(r"^#!CLI", "", code, 1).strip()  # noqa: B034
-                        # Remove any newlines to ensure it's a single command
-                        cli_command = cli_command.replace("\n", " ")
-                        result = run_with_timeout(run_cli_command, 
-                            args=[cli_command], 
-                            kwargs={"env_name": env_name,}, 
-                            timeout=timeout
-                        )
-                    else:
-                        # For Bash scripts, remove the marker and run as a bash script
-                        bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
-                        result = run_with_timeout(run_bash_script, 
-                            args=[bash_script], 
-                            kwargs={"env_name": env_name,}, 
-                            timeout=timeout
-                        )
-                else:
-                    # Inject custom functions into the Python execution environment
-                    self._inject_custom_functions_to_repl()
-                    result = run_with_timeout(run_python_code, 
-                        args=[code], 
-                        kwargs={"env_name": env_name,}, 
-                        timeout=timeout
-                    )
-
-                if len(result) > 10000:
-                    result = (
-                        "The output is too long to be added to context. Here are the first 10K characters...\n"
-                        + result[:10000]
-                    )
-                observation = f"\n<previous_execution_result>{result}</previous_execution_result>"
-                state["messages"].append(AIMessage(content=observation.strip()))
-
-            return state
-
-        def execute_self_critic(state: AgentState) -> AgentState:
-            if self.critic_count < test_time_scale_round:
-                # Generate feedback based on message history
-                messages = state["messages"]
-                feedback_prompt = f"""
-                Here is a reminder of what is the user requested: {self.user_task}
-                Examine the previous executions, reaosning, and solutions.
-                Critic harshly on what could be improved?
-                Be specific and constructive.
-                Think hard what are missing to solve the task.
-                No question asked, just feedbacks.
-                """
-                feedback = self.llm.invoke(messages + [HumanMessage(content=feedback_prompt)])
-
-                # Add feedback as a new message
-                state["messages"].append(
-                    HumanMessage(
-                        content=f"Wait... this is not enough to solve the task. Here are some feedbacks for improvement:\n{feedback.content}"
-                    )
-                )
-                self.critic_count += 1
-                state["next_step"] = "generate"
-            else:
-                state["next_step"] = "end"
-            return state
-
-        def ensure_env_node(state: AgentState) -> AgentState:
+            
+            msgs = [
+                self.system_prompt, 
+                HumanMessage(content=prompt), 
+                HumanMessage(content=content)
+            ]
+            
+            self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nrepair_mode={bool(repair_feedback)}", node=node)
+            resp = self._llm_invoke(node, "code_gen", msgs)
+    
+            sanitized_block = StateGraphHelper.sanitize_execute_block(resp.content)
+            code, lang = StateGraphHelper.parse_execute(sanitized_block)
+            
+            code_key = "diagnostic_code" if is_diagnostic else "pending_code"
+            updates = {
+                code_key: code,
+                "env_name": env_name,
+                "next_step": "ensure_env",
+                "messages": [AIMessage(content=sanitized_block)],
+            }
+            
+            # clear repair metadata once we ave generated new code
+            if repair_feedback:
+                new_manifest = dict(manifest)
+                new_manifest.pop("repair_feedback", None)
+                new_manifest.pop("repair_step_idx", None)
+                updates["manifest"] = new_manifest
+            
+            # MAYBE: return to observer from here if no code;
+            self._log("GENERATED CODE", body=code or "<empty>", node=node)
+            return updates
+        
+        def _ensure_env(self, state: AgentState) -> AgentState:
+            # Todos: (MVP) mark ready; replace with env manager later
+            # state["env_ready"] = True
+            # state["next_step"] = "executor"
+            # return state
             from genomeer.runtime.env_manager import load_registry, spec_path, create_or_update_env, env_prefix, has_env
-            env_name = state.get("env_name") or "bio-agent-env1"
+            env_name = state.get("env_name")
 
-            # If already present, proceed
             if has_env(env_name):
                 prefix = str(env_prefix(env_name))
-                state["messages"].append(
-                    AIMessage(content=f"<observation>Environment '{env_name}' ready at {prefix}</observation>")
-                )
-                state["env_ready"] = True
-                state["next_step"] = "execute"
-                return state
+                return {
+                    "env_ready": True,
+                    "next_step": "executor",
+                    "messages": [AIMessage(content=f"<observe>Environment '{env_name}' ready at {prefix}</observe>")],
+                }
             
-            # First visit: create a stream and announce
+            # first visit: create a stream and announce
             entry = self._install_threads.get(env_name)
             if entry is None:
                 sid, stream = self.log_registry.create()
                 self._install_threads[env_name] = {"stream_id": sid, "stream": stream}
-                state["messages"].append(AIMessage(
-                    content=f"<subscribe>Installing '{env_name}'. Subscribe to logs with stream_id='{sid}'.</subscribe>"
-                ))
-                # come back into this node to actually run the install synchronously
-                state["next_step"] = "ensure_env"
-                return state
+                return {
+                    "next_step": "ensure_env",
+                    "messages": [AIMessage(content=f"<subscribe>Installing '{env_name}'. Subscribe to logs with stream_id='{sid}'.</subscribe>")],
+                }
             
-            # Second visit: run the installer synchronously and stream logs (blocking)
+            # second visit: run the installer synchronously and stream logs (blocking)
             try:
                 reg = load_registry()
                 rec = next((e for e in reg.get("envs", []) if e.get("name") == env_name), None)
                 if not rec:
-                    state["messages"].append(AIMessage(
-                        content=f"<observation>Error: Env '{env_name}' not found in registry.</observation>"
-                    ))
-                    # cleanup stream/entry
-                    try: entry["stream"].close()
-                    except Exception: pass
+                    try: 
+                        entry["stream"].close()
+                    except Exception: 
+                        pass
                     self._install_threads.pop(env_name, None)
-                    state["next_step"] = "end"
-                    return state
+                    return {
+                        "next_step": "end",
+                        "messages": [AIMessage(content=f"<observe>Error: Env '{env_name}' not found in registry.</observe>")],
+                    }
                 
                 spec = spec_path(rec["spec"])
                 channels = rec.get("channels")
@@ -1437,85 +813,480 @@ Each library is listed with its description to help you understand its functiona
                 
                 # Success: mark ready, close stream, cleanup
                 stream.push(f"Environment '{env_name}' created.")
-                try: stream.close()
-                except Exception: pass
+                try: 
+                    stream.close()
+                except Exception: 
+                    pass
                 self._install_threads.pop(env_name, None)
                 
                 prefix = str(env_prefix(env_name))
-                state["messages"].append(
-                    AIMessage(content=f"<observation>Environment '{env_name}' ready at {prefix}</observation>")
-                )
-                state["env_ready"] = True
-                state["next_step"] = "execute"
-                return state
+                return {
+                    "env_ready": True,
+                    "next_step": "executor",
+                    "messages": [AIMessage(content=f"<observe>Environment '{env_name}' ready at {prefix}</observe>")]
+                }
             except Exception as e:
-                # Failure: surface error, close stream, cleanup
                 try: entry["stream"].push(f"ERROR: {e}\n")
                 except Exception: pass
                 try: entry["stream"].close()
                 except Exception: pass
                 self._install_threads.pop(env_name, None)
-                state["messages"].append(AIMessage(content=f"<observation>Env install failed: {e}</observation>"))
-                state["next_step"] = "end"
-                return state
+                return {
+                    "next_step": "end",
+                    "messages": [AIMessage(content=f"<observe>Env install failed: {e}</observe>")]
+                }
+        
+        def _executor(self, state: AgentState) -> AgentState:
+            node = "executor"
+            code = (state.get("pending_code") or "").strip()
+            diagnostic_code = (state.get("diagnostic_code") or "").strip()
+            diagnostic_mode = state.get("diagnostic_mode")
+            env = state["env_name"]
+            timeout = state["manifest"].get("timeout_seconds", 600)
+            last_result = ""
 
+            self._log("ENTER NODE", body=f"env={env}\ntimeout={timeout}s\ncode_preview=\n{code[:500] or '<no code>'}", node=node)
+
+            if not code or (diagnostic_mode and not diagnostic_code):
+                updates = {
+                    "next_step": "observer",
+                    "last_result": "No code produced by GENERATOR.",
+                    "messages": [AIMessage(content="No code produced by for this step.")],
+                }
+                self._log("NO CODE", body="Skipping execution", node=node)
+                self._log("EXIT NODE", body="next_step=observer", node=node)
+                return updates
+
+            if diagnostic_mode:
+                code = diagnostic_code
+                
+            try:
+                if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
+                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
+                    out = run_with_timeout(
+                        run_r_code, 
+                        args=[r_code], 
+                        kwargs={
+                            "env_name": env,
+                        }, 
+                        timeout=timeout
+                    )
+                elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
+                    if code.strip().startswith("#!CLI"):
+                        cli_command = re.sub(r"^#!CLI", "", code, 1).strip().replace("\n", " ")  # noqa: B034
+                        out = run_with_timeout(
+                            # PATCH: [EXECUTION ERROR] TypeError: 'NoneType' object is not subscriptable
+                            run_bash_script, #run_cli_command, 
+                            args=[cli_command], 
+                            kwargs={
+                                "env_name": env,
+                            }, 
+                            timeout=timeout
+                        )
+                    else:
+                        bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
+                        out = run_with_timeout(
+                            run_bash_script, 
+                            args=[bash_script], 
+                            kwargs={
+                                "env_name": env,
+                            },
+                            timeout=timeout
+                        )
+                else:
+                    # Inject custom functions into the Python execution environment
+                    self._inject_custom_functions_to_repl() #  TODOs: PRORITY-CHECK
+                    code = re.sub(r"^\s*#!PY\s*\r?\n", "", code, count=1)
+                    out = run_with_timeout(
+                        run_python_code, 
+                        args=[code], 
+                        kwargs={
+                            "env_name": env,
+                        },
+                        timeout=timeout
+                    )
+
+                # bound size
+                if out and len(out) > 12000:
+                    out = out[:12000] + "\n...<truncated>"
+                    
+                last_result = out or ""
+                self._log("EXECUTION RESULT", body=last_result[:2000], node=node)
+            except Exception as e:
+                tb = traceback.format_exc()
+                last_result = f"[EXECUTION ERROR] {type(e).__name__}: {e}\n"
+                last_result += f"traceback: {tb}"
+                self._log("EXECUTION ERROR", body=last_result, node=node)
+                
+            self._log("EXIT NODE", body="next_step=observer", node=node)
+            result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
+            updates = {
+                "next_step": "observer", #end
+                result_key: last_result,
+                "messages": [AIMessage(content=f"<observe>Code Execution output:  '{last_result}'</observe>")],
+            }
+            return updates
+        
+        def _observer(self, state: AgentState) -> AgentState:
+            node = "observer"
+            step = state["plan"][state["current_idx"]]
+            diagnostic_mode = state.get("diagnostic_mode")
+            
+            if diagnostic_mode:
+                payload = instructions.OBSERVER_DIAGNOSTIC_CTX_PROMPT.format(
+                    user_goal=state['last_prompt'],
+                    current_step_title=step['title'],
+                    manifest=state['manifest'],
+                    code=(state.get("pending_code") or "").strip(),
+                    result=state['last_result'],
+                    diagnostic_code=state.get("diagnostic_code").strip(),
+                    diagnostic_output=state.get("diagnostic_observation").strip(),
+                )
+            else:
+                payload = instructions.OBSERVER_CTX_PROMPT.format(
+                    user_goal=state['last_prompt'],
+                    current_step_title=step['title'],
+                    manifest=state['manifest'],
+                    code=(state.get("pending_code") or "").strip(),
+                    result=state['last_result'],
+                )
+            msgs = [
+                self.system_prompt,
+                HumanMessage(content=instructions.OBSERVER_PROMPT),
+                HumanMessage(content=payload),
+            ]
+            
+            self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nstep_title={step['title']}", node=node)
+            resp = self._llm_invoke(node, "observe_and_status", msgs)
+                    
+            status, summary = StateGraphHelper.parse_status(resp.content)
+            next_step = "generator" if status == "blocked" else "orchestrator"
+            next_idx = state["current_idx"] + (0 if status == "blocked" else 1)
+            
+            new_manifest = dict(state["manifest"])
+            rc = dict(state.get("retry_counts") or {})
+            diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
+            if status == "blocked":
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["retry_count"] = rc[state["current_idx"]]
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                
+                # routing
+                if rc[state["current_idx"]] > self.MAX_STEP_RETRIES:
+                    next_step = "diagnostics"
+                    next_idx = state["current_idx"]
+                else:
+                    next_step = "generator"
+                    next_idx = state["current_idx"]
+                    
+                # logs
+                self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
+                self._log("EXIT NODE", body="next_step=input_guard (retry same step)", node=node)
+            else:
+                new_manifest.pop("repair_feedback", None)
+                new_manifest.pop("repair_step_idx", None)
+                new_manifest.pop("retry_count", None)
+                
+                # routing
+                next_step = "orchestrator"
+                next_idx = state["current_idx"] + 1
+                if state["current_idx"] in rc:
+                    rc.pop(state["current_idx"], None)
+                    
+                # logs
+                self._log("STATUS", body=f"done=True\nnotes=\n{summary}", node=node)
+                self._log("EXIT NODE", body=f"advance_to_idx={state['current_idx']}\nnext_step=orchestrator", node=node)
+                
+                # storing succes state observation
+                obs = {
+                    "step_idx": state["current_idx"],
+                    "title": step["title"],
+                    "status": status,
+                    "summary": summary,
+                    "stdout": (state.get("last_result") or "")[:12000],
+                    "files_snapshot": self._list_ctx_files(state.get("run_temp_dir","")),
+                }
+                new_manifest["observation"] = list(new_manifest.get("observations", [])) + [obs]
+
+
+            plan = list(state["plan"])
+            plan[state["current_idx"]] = {
+                **plan[state["current_idx"]],
+                "notes": summary,
+                "status": "done" if status == "done" else "blocked",
+            }
+            updates = {
+                "plan": plan,
+                "current_idx": next_idx,
+                "next_step": next_step,
+                "messages": [AIMessage(content=resp.content)],
+                "manifest": new_manifest,
+                "retry_counts": rc,
+                "diagnostic_mode": False,
+                "diagnostic_code": False,
+                "diagnostic_observation": False,
+            }
+            return updates
+        
+        def _diagnostics(self, state: AgentState) -> AgentState:
+            node = "diagnostics"
+            step = state["plan"][state["current_idx"]]
+            manifest = state.get("manifest", {}) or {}
+            retry_count = manifest.get("retry_count", 0)
+            observer_summary = manifest.get("repair_feedback", "").strip()
+            last_code = (state.get("pending_code") or "").strip()
+
+            prompt = instructions.DIAGNOSTICS_PROMPT
+            ctx = instructions.DIAGNOSTICS_CTX_PROMPT.format(
+                user_goal=state.get("last_prompt",""),
+                current_step_title=step["title"],
+                retry_count=retry_count,
+                observer_summary=observer_summary or "<none>",
+                last_code=last_code or "<none>",
+                run_temp_dir=state.get("run_temp_dir",""),
+            )
+
+            msgs = [
+                self.system_prompt, 
+                HumanMessage(content=prompt),
+                HumanMessage(content=ctx) 
+            ]
+            self._log("ENTER NODE", body=f"retry_count={retry_count}\nstep={step['title']}", node=node)
+            resp = self._llm_invoke(node, "diagnostics_plan", msgs)
+
+            # Reuse GENERATOR to actually produce the probe code
+            # We piggyback repair flow by stuffing the plan into 'repair_feedback'
+            new_manifest = dict(manifest)
+            new_manifest["repair_feedback"] = f"DIAGNOSTICS_REQUEST:\n{resp.content}"
+            new_manifest["repair_step_idx"] = state["current_idx"]
+
+            self._log("EXIT NODE", body="next_step=generator (probe code)", node=node)
+            
+            rc = dict(state.get("retry_counts") or {})
+            if state["current_idx"] in rc:
+                rc.pop(state["current_idx"], None)
+            return {
+                "retry_counts": rc,
+                "manifest": new_manifest,
+                "diagnostic_mode": True,
+                "next_step": "generator",
+                "messages": [AIMessage(content=resp.content)],
+            }
+            
+        def _finalizer(self, state: AgentState) -> AgentState:
+            node = "finalizer"
+            self._log("ENTER NODE", body="publishing artifacts + generating report", node=node)
+
+            manifest = dict(state.get("manifest") or {})
+            temp_dir = state.get("run_temp_dir", "")
+            run_id = state.get("run_id")
+            pub = manifest.get("publisher") or {}
+            base_url = (pub.get("base_url") or "").rstrip("/")
+
+            files = self._list_ctx_files(temp_dir)
+            def _want(relname: str) -> bool:
+                name = relname.lower()
+                SKIP = (".cache/", "__pycache__", ".ipynb_checkpoints", ".mamba", ".micromamba")
+                return not any(x in name for x in SKIP)
+
+            expose_paths = [f["name"] for f in files if _want(f["name"])]
+
+            artifacts = {}
+            observations = manifest.get("observations", [])
+            try:
+                from genomeer.tools.function.artifacts import create_run, upload_files, publish_run
+                try:
+                    create_run(run_id)
+                except Exception:
+                    pass
+
+                abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
+                if abs_paths:
+                    upload_files(run_id, abs_paths, subdir="outputs")
+
+                expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
+                art_manifest = publish_run(run_id, expose_rel)
+                artifacts = art_manifest or {}
+            except Exception as e:
+                self._log("PUBLISH ERROR", body=str(e), node=node)
+                artifacts = {"artifacts": [], "error": str(e)}
+
+
+            msgs = [
+                SystemMessage(content=instructions.FINALIZER_PROMPT),
+                HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
+                    user_goal=state.get("last_prompt"),
+                    plan=state.get("plan"),
+                    observation=observations,
+                    artifacts=artifacts
+                ))
+            ]
+            resp = self._llm_invoke(node, "final_report", msgs)
+            self._log("EXIT NODE", body="final report generated", node=node)
+            return {
+                "manifest": manifest,
+                "next_step": "end",
+                "messages": [AIMessage(content=resp.content.strip())],
+            }
+
+        
+        # Bind as a bound method so it receives self automatically
+        # -------------------------------------------------------------------------------
+        self.planner = types.MethodType(_planner, self)
+        self.qa = types.MethodType(_qa, self)
+        self.orchestrator = types.MethodType(_orchestrator, self)
+        self.input_guard = types.MethodType(_input_guard, self)
+        self.generator = types.MethodType(_generator, self)
+        self.ensure_env = types.MethodType(_ensure_env, self)
+        self.executor = types.MethodType(_executor, self)
+        self.observer = types.MethodType(_observer, self)
+        self.diagnostics = types.MethodType(_diagnostics, self)
+        self.finalizer = types.MethodType(_finalizer, self)
+        
         # Create the workflow
         # --------------------------------------------------------------------------------
         workflow = StateGraph(AgentState)
-        workflow.add_node("generate", generate)
-        workflow.add_node("execute", execute)
-        workflow.add_node("ensure_env", ensure_env_node)
+        workflow.add_node("planner", self.planner)
+        workflow.add_node("qa", self.qa)
+        workflow.add_node("orchestrator", self.orchestrator)
+        workflow.add_node("input_guard", self.input_guard)
+        workflow.add_node("generator", self.generator)
+        workflow.add_node("ensure_env", self.ensure_env)
+        workflow.add_node("executor", self.executor)
+        workflow.add_node("observer", self.observer)
+        workflow.add_node("diagnostics", self.diagnostics)
+        workflow.add_node("finalizer", self.finalizer)
 
-        if self_critic:
-            workflow.add_node("self_critic", execute_self_critic)
-            workflow.add_conditional_edges(
-                "generate",
-                routing_function,
-                path_map={
-                    "execute": "execute",
-                    "ensure_env": "ensure_env",
-                    "generate": "generate",
-                    "end": "self_critic",
-                },
-            )
-            workflow.add_conditional_edges(
-                "self_critic",
-                routing_function_self_critic,
-                path_map={"generate": "generate", "end": END},
-            )
-        else:
-            workflow.add_conditional_edges(
-                "generate",
-                routing_function,
-                path_map={
-                    "execute": "execute", 
-                    "ensure_env": "ensure_env", 
-                    "generate": "generate", 
-                    "end": END
-                },
-            )
-
+        # defining workflow edges
+        workflow.add_edge(START, "planner")
+        workflow.add_conditional_edges(
+            "planner",
+            lambda s: s["next_step"],
+            {
+                "qa": "qa",
+                "orchestrator": "orchestrator",
+            },
+        )
+        workflow.add_conditional_edges(
+            "orchestrator",
+            lambda s: s["next_step"],
+            {
+                "planner": "planner",
+                "input_guard": "input_guard",
+                "finalizer": "finalizer",
+            },
+        )
+        workflow.add_conditional_edges(
+            "input_guard",
+            lambda s: s["next_step"],
+            {
+                "qa": "qa",
+                "generator": "generator",
+            },
+        )
+        workflow.add_edge("generator", "ensure_env")
         workflow.add_conditional_edges(
             "ensure_env",
-            routing_function,
-            path_map={
-                "execute": "execute",
+            lambda s: s["next_step"],
+            {
                 "ensure_env": "ensure_env",
-                "generate": "generate",
+                "executor": "executor",
                 "end": END,
             },
         )
-        workflow.add_edge("execute", "generate")
-        workflow.add_edge(START, "generate")
+        workflow.add_conditional_edges(
+            "executor",
+            lambda s: s["next_step"],
+            {
+                "observer": "observer",
+            },
+        )
+        workflow.add_conditional_edges(
+            "observer",
+            lambda s: s["next_step"],
+            {
+                "orchestrator": "orchestrator",
+                "generator": "generator",
+                "diagnostics": "diagnostics",
+            },
+        )
+        workflow.add_conditional_edges(
+            "diagnostics",
+            lambda s: s["next_step"],
+            {
+                "generator": "generator",
+                "end": "qa",
+            },
+        )
+        workflow.add_edge("qa", END)
+        workflow.add_edge("finalizer", END)
+        
+        # workflow.add_edge(START, "planner")
+        # workflow.add_edge("planner", "qa")
+        # workflow.add_edge("planner", "orchestrator")
+        # workflow.add_edge("orchestrator", "input_guard")
+        # workflow.add_edge("input_guard", "qa")
+        # workflow.add_edge("input_guard", "generator")
+        # workflow.add_edge("generator", "ensure_env")
+        # workflow.add_edge("ensure_env", "executor")
+        # workflow.add_edge("executor", "observer")
+        # workflow.add_edge("observer", "orchestrator")
+        # workflow.add_edge("qa", END)
+
 
         # Compile the workflow
         # --------------------------------------------------------------------------------
         self.app = workflow.compile()
         self.checkpointer = MemorySaver()
         self.app.checkpointer = self.checkpointer
-        # display(Image(self.app.get_graph().draw_mermaid_png()))
-    
+
+
     # OTHER UTILS
+    def _stage_attachments(self, tmp_dir: str, attachments: list[str]) -> list[str]:
+        """
+        Copy user-supplied file paths into the run's temp dir
+        Returns the relative paths inside tmp_dir
+        """
+        staged_rel: list[str] = []
+        up = os.path.join(tmp_dir, "uploads")
+        os.makedirs(up, exist_ok=True)
+        for src in attachments or []:
+            try:
+                bn = os.path.basename(src)
+                dst = os.path.join(up, bn)
+                # copy (safer across FS boundaries)
+                shutil.copy2(src, dst)
+                staged_rel.append(os.path.relpath(dst, tmp_dir))
+            except Exception as e:
+                self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
+        return staged_rel
+
+    def _list_ctx_files(self, temp_dir: str):
+        """
+        - This function will return a list of all files available in the the current run temp folder
+        - Indeed each request have a temp storage folder - ex: `/tmp/206005a0-c0a1-4114-907c-c3eda23d3f32`
+        - All uploaded file will be inside automatically and all downloaded file by agent will be there.
+        Return a list of all files inside temp_dir (including subfolders).
+        Each item: {'name': 'relative/path/to/file', 'ext': '.fasta', 'size_bytes': 123}
+        """
+        files = []
+        try:
+            for root, _, entries in os.walk(temp_dir):
+                for entry in sorted(entries):
+                    p = os.path.join(root, entry)
+                    if os.path.isfile(p):
+                        rel_path = os.path.relpath(p, temp_dir)  # keep it relative
+                        ext = os.path.splitext(entry)[1]
+                        files.append({
+                            "name": rel_path,
+                            "ext": ext if ext else "",
+                            "size_bytes": os.path.getsize(p),
+                        })
+        except Exception as e:
+            self._log("TEMP LIST ERROR", body=str(e), node="input_guard")
+        return files
+    
     def _inject_custom_functions_to_repl(self):
         """Inject custom functions into the Python REPL execution environment.
         This makes custom tools available during code execution.
@@ -1717,226 +1488,271 @@ Each library is listed with its description to help you understand its functiona
         # print(self.system_prompt)
         # print("="*70 + "\n")
     
-    def create_mcp_server(self, tool_modules=None):
-        pass
-        # """
-        # Create an MCP server object that exposes internal genomeer tools.
-        # This gives you control over when and how to run the server.
+    def visualize_graph(self, mode="manual", file: str | None = None, show: bool = True):
+        """
+        Visualize the compiled agent graph using mermaid.ink API.
+        Returns PNG bytes.
+        """
+        if not hasattr(self, "app"):
+            raise RuntimeError("Graph is not compiled yet. Call configure() first.")
 
-        # Args:
-        #     tool_modules: List of module names to expose (default: all in self.module2api)
+        import base64, requests
+        from IPython.display import Image, display
 
-        # Returns:
-        #     FastMCP server object that you can run manually
-        # """
-        # import importlib
+        if mode  == "manual":
+            mmd = self.app.get_graph().draw_mermaid()
+            print(mmd)
+            print("Open : https://mermaid.live/edit and pass this code to render the graph.")
+            return mmd
+        
+        encoded = base64.urlsafe_b64encode(mmd.encode("utf-8")).decode("ascii")
+        url = f"https://mermaid.ink/svg/{encoded}"
 
-        # from mcp.server.fastmcp import FastMCP
+        resp = requests.get(url)
+        resp.raise_for_status()
+        img_bytes = resp.content
 
-        # mcp = FastMCP("genomeerTools")
-        # modules = tool_modules or list(self.module2api.keys())
-
-        # registered_tools = 0
-
-        # for module_name in modules:
-        #     try:
-        #         # Import the actual module
-        #         module = importlib.import_module(module_name)
-        #         # Get tools for this module
-        #         module_tools = self.module2api.get(module_name, [])
-
-        #         for tool_schema in module_tools:
-        #             tool_name = tool_schema.get("name")
-        #             if not tool_name:
-        #                 continue
-
-        #             try:
-        #                 # Get the actual function
-        #                 fn = getattr(module, tool_name, None)
-        #                 if fn is None:
-        #                     fn = getattr(self, "_custom_functions", {}).get(tool_name)
-
-        #                 if fn is None:
-        #                     print(f"Warning: Could not find function '{tool_name}' in module '{module_name}'")
-        #                     continue
-
-        #                 # Extract parameters from your specific schema format
-        #                 required_params = tool_schema.get("required_parameters", [])
-        #                 optional_params = tool_schema.get("optional_parameters", [])
-
-        #                 # Generate the wrapper function
-        #                 wrapper_func = self._generate_mcp_wrapper_from_genomeer_schema(
-        #                     fn, tool_name, required_params, optional_params
-        #                 )
-
-        #                 # Register with MCP
-        #                 mcp.tool()(wrapper_func)
-        #                 registered_tools += 1
-
-        #             except Exception as e:
-        #                 print(f"Warning: Failed to register tool '{tool_name}': {e}")
-        #                 continue
-
-        #     except ImportError as e:
-        #         print(f"Warning: Could not import module '{module_name}': {e}")
-        #         continue
-
-        # print(f"Created MCP server with {registered_tools} tools")
-        # return mcp
-
-    def _generate_mcp_wrapper_from_genomeer_schema(self, original_func, func_name, required_params, optional_params):
-        pass
-        # """Generate wrapper function based on genomeer schema format."""
-        # import inspect
-
-        # # Combine all parameters
-        # all_params = required_params + optional_params
-
-        # if not all_params:
-        #     # No parameters
-        #     def wrapper() -> dict:
-        #         try:
-        #             result = original_func()
-        #             if isinstance(result, dict):
-        #                 return result
-        #             return {"result": result}
-        #         except Exception as e:
-        #             return {"error": str(e)}
-
-        #     wrapper.__name__ = func_name
-        #     wrapper.__doc__ = original_func.__doc__
-        #     return wrapper
-
-        # else:
-        #     # Has parameters
-        #     def wrapper(**kwargs) -> dict:
-        #         try:
-        #             # Build arguments dict
-        #             filtered_kwargs = {}
-
-        #             # Add required parameters
-        #             for param_info in required_params:
-        #                 param_name = param_info["name"]
-        #                 if param_name in kwargs and kwargs[param_name] is not None:
-        #                     filtered_kwargs[param_name] = kwargs[param_name]
-
-        #             # Add optional parameters only if provided and not None
-        #             for param_info in optional_params:
-        #                 param_name = param_info["name"]
-        #                 if param_name in kwargs and kwargs[param_name] is not None:
-        #                     filtered_kwargs[param_name] = kwargs[param_name]
-
-        #             result = original_func(**filtered_kwargs)
-        #             if isinstance(result, dict):
-        #                 return result
-        #             return {"result": result}
-        #         except Exception as e:
-        #             return {"error": str(e)}
-
-        #     # Set function metadata
-        #     wrapper.__name__ = func_name
-        #     wrapper.__doc__ = original_func.__doc__
-
-        #     # Create proper signature
-        #     new_params = []
-
-        #     # Map your types to Python types
-        #     type_map = {"str": str, "int": int, "float": float, "bool": bool, "List[str]": list[str], "dict": dict}
-
-        #     # Add required parameters
-        #     for param_info in required_params:
-        #         param_name = param_info["name"]
-        #         param_type_str = param_info["type"]
-        #         param_type = type_map.get(param_type_str, str)
-
-        #         new_params.append(inspect.Parameter(param_name, inspect.Parameter.KEYWORD_ONLY, annotation=param_type))
-
-        #     # Add optional parameters
-        #     for param_info in optional_params:
-        #         param_name = param_info["name"]
-        #         param_type_str = param_info["type"]
-        #         param_type = type_map.get(param_type_str, str)
-
-        #         # Make it optional
-        #         optional_type = param_type | None
-
-        #         new_params.append(
-        #             inspect.Parameter(
-        #                 param_name, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=optional_type
-        #             )
-        #         )
-
-        #     # Set the signature
-        #     wrapper.__signature__ = inspect.Signature(new_params, return_annotation=dict)
-
-        #     return wrapper
-
-    
-    # SANITIZE UTILS
+        if file:
+            with open(file, "wb") as f:
+                f.write(img_bytes)
+        if show:
+            display(Image(img_bytes))
+        return img_bytes
+     
     def extract_tagged_blocks(self, text: str):
-        """Yield each tagged block INCLUDING the tags themselves, in order."""
-        BLOCK_RX = re.compile(
-            r"<(execute|observation|solution|think|subscribe|logs)>(.*?)</\1>",
-            re.DOTALL | re.IGNORECASE,
+        """
+        Split text into an ordered list of segments:
+        - {"kind": "text", "text": "..."}
+        - {"kind": "block", "tag": "EXECUTE"|"OBSERVE"|... , "text": "<...>...</...>"}
+        Preserves exact order of appearance. Handles:
+        - Paired tags: <execute|observe|observation|solution|think|subscribe|logs>...</...>
+        - Standalone tags: <STATUS:...>, <OK/>, <NEXT:...>
+        """
+        if not text:
+            return []
+
+        RX = re.compile(
+            r"""
+            (?P<block>                                   # Paired block
+            <
+                (?P<name>[a-z]+)                        # tag name (letters)
+                (?:\s+[^>]*)?                           # optional attrs
+            >
+            (?P<body>.*?)
+            </(?P=name)>
+            )
+            |
+            (?P<standalone>                              # Standalone tags
+            <
+                (?P<solo>STATUS:[^>]+|OK\s*/\s*|NEXT:[^>]+)
+            \s*>
+            )
+            """,
+            re.IGNORECASE | re.DOTALL | re.VERBOSE,
         )
-        return [m.group(0) for m in BLOCK_RX.finditer(text)]
+
+        segments = []
+        pos = 0
+        for m in RX.finditer(text):
+            start, end = m.start(), m.end()
+            # Emit any preceding plain text
+            if start > pos:
+                before = text[pos:start]
+                if before:  # keep empty filtering to caller if you want
+                    segments.append({"kind": "text", "text": before})
+
+            if m.group("block"):
+                raw = m.group(0)
+                name = (m.group("name") or "").upper()
+                # normalize OBSERVATION -> OBSERVE (optional)
+                if name == "OBSERVATION":
+                    name = "OBSERVE"
+                segments.append({"kind": "block", "tag": name, "text": raw})
+            else:
+                raw = m.group(0)
+                solo = (m.group("solo") or "").upper()
+                # Tag is the leading token before ':' or whitespace
+                base = solo.split(":", 1)[0].split()[0]  # STATUS / OK / NEXT
+                segments.append({"kind": "block", "tag": base, "text": raw})
+
+            pos = end
+
+        # Emit trailing text
+        if pos < len(text):
+            tail = text[pos:]
+            if tail:
+                segments.append({"kind": "text", "text": tail})
+
+        return segments
+    
 
     # AGENT RUNNER
-    def go(self, prompt):
+    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None):
         """Execute the agent with the given prompt.
         Args:
             prompt: The user's query
+            mode: 'dev' (default) shows everything; 'prod' hides HumanMessage outputs.
         """
         self.critic_count = 0
         self.user_task = prompt
+        
+        assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
+        def _is_human(msg) -> bool:
+            return getattr(msg, "type", "").lower() == "human"
 
         if self.use_tool_retriever:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
-        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None, "env_name": "bio-agent-env1", "env_ready": False, "pending_code": None,}
-        config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
-        self.log = []
+        with run_workdir("run") as tmp:
+            staged = self._stage_attachments(tmp, attachments or [])
+            inputs = {
+                "messages": [HumanMessage(content=prompt)], 
+                "next_step": None, 
+                "env_name": "bio-agent-env1", 
+                "env_ready": False, 
+                "pending_code": None,
+                "manifest": {"timeout_seconds": self.timeout_seconds, "observation": [], "attachments": staged},
+                "plan": [],
+                "current_idx": 0,
+                "last_prompt": None,
+                "last_result": None,
+                "missing": [],
+                "run_temp_dir": tmp,
+                "retry_counts": {},
+                "diagnostic_mode": False,
+                "diagnostic_code": None,
+                "diagnostic_observation": None,
+                "run_id": tmp.split('run')[1][1:],
+    
+            }
+            config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+            self.log = []
+            last_msg_text = None
 
-        for s in self.app.stream(inputs, stream_mode="values", config=config):
-            message = s["messages"][-1]
-            print("***************************")
-            print(message)
-            print("***************************")
-            out = pretty_print(message)
-            self.log.append(out)
+            for s in self.app.stream(inputs, stream_mode="values", config=config):
+                message = s["messages"][-1]
+                
+                if mode == "prod" and _is_human(message):
+                    continue
+            
+                text = str(message.content)
+                if text != last_msg_text:
+                    out = pretty_print(message)
+                    self.log.append(out)
+                    last_msg_text = text
+                
+                # ************* logs [dev-only] *************
+                curr_idx = s.get("current_idx", None)
+                next_step = s.get("next_step", None)
+                self._log("STEP SNAPSHOT", body=f"current_idx={curr_idx}\nnext_step={next_step}", node="driver")
+                # *******************************************
 
-        return self.log, self.extract_tagged_blocks(str(message.content))
-
-    def go_stream(self, prompt) -> Generator[dict, None, None]:
+            return self.log, last_msg_text #str(message.content)
+    
+    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
         This function returns a generator that yields each step of the agent's execution,
         allowing for real-time monitoring of the agent's progress.
         Args:
             prompt: The user's query
+            mode: 'dev' (default) shows everything; 'prod' hides HumanMessage outputs.
 
         Yields:
-            dict: Each step of the agent's execution containing the current message and state
+            {"type": "message", "text": "..."}                 # de-duped raw assistant text
+            {"type": "block", "tag": "EXECUTE", "text": "..."} # extracted tagged blocks
+            {"type": "think", "tag": "THINK", "text": "..."}   # if THINK blocks appear
         """
         self.critic_count = 0
         self.user_task = prompt
+        
+        assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
+        def _is_human(msg) -> bool:
+            return getattr(msg, "type", "").lower() == "human"
 
         if self.use_tool_retriever:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
-        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None, "env_name": "bio-agent-env1", "env_ready": False, "pending_code": None,}
-        config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
-        self.log = []
+        with run_workdir("run") as tmp:
+            staged = self._stage_attachments(tmp, attachments or [])
+            inputs = {
+                "messages": [HumanMessage(content=prompt)],
+                "next_step": None,
+                "env_name": "bio-agent-env1",
+                "env_ready": False,
+                "pending_code": None,
+                "manifest": {"timeout_seconds": self.timeout_seconds, "observation": [], "attachments": staged},
+                "plan": [],
+                "current_idx": 0,
+                "last_prompt": None,
+                "last_result": None,
+                "missing": [],
+                "run_temp_dir": tmp,
+                "retry_counts": {},
+                "diagnostic_mode": False,
+                "diagnostic_code": None,
+                "diagnostic_observation": None,
+                "run_id": tmp.split('run')[1][1:],
+            }
+            config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
 
-        for s in self.app.stream(inputs, stream_mode="values", config=config):
-            message = s["messages"][-1]
-            out = pretty_print(message)
-            self.log.append(out)
+            last_msg_text = None
+            self.log = []
+
+            for s in self.app.stream(inputs, stream_mode="values", config=config):
+                message = s["messages"][-1]
+                text = str(message.content)
+
+                if mode == "prod" and _is_human(message):
+                    continue
+                if text == last_msg_text:
+                    continue
+                
+                last_msg_text = text
+                out = pretty_print(message)
+                self.log.append(out)
+
+                for seg in self.extract_tagged_blocks(text):
+                    if seg["kind"] == "text":
+                        if seg["text"].strip():
+                            yield {"type": "message", "text": seg["text"]}
+                    else:
+                        tag = seg.get("tag", "BLOCK").upper()
+                        if tag == "THINK":
+                            yield {"type": "think", "tag": tag, "text": seg["text"]}
+                        else:
+                            yield {"type": "block", "tag": tag, "text": seg["text"]}
+                    
+    # def go_stream(self, prompt) -> Generator[dict, None, None]:
+    #     """Execute the agent with the given prompt and return a generator that yields each step.
+    #     This function returns a generator that yields each step of the agent's execution,
+    #     allowing for real-time monitoring of the agent's progress.
+    #     Args:
+    #         prompt: The user's query
+
+    #     Yields:
+    #         dict: Each step of the agent's execution containing the current message and state
+    #     """
+    #     self.critic_count = 0
+    #     self.user_task = prompt
+
+    #     if self.use_tool_retriever:
+    #         selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+    #         self.update_system_prompt_with_selected_resources(selected_resources_names)
+
+    #     inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None, "env_name": "bio-agent-env1", "env_ready": False, "pending_code": None,}
+    #     config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+    #     self.log = []
+
+    #     for s in self.app.stream(inputs, stream_mode="values", config=config):
+    #         message = s["messages"][-1]
+    #         out = pretty_print(message)
+    #         self.log.append(out)
             
-            # Yield the current step
-            for block in self.extract_tagged_blocks(str(message.content)):
-                yield {"output": block}
+    #         # Yield the current step
+    #         for block in self.extract_tagged_blocks(str(message.content)):
+    #             yield {"output": block}
 
     
 

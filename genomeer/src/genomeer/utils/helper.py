@@ -1,4 +1,5 @@
 from io import StringIO
+from contextlib import redirect_stdout, redirect_stderr
 import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys
 from typing import Any, Callable, Iterable, Mapping, Optional
 from pydantic import BaseModel, Field, ValidationError
@@ -55,6 +56,21 @@ def _run_in_env(
         timeout=timeout,
     )
     
+def _tail(text: str, limit: int = 20000) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= limit else (text[-limit:] + "\n...<truncated tail>")
+
+def _format_proc_error(title: str, cmd: list[str] | str, rc: int, stdout: str, stderr: str) -> str:
+    cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+    parts = [
+        f"{title}",
+        f"Exit code: {rc}",
+        f"Command: {cmd_str}",
+        "--- STDOUT (tail) ---\n" + _tail(stdout),
+        "--- STDERR (tail) ---\n" + _tail(stderr),
+    ]
+    return "\n".join(parts).strip()
     
 # ------------------------------------------------------------------------------------------
 # Function: run_r_code
@@ -63,6 +79,10 @@ def _run_in_env(
 # ------------------------------------------------------------------------------------------
 def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
+    code = (code or "").strip()
+    if not code: 
+        return "Error: Empty script"
+    
     try:
         with tempfile.NamedTemporaryFile(suffix=".R", mode="w", dir=settings.run_dir, delete=False) as f:
             f.write(code); path = f.name
@@ -71,8 +91,16 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
             if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available." 
             proc = _run_in_env(env_name, ["Rscript", path], timeout=settings.timeout_seconds)
-            os.unlink(path)
-            return proc.stdout if proc.returncode == 0 else f"Error running R code in '{env_name}':\n{proc.stderr}"
+            cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
+            if proc.returncode == 0:
+                return proc.stdout or ""
+            return _format_proc_error(
+                "Error running this script",
+                cmd_display,
+                proc.returncode,
+                proc.stdout or "",
+                proc.stderr or "",
+            )
 
         # fallback: host R
         res = subprocess.run(
@@ -82,10 +110,24 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
             check=False,
             timeout=settings.timeout_seconds,
         )
-        os.unlink(path)
-        return res.stdout if res.returncode == 0 else f"Error running R code:\n{res.stderr}"
+        if res.returncode == 0:
+            return res.stdout or ""
+        return _format_proc_error(
+            "Error running Bash script",
+            [path],
+            res.returncode,
+            res.stdout or "",
+            res.stderr or "",
+        )
     except Exception as e:
-        return f"Error running R code: {e}"
+        # return f"Error running R code: {e}"
+        tb = traceback.format_exc()
+        return f"Error running Bash script: {tb}"
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------------------------
@@ -95,23 +137,32 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
 # ------------------------------------------------------------------------------------------
 def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
+    script = (script or "").strip()
+    if not script: 
+        return "Error: Empty script"
+    
+    with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
+        if not script.startswith("#!/"): f.write("#!/bin/bash\n")
+        if "set -e" not in script: f.write("set -euo pipefail\n")
+        f.write(script); path = f.name
+    os.chmod(path, 0o755)
+    
     try:
-        script = (script or "").strip()
-        if not script: 
-            return "Error: Empty script"
-        with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
-            if not script.startswith("#!/"): f.write("#!/bin/bash\n")
-            if "set -e" not in script: f.write("set -e\n")
-            f.write(script); path = f.name
-        os.chmod(path, 0o755)
-        
         if env_name:
             if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available."
-            # run bash from env; pass the script path as arg
+
             proc = _run_in_env(env_name, ["bash", path], timeout=settings.timeout_seconds)
-            os.unlink(path)
-            return proc.stdout if proc.returncode == 0 else f"Error running Bash script in '{env_name}' (exit {proc.returncode}):\n{proc.stderr}"
+            cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
+            if proc.returncode == 0:
+                return proc.stdout or ""
+            return _format_proc_error(
+                "Error running this script",
+                cmd_display,
+                proc.returncode,
+                proc.stdout or "",
+                proc.stderr or "",
+            )
 
         # fallback: host bash
         res = subprocess.run(
@@ -122,17 +173,32 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
             check=False,
             timeout=settings.timeout_seconds,
         )
-        os.unlink(path)
-        return res.stdout if res.returncode == 0 else f"Error running Bash script (exit {res.returncode}):\n{res.stderr}"
+        if res.returncode == 0:
+            return res.stdout or ""
+        return _format_proc_error(
+            "Error running Bash script",
+            [path],
+            res.returncode,
+            res.stdout or "",
+            res.stderr or "",
+        )
     except Exception as e:
-        traceback.print_exc()
-        return f"Error running Bash script: {e}"
+        # traceback.print_exc()
+        tb = traceback.format_exc()
+        # return f"Error running Bash script: {e}"
+        return f"Error running Bash script: {tb}"
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------------------------
 # Function: run_cli_command
 # Desc: Helper function for LLM to run command in shell while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
+# UPDATE: Stop maintaining this helper 25.09.25
 # ------------------------------------------------------------------------------------------
 def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
@@ -167,46 +233,92 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -
     """
 
     code = code.strip("```").strip()
+    try: 
+        # --- Case 1: run in a micromamba environment ---
+        if env_name:
+            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
+                return f"Environment '{env_name}' is not available."
 
-    # --- Case 1: run in a micromamba environment ---
-    if env_name:
-        if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-            return f"Environment '{env_name}' is not available."
+            # Write the code to a temp file
+            os.makedirs(settings.run_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
+                f.write(code)
+                path = f.name
 
-        # Write the code to a temp file
-        os.makedirs(settings.run_dir, exist_ok=True)
-        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
-            f.write(code)
-            path = f.name
+            try:
+                proc = _run_in_env(env_name, ["python", path], timeout=settings.timeout_seconds)
+            except subprocess.TimeoutExpired as te:
+                cmd_display = getattr(te, "cmd", ["python", path])
+                return (
+                    "Timeout running Python script in environment\n"
+                    f"Timeout (s): {settings.timeout_seconds}\n"
+                    f"Command: {' '.join(cmd_display) if isinstance(cmd_display, (list, tuple)) else cmd_display}\n"
+                    f"\n--- STDERR (tail) ---\n{_tail(getattr(te, 'stderr', '') or '')}"
+                    f"\n--- STDOUT (tail) ---\n{_tail(getattr(te, 'stdout', '') or '')}"
+                ).strip()
 
-        try:
-            proc = _run_in_env(env_name, ["python", path], timeout=settings.timeout_seconds)
-            return proc.stdout if proc.returncode == 0 else f"Error running Python code in '{env_name}':\n{proc.stderr}"
-        finally:
+            cmd_display = proc.args if hasattr(proc, "args") else ["python", path]
+            if proc.returncode == 0:
+                return proc.stdout or ""
+            return _format_proc_error(
+                "Error running this script",
+                cmd_display,
+                proc.returncode,
+                proc.stdout or "",
+                proc.stderr or "",
+            )
+
+
+        # --- Case 2: run in persistent in-process REPL ---
+        stdout_buf, stderr_buf = StringIO(), StringIO()
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            try:
+                # compile first to get better syntax errors with filename "<repl>"
+                compiled = compile(code, "<repl>", "exec")
+                exec(compiled, _persistent_namespace)
+            except Exception:
+                # include full traceback + whatever was printed so far
+                tb = traceback.format_exc()
+                out = stdout_buf.getvalue()
+                err = stderr_buf.getvalue()
+                return (
+                    "Error running Python code (REPL)\n"
+                    f"\n--- TRACEBACK ---\n{tb}"
+                    f"\n--- STDOUT (so far) ---\n{_tail(out)}"
+                    f"\n--- STDERR (so far) ---\n{_tail(err)}"
+                ).strip()
+
+        # success: return combined stdout+stderr (stderr might contain warnings/prints)
+        out = stdout_buf.getvalue()
+        err = stderr_buf.getvalue()
+        return (out + (("\n" + err) if err else "")).rstrip("\n")
+    
+        # else:
+        #     def execute_in_repl(command: str) -> str:
+        #         """Helper to execute inside persistent namespace."""
+        #         old_stdout = sys.stdout
+        #         sys.stdout = mystdout = StringIO()
+
+        #         global _persistent_namespace
+        #         try:
+        #             exec(command, _persistent_namespace)
+        #             output = mystdout.getvalue()
+        #         except Exception as e:
+        #             output = f"Error: {str(e)}"
+        #         finally:
+        #             sys.stdout = old_stdout
+        #         return output
+        #     return execute_in_repl(code)
+        
+    except Exception as e:
+        tb = traceback.format_exc()
+        return f"Error running Python script: {tb}"
+    finally:
+        if path:
             try:
                 os.unlink(path)
             except Exception:
                 pass
-
-    # --- Case 2: run in persistent in-process REPL ---
-    else:
-        def execute_in_repl(command: str) -> str:
-            """Helper to execute inside persistent namespace."""
-            old_stdout = sys.stdout
-            sys.stdout = mystdout = StringIO()
-
-            global _persistent_namespace
-            try:
-                exec(command, _persistent_namespace)
-                output = mystdout.getvalue()
-            except Exception as e:
-                output = f"Error: {str(e)}"
-            finally:
-                sys.stdout = old_stdout
-            return output
-
-        return execute_in_repl(code)
-    
     
 # ------------------------------------------------------------------------------------------
 # Function: run_with_timeout
@@ -252,7 +364,9 @@ def run_with_timeout(
 # ------------------------------------------------------------------------------------------
 def read_module2api():
     fields = [
-        "basic"
+        "ncbi",
+        "basic",
+        # "artifacts",
         # "literature",
         # "biochemistry",
         # "bioengineering",

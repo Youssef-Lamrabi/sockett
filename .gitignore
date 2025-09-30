@@ -318,3 +318,8 @@ cypress/videos
 cypress/screenshots
 .vscode/settings.json
 Biomni
+.virtual_documents
+.genomeer_runs
+data
+tmp
+tmp_dryrun
