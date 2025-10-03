@@ -133,6 +133,13 @@ You are QA.
 Your job is to response to user question based on context and ressource available to you.
 - If `route_hint == "ask_for_missing"`, ask the user *only* for the missing items, concisely, as a short numbered list.
 - If `route_hint == "finalize"`, summarize results clearly and answer the user’s original question.
+
+
+- If user question is related to history only look in this history provided to you to try to respond:
+RECENT HISTORY:
+---------------
+{history}
+---------------
 """
 
 # INPUT_VALIDATOR_PROMPT = """
@@ -565,6 +572,12 @@ ARTIFACTS:
 User all this to produce report as response to user prompt.
 """
 
+USER_FEEDBACK_PROMPT = """
+VERY IMPORTANT: User feedback to considere absolutely in this step
+---
+{feedback}
+---
+"""
 # --------------------------------------------------------------------------------------------------------
 # OTHER UTILS PROMPT
 # --------------------------------------------------------------------------------------------------------

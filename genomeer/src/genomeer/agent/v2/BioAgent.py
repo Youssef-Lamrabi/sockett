@@ -7,6 +7,7 @@ from collections.abc import Generator
 from typing import Any, List, Dict
 from typing_extensions import TypedDict, Literal, Annotated
 import shutil
+from uuid import uuid4
 
 from dotenv import load_dotenv, find_dotenv
 from langgraph.graph.message import add_messages
@@ -33,6 +34,7 @@ from genomeer.tools.registry import ToolRegistry
 from genomeer.utils.stream.shared import REGISTRY
 from genomeer.agent.v2.utils import instructions
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
+from genomeer.model.feedback import FeedbackParser
 
 # -----------------------------------------------
 # UTILS
@@ -95,6 +97,11 @@ class BioAgent:
         base_url: str | None = None,
         api_key: str | None = None,
         expected_data_lake_files: list | None = None,
+        auto_start_artifacts: bool = False,
+        artifacts_host: str = "127.0.0.1",
+        artifacts_port: int = 8910,
+        artifacts_prefix: str = "/api/v1/artifacts",
+        interaction_mode: str = "auto"
     ):
         """
         Agent initalization
@@ -173,6 +180,9 @@ class BioAgent:
         self._install_iters = {}
         self.log_registry = REGISTRY
         self._install_threads = {}
+        
+        # Interaction mode
+        self.interaction_mode = interaction_mode
 
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds
@@ -184,6 +194,11 @@ class BioAgent:
         # CONSTANTS
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics
         self.MAX_DIAG_ROUNDS_PER_STEP = 2  # how many times we allow re-entering diagnostics for the same step
+        
+        # Artifact server
+        self.artifacts_base_url = os.getenv("PUBLIC_ARTIFACTS_URL", "http://localhost:8910/api/v1/artifacts")
+        if auto_start_artifacts:
+            self._start_artifacts_server_in_bg(host=artifacts_host, port=artifacts_port, prefix=artifacts_prefix)
 
 
     # LOGS UTILS [DEV-ONLY]
@@ -531,55 +546,145 @@ class BioAgent:
         def _planner(self, state: AgentState) -> AgentState:
             node = "planner"
             self._log("ENTER NODE", body=f"state keys: {list(state.keys())}", node=node)
-    
-            user_prompt = state["messages"][0].content
+
+            # ------ RESUME FAST-PATH ------
+            manifest = state.get("manifest") or {}
+            if manifest.get("route_hint") == "ask_for_missing":
+                # user likely provided the missing info in the latest message.
+                # we don’t re-plan; we jump back into the current step’s guard.
+                self._log("RESUME", body="Pending missing inputs -> jump to input_guard", node=node)
+                return {
+                    # "next_step": "input_guard",
+                    "next_step": "orchestrator",
+                    "messages": [AIMessage(content="<observe>Resuming with your new inputs…</observe>")],
+                }
+            # -----------------------------
+                
+            user_prompt = state["messages"][-1].content
             msgs = [
                 self.system_prompt,
                 HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
-                HumanMessage(content=user_prompt),
             ]
-            resp = self._llm_invoke(node, "plan_route", msgs)
             
+            # ------ Interactive mode ------
+            if manifest.get("route_hint") == "await_user":
+                user_text = ""
+                for m in reversed(state["messages"]):
+                    if getattr(m, "type", "") == "human":
+                        user_text = (m.content or "").strip()
+                        break
+                lower = user_text.lower()
+                # ------
+                feedbackParser = FeedbackParser()
+                fr = feedbackParser.parse(lower, llm=self.llm)
+                # ------
+                # approve = bool(re.match(r"^(y|yes|ok|okay|go|run|proceed|continue|looks good)\b", lower))
+                # ------
+
+                pause_kind  = manifest.get("pause_kind")
+                resume_to   = manifest.get("resume_to", "orchestrator")
+                resume_idx  = manifest.get("resume_step_idx", state.get("current_idx", 0))
+
+                new_manifest = dict(manifest)
+                # clear pause metadata
+                for k in ("route_hint","qa_payload","resume_to","pause_kind"):
+                    new_manifest.pop(k, None)
+
+                # APPROVED -> jump where we intended
+                if fr.approved:
+                    self._log("RESUME", body=f"Approved. Jumping to '{resume_to}'.", node=node)
+                    return {
+                        "next_step": resume_to,
+                        "manifest": new_manifest,
+                        "current_idx": resume_idx,
+                        "messages": [AIMessage(content="<observe>Resuming after your approval…</observe>")],
+                    }
+
+                # CORRECTION -> inject feedback & retry correct node
+                feedback = user_text or "(no text)"
+                if pause_kind == "after_planner":
+                    msgs.append(HumanMessage(content=instructions.USER_FEEDBACK_PROMPT.format(
+                        feedback=feedback
+                    )))
+                    # Re-plan with user feedback this run
+                    self._log("RESUME", body="User provided plan corrections. Re-planning now.", node=node)
+
+                elif pause_kind in ("after_generator", "after_observer"):
+                    # Retry current step codegen using repair flow
+                    new_manifest["repair_feedback"] = f"USER_FEEDBACK:\n{feedback}"
+                    new_manifest["repair_step_idx"] = resume_idx
+                    self._log("RESUME", body="User provided code/result feedback. Regenerating code.", node=node)
+                    return {
+                        "next_step": "generator",
+                        "manifest": new_manifest,
+                        "current_idx": resume_idx,
+                        "messages": [AIMessage(content="<observe>Regenerating code with your feedback…</observe>")],
+                    }
+            
+            
+            msgs.append(HumanMessage(content=user_prompt))
+            resp = self._llm_invoke(node, "plan_route", msgs)
             steps, route = StateGraphHelper.parse_checklist_and_route(resp.content)
             updates = {
                 "plan": steps,
                 "current_idx": 0,
                 "next_step": route,
                 "messages": [AIMessage(content=resp.content)],
-                "last_prompt": user_prompt
+                "last_prompt": user_prompt,
             }
-            # state["plan"] = steps
-            # state["current_idx"] = 0
-            # state["messages"].append(AIMessage(content=resp.content))
-            # state["next_step"] = route
-            
+            if manifest.get("route_hint") == "await_user":
+                updates["manifest"] = new_manifest
             self._log("EXIT NODE", body=f"route={route}\nsteps={steps}", node=node)
+            
+            # ------ feedback replay mode check ------
+            pause = self._maybe_pause(
+                state,
+                resume_to=route or "orchestrator",
+                pause_kind="after_planner",
+                prompt_text=(
+                    "PLAN READY ✅\n\n"
+                    "Proposed steps:\n"
+                    + "\n".join(f"- {i+1}. {s['title']}" for i, s in enumerate(steps))
+                ),
+            )
+            if pause:
+                return {**updates, **pause}
+            # --------------------------------------
+            
             return updates
 
         def _qa(self, state: AgentState) -> AgentState:
             node = "qa"
+            next_step = "end"
             self._log("ENTER NODE", body=f"route_hint={state['manifest'].get('route_hint')}", node=node)
-
+            history = self._history_snippet(state["messages"])
+            
             route_hint = state["manifest"].get("route_hint")
             payload = state["manifest"].get("qa_payload","")
             last_prompt = state["last_prompt"]
-            msgs = [self.system_prompt, HumanMessage(content=instructions.QA_PROMPT)]
+            msgs = [
+                self.system_prompt, 
+                HumanMessage(content=instructions.QA_PROMPT.format(
+                    history=history
+                ))
+            ]
             if route_hint == "ask_for_missing":
                 msgs.append(HumanMessage(content=f"Ask user for these missing items only:\n{payload}"))
+                next_step = "end"
             elif route_hint == "finalize":
                 msgs.append(HumanMessage(content=f"Summarize and answer:\n{payload}"))
+                next_step = "end"
+            elif route_hint == "await_user":
+                msgs.append(HumanMessage(content="""Prompt the user to review the previous step’s output and either approve it or request corrections before proceeding. Do not repeat the output (already sent to user) —just ask the question.""")) 
             else:
                 msgs.append(HumanMessage(content=payload or f"Please be generous and Answer clearly to the user's question or request: '{last_prompt}'"))
+                next_step = "orchestrator"
             
             resp = self._llm_invoke(node, "qa", msgs)
-            next_step = "end" if route_hint == "finalize" else "orchestrator"
             updates = {
                 "next_step": next_step,
                 "messages": [AIMessage(content=resp.content)],
             }
-            # state["messages"].append(AIMessage(content=resp.content))
-            # state["next_step"] = "end" if route_hint == "finalize" else "orchestrator"
-
             self._log("EXIT NODE", body=f"next_step={state['next_step']}", node=node)
             return updates
 
@@ -761,6 +866,22 @@ class BioAgent:
             
             # MAYBE: return to observer from here if no code;
             self._log("GENERATED CODE", body=code or "<empty>", node=node)
+            
+            # ------ feedback replay mode check ------
+            pause = self._maybe_pause(
+                state,
+                resume_to="ensure_env",
+                pause_kind="after_generator",
+                prompt_text=(
+                    "CODE PROPOSED TO EXECUTE THIS STEP \n\n"
+                    # "Approve with **yes** to run, or send edits/constraints to regenerate before running.\n\n"
+                    f"{sanitized_block}"
+                ),
+            )
+            if pause:
+                return {**updates, **pause}
+            # ----------------------------------------
+
             return updates
         
         def _ensure_env(self, state: AgentState) -> AgentState:
@@ -1007,7 +1128,7 @@ class BioAgent:
                     "stdout": (state.get("last_result") or "")[:12000],
                     "files_snapshot": self._list_ctx_files(state.get("run_temp_dir","")),
                 }
-                new_manifest["observation"] = list(new_manifest.get("observations", [])) + [obs]
+                new_manifest["observations"] = list(new_manifest.get("observations", [])) + [obs]
 
 
             plan = list(state["plan"])
@@ -1027,6 +1148,20 @@ class BioAgent:
                 "diagnostic_code": False,
                 "diagnostic_observation": False,
             }
+            
+            # ------ feedback replay mode check ------
+            if status == "blocked":
+                pause = self._maybe_pause(
+                    state,
+                    resume_to="generator",
+                    pause_kind="after_observer",
+                    prompt_text=f"""STEP RESULT\n\nStatus: {status.upper()}\n\nSummary:\n{summary}\n\n""",
+                    # Reply **yes** to continue. I'll try to fix the issue by myself, or send changes to retry this step before moving on.""",
+                )
+                if pause:
+                    return {**updates, **pause}
+            # ----------------------------------------
+
             return updates
         
         def _diagnostics(self, state: AgentState) -> AgentState:
@@ -1095,23 +1230,23 @@ class BioAgent:
             artifacts = {}
             observations = manifest.get("observations", [])
             try:
-                from genomeer.tools.function.artifacts import create_run, upload_files, publish_run
+                # from genomeer.tools.function.artifacts import create_run, upload_files, publish_run
+                from genomeer.agent.v2.utils.artifacts_service import create_run, upload_files, publish_run_http
                 try:
-                    create_run(run_id)
+                    create_run(run_id, base_url=self.artifacts_base_url)
                 except Exception:
                     pass
 
                 abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
                 if abs_paths:
-                    upload_files(run_id, abs_paths, subdir="outputs")
+                    upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
 
                 expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
-                art_manifest = publish_run(run_id, expose_rel)
+                art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
                 artifacts = art_manifest or {}
             except Exception as e:
                 self._log("PUBLISH ERROR", body=str(e), node=node)
                 artifacts = {"artifacts": [], "error": str(e)}
-
 
             msgs = [
                 SystemMessage(content=instructions.FINALIZER_PROMPT),
@@ -1166,6 +1301,10 @@ class BioAgent:
             {
                 "qa": "qa",
                 "orchestrator": "orchestrator",
+                # for jump after feedback
+                "generator": "generator",
+                "ensure_env": "ensure_env",
+                "input_guard": "input_guard",
             },
         )
         workflow.add_conditional_edges(
@@ -1185,7 +1324,14 @@ class BioAgent:
                 "generator": "generator",
             },
         )
-        workflow.add_edge("generator", "ensure_env")
+        workflow.add_conditional_edges(
+            "generator",
+            lambda s: s["next_step"],
+            {
+                "ensure_env": "ensure_env",
+                "qa": "qa",
+            },
+        )
         workflow.add_conditional_edges(
             "ensure_env",
             lambda s: s["next_step"],
@@ -1209,6 +1355,7 @@ class BioAgent:
                 "orchestrator": "orchestrator",
                 "generator": "generator",
                 "diagnostics": "diagnostics",
+                "qa": "qa",
             },
         )
         workflow.add_conditional_edges(
@@ -1222,19 +1369,6 @@ class BioAgent:
         workflow.add_edge("qa", END)
         workflow.add_edge("finalizer", END)
         
-        # workflow.add_edge(START, "planner")
-        # workflow.add_edge("planner", "qa")
-        # workflow.add_edge("planner", "orchestrator")
-        # workflow.add_edge("orchestrator", "input_guard")
-        # workflow.add_edge("input_guard", "qa")
-        # workflow.add_edge("input_guard", "generator")
-        # workflow.add_edge("generator", "ensure_env")
-        # workflow.add_edge("ensure_env", "executor")
-        # workflow.add_edge("executor", "observer")
-        # workflow.add_edge("observer", "orchestrator")
-        # workflow.add_edge("qa", END)
-
-
         # Compile the workflow
         # --------------------------------------------------------------------------------
         self.app = workflow.compile()
@@ -1379,6 +1513,18 @@ class BioAgent:
 
         return selected_resources_names
 
+    def _start_artifacts_server_in_bg(self, host: str, port: int, prefix: str):
+        """
+        Fire-and-forget tiny artifact server in a background thread.
+        Intended for local/dev workflows. In production, prefer mounting the router in main API.
+        """
+        def _run():
+            from genomeer.agent.v2.utils.artifacts_service import start_artifacts_server
+            start_artifacts_server(host=host, port=port, prefix=prefix)
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self._log("ARTIFACT SERVER", f"Started on http://{host}:{port}{prefix}", node="driver")
+        
     def update_system_prompt_with_selected_resources(self, selected_resources):
         """Update the system prompt with the selected resources."""
         # Extract tool descriptions for the selected tools
@@ -1585,9 +1731,43 @@ class BioAgent:
 
         return segments
     
+    def _history_snippet(self, messages, max_chars=3000):
+        parts = []
+        for m in messages[-10:]:  # last 10 turns
+            role = getattr(m, "type", "").upper() or m.__class__.__name__.upper()
+            parts.append(f"{role}: {getattr(m, 'content', str(m))}")
+        txt = "\n".join(parts)
+        return txt[-max_chars:]
+    
+    def _has_session_state(self, thread_id: str) -> bool:
+        try:
+            state = self.app.get_state({"configurable": {"thread_id": thread_id}})
+            # state.values holds your saved AgentState; state.next is the saved next node
+            return bool(state and (state.values or state.next))
+        except Exception:
+            return False
+
+    def _maybe_pause(self, state: AgentState, *, resume_to: str, prompt_text: str, pause_kind: str) -> Dict[str, Any] | None:
+        mode = (state.get("manifest") or {}).get("interaction_mode", "auto")
+        if mode != "feedback":
+            return None
+
+        new_manifest = dict(state.get("manifest") or {})
+        new_manifest["route_hint"] = "await_user"
+        new_manifest["qa_payload"] = prompt_text
+        new_manifest["resume_to"] = resume_to
+        new_manifest["resume_step_idx"] = state.get("current_idx", 0)
+        new_manifest["pause_kind"] = pause_kind
+
+        return {
+            "manifest": new_manifest,
+            "next_step": "qa",
+            "messages": [AIMessage(content=f"<REVIEW>\n{prompt_text}\n</REVIEW>")],
+        }
+
 
     # AGENT RUNNER
-    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None):
+    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None):
         """Execute the agent with the given prompt.
         Args:
             prompt: The user's query
@@ -1595,6 +1775,7 @@ class BioAgent:
         """
         self.critic_count = 0
         self.user_task = prompt
+        thread_id = session_id or str(uuid4())
         
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
         def _is_human(msg) -> bool:
@@ -1604,29 +1785,45 @@ class BioAgent:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
-        with run_workdir("run") as tmp:
+        with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
-            inputs = {
-                "messages": [HumanMessage(content=prompt)], 
-                "next_step": None, 
-                "env_name": "bio-agent-env1", 
-                "env_ready": False, 
-                "pending_code": None,
-                "manifest": {"timeout_seconds": self.timeout_seconds, "observation": [], "attachments": staged},
-                "plan": [],
-                "current_idx": 0,
-                "last_prompt": None,
-                "last_result": None,
-                "missing": [],
-                "run_temp_dir": tmp,
-                "retry_counts": {},
-                "diagnostic_mode": False,
-                "diagnostic_code": None,
-                "diagnostic_observation": None,
-                "run_id": tmp.split('run')[1][1:],
-    
-            }
-            config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+            
+            if not self._has_session_state(thread_id):
+                # FIRST TURN OF THIS SESSION -> full bootstrap state
+                inputs = {
+                    "messages": [HumanMessage(content=prompt)], 
+                    "next_step": None, 
+                    "env_name": "bio-agent-env1", 
+                    "env_ready": False, 
+                    "pending_code": None,
+                    "manifest": {
+                        "timeout_seconds": self.timeout_seconds, 
+                        "observations": [], 
+                        "attachments": staged,
+                        "interaction_mode": getattr(self, "interaction_mode", "auto"),
+                    },
+                    "plan": [],
+                    "current_idx": 0,
+                    "last_prompt": None,
+                    "last_result": None,
+                    "missing": [],
+                    "run_temp_dir": tmp,
+                    "retry_counts": {},
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                    "run_id": tmp.split('run')[1][1:],
+                }
+            else:
+                # FOLLOW-UP TURN -> only append the new message and record any new attachments
+                msg_block = [HumanMessage(content=prompt)]
+                if staged:
+                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                inputs = {
+                    "messages": msg_block
+                }
+                
+            config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             self.log = []
             last_msg_text = None
 
@@ -1650,7 +1847,7 @@ class BioAgent:
 
             return self.log, last_msg_text #str(message.content)
     
-    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None) -> Generator[dict, None, None]:
+    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
         This function returns a generator that yields each step of the agent's execution,
         allowing for real-time monitoring of the agent's progress.
@@ -1665,6 +1862,7 @@ class BioAgent:
         """
         self.critic_count = 0
         self.user_task = prompt
+        thread_id = session_id or str(uuid4())
         
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
         def _is_human(msg) -> bool:
@@ -1674,29 +1872,45 @@ class BioAgent:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
-        with run_workdir("run") as tmp:
+        with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
-            inputs = {
-                "messages": [HumanMessage(content=prompt)],
-                "next_step": None,
-                "env_name": "bio-agent-env1",
-                "env_ready": False,
-                "pending_code": None,
-                "manifest": {"timeout_seconds": self.timeout_seconds, "observation": [], "attachments": staged},
-                "plan": [],
-                "current_idx": 0,
-                "last_prompt": None,
-                "last_result": None,
-                "missing": [],
-                "run_temp_dir": tmp,
-                "retry_counts": {},
-                "diagnostic_mode": False,
-                "diagnostic_code": None,
-                "diagnostic_observation": None,
-                "run_id": tmp.split('run')[1][1:],
-            }
-            config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+            
+            if not self._has_session_state(thread_id):
+                # FIRST TURN OF THIS SESSION -> full bootstrap state
+                inputs = {
+                    "messages": [HumanMessage(content=prompt)], 
+                    "next_step": None, 
+                    "env_name": "bio-agent-env1", 
+                    "env_ready": False, 
+                    "pending_code": None,
+                    "manifest": {
+                        "timeout_seconds": self.timeout_seconds, 
+                        "observations": [], 
+                        "attachments": staged,
+                        "interaction_mode": getattr(self, "interaction_mode", "auto"),
+                    },
+                    "plan": [],
+                    "current_idx": 0,
+                    "last_prompt": None,
+                    "last_result": None,
+                    "missing": [],
+                    "run_temp_dir": tmp,
+                    "retry_counts": {},
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                    "run_id": tmp.split('run')[1][1:],
+                }
+            else:
+                # FOLLOW-UP TURN -> only append the new message and record any new attachments
+                msg_block = [HumanMessage(content=prompt)]
+                if staged:
+                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                inputs = {
+                    "messages": msg_block
+                }
 
+            config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             last_msg_text = None
             self.log = []
 
@@ -1723,37 +1937,4 @@ class BioAgent:
                             yield {"type": "think", "tag": tag, "text": seg["text"]}
                         else:
                             yield {"type": "block", "tag": tag, "text": seg["text"]}
-                    
-    # def go_stream(self, prompt) -> Generator[dict, None, None]:
-    #     """Execute the agent with the given prompt and return a generator that yields each step.
-    #     This function returns a generator that yields each step of the agent's execution,
-    #     allowing for real-time monitoring of the agent's progress.
-    #     Args:
-    #         prompt: The user's query
-
-    #     Yields:
-    #         dict: Each step of the agent's execution containing the current message and state
-    #     """
-    #     self.critic_count = 0
-    #     self.user_task = prompt
-
-    #     if self.use_tool_retriever:
-    #         selected_resources_names = self._prepare_resources_for_retrieval(prompt)
-    #         self.update_system_prompt_with_selected_resources(selected_resources_names)
-
-    #     inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None, "env_name": "bio-agent-env1", "env_ready": False, "pending_code": None,}
-    #     config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
-    #     self.log = []
-
-    #     for s in self.app.stream(inputs, stream_mode="values", config=config):
-    #         message = s["messages"][-1]
-    #         out = pretty_print(message)
-    #         self.log.append(out)
-            
-    #         # Yield the current step
-    #         for block in self.extract_tagged_blocks(str(message.content)):
-    #             yield {"output": block}
-
-    
-
     
