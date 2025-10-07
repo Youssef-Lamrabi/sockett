@@ -1,0 +1,5 @@
+.env
+.venv
+agent_copilot.sqlite3
+logs/**
+uploads/**
