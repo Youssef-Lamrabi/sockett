@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Agent Copilot – Login{% endblock %}
+
+{% block body %}
+  <div id="auth-panel">
+    <div class="auth-card pop" id="auth-card">
+      <!-- Brand header -->
+      <div class="auth-head">
+        <div class="brand">
+          <span class="brand-logo"></span>
+          <div>
+            <div class="brand-name">BioAgentCopilot</div>
+            <div class="brand-sub">Metagenomics, end-to-end.</div>
+          </div>
+        </div>
+        <div class="head-actions">
+          <a href="/" class="link muted">← Back to landing</a>
+        </div>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tabs" role="tablist">
+        <button class="tab active" id="tab-login" role="tab" aria-selected="true">Login</button>
+        <button class="tab" id="tab-register" role="tab" aria-selected="false">Create account</button>
+      </div>
+
+      <div class="tab-content" style="min-height: 21em;">
+        <!-- LOGIN -->
+        <form id="login-form" class="form active" role="tabpanel" aria-labelledby="tab-login" autocomplete="on" novalidate> 
+          <div class="field">
+            <label>Email</label>
+            <div class="input-wrap">
+              <span class="icon" aria-hidden="true">
+                <!-- mail icon -->
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 6h16v12H4z" stroke="#94a3b8" stroke-width="1.7"/><path d="m4 7 8 6 8-6" stroke="#94a3b8" stroke-width="1.7"/></svg>
+              </span>
+              <input id="login-email" placeholder="mail@um6p.ma" autocomplete="username" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Password</label>
+            <div class="input-wrap">
+              <span class="icon" aria-hidden="true">
+                <!-- lock icon -->
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="10" rx="2" stroke="#94a3b8" stroke-width="1.7"/><path d="M8 10V8a4 4 0 1 1 8 0v2" stroke="#94a3b8" stroke-width="1.7"/></svg>
+              </span>
+              <input id="login-pass" placeholder="" type="password" autocomplete="current-password" />
+              <button type="button" class="toggle-pass" data-target="login-pass" aria-label="Show password" aria-pressed="false">
+                <i class="fa-regular fa-eye"></i>
+              </button>
+            </div>
+            <div class="help-row">
+              <a class="link muted" href="#" onclick="return false;">Forgot password?</a>
+            </div>
+          </div>
+
+          <button id="btn-login" class="primary w-full btn">Login</button>
+
+          <div id="login-error" class="alert error hidden" role="alert"></div>
+          <div id="login-feedback" class="feedback" role="status" aria-live="polite"></div>
+        </form>
+
+        <!-- REGISTER -->
+        <form id="register-form" class="form" role="tabpanel" aria-labelledby="tab-register" aria-hidden="true" autocomplete="on" novalidate>
+          <div class="field">
+            <label>Name</label>
+            <div class="input-wrap">
+              <span class="icon" aria-hidden="true">
+                <!-- user icon -->
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="#94a3b8" stroke-width="1.7"/><path d="M4 20a8 8 0 0 1 16 0" stroke="#94a3b8" stroke-width="1.7"/></svg>
+              </span>
+              <input id="reg-name" placeholder="Name" autocomplete="name" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Email</label>
+            <div class="input-wrap">
+              <span class="icon" aria-hidden="true">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 6h16v12H4z" stroke="#94a3b8" stroke-width="1.7"/><path d="m4 7 8 6 8-6" stroke="#94a3b8" stroke-width="1.7"/></svg>
+              </span>
+              <input id="reg-email" placeholder="mail@um6p.ma" autocomplete="email" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Password</label>
+            <div class="input-wrap">
+              <span class="icon" aria-hidden="true">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="10" rx="2" stroke="#94a3b8" stroke-width="1.7"/><path d="M8 10V8a4 4 0 1 1 8 0v2" stroke="#94a3b8" stroke-width="1.7"/></svg>
+              </span>
+              <input id="reg-pass" placeholder="Create a password" type="password" autocomplete="new-password" />
+              <button type="button" class="toggle-pass" data-target="reg-pass" aria-label="Show password" aria-pressed="false">
+                 <i class="fa-regular fa-eye"></i>
+              </button>
+            </div>
+          </div>
+
+          <button id="btn-register" class="primary w-full btn">Create account</button>
+
+          <div id="register-error" class="alert error hidden" role="alert"></div>
+          <div id="register-feedback" class="feedback" role="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </div>
+  </div>
+{% endblock %}

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{% block title %}Agent Copilot{% endblock %}</title>
+  <link rel="icon" type="image/x-icon" href="/static/assets/favicon.ico">
+  <link rel="stylesheet" href="/static/styles.css"/>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" referrerpolicy="no-referrer">
+</head>
+<body data-page="{{ page | default('') }}">
+  <div id="toasts" aria-live="polite" aria-atomic="true"></div>
+
+  {% block body %}{% endblock %}
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
