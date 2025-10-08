@@ -51,10 +51,22 @@ class ChatSession(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, default="New Chat")
     model = Column(String, default="gpt-oss:20b")
+    interaction_mode = Column(String, default="auto")  # 'auto' | 'feedback'
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="sessions")
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
+
+class MessageLog(Base):
+    __tablename__ = "message_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    tag = Column(String, nullable=False)      # EXECUTE | OBSERVE | LOGS | THINK | STATUS | NEXT
+    body = Column(Text, nullable=False)       # inner content only (see router)
+    ord = Column(Integer, default=0)          # order within the message
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    message = relationship("Message", back_populates="logs")
 
 class Message(Base):
     __tablename__ = "messages"
@@ -65,4 +77,10 @@ class Message(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("ChatSession", back_populates="messages")
+    logs = relationship(
+        "MessageLog",
+        back_populates="message",
+        cascade="all, delete-orphan",
+        order_by="MessageLog.ord",
+    )
 

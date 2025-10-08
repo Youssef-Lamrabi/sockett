@@ -1,35 +1,48 @@
-import os
-import json
-import asyncio
+import asyncio, threading, json, os, re
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pathlib import Path
 
 from .db import get_db
-from .models import User, ChatSession, Message, ProviderConfig, UserModel
+from .models import User, ChatSession, Message, ProviderConfig, UserModel, MessageLog
 from .config import system_default
 from .auth import get_current_user
 
 from genomeer.agent.v2 import BioAgent
 
-router = APIRouter()
 
+router = APIRouter()
+INFLIGHT: dict[tuple[int, int], threading.Event] = {}
 UPLOAD_DIR = os.path.abspath("./uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 class SessionCreateBody(BaseModel):
     title: Optional[str] = None
     model: Optional[str] = None
+    interaction_mode: Optional[str] = "auto"  # 'auto' | 'feedback'
+    
+    @field_validator("interaction_mode")
+    @classmethod
+    def _v_mode(cls, v):
+        v = (v or "auto").lower()
+        if v not in {"auto","feedback"}:
+            raise ValueError("interaction_mode must be 'auto' or 'feedback'")
+        return v
 
 @router.post("/sessions")
 def create_session(body: SessionCreateBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # default model falls back to user's provider config
     cfg = db.query(ProviderConfig).filter(ProviderConfig.user_id == user.id).first()
     default_model = (cfg.default_model if cfg else "gpt-oss:20b")
-    sess = ChatSession(user_id=user.id, title=body.title or "New Chat", model=body.model or default_model)
+    sess = ChatSession(
+        user_id=user.id,
+        title=body.title or "New Chat",
+        model=body.model or default_model,
+        interaction_mode=body.interaction_mode or "auto"
+    )
     db.add(sess); db.commit(); db.refresh(sess)
     return {"id": sess.id, "title": sess.title, "model": sess.model}
 
@@ -55,11 +68,32 @@ def update_session_model(session_id: int, body: SessionModelUpdate, db: Session 
     db.commit()
     return {"id": sess.id, "model": sess.model}
 
+class SessionModeUpdate(BaseModel):
+    interaction_mode: str
+
+    @field_validator("interaction_mode")
+    @classmethod
+    def _v_mode(cls, v):
+        v = (v or "auto").lower()
+        if v not in {"auto","feedback"}:
+            raise ValueError("interaction_mode must be 'auto' or 'feedback'")
+        return v
+
+@router.post("/sessions/{session_id}/mode")
+def update_session_mode(session_id: int, body: SessionModeUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == user.id).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sess.interaction_mode = body.interaction_mode
+    db.commit()
+    return {"id": sess.id, "interaction_mode": sess.interaction_mode}
+
 class ChatBody(BaseModel):
     message: str
     stream: Optional[bool] = True
+    interaction_mode: Optional[str] = None
 
-def _mk_agent_for_user(db: Session, user: User, model_name: str) -> BioAgent:
+def _mk_agent_for_user(db: Session, user: User, model_name: str, interaction_mode: str = "auto") -> BioAgent:
     # fallback provider config
     cfg = db.query(ProviderConfig).filter(ProviderConfig.user_id == user.id).first()
 
@@ -94,30 +128,40 @@ def _mk_agent_for_user(db: Session, user: User, model_name: str) -> BioAgent:
         timeout_seconds=600,
         base_url=base_url,
         api_key=api_key,
-        interaction_mode="auto",
+        auto_start_artifacts=False,
+        interaction_mode=interaction_mode,
     )
     return agent
 
 @router.post("/sessions/{session_id}/messages")
-async def chat(session_id: int, body: ChatBody, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == user.id).first()
+async def chat(session_id: int, body: ChatBody, request: Request,
+               db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    sess = db.query(ChatSession).filter(ChatSession.id == session_id,
+                                        ChatSession.user_id == user.id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Persist user message
+    # Save user message
     m_user = Message(session_id=sess.id, role="user", content=body.message)
     db.add(m_user); db.commit()
 
-    # attachments (client can supply override header, optional)
+    # attachments hook (optional)
     try:
         meta = await request.json()
     except Exception:
         meta = {}
     attachments = meta.get("__attachments_override__") or []
 
-    agent = _mk_agent_for_user(db, user, sess.model)
+    effective_mode = (body.interaction_mode or sess.interaction_mode or "auto").lower()
+    agent = _mk_agent_for_user(db, user, sess.model, interaction_mode=effective_mode)
 
     if body.stream:
+        cancel_event = threading.Event()
+        INFLIGHT[(user.id, sess.id)] = cancel_event
+
+        assistant_parts: list[str] = []   # ← collect what the user actually sees
+        saved_logs: list[dict] = []       # ← blocks for the right pane (tag/body)
+
         async def _streamer():
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -127,31 +171,109 @@ async def chat(session_id: int, body: ChatBody, request: Request, db: Session = 
 
             def _producer():
                 try:
-                    for evt in agent.go_stream(body.message, mode="prod", attachments=attachments, session_id=str(sess.id)):
-                        etype = evt.get("type")
-                        text = evt.get("text", "")
-                        _send({"type": etype, "text": text})
+                    for evt in agent.go_stream(
+                        body.message,
+                        mode="prod",
+                        attachments=attachments,
+                        session_id=str(sess.id),
+                        cancel_event=cancel_event
+                    ):
+                        if cancel_event.is_set():
+                            break
+
+                        # -------- capture assistant-visible content ----------
+                        try:
+                            typ = (evt or {}).get("type")
+                            if typ == "message":
+                                txt = (evt.get("text") or "")
+                                if txt: assistant_parts.append(txt)
+                            elif typ == "block":
+                                tag = str(evt.get("tag") or "").upper()
+                                if tag in {"SOLUTION","FINAL","ANSWER","SUMMARY","REVIEW"}:
+                                    raw = evt.get("text") or ""
+                                    # strip <TAG> ... </TAG>
+                                    inner = re.sub(r"^<[^>]+>", "", raw)
+                                    inner = re.sub(r"</[^>]+>$", "", inner).strip()
+                                    if inner: assistant_parts.append(inner)
+                                
+                                # Save loggable blocks for history
+                                # These are the ones your right panel renderer understands.
+                                LOGGABLE = {"EXECUTE","OBSERVE","LOGS","THINK","STATUS","NEXT"}
+                                if tag in LOGGABLE:
+                                    raw = evt.get("text") or ""
+                                    body_txt = raw
+                                    if tag in {"EXECUTE","OBSERVE","LOGS","THINK","NEXT"}:
+                                        # store inner content only (no <TAG> wrappers)
+                                        body_txt = re.sub(r"^<[^>]+>", "", raw)
+                                        body_txt = re.sub(r"</[^>]+>$", "", body_txt).strip()
+                                    elif tag == "STATUS":
+                                        # normalize to 'running|done|...' without angle brackets
+                                        m = re.search(r"<\s*status\s*:\s*([^>]+)>", raw, flags=re.I)
+                                        body_txt = (m.group(1) if m else raw).strip()
+                                    saved_logs.append({"tag": tag, "body": body_txt})
+
+                        except Exception:
+                            pass
+                        # -----------------------------------------------------
+
+                        _send(evt)
+                except Exception as e:
+                    _send({"type": "error", "text": str(e)})
                 finally:
                     _send({"type": "done"})
+                    INFLIGHT.pop((user.id, sess.id), None)
 
             loop.run_in_executor(None, _producer)
 
-            while True:
-                chunk = await queue.get()
-                yield chunk
-                try:
-                    obj = json.loads(chunk.decode().strip() or "{}")
-                    if obj.get("type") == "done":
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        cancel_event.set()
                         break
-                except Exception:
-                    pass
+                    chunk = await queue.get()
+                    yield chunk
 
-        return StreamingResponse(_streamer(), media_type="text/event-stream")
-    else:
-        log, final = agent.go(body.message, mode="prod", attachments=attachments, session_id=str(sess.id))
-        m_assist = Message(session_id=sess.id, role="assistant", content=final or "")
-        db.add(m_assist); db.commit()
-        return {"message": final}
+                    # stop when producer says "done"
+                    try:
+                        obj = json.loads(chunk.decode().strip() or "{}")
+                        if obj.get("type") == "done":
+                            break
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                cancel_event.set()
+                raise
+            finally:
+                cancel_event.set()
+                # ------------ persist assistant reply for history ------------
+                final_text = "\n".join(p for p in assistant_parts if p).strip()
+                if final_text:
+                    # db.add(Message(session_id=sess.id, role="assistant", content=final_text))
+                    # db.commit()
+                    m = Message(session_id=sess.id, role="assistant", content=final_text)
+                    db.add(m); db.commit(); db.refresh(m)
+                    # persist logs in original order
+                    for i, L in enumerate(saved_logs):
+                        db.add(MessageLog(message_id=m.id, tag=L["tag"], body=L["body"], ord=i))
+                    db.commit()
+                # ------------------------------------------------------------
+
+        return StreamingResponse(_streamer(), media_type="application/x-ndjson")
+
+    # non-stream path (unchanged)
+    log, final = agent.go(body.message, mode="prod", attachments=attachments, session_id=str(sess.id))
+    m_assist = Message(session_id=sess.id, role="assistant", content=final or "")
+    db.add(m_assist); db.commit()
+    return {"message": final}
+
+
+@router.post("/sessions/{session_id}/cancel")
+def cancel_run(session_id: int, user: User = Depends(get_current_user)):
+    ev = INFLIGHT.get((user.id, session_id))
+    if ev:
+        ev.set()
+        return {"ok": True, "canceled": True}
+    return {"ok": True, "canceled": False}
 
 @router.post("/upload")
 async def upload(file: UploadFile = File(...), user: User = Depends(get_current_user)):
@@ -160,3 +282,61 @@ async def upload(file: UploadFile = File(...), user: User = Depends(get_current_
     dest.write_bytes(data)
     return {"path": str(dest.resolve())}
 
+
+from fastapi import HTTPException
+
+@router.get("/sessions/{session_id}")
+def get_session(session_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    sess = (
+        db.query(ChatSession)
+        .filter(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "id": sess.id,
+        "title": sess.title,
+        "model": sess.model,
+        "interaction_mode": sess.interaction_mode,
+        "created_at": sess.created_at.isoformat(),
+    }
+
+@router.get("/sessions/{session_id}/messages")
+def get_messages(session_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    sess = (
+        db.query(ChatSession)
+        .filter(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    msgs = (
+        db.query(Message)
+        .filter(Message.session_id == session_id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    # return [
+    #     {
+    #         "id": m.id,
+    #         "role": m.role,
+    #         "content": m.content,
+    #         "created_at": m.created_at.isoformat(),
+    #         # "attachments": [],  # add later if you persist them
+    #     }
+    #     for m in msgs
+    # ]
+    out = []
+    for m in msgs:
+        item = {
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at.isoformat(),
+        }
+        if m.role == "assistant":
+            item["logs"] = [{"tag": L.tag, "body": L.body} for L in (m.logs or [])]
+        out.append(item)
+    return out

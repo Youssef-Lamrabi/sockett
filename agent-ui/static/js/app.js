@@ -1,66 +1,167 @@
 /* =========================================================================
-   Agent Copilot – App JS (model mgmt + chat UX + smooth scroll + markdown)
-   ========================================================================= */
+  Agent Copilot – App JS (model mgmt + chat UX + smooth scroll + markdown)
+========================================================================= */
+import {
+  parseTaggedBlocks,
+  renderAssistantEvent,
+  renderUserMessage,
+  renderLogBlock,
+  clearChat,
+  clearLogs,
+  escapeHtml,
+  showAssistantTyping,
+  hideAssistantTyping,
+  renderUserMessageWithAttachments,
+  renderAssistantMarkdownStatic,
+} from './agent_render.js';
 
 const api = {
   token: null,
   setToken(t) { this.token = t; localStorage.setItem('agent_token', t || ''); },
   headers() { return this.token ? { 'Authorization': 'Bearer ' + this.token } : {}; }
 };
+let composerBusy = false;
+
+// Abort the active stream if the tab is closed/refreshed
+let currentChatController = null;
+window.addEventListener('beforeunload', () => {
+  try { currentChatController?.abort(); } catch { }
+});
 
 /* -------------------------- Helpers ------------------------------------ */
 function el(id) { return document.getElementById(id); }
 function append(parent, html) { const div = document.createElement('div'); div.innerHTML = html; parent.appendChild(div.firstElementChild); }
-function escapeHtml(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
-/* Simple near-bottom check + smooth scroll */
+async function loadSessionDetails(sid) {
+  const res = await fetch(`/api/sessions/${sid}`, { headers: { ...api.headers() } });
+  if (!res.ok) return null;
+  const s = await res.json();
+  if (s?.interaction_mode) {
+    localStorage.setItem('agent_mode', s.interaction_mode); // keep in sync
+    updateModeUI(s.interaction_mode);
+  }
+  return s;
+}
+
+async function setSessionMode(mode) {
+  const sid = getCurrentSessionId();
+  if (!sid) return;
+  const res = await fetch(`/api/sessions/${sid}/mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...api.headers() },
+    body: JSON.stringify({ interaction_mode: mode })
+  });
+  if (!res.ok) {
+    notify('error', 'Failed to set mode');
+    return;
+  }
+  localStorage.setItem('agent_mode', mode);
+  updateModeUI(mode);
+}
+
+/* ------------------- Sticky-to-bottom (chat & logs) -------------------- */
+// Both panes smart-scroll; pause while the user is interacting.
+
 let chatStickToBottom = true;
+let chatUserDragging = false;
+
 let logsStickToBottom = true;
+let logsUserDragging = false;
 
 function isNearBottom(node, threshold = 60) {
   if (!node) return true;
   return node.scrollHeight - node.scrollTop - node.clientHeight < threshold;
 }
-function scrollChatSmooth() {
-  const chat = el('chat');
-  if (chat && chatStickToBottom) chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' });
-}
-function scrollLogsSmooth() {
-  const logs = el('logs');
-  if (logs && logsStickToBottom) logs.scrollTo({ top: logs.scrollHeight, behavior: 'smooth' });
+
+// CHAT: smooth scroll (unless user is dragging / scrolled up)
+function scrollChatSmooth(force = false) {
+  const chat = el('chat'); if (!chat) return;
+  if (!force && (!chatStickToBottom || chatUserDragging)) return;
+
+  requestAnimationFrame(() => {
+    chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' });
+    // double-tap to overcome layout thrash
+    setTimeout(() => {
+      if (chatStickToBottom && !chatUserDragging) {
+        chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' });
+      }
+    }, 60);
+  });
 }
 
-/* Markdown renderer (uses marked if available, falls back to basic) */
-function mdToHtml(md = "") {
-  if (window.marked?.parse) {
-    // If DOMPurify is present, sanitize; else basic marked with breaks
-    const raw = window.marked.parse(md, { breaks: true });
-    if (window.DOMPurify?.sanitize) return window.DOMPurify.sanitize(raw);
-    return raw;
-  }
-  // Minimal safe fallback
-  let s = escapeHtml(md);
+// LOGS: smooth scroll (unless user is dragging / scrolled up)
+function scrollLogsSmooth(force = false) {
+  const logs = el('logs'); if (!logs) return;
+  if (!force && (!logsStickToBottom || logsUserDragging)) return;
 
-  // Code blocks ```lang\n...\n```
-  s = s.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code.replace(/^\n+|\n+$/g,'')}</code></pre>`);
-  // Inline code
-  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Bold/italic
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  // Headings
-  s = s.replace(/^###### (.*)$/gm, '<h6>$1</h6>')
-       .replace(/^##### (.*)$/gm, '<h5>$1</h5>')
-       .replace(/^#### (.*)$/gm, '<h4>$1</h4>')
-       .replace(/^### (.*)$/gm, '<h3>$1</h3>')
-       .replace(/^## (.*)$/gm, '<h2>$1</h2>')
-       .replace(/^# (.*)$/gm, '<h1>$1</h1>');
-  // Links [text](url)
-  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  // Line breaks to <br> (paragraph-lite)
-  s = s.replace(/\n/g, '<br>');
-  return s;
+  requestAnimationFrame(() => {
+    logs.scrollTo({ top: logs.scrollHeight, behavior: 'smooth' });
+    setTimeout(() => {
+      if (logsStickToBottom && !logsUserDragging) {
+        logs.scrollTo({ top: logs.scrollHeight, behavior: 'smooth' });
+      }
+    }, 60);
+  });
 }
+
+// ---------------------- Attachments (pending in composer) -----------------
+let pendingUploads = []; // {id, name, type, size, localUrl, serverPath, status:'uploading'|'ready'|'error'}
+
+function uid() { return 'att-' + Math.random().toString(36).slice(2); }
+function formatBytes(b = 0) { if (!b) return '0 B'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.floor(Math.log(b) / Math.log(1024)); return (b / Math.pow(1024, i)).toFixed(i ? 1 : 0) + ' ' + u[i]; }
+function isImageLike(mime = '', name = '') { return /^image\//i.test(mime) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name); }
+
+function renderAttachDock() {
+  const dock = el('attach-dock'); if (!dock) return;
+  if (!pendingUploads.length) { dock.innerHTML = ''; return; }
+
+  dock.innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin:0 0 8px 0;">
+      ${pendingUploads.map(a => {
+    const img = isImageLike(a.type, a.name) && a.localUrl;
+    const statusIcon = a.status === 'uploading'
+      ? `<i class="fa fa-spinner fa-spin" aria-hidden="true"></i>`
+      : (a.status === 'ready'
+        ? `<i class="fa fa-check" aria-hidden="true"></i>`
+        : `<i class="fa fa-exclamation-triangle" aria-hidden="true"></i>`);
+    return `
+          <div class="tiny-att" data-id="${a.id}"
+               style="display:flex;align-items:center;gap:6px;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:999px;padding:4px 8px;">
+            <div style="width:22px;height:22px;border-radius:6px;overflow:hidden;background:#EDF2F7;display:flex;align-items:center;justify-content:center;">
+              ${img ? `<img src="${escapeHtml(a.localUrl)}" alt="" style="width:100%;height:100%;object-fit:cover;">`
+        : `<span style="font-size:11px;font-weight:700;opacity:.7;">.${escapeHtml(a.name.split('.').pop()?.toUpperCase() || 'FILE')}</span>`}
+            </div>
+            <div style="max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+              <strong style="font-size:12px;">${escapeHtml(a.name)}</strong>
+              <span class="muted" style="font-size:11px;opacity:.7;"> • ${formatBytes(a.size)}</span>
+            </div>
+            <span class="stat" title="${escapeHtml(a.status)}" style="opacity:.7;">${statusIcon}</span>
+            <button class="rm" title="Remove"
+                    style="border:none;background:transparent;cursor:pointer;opacity:.6;padding:2px 4px;">
+              ✕
+            </button>
+          </div>
+        `;
+  }).join('')}
+    </div>
+  `;
+
+  // remove handlers
+  dock.querySelectorAll('.tiny-att .rm').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const id = btn.closest('.tiny-att')?.dataset?.id;
+      if (!id) return;
+      const idx = pendingUploads.findIndex(x => x.id === id);
+      if (idx >= 0) {
+        const u = pendingUploads[idx];
+        if (u.localUrl) URL.revokeObjectURL(u.localUrl);
+        pendingUploads.splice(idx, 1);
+        renderAttachDock();
+      }
+    });
+  });
+}
+
 
 /* App show/hide */
 function showApp() { const a = el('auth-panel'); const app = el('app'); if (!a || !app) return; a.classList.add('hidden'); app.classList.remove('hidden'); a.style.display = 'none'; app.style.display = 'block'; }
@@ -144,11 +245,41 @@ function wireFieldListeners() {
   });
 }
 
+async function loadSessionMessages(sid) {
+  const res = await fetch(`/api/sessions/${sid}/messages`, { headers: { ...api.headers() } });
+  if (!res.ok) return;
+  const msgs = await res.json();
+  const chat = el('chat'); if (chat) chat.innerHTML = '';   // reset chat
+  const logs = el('logs'); if (logs) logs.innerHTML = '';   // reset right pane
+
+  for (const m of msgs) {
+    if (m.role === 'user') {
+      renderUserMessage(m.content);
+    }
+    else if (m.role === 'assistant') {
+      // left pane: final assistant text
+      renderAssistantMarkdownStatic(m.content);
+
+      // right pane: replay saved tool/log blocks (if any)
+      const savedLogs = m.logs || [];
+      for (const L of savedLogs) {
+        renderLogBlock(String(L.tag || '').toUpperCase(), L.body || '');
+      }
+      // remove any spinner visuals (history is not "live")
+      // light-touch way: drop a terminal status which also clears spinners
+      if (savedLogs.length) {
+        renderAssistantEvent({ type: 'block', tag: 'STATUS', text: '<status:done>' });
+      }
+    }
+  }
+}
+
 function autoGrowTextArea(t) {
   if (!t) return;
   t.style.height = 'auto';
   const max = 420; // keep in sync with CSS
   t.style.height = Math.min(t.scrollHeight, max) + 'px';
+  t.style.overflow = (Math.min(t.scrollHeight, max) >= max) ? "auto" : "hidden";
 }
 function focusComposer() {
   const msg = el('message');
@@ -164,6 +295,20 @@ function markSessionActive(sid) {
   list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
   const item = list.querySelector(`.session-item[data-sid="${sid}"]`);
   if (item) item.classList.add('active');
+}
+
+function getAgentMode() {
+  return localStorage.getItem('agent_mode') || 'auto'; // 'auto' | 'feedback'
+}
+function setAgentMode(m) {
+  localStorage.setItem('agent_mode', m);
+  updateModeUI(m);
+}
+function updateModeUI(m) {
+  const autoBtn = document.getElementById('mode-auto');
+  const fbBtn = document.getElementById('mode-feedback');
+  if (autoBtn) autoBtn.classList.toggle('active', m === 'auto');
+  if (fbBtn) fbBtn.classList.toggle('active', m === 'feedback');
 }
 
 /* ---------------------------- Auth API ---------------------------------- */
@@ -244,6 +389,15 @@ async function me() {
   return res.ok ? res.json() : null;
 }
 
+// async function afterLogin() {
+//   const u = await me();
+//   if (!u) { showAuth(); return; }
+//   const nameNode = el('profile-name'), mailNode = el('profile-email'), avatar = el('profile-avatar');
+//   if (nameNode) nameNode.textContent = u.name || 'User';
+//   if (mailNode) mailNode.textContent = u.email || '';
+//   if (avatar) avatar.textContent = (u.name || u.email || 'U').charAt(0).toUpperCase();
+//   if (el('app')) { await loadSessions(); showApp(); }
+// }
 async function afterLogin() {
   const u = await me();
   if (!u) { showAuth(); return; }
@@ -251,7 +405,10 @@ async function afterLogin() {
   if (nameNode) nameNode.textContent = u.name || 'User';
   if (mailNode) mailNode.textContent = u.email || '';
   if (avatar) avatar.textContent = (u.name || u.email || 'U').charAt(0).toUpperCase();
-  if (el('app')) { await loadSessions(); showApp(); }
+  if (el('app')) {
+    await loadSessions();
+    showApp();
+  }
 }
 
 /* ------------------------ Sessions (drawer UI) --------------------------- */
@@ -266,10 +423,11 @@ async function createSession(focusAfter = false) {
   }
 
   const model = modelSel.value;
+  const interaction_mode = getAgentMode();
   const res = await fetch('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...api.headers() },
-    body: JSON.stringify({ title: 'New Chat', model })
+    body: JSON.stringify({ title: 'New Chat', model, interaction_mode })
   });
   if (!res.ok) {
     notify('error', 'Failed to create session');
@@ -289,17 +447,6 @@ async function createSession(focusAfter = false) {
   notify('success', 'New chat created');
   return data.id;
 }
-// async function setSessionModelAuto() {
-//   const sid = getCurrentSessionId();
-//   const sel = document.getElementById('model-select'); const model = sel ? sel.value : null;
-//   if (!sid || !model) return;
-//   const res = await fetch(`/api/sessions/${sid}/model`, {
-//     method: 'POST', headers: { 'Content-Type': 'application/json', ...api.headers() },
-//     body: JSON.stringify({ model })
-//   });
-//   if (!res.ok) { notify('error', 'Failed to set model'); return; }
-//   notify('success', `Model set to ${model}`);
-// }
 async function setSessionModelAuto() {
   const sid = getCurrentSessionId();
   const sel = document.getElementById('model-select'); const model = sel ? sel.value : null;
@@ -309,21 +456,63 @@ async function setSessionModelAuto() {
     body: JSON.stringify({ model })
   });
   if (!res.ok) { notify('error', 'Failed to set model'); return; }
-  localStorage.setItem('last_model', model); // 👈 persist on success
+  localStorage.setItem('last_model', model);
   notify('success', `Model set to ${model}`);
 }
 
 async function loadSessions(andOpen = false) {
   const res = await fetch('/api/sessions', { headers: { ...api.headers() } });
-  if (!res.ok) { return; }
+  if (!res.ok) return;
   const data = await res.json(); sessionsCache = data || [];
-  renderSessionsList(); if (andOpen) openSessionsDrawer();
+  renderSessionsList();
+  if (sessionsCache.length) {
+    const sid = String(sessionsCache[0].id);
+    markSessionActive(sid);
+    await loadSessionMessages(sid);            // ← add
+    await loadSessionDetails(sid);
+  }
+  if (andOpen) openSessionsDrawer();
 }
+
 function getCurrentSessionId() {
   const btn = document.querySelector('.session-item.active');
   if (btn) return btn.dataset.sid;
   return sessionsCache[0]?.id || null;
 }
+// function renderSessionsList() {
+//   const list = el('sessions-list'); if (!list) return;
+//   list.innerHTML = '';
+//   if (!sessionsCache.length) {
+//     append(list, `<div class="muted" style="padding:10px;">No chats yet. Click “New Chat”.</div>`); return;
+//   }
+//   sessionsCache.forEach((s, i) => {
+//     const title = s.title || `Chat ${i + 1}`, model = s.model || '';
+//     const activeClass = i === 0 ? 'active' : '';
+//     append(list, `
+//       <div class="session-item ${activeClass}" data-sid="${s.id}">
+//         <div>
+//           <div class="title">${escapeHtml(title)}</div>
+//           <div class="meta">${escapeHtml(model)}</div>
+//         </div>
+//         <button class="open">Open</button>
+//       </div>
+//     `);
+//   });
+//   list.querySelectorAll('.session-item').forEach(item => {
+//     item.addEventListener('click', () => {
+//       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
+//       item.classList.add('active');
+//     });
+//   });
+//   list.querySelectorAll('.session-item .open').forEach(btn => {
+//     btn.addEventListener('click', (e) => {
+//       e.stopPropagation(); closeSessionsDrawer();
+//       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
+//       btn.parentElement.classList.add('active');
+//       notify('info', 'Chat opened');
+//     });
+//   });
+// }
 function renderSessionsList() {
   const list = el('sessions-list'); if (!list) return;
   list.innerHTML = '';
@@ -343,17 +532,23 @@ function renderSessionsList() {
       </div>
     `);
   });
+
+  // select highlight
   list.querySelectorAll('.session-item').forEach(item => {
     item.addEventListener('click', () => {
       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
       item.classList.add('active');
     });
   });
+
+  // open + load history
   list.querySelectorAll('.session-item .open').forEach(btn => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       e.stopPropagation(); closeSessionsDrawer();
       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
       btn.parentElement.classList.add('active');
+      await loadSessionMessages(btn.parentElement.dataset.sid); // ← add
+      await loadSessionDetails(btn.parentElement.dataset.sid);
       notify('info', 'Chat opened');
     });
   });
@@ -361,182 +556,153 @@ function renderSessionsList() {
 
 /* -------------------------- Uploads ------------------------------------- */
 async function uploadFile() {
-  const input = document.querySelector('#composer input[type=file]'); const f = input?.files?.[0]; if (!f) return;
-  const form = new FormData(); form.append('file', f);
-  const res = await fetch('/api/upload', { method: 'POST', headers: { ...api.headers() }, body: form });
-  if (!res.ok) { notify('error', 'Upload failed'); return; }
-  const data = await res.json();
-  append(el('logs'), `<div class="tag-block">Uploaded: ${escapeHtml(data.path)}</div>`);
-  notify('success', 'File uploaded'); input.value = '';
-  scrollLogsSmooth();
-}
+  const input = document.querySelector('#composer input[type=file]');
+  const f = input?.files?.[0]; if (!f) return;
 
-/* --------------------- Logs/Chat rendering ------------------------------ */
-function parseTaggedBlocks(text) {
-  const out = []; const rx = /<(execute|observe|observation|solution|think|subscribe|logs)>([\s\S]*?)<\/\1>/ig;
-  let lastIndex = 0, m;
-  while ((m = rx.exec(text))) {
-    if (m.index > lastIndex) { out.push({ kind: 'text', text: text.slice(lastIndex, m.index) }); }
-    let name = m[1].toUpperCase(); if (name === 'OBSERVATION') name = 'OBSERVE';
-    out.push({ kind: 'block', tag: name, text: m[2] }); lastIndex = rx.lastIndex;
-  }
-  if (lastIndex < text.length) { out.push({ kind: 'text', text: text.slice(lastIndex) }); }
-  return out;
-}
-function renderToLogs(evt) {
-  const logs = el('logs'); if (!logs) return;
-  if (evt.type === 'done') { append(logs, `<div class="tag-block">[done]</div>`); scrollLogsSmooth(); return; }
-  const text = evt.text || ''; const parts = parseTaggedBlocks(text);
-  parts.forEach(p => {
-    if (p.kind === 'text') {
-      const t = p.text.trim(); if (t) { append(logs, `<div class="tag-block">${escapeHtml(t)}</div>`); }
-    } else {
-      const cls = p.tag.toLowerCase() === 'execute' ? 'tag-execute'
-        : p.tag.toLowerCase() === 'observe' ? 'tag-observe' : p.tag.toLowerCase();
-      append(logs, `<div class="tag-block ${cls}"><b>${p.tag}</b><div>${escapeHtml(p.text)}</div></div>`);
-    }
-  });
-  scrollLogsSmooth();
-}
+  // 1) create a pending chip immediately (local preview)
+  const rec = {
+    id: uid(),
+    name: f.name,
+    type: f.type || '',
+    size: f.size || 0,
+    localUrl: URL.createObjectURL(f),
+    serverPath: null,
+    status: 'uploading'
+  };
+  pendingUploads.push(rec);
+  renderAttachDock();
 
-/* Chat bubbles (user: plain; assistant: markdown) */
-function renderToChat(role, content) {
-  const chat = el('chat'); if (!chat) return;
-  if (role === 'user') {
-    const htmlSafe = escapeHtml(content || "").replace(/\n/g, '<br>');
-    append(chat, `<div class="msg user"><div class="bubble">${htmlSafe}</div></div>`);
-  } else {
-    const html = mdToHtml(content || "");
-    append(chat, `<div class="msg assistant"><div class="bubble">${html}</div></div>`);
-  }
-  scrollChatSmooth();
-}
+  // 2) upload to server
+  try {
+    const form = new FormData();
+    form.append('file', f);
+    const res = await fetch('/api/upload', { method: 'POST', headers: { ...api.headers() }, body: form });
+    if (!res.ok) throw new Error(await res.text() || 'Upload failed');
 
-/* ----------- Stream routing helpers (chat vs logs panes) --------------- */
-const CHAT_BLOCK_TAGS = new Set(["SOLUTION", "FINAL", "ANSWER", "REVIEW", "SUMMARY"]);
-const LOG_BLOCK_TAGS = new Set(["EXECUTE", "OBSERVE", "LOGS", "SUBSCRIBE", "STATUS", "NEXT"]);
-
-// strip the outermost <tag>...</tag> or <STATUS:...> wrapper for display
-function stripOuterTag(s = "") {
-  if (!s) return "";
-  s = s.replace(/^<([a-z]+)(\s+[^>]*)?>/i, "");
-  s = s.replace(/<\/[a-z]+\s*>$/i, "");
-  s = s.replace(/^<[^>]+>\s*/i, "");
-  return s;
-}
-function classForTag(tag) {
-  switch (String(tag || "").toUpperCase()) {
-    case "EXECUTE": return "tag-execute";
-    case "OBSERVE": return "tag-observe";
-    case "SUBSCRIBE": return "tag-subscribe";
-    case "LOGS": return "tag-logs";
-    default: return "";
+    const data = await res.json(); // expect { path }
+    rec.serverPath = data?.path || null;
+    rec.status = 'ready';
+    notify('success', `Uploaded: ${f.name}`);
+  } catch (err) {
+    console.error(err);
+    rec.status = 'error';
+    notify('error', `Upload failed: ${f.name}`);
+  } finally {
+    // 3) clear the input so same file can be chosen again
+    if (input) input.value = '';
+    renderAttachDock();
   }
 }
-function renderBlockToLogs(evt) {
-  const logs = el('logs'); if (!logs) return;
-  const tag = String(evt.tag || "").toUpperCase();
-  const body = stripOuterTag(evt.text || "");
-  const cls = classForTag(tag);
-  append(logs, `<div class="tag-block ${cls}"><b>${escapeHtml(tag)}</b><div>${escapeHtml(body)}</div></div>`);
-  scrollLogsSmooth();
-}
 
-/* ---------- Assistant typing indicator + busy composer ---------- */
-let typingEl = null;
-let currentAssistantEl = null;
-
-function showTypingIndicator() {
-  const chat = el('chat'); if (!chat) return;
-  removeTypingIndicator();
-  append(chat, `
-    <div class="msg assistant typing">
-      <div class="bubble"><span class="dots"><span></span><span></span><span></span></span></div>
-    </div>
-  `);
-  typingEl = chat.lastElementChild;
-  scrollChatSmooth();
-}
-function removeTypingIndicator() {
-  if (typingEl?.parentNode) typingEl.parentNode.removeChild(typingEl);
-  typingEl = null;
-}
-// function startAssistantMessage() {
-//   const chat = el('chat'); if (!chat) return null;
-//   removeTypingIndicator();
-//   const div = document.createElement('div');
-//   div.className = 'msg assistant';
-//   div.innerHTML = `<div class="bubble"></div>`;
-//   chat.appendChild(div);
-//   currentAssistantEl = div;
-//   scrollChatSmooth();
-//   return div;
-// }
-function startAssistantMessage() {
-  const chat = el('chat'); if (!chat) return null;
-  const div = document.createElement('div');
-  div.className = 'msg assistant';
-  div.innerHTML = `<div class="bubble"></div>`;
-  if (typingEl && typingEl.parentNode === chat) {
-    chat.insertBefore(div, typingEl);   // 👈 keep dots at the bottom
-  } else {
-    chat.appendChild(div);
-  }
-  currentAssistantEl = div;
-  scrollChatSmooth();
-  return div;
-}
-
-function appendAssistantMarkdown(mdChunk = "") {
-  if (!currentAssistantEl) startAssistantMessage();
-  const container = currentAssistantEl.querySelector('.bubble');
-  const html = mdToHtml(mdChunk);
-  // Append without nuking previous HTML
-  const frag = document.createElement('div');
-  frag.innerHTML = html;
-  container.appendChild(frag);
-  scrollChatSmooth();
-}
+/* --------------------- while agent respond ------------------------------ */
 function setComposerBusy(busy) {
+  composerBusy = busy;
+
   const send = el('send');
+  const stop = el('stop');
   const file = document.querySelector('#composer input[type=file]');
+  const msg = el('message');
+
+  // Toggle controls
   if (send) {
     send.disabled = busy;
     send.classList.toggle('is-busy', busy);
+    send.setAttribute('aria-busy', String(busy));
+    // 👇 Hide Send when running; show when idle
+    send.style.display = busy ? 'none' : '';
+  }
+  if (stop) {
+    // 👇 Show Stop when running; hide when idle
+    stop.style.display = busy ? '' : 'none';
+    stop.disabled = !busy;
+    if (!busy) stop.removeAttribute('aria-busy');
   }
   if (file) file.disabled = busy;
+
+  // optional: visual hint on the textarea, but still allow typing
+  if (msg) msg.classList.toggle('is-busy', busy);
 }
+
+
+/* ------------------------- Stop current run ----------------------------- */
+function stopRun() {
+  // abort the active stream; send()’s catch(AbortError) will log and clean up
+  if (!currentChatController) return;
+  try { currentChatController.abort(); } catch { }
+  // small immediate feedback (optional)
+  const stop = el('stop');
+  if (stop) { stop.disabled = true; stop.setAttribute('aria-busy', 'true'); }
+}
+window.stopCurrentRun = stopRun;
+
 
 /* ------------------------- Send message --------------------------------- */
 async function send() {
-  // Guard: require a model
+  if (composerBusy) return;
+
+  // Guard: model + session
   if (!document.getElementById('model-select')?.value) {
-    notify('info', 'Add a model in Settings first');
-    openSettings();
+    notify('info', 'Add a model in Settings first'); openSettings(); return;
+  }
+  const sid = getCurrentSessionId(); if (!sid) { notify('error', 'Create a session first'); return; }
+
+  const textarea = el('message');
+  const msg = textarea?.value?.trim(); if (!msg) return;
+
+  // // User bubble
+  // renderUserMessage(msg);
+  // if (textarea) { textarea.value = ''; textarea.style.height = 'auto'; textarea.focus(); }
+  // Don't allow sending while any file is still uploading
+  if (pendingUploads.some(x => x.status === 'uploading')) {
+    notify('info', 'Please wait for files to finish uploading.');
     return;
   }
+  // Ready attachments to render + send
+  const ready = pendingUploads.filter(x => x.status === 'ready');
+  if (ready.length) {
+    renderUserMessageWithAttachments(msg, ready.map(a => ({
+      name: a.name,
+      type: a.type,
+      path: a.serverPath,        // backend path
+      url: a.serverPath,         // used for browser if accessible
+      previewUrl: a.localUrl     // fallback/local preview
+    })));
+  } else {
+    renderUserMessage(msg);
+  }
+  // clear composer text + dock (but keep previews alive until after we render)
+  if (textarea) { textarea.value = ''; textarea.style.height = 'auto'; textarea.focus(); }
+  pendingUploads.forEach(a => { if (a.localUrl) URL.revokeObjectURL(a.localUrl); });
+  pendingUploads = [];
+  renderAttachDock();
 
-  const sid = getCurrentSessionId(); if (!sid) { notify('error', 'Create a session first'); return; }
-  const msgNode = el('message');
-  const msg = msgNode?.value;
-  if (!msg) return;
 
-  // render user bubble
-  renderToChat('user', msg);
-  if (msgNode) { msgNode.value = ''; autoGrowTextArea(msgNode); }
+  // Abort any existing run
+  if (currentChatController) currentChatController.abort();
+  currentChatController = new AbortController();
 
-  // prepare stream
-  const stream = true;
-  const headers = { 'Content-Type': 'application/json', ...api.headers() };
-  const body = JSON.stringify({ message: msg, stream });
-
+  // Busy + typing
   setComposerBusy(true);
-  showTypingIndicator();
-  currentAssistantEl = null; // reset aggregation
-  let sawAssistantContent = false;
+  showAssistantTyping();
+
+  const interaction_mode = localStorage.getItem('agent_mode') || 'auto'; // if you added the toggle
+  const headers = { 'Content-Type': 'application/json', ...api.headers() };
+  // const body = JSON.stringify({ message: msg, stream: true, interaction_mode });
+  const attachments = ready.map(a => ({
+    path: a.serverPath,
+    name: a.name,
+    mime: a.type,
+    size: a.size
+  }));
+  const body = JSON.stringify({ message: msg, stream: true, interaction_mode, attachments });
 
   try {
-    const resp = await fetch(`/api/sessions/${sid}/messages`, { method: 'POST', headers, body });
+    const resp = await fetch(`/api/sessions/${sid}/messages`, {
+      method: 'POST',
+      headers,
+      body,
+      signal: currentChatController.signal
+    });
     if (!resp.ok) { throw new Error('Send failed'); }
 
     const reader = resp.body.getReader();
@@ -555,82 +721,41 @@ async function send() {
         if (!line.trim()) continue;
         try {
           const evt = JSON.parse(line);
-
-          // end marker
-          if (evt.type === 'done') {
-            renderBlockToLogs({ tag: 'STATUS', text: '<OK/>' });
-            continue;
-          }
-
-          // plain assistant text (untagged)
-          if (evt.type === 'message') {
-            const t = (evt.text || '').trim();
-            if (t) {
-              if (!sawAssistantContent) { startAssistantMessage(); sawAssistantContent = true; }
-              appendAssistantMarkdown(t);
-            }
-            continue;
-          }
-
-          // tagged blocks
-          if (evt.type === 'block') {
-            const tag = String(evt.tag || '').toUpperCase();
-            if (CHAT_BLOCK_TAGS.has(tag)) {
-              const inner = stripOuterTag(evt.text || '');
-              if (inner.trim()) {
-                if (!sawAssistantContent) { startAssistantMessage(); sawAssistantContent = true; }
-                appendAssistantMarkdown(inner);
-              }
-            } else {
-              renderBlockToLogs(evt);
-            }
-            continue;
-          }
-
-          // optional: send 'think' to logs but lightly
-          if (evt.type === 'think') {
-            renderBlockToLogs({ tag: 'THINK', text: evt.text || '' });
-            continue;
-          }
-
-        } catch {
-          /* ignore malformed line */
-        }
+          renderAssistantEvent(evt);
+        } catch { /* ignore parse errors */ }
       }
     }
 
-    // flush trailing chunk
     if (buffer.trim()) {
-      try {
-        const evt = JSON.parse(buffer.trim());
-        if (evt.type === 'message') {
-          const t = (evt.text || '').trim();
-          if (t) {
-            if (!sawAssistantContent) { startAssistantMessage(); sawAssistantContent = true; }
-            appendAssistantMarkdown(t);
-          }
-        } else if (evt.type === 'block') {
-          const tag = String(evt.tag || '').toUpperCase();
-          if (CHAT_BLOCK_TAGS.has(tag)) {
-            const inner = stripOuterTag(evt.text || '');
-            if (inner.trim()) {
-              if (!sawAssistantContent) { startAssistantMessage(); sawAssistantContent = true; }
-              appendAssistantMarkdown(inner);
-            }
-          } else {
-            renderBlockToLogs(evt);
-          }
-        }
-      } catch { /* ignore */ }
+      try { renderAssistantEvent(JSON.parse(buffer.trim())); } catch { }
     }
-
-  } catch (e) {
-    notify('error', e?.message || 'Send failed');
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      // Optional: tell backend to cancel job
+      try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch { }
+      if (window.AgentRender?.renderLogBlock) window.AgentRender.renderLogBlock('STATUS', 'Canceled by user');
+    } else {
+      notify('error', err?.message || 'Send failed');
+    }
   } finally {
-    removeTypingIndicator();
+    hideAssistantTyping();
     setComposerBusy(false);
+    currentChatController = null;
   }
 }
+
+// Render a simple assistant bubble (no typing effect, safe HTML)
+function renderAssistantHistoryPlain(text) {
+  const chat = el('chat'); if (!chat) return;
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.innerHTML = `<div class="bubble">${escapeHtml(text || '').replace(/\n/g, '<br>')}</div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+
+
 
 /* -------------------------- Drawer controls ----------------------------- */
 function openSessionsDrawer() { const d = el('sessions-drawer'); if (d) { d.classList.add('active'); d.setAttribute('aria-hidden', 'false'); } }
@@ -659,7 +784,6 @@ function boot() {
   // Auth + guard
   api.setToken(localStorage.getItem('agent_token') || '');
   guardDashboard().then(async () => {
-    // 👇 Prefer last selected model (if any) over system default
     await refreshModelSelectFromServer(localStorage.getItem('last_model') || undefined);
     if (!document.getElementById('model-select')?.value) {
       notify('info', 'No models configured yet. Add one in Settings.');
@@ -676,7 +800,7 @@ function boot() {
   if (modelSel) {
     modelSel.addEventListener('change', (e) => {
       const v = e.target.value;
-      localStorage.setItem('last_model', v); // 👈 persist
+      localStorage.setItem('last_model', v);
       setSessionModelAuto();
     });
   }
@@ -690,8 +814,10 @@ function boot() {
   // New Chat flow...
   const newChatFlow = async (e) => {
     e?.preventDefault?.();
-    await createSession(true);
-    const logs = el('logs'); if (logs) logs.innerHTML = '';
+    await createSession();
+    closeSessionsDrawer();
+    clearChat(); clearLogs();
+    const msg = el('message'); if (msg) { msg.value = ''; msg.focus(); }
   };
   el('btn-new-chat')?.addEventListener('click', newChatFlow);
   el('drawer-new')?.addEventListener('click', newChatFlow);
@@ -706,7 +832,11 @@ function boot() {
     autoGrowTextArea(msgInput);
     msgInput.addEventListener('input', () => autoGrowTextArea(msgInput));
     msgInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (composerBusy) return;
+        send();
+      }
     });
   }
 
@@ -721,9 +851,139 @@ function boot() {
   initSplitter();
   el('mdl-add')?.addEventListener('click', (e) => { e.preventDefault(); addModel(); });
 
-  // Stick-to-bottom listeners
-  const chat = el('chat'); if (chat) chat.addEventListener('scroll', () => { chatStickToBottom = isNearBottom(chat); });
-  const logs = el('logs'); if (logs) logs.addEventListener('scroll', () => { logsStickToBottom = isNearBottom(logs); });
+  // Initialize mode UI from persisted value
+  updateModeUI(getAgentMode());
+  // document.getElementById('mode-auto')?.addEventListener('click', (e) => {
+  //   e.preventDefault();
+  //   setAgentMode('auto');
+  //   notify('info', 'Auto mode enabled');
+  // });
+  // document.getElementById('mode-feedback')?.addEventListener('click', (e) => {
+  //   e.preventDefault();
+  //   setAgentMode('feedback');
+  //   notify('info', 'Human-in-loop mode enabled');
+  // });
+  async function onModeChange(nextMode) {
+    const isRunning = !!currentChatController;
+    if (isRunning) {
+      const startNew = confirm(
+        'A response is currently running.\n\n' +
+        '• OK = start a NEW conversation now with this mode\n' +
+        '• Cancel = keep this chat; the mode will apply on the next message.'
+      );
+      if (startNew) {
+        // make a fresh session immediately in requested mode
+        const createdId = await createSession(true);
+        if (createdId) {
+          await setSessionMode(nextMode);
+          setAgentMode(nextMode);
+          notify('success', (nextMode === 'auto' ? 'Auto' : 'Human-in-the-loop') + ' mode enabled (new chat).');
+        }
+        return;
+      }
+      // apply to current session but only effective on next send
+      await setSessionMode(nextMode);
+      setAgentMode(nextMode);
+      notify('info', (nextMode === 'auto' ? 'Auto' : 'Human-in-the-loop') + ' mode will apply to the next message.');
+      return;
+    }
+    await setSessionMode(nextMode);
+    setAgentMode(nextMode);
+    notify('success', (nextMode === 'auto' ? 'Auto' : 'Human-in-the-loop') + ' mode enabled.');
+  }
+
+  document.getElementById('mode-auto')?.addEventListener('click', (e) => { e.preventDefault(); onModeChange('auto'); });
+  document.getElementById('mode-feedback')?.addEventListener('click', (e) => { e.preventDefault(); onModeChange('feedback'); });
+
+
+  // Stick-to-bottom listeners (chat) — don't fight the user
+  const chat = el('chat');
+  if (chat) {
+    // update “near bottom” as they scroll
+    chat.addEventListener('scroll', () => {
+      chatStickToBottom = isNearBottom(chat);
+    });
+
+    // pause auto-scroll while interacting
+    ['pointerdown', 'touchstart'].forEach(ev =>
+      chat.addEventListener(ev, () => { chatUserDragging = true; })
+    );
+    ['pointerup', 'touchend', 'mouseleave'].forEach(ev =>
+      chat.addEventListener(ev, () => {
+        chatUserDragging = false;
+        chatStickToBottom = isNearBottom(chat);
+      })
+    );
+    chat.addEventListener('wheel', () => {
+      chatStickToBottom = isNearBottom(chat);
+    });
+
+    // observe DOM changes under #chat and auto-scroll if allowed
+    const chatMo = new MutationObserver(() => scrollChatSmooth());
+    chatMo.observe(chat, { childList: true, subtree: true });
+
+    // also honor explicit renderer signals (if agent_render dispatches them)
+    window.addEventListener('chat:changed', () => scrollChatSmooth());
+  }
+
+
+  // Stick-to-bottom listeners (logs) — don't fight the user
+  const logs = el('logs');
+  if (logs) {
+    // track “near bottom”
+    logs.addEventListener('scroll', () => {
+      logsStickToBottom = isNearBottom(logs);
+    });
+
+    // if the user starts interacting with the scrollbar/content, pause auto-stick
+    ['pointerdown', 'touchstart'].forEach(ev =>
+      logs.addEventListener(ev, () => { logsUserDragging = true; })
+    );
+    // when interaction ends, recompute and possibly resume stickiness
+    ['pointerup', 'touchend', 'mouseleave'].forEach(ev =>
+      logs.addEventListener(ev, () => {
+        logsUserDragging = false;
+        logsStickToBottom = isNearBottom(logs);
+      })
+    );
+    // wheel scrolling also updates stickiness
+    logs.addEventListener('wheel', () => {
+      logsStickToBottom = isNearBottom(logs);
+    });
+
+    // as a safety net, observe DOM changes under #logs and auto-scroll if allowed
+    const mo = new MutationObserver(() => scrollLogsSmooth());
+    mo.observe(logs, { childList: true, subtree: true });
+  }
+
+  // also scroll when renderers signal that logs changed
+  window.addEventListener('logs:changed', () => scrollLogsSmooth());
+
+  // Stop button
+  el('stop')?.addEventListener('click', (e) => { e.preventDefault(); stopRun(); });
+  // ESC to stop
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && currentChatController) stopRun();
+  });
+
+  setComposerBusy(false);
+  renderAttachDock();
+
+  // review btn
+  window.addEventListener('review:approve', (e) => {
+    const msg = (e?.detail && e.detail.msg) || 'Approved — please continue.';
+    const t = document.getElementById('message');
+    if (t) {
+      t.value = msg;
+      // keep your auto-grow behavior
+      try { if (typeof autoGrowTextArea === 'function') autoGrowTextArea(t); } catch {}
+    }
+    if (!composerBusy) {
+      // use your existing send() to submit immediately
+      // (send is in scope inside app.js)
+      send();
+    }
+  });
 }
 
 window.addEventListener('DOMContentLoaded', boot);
@@ -881,46 +1141,6 @@ async function loadModelsIntoUI() {
 }
 
 /* Populate #model-select only from backend (system default + user models) */
-// async function refreshModelSelectFromServer(preferValue) {
-//   const sel = el('model-select'); if (!sel) return;
-//   sel.innerHTML = '';
-//   let data;
-//   try {
-//     data = await fetchModels();
-//   } catch (e) {
-//     const opt = document.createElement('option');
-//     opt.value = ''; opt.textContent = '— Select a model in Settings —';
-//     opt.disabled = true; opt.selected = true; sel.appendChild(opt);
-//     return;
-//   }
-
-//   const options = [];
-//   if (data.system_default?.model) {
-//     options.push({ value: data.system_default.model, label: `System: ${data.system_default.model}` });
-//   }
-//   (data.user_models || []).forEach(m => {
-//     options.push({ value: m.name, label: m.name });
-//   });
-
-//   if (!options.length) {
-//     const opt = document.createElement('option');
-//     opt.value = ''; opt.textContent = '— Select a model in Settings —'; opt.disabled = true; opt.selected = true;
-//     sel.appendChild(opt);
-//     return;
-//   }
-
-//   options.forEach(o => {
-//     const opt = document.createElement('option');
-//     opt.value = o.value; opt.textContent = o.label;
-//     sel.appendChild(opt);
-//   });
-
-//   if (preferValue && options.some(o => o.value === preferValue)) {
-//     sel.value = preferValue;
-//   } else if (!sel.value && options.length) {
-//     sel.value = options[0].value;
-//   }
-// }
 async function refreshModelSelectFromServer(preferValue) {
   const sel = el('model-select'); if (!sel) return;
   sel.innerHTML = '';
@@ -955,7 +1175,7 @@ async function refreshModelSelectFromServer(preferValue) {
     sel.appendChild(opt);
   });
 
-  // 👇 choose selected: prefer explicit arg, then localStorage, then system default, then first item
+  // choose selected: prefer explicit arg, then localStorage, then system default, then first item
   const stored = localStorage.getItem('last_model');
   const fallback = data.system_default?.model || options[0]?.value;
   const preferred = preferValue || stored || fallback;
@@ -966,7 +1186,6 @@ async function refreshModelSelectFromServer(preferValue) {
     sel.value = options[0].value;
   }
 }
-
 
 /* ------------------------------ Guard ----------------------------------- */
 async function guardDashboard() {

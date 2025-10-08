@@ -1768,7 +1768,7 @@ class BioAgent:
 
 
     # AGENT RUNNER
-    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None):
+    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
         """Execute the agent with the given prompt.
         Args:
             prompt: The user's query
@@ -1829,8 +1829,12 @@ class BioAgent:
             last_msg_text = None
 
             for s in self.app.stream(inputs, stream_mode="values", config=config):
-                message = s["messages"][-1]
+                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                    # graceful exit
+                    last_msg_text = "<observe>Request canceled by client.</observe>"
+                    break
                 
+                message = s["messages"][-1]
                 if mode == "prod" and _is_human(message):
                     continue
             
@@ -1848,7 +1852,7 @@ class BioAgent:
 
             return self.log, last_msg_text #str(message.content)
     
-    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None) -> Generator[dict, None, None]:
+    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
         This function returns a generator that yields each step of the agent's execution,
         allowing for real-time monitoring of the agent's progress.
@@ -1916,6 +1920,11 @@ class BioAgent:
             self.log = []
 
             for s in self.app.stream(inputs, stream_mode="values", config=config):
+                # bail if canceled
+                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                    yield {"type": "message", "text": "<observe>Request canceled by client.</observe>"}
+                    return
+                
                 message = s["messages"][-1]
                 text = str(message.content)
 

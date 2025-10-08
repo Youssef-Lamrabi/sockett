@@ -16,6 +16,11 @@
           <option value="gpt-oss:20b">gpt-oss:20b</option>
         </select>
       </div>
+      <div style="font-size: 14px;">&nbsp;&nbsp;MODE</div>
+      <div class="mode-switch" id="mode-switch" role="group" aria-label="Agent mode">
+        <button id="mode-auto" class="seg active" data-mode="auto" title="Let the agent run end to end">Agent-Self-critic</button>
+        <button id="mode-feedback" class="seg" data-mode="feedback" title="Ask before running code">Human-in-loop</button>
+      </div>
     </div>
 
     <div class="profile">
@@ -35,7 +40,7 @@
 
   <div id="layout">
     <aside id="left">
-      <h3>Tool / Logs</h3>
+      <h3 style="margin-top: 0;font-size: 15px;">Tool / Logs</h3>
       <div id="logs"></div>
     </aside>
 
@@ -43,21 +48,26 @@
 
     <main id="right">
       <div id="chat"></div>
-      <div id="composer">
-        <label class="upload" title="Attach file">
-          <input type="file" id="file-input" />
-          <span>＋</span>
-        </label>
-        <!-- <input id="message" placeholder="Enter your query..." autocomplete="off" /> -->
-        <textarea
-          id="message"
-          class="composer-textarea"
-          placeholder="Enter your message… (Enter to send • Shift+Enter for newline)"
-          rows="1"
-          autocomplete="off"
-          spellcheck="true"
-        ></textarea>
-        <button id="send" class="primary button-submit">Send</button>
+      <div class="composer-wrapper">
+        <div id="attach-dock" class="attach-dock" aria-live="polite"></div>
+        <div id="composer">
+          <label class="upload" title="Attach file">
+            <input type="file" id="file-input" />
+            <span>＋</span>
+          </label>
+          <textarea
+            id="message"
+            class="composer-textarea"
+            placeholder="Enter your message… "
+            rows="1"
+            autocomplete="off"
+            spellcheck="true"
+          >save a text file with inside "Hellow word" and give me link to download. formulate this as 3 steps job only.</textarea>
+          <button id="send" type="button" class="primary button-submit">Send</button>
+          <button id="stop" type="button" class="danger button-stop" style="display:none;border-radius: 0px 19px 19px 0px;" aria-label="Stop current run">
+            <i class="fa fa-stop" aria-hidden="true"></i> Stop
+          </button>
+        </div>
       </div>
     </main>
   </div>
@@ -114,33 +124,6 @@
         <label>Your Models</label>
         <div id="models-list" class="models-list"></div>
       </div>
-      <!-- <div class="field">
-        <label>Source</label>
-        <div class="select-wrap">
-          <select id="set-source">
-            <option>Ollama</option>
-            <option>OpenAI</option>
-            <option>AzureOpenAI</option>
-            <option>Anthropic</option>
-            <option>Gemini</option>
-            <option>Groq</option>
-            <option>Bedrock</option>
-            <option>Custom</option>
-          </select>
-        </div>
-      </div>
-      <div class="field">
-        <label>Base URL (for Ollama/Custom/OpenAI-compatible)</label>
-        <input id="set-base-url" placeholder="http://localhost:11434/v1"/>
-      </div>
-      <div class="field">
-        <label>API Key (leave '***' to keep existing)</label>
-        <input id="set-api-key" placeholder="***" />
-      </div>
-      <div class="field">
-        <label>Default Model</label>
-        <input id="set-default-model" placeholder="gpt-oss:20b"/>
-      </div> -->
     </div>
     <div class="modal-footer">
       <button id="settings-save" class="primary">Save</button>
