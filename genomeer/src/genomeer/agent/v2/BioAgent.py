@@ -189,7 +189,8 @@ class BioAgent:
         self.configure()
         
         # [DEV-ONLY] logs
-        self._set_debug_log("/home/biolab-office-1/DATALAB/2025/Genomeer/genomeer/src/genomeer/agent/v2/agent_debug.log")
+        # self._set_debug_log("/home/biolab-office-1/DATALAB/2025/Genomeer/genomeer/src/genomeer/agent/v2/agent_debug.log")
+        self._set_debug_log("./agent_debug.log")
         
         # CONSTANTS
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics

@@ -225,7 +225,7 @@ body {
 
 .tab.active {
     color: #0f172a;
-    border-bottom: 2px solid var(--accent);
+    /* border-bottom: 2px solid var(--accent); */
     background: #ffffff;
 }
 
@@ -417,7 +417,7 @@ button.primary {
     align-items: center;
     gap: 12px;
     padding: 10px 12px;
-    background: #f8f8f800;
+    background: #f8f8f8;
     /* background: var(--panel); */
     
     position: sticky;
@@ -505,12 +505,16 @@ button.primary {
     padding: 12px;
     overflow: auto;
     background: #ffffff;
+    /* background: #404040; */
+    height: calc(100vh - 62px);
 }
 
 #right {
     display: flex;
     flex-direction: column;
     background: #ffffff;
+    /* background: #404040; */
+    height: calc(100vh - 62px);
 }
 
 #chat {
@@ -518,6 +522,7 @@ button.primary {
     overflow: auto;
     padding: 12px;
     background: #ffffff;
+    /* background: #404040; */
 }
 
 /* Composer */
@@ -534,6 +539,8 @@ button.primary {
     border: 1px dashed #cbd5e1;
     margin-bottom: 1.5em;
     background: #f8fafc;
+    position: sticky;
+    bottom: 0;
 }
 
 #composer input {
@@ -562,7 +569,7 @@ button.primary {
     overflow-y: auto;
     transition: border-color .15s ease, box-shadow .15s ease;
     border-radius: 0px;
-    overflow: hidden;
+    overflow: inherit;
   }
   
   .composer-textarea:focus {
@@ -927,9 +934,32 @@ button.primary {
   .msg.assistant .bubble {
     background: transparent;
     border: none;
-    padding: 0;                      /* just text content */
+    /* padding: 0; */
   }
   
   /* Optional: nicer paragraph spacing in assistant content */
   .msg.assistant .bubble p { margin: 0 0 10px; }
   .msg.assistant .bubble p:last-child { margin-bottom: 0; }
+
+
+  /* Typing indicator */
+.msg.assistant.typing .bubble { opacity: 0.8; }
+.dots { display:inline-flex; gap:6px; vertical-align:middle; }
+.dots span { width:6px; height:6px; border-radius:50%; background:#888; display:inline-block; animation:bounce 1.2s infinite; }
+.dots span:nth-child(2){ animation-delay:.15s; }
+.dots span:nth-child(3){ animation-delay:.3s; }
+@keyframes bounce { 0%,80%,100% { transform:scale(0.6); opacity:.5; } 40% { transform:scale(1); opacity:1; } }
+
+/* Composer busy */
+#send.is-busy, #send:disabled { opacity:.6; cursor:not-allowed; }
+#composer input[type=file]:disabled + span { opacity:.6; cursor:not-allowed; }
+
+/* Markdown basics */
+.msg.assistant .bubble pre { background:#0f1115; color:#eaeef2; padding:10px; border-radius:8px; overflow:auto; }
+.msg.assistant .bubble code { background:#f5f5f7; padding:0 .25em; border-radius:4px; }
+.msg.assistant .bubble pre code { background:transparent; padding:0; }
+.msg.assistant .bubble h1, 
+.msg.assistant .bubble h2, 
+.msg.assistant .bubble h3 { margin: .6em 0 .3em; }
+.msg.assistant .bubble a { color: #2563eb; text-decoration: none; }
+.msg.assistant .bubble a:hover { text-decoration: underline; }
