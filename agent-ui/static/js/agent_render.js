@@ -58,6 +58,44 @@ function mdToHtml(md = "") {
 }
 
 /* ------------------------------- Utils ---------------------------------- */
+function inFeedbackMode() {
+  return document.querySelector('#mode-switch .seg.active')?.dataset.mode === 'feedback';
+}
+
+let currentReviewCard = null;
+let reviewSeq = 0;
+
+function retireReviewCard(card, reason = '') {
+  if (!card) return;
+  const btn = card.querySelector('.btn-approve');
+  if (btn) btn.remove();               // disappear the button
+  card.classList.add('review-retired');
+  if (reason) {
+    const actions = card.querySelector('.review-actions');
+    if (actions) {
+      const note = document.createElement('div');
+      note.className = 'muted';
+      note.style.fontSize = '12px';
+      note.textContent = reason;
+      actions.appendChild(note);
+    }
+  }
+}
+
+function retireActiveReview(reason = '') {
+  if (currentReviewCard) {
+    retireReviewCard(currentReviewCard, reason);
+    currentReviewCard = null;
+  }
+}
+
+function removeApproveButtonsExcept(scopeCard) {
+  document.querySelectorAll('.review-card .btn-approve').forEach(btn => {
+    const card = btn.closest('.review-card');
+    if (!scopeCard || card !== scopeCard) btn.remove();
+  });
+}
+
 function markRunInactive() {
   if (!currentRun?.logsEl) return;
   const btn = currentRun.logsEl.querySelector('.btn-stop-run');
@@ -138,6 +176,7 @@ export function renderUserMessage(content) {
   item.innerHTML = `<div class="bubble user-bubble">${escapeHtml(content).replace(/\n/g, '<br>')}</div>`;
   chat.appendChild(item);
   chat.scrollTop = chat.scrollHeight;
+  if (inFeedbackMode()) retireActiveReview('');
 }
 export function renderAssistantMessage(content) {
   if (CHAT_SIMULATE_TYPING) pushAssistantChunkLive(content || "");
@@ -646,6 +685,59 @@ function renderMissingInChat(raw = "") {
   return renderChatCard(html);
 }
 
+// function renderReviewCard(raw = "") {
+//   // 1) extract inner review content
+//   const inner = String(raw).replace(/^<\s*review\s*>/i, '').replace(/<\/\s*review\s*>$/i, '').trim();
+
+//   // 2) split into text + <execute> code parts
+//   const parts = [];
+//   const rx = /<\s*execute\s*>([\s\S]*?)<\/\s*execute\s*>/ig;
+//   let last = 0, m;
+//   while ((m = rx.exec(inner))) {
+//     if (m.index > last) parts.push({ type: 'text', value: inner.slice(last, m.index) });
+//     parts.push({ type: 'code', value: m[1] || '' });
+//     last = rx.lastIndex;
+//   }
+//   if (last < inner.length) parts.push({ type: 'text', value: inner.slice(last) });
+
+//   // 3) build body: markdown for text, <pre><code> for execute blocks
+//   const bodyHtml = parts.map(p => {
+//     if (p.type === 'code') {
+//       return `<pre style="margin:.5rem 0;white-space:pre-wrap;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:8px;overflow:auto;"><code>${escapeHtml(p.value.trim())}</code></pre>`;
+//     }
+//     const md = mdToHtml(p.value || "");
+//     return `<div class="md">${md}</div>`;
+//   }).join('');
+
+//   // 4) card + approve button
+//   const html = `
+//     <div class="review-card" style="background:transparent;border:2px dashed #F3E6A4;border-radius:10px;padding:12px">
+//       <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+//         <i class="fa fa-clipboard-check" aria-hidden="true" style="opacity:.7"></i>
+//         <strong>Review Required</strong>
+//       </div>
+//       <div class="review-body">${bodyHtml}</div>
+//       <div class="review-actions" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content: end;">
+//         <button class="btn-approve" data-msg="Approved — please continue."
+//           style="background:#9BD09B;color:#0B6B0B;border:1px solid #73a573;border-radius:8px;padding:8px 12px;cursor:pointer;font-weight:700;">
+//           I agree, CONTINUE
+//         </button>
+//       </div>
+//     </div>
+//   `;
+
+//   const el = renderChatCard(html);
+//   const btn = el?.querySelector('.btn-approve');
+//   if (btn) {
+//     btn.addEventListener('click', () => {
+//       const msg = btn.getAttribute('data-msg') || 'Approved — please continue.';
+//       // broadcast for app.js to auto-fill + send
+//       window.dispatchEvent(new CustomEvent('review:approve', { detail: { msg } }));
+//     });
+//   }
+//   // highlightIn(el);
+//   return el;
+// }
 function renderReviewCard(raw = "") {
   // 1) extract inner review content
   const inner = String(raw).replace(/^<\s*review\s*>/i, '').replace(/<\/\s*review\s*>$/i, '').trim();
@@ -661,10 +753,10 @@ function renderReviewCard(raw = "") {
   }
   if (last < inner.length) parts.push({ type: 'text', value: inner.slice(last) });
 
-  // 3) build body: markdown for text, <pre><code> for execute blocks
+  // 3) build body
   const bodyHtml = parts.map(p => {
     if (p.type === 'code') {
-      return `<pre style="margin:.5rem 0;white-space:pre-wrap;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:8px;overflow:auto;"><code>${escapeHtml(p.value.trim())}</code></pre>`;
+      return `<pre class="codeblock" style="margin:.5rem 0;"><code>${escapeHtml(p.value.trim())}</code></pre>`;
     }
     const md = mdToHtml(p.value || "");
     return `<div class="md">${md}</div>`;
@@ -687,18 +779,33 @@ function renderReviewCard(raw = "") {
     </div>
   `;
 
+  // Retire any active review first (feedback mode only)
+  if (inFeedbackMode()) retireActiveReview('');
+
   const el = renderChatCard(html);
+  const card = el?.querySelector('.review-card');
+  if (card) {
+    card.dataset.reviewSeq = String(++reviewSeq);
+    currentReviewCard = card;                  // set as the only active review
+  }
+
+  // Ensure there's only ONE approve button in the whole chat (the newest one)
+  removeApproveButtonsExcept(card);
+
+  // Wire the button
   const btn = el?.querySelector('.btn-approve');
   if (btn) {
     btn.addEventListener('click', () => {
-      const msg = btn.getAttribute('data-msg') || 'Approved — please continue.';
-      // broadcast for app.js to auto-fill + send
+      const msg = btn.getAttribute('data-msg');
+      retireActiveReview('Approved');          // hide this button immediately
       window.dispatchEvent(new CustomEvent('review:approve', { detail: { msg } }));
     });
   }
-  // highlightIn(el);
+
+  highlightIn(el);
   return el;
 }
+
 
 /* -------------------------- STATUS chip (logs) -------------------------- */
 function parseStatusValue(raw = "") {
