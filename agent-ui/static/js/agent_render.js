@@ -7,6 +7,32 @@ const CHAT_TYPING_CHARS_PER_TICK = 1;
 
 const CHAT_ALWAYS_NEW_BUBBLE_PER_CHAT_BLOCK = true;
 const CHAT_LIVE_MARKDOWN_ON_NEWLINE = true;  // live MD preview only when newline arrives
+let lastStreamHadError = false;
+
+// ---------------- code block syntax highlighting ---------------
+// One-time Marked config to use highlight.js if present
+try {
+  if (window.marked) {
+    window.marked.setOptions({
+      breaks: true,
+      highlight(code, lang) {
+        if (window.hljs) {
+          if (lang && window.hljs.getLanguage(lang)) {
+            return window.hljs.highlight(code, { language: lang }).value;
+          }
+          return window.hljs.highlightAuto(code).value;
+        }
+        return code;
+      }
+    });
+  }
+} catch {}
+function highlightIn(el) {
+  if (!window.hljs || !el) return;
+  el.querySelectorAll('pre code').forEach((block) => {
+    try { window.hljs.highlightElement(block); } catch {}
+  });
+}
 
 /* ---------- Markdown (marked + DOMPurify if present; safe fallback) ---- */
 function mdToHtml(md = "") {
@@ -90,6 +116,7 @@ function appendAssistantMarkdown(mdChunk = "") {
   const frag = document.createElement('div');
   frag.innerHTML = html;
   container.appendChild(frag);
+  highlightIn(container);
   const chat = $('chat'); if (chat) chat.scrollTop = chat.scrollHeight;
 }
 
@@ -200,6 +227,7 @@ function tickTypewriter() {
   const chat = $('chat'); if (chat) chat.scrollTop = chat.scrollHeight;
 }
 
+
 function pushAssistantChunkLive(chunk = "") {
   if (!chunk) return;
   liveContainer();
@@ -229,10 +257,23 @@ function finalizeAssistantMessageLive() {
   }
 
   bubble.innerHTML = mdToHtml(liveFull || "");
+  highlightIn(bubble);
   liveFull = "";
 
   // end streaming bubble; next text starts a new one AFTER any cards we insert
   currentAssistantEl = null;
+}
+
+function renderErrorCard(msg = "Something went wrong.") {
+  const html = `
+    <div class="error-card" style="background:#FFE3E3;border:1px solid #F5B7B7;border-radius:10px;padding:10px;">
+      <div style="display:flex;gap:8px;align-items:center;color:#8b0000;font-weight:700;">
+        <i class="fa fa-times-circle" aria-hidden="true"></i>
+        <span>Error</span>
+      </div>
+      <div style="margin-top:6px;color:#5a0000;">${escapeHtml(msg)}</div>
+    </div>`;
+  return renderChatCard(html);
 }
 
 /* ------------------------------ Logs pane ------------------------------- */
@@ -313,7 +354,7 @@ function renderCollapsibleLog(tag, body) {
   }
 
   const preOpen = isExec
-    ? `<pre style="margin:0;white-space:pre-wrap;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:8px;overflow:auto;"><code>`
+    ? `<pre style="margin:0;white-space:pre-wrap;background:#0d1117;color:#c9d1d9;border-radius:8px;overflow:auto;"><code>`
     : `<pre style="margin:0;white-space:pre-wrap;"><code>`;
   const preClose = `</code></pre>`;
 
@@ -337,7 +378,7 @@ function renderCollapsibleLog(tag, body) {
         <span class="chev" style="opacity:.7;margin-left:8px;">▼</span>
       </div>
     </div>
-    <div class="collap-body" style="display:none;margin-top:6px;">
+    <div class="collap-body" style="display:none;">
       ${preOpen}${escapeHtml(body || '')}${preClose}
     </div>
   `;
@@ -368,6 +409,7 @@ function renderCollapsibleLog(tag, body) {
 
   box.scrollTop = box.scrollHeight;
   window.dispatchEvent(new Event('logs:changed'));
+  highlightIn(wrap);
   return wrap;
 }
 
@@ -565,6 +607,7 @@ export function renderAssistantMarkdownStatic(md = "") {
   div.className = 'msg assistant';
   div.innerHTML = `<div class="bubble">${mdToHtml(md)}</div>`;
   chat.appendChild(div);
+  highlightIn(div);
   chat.scrollTop = chat.scrollHeight;
 }
 
@@ -596,10 +639,9 @@ function renderMissingInChat(raw = "") {
   const html = `
     <div class="missing-card" style="background:#FFF0F0;border:1px solid #F5B7B7;border-radius:10px;padding:10px">
       <div style="display:flex;gap:10px;align-items:center;font-weight:700;color:#B00020;">
-        <i class="fa fa-exclamation-triangle" aria-hidden="true"></i>
         <span>Missing requirements</span>
       </div>
-      <ul style="margin:8px 0 0 18px; color:#6b0000;">${listHtml}</ul>
+      <ul style="position: relative; left: -25px; color:#6b0000;">${listHtml}</ul>
     </div>`;
   return renderChatCard(html);
 }
@@ -654,6 +696,7 @@ function renderReviewCard(raw = "") {
       window.dispatchEvent(new CustomEvent('review:approve', { detail: { msg } }));
     });
   }
+  // highlightIn(el);
   return el;
 }
 
@@ -805,6 +848,17 @@ const CHAT_BLOCK_TAGS = new Set(["SOLUTION", "FINAL", "ANSWER", "REVIEW", "SUMMA
 export function renderAssistantEvent(evt) {
   if (!evt) return;
 
+  if (evt.type === 'error') {
+    lastStreamHadError = true;
+    endCurrentChatStreamNow();
+    hideAssistantTyping();
+    renderErrorCard(evt.text || 'Connection error.');
+    renderStatusBox('error'); 
+    clearLiveSpinner();
+    markRunInactive();
+    return;
+  }
+
   if (evt.type === 'message') {
     let t = (evt.text || '');
     const remaining = processInlineSystemTagsInOrder(t);
@@ -890,13 +944,21 @@ export function renderAssistantEvent(evt) {
   }
 
   if (evt.type === 'done') {
+    if (lastStreamHadError) {
+      hideAssistantTyping();
+      clearLiveSpinner();
+      markRunInactive();
+      lastStreamHadError = false;
+      return;
+    }
     if (CHAT_SIMULATE_TYPING) {
       if (liveTimer || liveBuf.length) {
         finalizePending = true;
       } else {
         finalizeAssistantMessageLive();
       }
-    } else {
+    } 
+    else {
       finalizeAssistantMessageLive();
     }
     hideAssistantTyping();

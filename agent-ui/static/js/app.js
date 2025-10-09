@@ -32,6 +32,11 @@ window.addEventListener('beforeunload', () => {
 function el(id) { return document.getElementById(id); }
 function append(parent, html) { const div = document.createElement('div'); div.innerHTML = html; parent.appendChild(div.firstElementChild); }
 
+function updateSessionTitleInSidebar(sid, title) {
+  const item = document.querySelector(`.session-item[data-sid="${sid}"] .title`);
+  if (item) item.textContent = title;
+}
+
 async function loadSessionDetails(sid) {
   const res = await fetch(`/api/sessions/${sid}`, { headers: { ...api.headers() } });
   if (!res.ok) return null;
@@ -479,40 +484,6 @@ function getCurrentSessionId() {
   if (btn) return btn.dataset.sid;
   return sessionsCache[0]?.id || null;
 }
-// function renderSessionsList() {
-//   const list = el('sessions-list'); if (!list) return;
-//   list.innerHTML = '';
-//   if (!sessionsCache.length) {
-//     append(list, `<div class="muted" style="padding:10px;">No chats yet. Click “New Chat”.</div>`); return;
-//   }
-//   sessionsCache.forEach((s, i) => {
-//     const title = s.title || `Chat ${i + 1}`, model = s.model || '';
-//     const activeClass = i === 0 ? 'active' : '';
-//     append(list, `
-//       <div class="session-item ${activeClass}" data-sid="${s.id}">
-//         <div>
-//           <div class="title">${escapeHtml(title)}</div>
-//           <div class="meta">${escapeHtml(model)}</div>
-//         </div>
-//         <button class="open">Open</button>
-//       </div>
-//     `);
-//   });
-//   list.querySelectorAll('.session-item').forEach(item => {
-//     item.addEventListener('click', () => {
-//       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
-//       item.classList.add('active');
-//     });
-//   });
-//   list.querySelectorAll('.session-item .open').forEach(btn => {
-//     btn.addEventListener('click', (e) => {
-//       e.stopPropagation(); closeSessionsDrawer();
-//       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
-//       btn.parentElement.classList.add('active');
-//       notify('info', 'Chat opened');
-//     });
-//   });
-// }
 function renderSessionsList() {
   const list = el('sessions-list'); if (!list) return;
   list.innerHTML = '';
@@ -524,11 +495,10 @@ function renderSessionsList() {
     const activeClass = i === 0 ? 'active' : '';
     append(list, `
       <div class="session-item ${activeClass}" data-sid="${s.id}">
-        <div>
+        <div class="open">
           <div class="title">${escapeHtml(title)}</div>
           <div class="meta">${escapeHtml(model)}</div>
         </div>
-        <button class="open">Open</button>
       </div>
     `);
   });
@@ -721,6 +691,12 @@ async function send() {
         if (!line.trim()) continue;
         try {
           const evt = JSON.parse(line);
+
+          if (evt.type === 'meta' && evt.session_id && evt.session_title) {
+            updateSessionTitleInSidebar(String(evt.session_id), String(evt.session_title));
+            continue; // don't pass to renderAssistantEvent
+          }
+          
           renderAssistantEvent(evt);
         } catch { /* ignore parse errors */ }
       }
@@ -729,15 +705,17 @@ async function send() {
     if (buffer.trim()) {
       try { renderAssistantEvent(JSON.parse(buffer.trim())); } catch { }
     }
-  } catch (err) {
+  } 
+  catch (err) {
     if (err?.name === 'AbortError') {
-      // Optional: tell backend to cancel job
-      try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch { }
+      try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch {}
       if (window.AgentRender?.renderLogBlock) window.AgentRender.renderLogBlock('STATUS', 'Canceled by user');
     } else {
       notify('error', err?.message || 'Send failed');
+      try { renderAssistantEvent({ type: 'error', text: err?.message || 'Send failed' }); } catch {}
     }
-  } finally {
+  } 
+  finally {
     hideAssistantTyping();
     setComposerBusy(false);
     currentChatController = null;
@@ -775,7 +753,7 @@ function boot() {
   // Settings modal buttons...
   const openSet = el('btn-open-settings'); if (openSet) openSet.onclick = (e) => { e.preventDefault(); openSettings(); };
   const closeSet = el('settings-close'); if (closeSet) closeSet.onclick = (e) => { e.preventDefault(); closeSettings(); };
-  const saveSet = el('settings-save'); if (saveSet) saveSet.onclick = (e) => { e.preventDefault(); saveSettings(); };
+  const saveSet = el('settings-save-old'); if (saveSet) saveSet.onclick = (e) => { e.preventDefault(); saveSettings(); };
 
   // Close modal by clicking backdrop
   const modal = el('settings-modal');
@@ -850,6 +828,7 @@ function boot() {
   // Splitter + models add
   initSplitter();
   el('mdl-add')?.addEventListener('click', (e) => { e.preventDefault(); addModel(); });
+  el('settings-save')?.addEventListener('click', (e) => { e.preventDefault(); addModel(); });
 
   // Initialize mode UI from persisted value
   updateModeUI(getAgentMode());

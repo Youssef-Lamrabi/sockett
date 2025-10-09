@@ -623,11 +623,11 @@ button.primary {
 
 /* Messages */
 .msg {
-    margin: 10px 0;
+    margin: 5px 0;
     padding: 12px 14px;
     border-radius: 12px;
     border: 1px solid var(--border);
-    background: #f8fafc;
+    /* background: #f8fafc; */
 }
 
 .msg.user {
@@ -729,11 +729,13 @@ button.primary {
     margin: 8px 0;
     background: #f8fafc;
     cursor: pointer;
+    overflow: hidden;
 }
 
 .session-item .title {
     font-weight: 600;
     color: #0f172a;
+    white-space: nowrap;
 }
 
 .session-item .meta {
@@ -741,9 +743,13 @@ button.primary {
     color: var(--muted);
 }
 
-.session-item .open {
+/* .session-item .open {
     border: none;
     background: #ffffff;
+} */
+
+.session-item.active{
+    background: #c2cad4;
 }
 
 /* Responsive tweaks */
@@ -1359,3 +1365,4 @@ button-stop,
     left: 3.2em;
     background: #fff;
 }
+
