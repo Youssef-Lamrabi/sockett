@@ -637,6 +637,10 @@ class BioAgent:
                 updates["manifest"] = new_manifest
             self._log("EXIT NODE", body=f"route={route}\nsteps={steps}", node=node)
             
+            if route == "qa" or not steps:
+                self._log("HITL: skip planner pause for QA", body=f"route={route}, steps={len(steps)}", node=node)
+                return updates
+
             # ------ feedback replay mode check ------
             pause = self._maybe_pause(
                 state,
@@ -679,7 +683,7 @@ class BioAgent:
                 msgs.append(HumanMessage(content="""Prompt the user to review the previous step’s output and either approve it or request corrections before proceeding. Do not repeat the output (already sent to user) —just ask the question.""")) 
             else:
                 msgs.append(HumanMessage(content=payload or f"Please be generous and Answer clearly to the user's question or request: '{last_prompt}'"))
-                next_step = "orchestrator"
+                next_step = "end" #orchestrator
             
             resp = self._llm_invoke(node, "qa", msgs)
             updates = {
@@ -1751,6 +1755,10 @@ class BioAgent:
     def _maybe_pause(self, state: AgentState, *, resume_to: str, prompt_text: str, pause_kind: str) -> Dict[str, Any] | None:
         mode = (state.get("manifest") or {}).get("interaction_mode", "auto")
         if mode != "feedback":
+            return None
+        
+        if not (prompt_text and prompt_text.strip()):
+            self._log("HITL: skip pause (empty prompt_text)", node="driver")
             return None
 
         new_manifest = dict(state.get("manifest") or {})

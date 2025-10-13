@@ -773,7 +773,8 @@ function renderReviewCard(raw = "") {
       <div class="review-actions" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content: end;">
         <button class="btn-approve" data-msg="Approved — please continue."
           style="background:#9BD09B;color:#0B6B0B;border:1px solid #73a573;border-radius:8px;padding:8px 12px;cursor:pointer;font-weight:700;">
-          I agree, CONTINUE
+          I agree&nbsp;
+          <i class="fas fa-forward"></i>
         </button>
       </div>
     </div>
