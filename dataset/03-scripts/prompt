@@ -1,0 +1,445 @@
+here is the whole code import re, time, json, csv, html
+from pathlib import Path
+from urllib.parse import urlencode
+from functools import lru_cache
+import requests
+from bs4 import BeautifulSoup <------> # ------------------------
+# Paths & output
+# ------------------------
+CONFIG_PATH = Path("../02-datasource/category.json")
+OUT_DIR     = Path("../04-output/raw/biostars")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+JSONL_PATH  = OUT_DIR/"biostars_metagenomics.jsonl"
+CSV_PATH    = OUT_DIR/"biostars_metagenomics.csv"
+CACHE_IDS   = OUT_DIR/"seen_ids.txt"
+
+HEADERS = {"User-Agent": "MetagenomicsCollector/1.1 (+research use; contact: mahouzonssou.akotenou@um6p.ma)"}
+
+# Crawl config
+PAGES_PER_QUERY = 1000
+SLEEP_BETWEEN_REQUESTS = 0.2 <-----> # ------------------------
+# Helpers
+# ------------------------
+def sleep():
+    time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+def load_seen_ids():
+    if CACHE_IDS.exists():
+        return set(x.strip() for x in CACHE_IDS.read_text().splitlines() if x.strip())
+    return set()
+
+def save_seen_ids(ids):
+    with open(CACHE_IDS, "w") as f:
+        for pid in sorted(ids):
+            f.write(f"{pid}\n")
+
+def biostars_search_urls(query, pages=PAGES_PER_QUERY):
+    base = "https://www.biostars.org/post/search/"
+    for p in range(1, pages+1):
+        yield base + "?" + urlencode({"query": query, "page": p, "order": "relevance"})
+
+def fetch(url, as_json=False, params=None):
+    r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json() if as_json else r.text
+
+def extract_post_ids_from_search(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    ids = set()
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/p/(\d+)/?", a["href"])
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+@lru_cache(maxsize=8192)
+def get_post_json(pid):
+    return fetch(f"https://www.biostars.org/api/post/{pid}/", as_json=True)
+
+@lru_cache(maxsize=4096)
+def get_user_json(uid):
+    """Fetch Biostars user profile once; cached."""
+    if not uid:
+        return {}
+    try:
+        return fetch(f"https://www.biostars.org/api/user/{uid}/", as_json=True)
+    except Exception:
+        return {}
+
+def compact_user_profile(u):
+    """Keep only the fields we care about for rating later."""
+    if not u:
+        return None
+    return {
+        "id": u.get("id"),
+        "name": u.get("name"),
+        "joined_days_ago": u.get("joined_days_ago"),
+        "vote_count": u.get("vote_count"),
+    }
+
+def html_plain_text(xhtml):
+    try:
+        return BeautifulSoup(xhtml or "", "html.parser").get_text("\n", strip=True)
+    except Exception:
+        return (xhtml or "").strip()
+
+def normalize_tags(tag_val, fallback=None):
+    if isinstance(tag_val, list):
+        return [t for t in tag_val if t]
+    if isinstance(tag_val, str):
+        # Biostars returns space-separated tags in tag_val
+        toks = [t.strip() for t in tag_val.split() if t.strip()]
+        if toks:
+            return toks
+    return fallback or [] <----> # ------------------------
+# Load and compile config
+# ------------------------
+def load_category_config(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg
+
+def compile_regex_list(patterns, flags=re.I):
+    compiled = []
+    for pat in patterns:
+        try:
+            compiled.append(re.compile(pat, flags))
+        except re.error as e:
+            try:
+                compiled.append(re.compile(pat.encode("utf-8").decode("unicode_escape"), flags))
+            except Exception:
+                print(f"[warn] bad regex skipped: {pat} ({e})")
+    return compiled
+
+CFG = load_category_config(CONFIG_PATH)
+GLOBAL_EXCLUDES = compile_regex_list(CFG.get("global_exclude_regex", []))
+CATEGORY_RULES = []
+for cat in CFG.get("categories", []):
+    CATEGORY_RULES.append({
+        "name": cat.get("name"),
+        "tags": cat.get("tags", []),
+        "includes": compile_regex_list(cat.get("include_regex_any", []))
+    })
+
+# Build discovery query terms
+QUERY_TERMS = set()
+for cat in CFG.get("categories", []):
+    if cat.get("name"):
+        QUERY_TERMS.add(cat["name"])
+    for t in cat.get("tags", []):
+        QUERY_TERMS.add(t)
+tool_aliases = CFG.get("tool_aliases", {})
+for tool, variants in tool_aliases.items():
+    QUERY_TERMS.add(tool)
+    for v in variants:
+        QUERY_TERMS.add(v)
+QUERY_TERMS.update([
+    "metagenome", "metagenomics", "microbiome shotgun",
+    "metagenome assembly", "metagenome binning", "MAGs",
+    "host removal", "contamination", "quality trimming",
+    "alpha diversity", "beta diversity", "ANCOM", "DESeq2"
+])
+QUERY_TERMS = sorted({q for q in QUERY_TERMS if 2 <= len(q) <= 40})
+print(f"Loaded {len(CATEGORY_RULES)} categories, "
+      f"{len(GLOBAL_EXCLUDES)} global excludes, "
+      f"{len(QUERY_TERMS)} discovery queries.") <-----> # ------------------------
+# Labeling
+# ------------------------
+def matches_any(patterns, text):
+    return any(rx.search(text) for rx in patterns)
+
+def apply_labels_from_config(text):
+    if not text:
+        return []
+    hits = []
+    for cat in CATEGORY_RULES:
+        if matches_any(cat["includes"], text):
+            hits.append(cat["name"])
+    return sorted(set(hits))
+
+def blocked_by_global_excludes(text):
+    if not text:
+        return False
+    return matches_any(GLOBAL_EXCLUDES, text)
+
+# ------------------------
+# Small helpers
+# ------------------------
+def normalize_tags(tag_val, fallback=None):
+    if tag_val:
+        if isinstance(tag_val, list):
+            return [t for t in tag_val if t]
+        if isinstance(tag_val, str):
+            return [p.strip() for p in re.split(r"[,\s]+", tag_val) if p.strip()]
+    return list(fallback) if fallback else []
+
+def get_body_text(post_json: dict) -> str:
+    # Biostars sometimes uses xhtml, sometimes content
+    html_blob = post_json.get("xhtml") or post_json.get("content") or ""
+    return html_plain_text(html_blob)
+
+def as_int_or_str(x):
+    try:
+        return int(x)
+    except Exception:
+        return x
+
+def make_author_obj(name, uid):
+    """Return merged author object with profile fields."""
+    if uid in (None, ""):
+        return {"id": None, "name": name, "date_joined": None,
+                "last_login": None, "vote_count": None, "joined_days_ago": None}
+    uid_norm = as_int_or_str(uid)
+    prof_raw = compact_user_profile(get_user_json(uid_norm)) or {}
+    return {
+        "id": uid_norm,
+        "name": name,
+        "total_vote_count": prof_raw.get("vote_count"),
+        "joined_days_ago": prof_raw.get("joined_days_ago"),
+    }
+
+# ------------------------
+# HTML answer enumeration
+# ------------------------
+def extract_answer_ids_and_accept_flag(soup):
+    """
+    Return (answer_ids, accepted_id) from a Biostars thread HTML.
+    - Each answer is under: div.post.view.open[data-value]
+    - Accepted answer body has itemprop="acceptedAnswer"
+    - Other answers use itemprop="suggestedAnswer"
+    """
+    ans_ids, accepted_id = [], None
+    for block in soup.select('div.post.view.open[data-value]'):
+        pid = block.get("data-value")
+        if not pid:
+            continue
+        body = block.select_one(
+            'div.body[itemprop="acceptedAnswer"], div.body[itemprop="suggestedAnswer"]'
+        )
+        if body:
+            ans_ids.append(pid)
+            if body.get("itemprop") == "acceptedAnswer":
+                accepted_id = pid
+    return ans_ids, accepted_id
+
+# ------------------------
+# Thread parsing (API + HTML) incl. user profiles
+# ------------------------
+def parse_thread_page(pid):
+    """
+    - Use HTML to enumerate answer IDs and detect accepted answer.
+    - Use API to get clean bodies & metadata.
+    - Merge author (id/name + profile fields) into a single object.
+    """
+    url = f"https://www.biostars.org/p/{pid}/"
+    soup = BeautifulSoup(fetch(url), "html.parser")
+
+    # Title
+    title_el = soup.select_one('div.post.view .title[itemprop="name"]') or soup.select_one("div.title")
+    title = title_el.get_text(strip=True) if title_el else ""
+
+    # Question via API
+    q_json = get_post_json(pid)
+    q_text = get_body_text(q_json) or ""
+    if not q_text.strip():
+        q_html_el = soup.select_one('[itemprop="mainEntity"] [itemprop="text"]')
+        if q_html_el:
+            q_text = q_html_el.get_text("\n", strip=True)
+
+    q_created_at  = q_json.get("creation_date")
+    q_author_uid  = q_json.get("author_uid") or q_json.get("author_id")
+    q_author_name = q_json.get("author")
+    q_author      = make_author_obj(q_author_name, q_author_uid)
+
+    # Tags
+    tags_api  = normalize_tags(q_json.get("tag_val"))
+    tags_html = [a.get_text(strip=True) for a in soup.select("span.inplace-tags a.ptag")]
+
+    # Answers: enumerate then hydrate via API
+    ans_ids, accepted_id = extract_answer_ids_and_accept_flag(soup)
+    answers = []
+    for aid in ans_ids:
+        a_json = get_post_json(aid)
+        a_text = get_body_text(a_json)
+        if not a_text or len(a_text) < 20:
+            continue
+
+        a_author_uid  = a_json.get("author_uid") or a_json.get("author_id")
+        a_author_name = a_json.get("author")
+        a_author      = make_author_obj(a_author_name, a_author_uid)
+
+        answers.append({
+            "answer_id": as_int_or_str(aid),
+            "text": a_text,
+            "score": int(a_json.get("vote_count", 0) or 0),
+            "accepted": (str(aid) == str(accepted_id)),
+            "created_at": a_json.get("creation_date"),
+            "author": a_author,
+        })
+
+    # Pick best: accepted > highest score > longer
+    best = None
+    if answers:
+        acc = [a for a in answers if a["accepted"]]
+        best = (sorted(acc, key=lambda x: (x["score"], len(x["text"])), reverse=True)[0]
+                if acc else sorted(answers, key=lambda x: (x["score"], len(x["text"])), reverse=True)[0])
+
+    return {
+        "url": url,
+        "title": title,
+        "question_text": q_text,
+        "question_created_at": q_created_at,
+        "question_author": q_author,           # merged object
+        "answers": answers,                    # each with merged author
+        "best_answer": best,
+        "tags_api": tags_api,
+        "tags_html": tags_html,
+    }
+
+# ------------------------
+# Normalizer (adds answers_all, search_query)
+# ------------------------
+def normalize_record(pid, thread_meta, post_json, search_query=""):
+    q = (thread_meta.get("question_text") or "").strip()
+    a_best = (thread_meta.get("best_answer", {}) or {}).get("text", "").strip()
+    if not q or not a_best:
+        return None
+
+    # tags: prefer API tag_val, fallback to HTML
+    tags_site = normalize_tags(
+        post_json.get("tag_val"),
+        fallback=(thread_meta.get("tags_api") or thread_meta.get("tags_html") or [])
+    )
+
+    full_text = " ".join([thread_meta.get("title",""), q, a_best, " ".join(tags_site)])
+    if blocked_by_global_excludes(full_text):
+        return None
+    labels = apply_labels_from_config(full_text)
+
+    return {
+        "source": "biostars",
+        "post_id": as_int_or_str(pid),
+        "url": thread_meta["url"],
+        "title": thread_meta.get("title", ""),
+        "search_query": search_query,
+
+        # Question (author merged)
+        "question": q,
+        "question_created_at": thread_meta.get("question_created_at"),
+        "question_author": thread_meta.get("question_author"),
+
+        # Answers
+        "answer": a_best,                          # best answer text
+        "answers_all": thread_meta.get("answers", []),
+        "accepted": bool(thread_meta.get("best_answer", {}).get("accepted", False)),
+        "score": int(thread_meta.get("best_answer", {}).get("score", 0) or 0),
+
+        # Site/meta
+        "tags_site": tags_site,
+        "created_at": post_json.get("creation_date"),
+        "has_accepted": post_json.get("has_accepted", False),
+        "view_count": post_json.get("view_count", 0),
+
+        # Auto-labels
+        "topic_labels": labels,
+    } <-----> # ------------------------
+# Crawl (API + HTML hybrid, author profiles, diagnostics)
+# ------------------------
+from collections import defaultdict
+
+seen = load_seen_ids()
+collected_total = 0
+drop_stats = defaultdict(int)
+
+with open(JSONL_PATH, "a", encoding="utf-8") as jf:
+    for term in QUERY_TERMS:
+        term_collected = 0
+        pages_scanned = 0
+        print(f"\n=== TERM: {term} ===")
+
+        for url in biostars_search_urls(term, pages=PAGES_PER_QUERY):
+            try:
+                html_text = fetch(url)
+            except Exception as e:
+                print("Search fetch failed:", url, e)
+                sleep()
+                continue
+            sleep()
+            pages_scanned += 1
+
+            pids = extract_post_ids_from_search(html_text)
+            if not pids:
+                print(f"[{term}] no post ids on {url}")
+                continue
+
+            print(f"[{term}] {len(pids)} posts on {url}")
+
+            for pid in sorted(pids):
+                if pid in seen:
+                    continue
+
+                try:
+                    thread_meta = parse_thread_page(pid); sleep()
+                    post_json   = get_post_json(pid);     sleep()
+
+                    rec = normalize_record(pid, thread_meta, post_json, search_query=term)
+                    if rec:
+                        jf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        jf.flush()
+                        collected_total += 1
+                        term_collected += 1
+                        seen.add(pid)
+
+                        if collected_total % 25 == 0:
+                            print(f"Collected {collected_total} items so far...")
+                    else:
+                        if not (thread_meta.get("question_text") or "").strip():
+                            drop_stats["empty_question"] += 1
+                        elif not (thread_meta.get("best_answer") or {}).get("text"):
+                            drop_stats["no_answer"] += 1
+                        else:
+                            drop_stats["excluded_or_other"] += 1
+
+                except requests.HTTPError as e:
+                    print(f"[warn] HTTP error pid={pid}: {e}")
+                    sleep()
+                except Exception as e:
+                    print(f"[warn] failed pid={pid}: {e}")
+                    sleep()
+
+            save_seen_ids(seen)
+            sleep()
+
+        print(f"[{term}] pages_scanned={pages_scanned}, collected={term_collected}")
+
+print(f"\nDone. Collected {collected_total} items → {JSONL_PATH}")
+print("Drop stats:", dict(drop_stats)) <----> # ------------------------
+# Emit CSV snapshot
+# ------------------------
+field_order = [
+    "source","post_id","url","title","question","answer","accepted",
+    "score","tags_site","created_at","has_accepted","view_count","topic_labels"
+]
+
+rows = []
+if JSONL_PATH.exists():
+    with open(JSONL_PATH, "r", encoding="utf-8") as jf:
+        for line in jf:
+            obj = json.loads(line)
+            obj["topic_labels"] = ";".join(obj.get("topic_labels", []))
+            # join tags list for CSV
+            tags = obj.get("tags_site", [])
+            if isinstance(tags, list):
+                obj["tags_site"] = ";".join(tags)
+            rows.append({k: obj.get(k, "") for k in field_order})
+
+    with open(CSV_PATH, "w", encoding="utf-8", newline="") as cf:
+        w = csv.DictWriter(cf, fieldnames=field_order)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    print(f"Wrote CSV: {CSV_PATH} (rows={len(rows)})")
+else:
+    print(f"No JSONL at {JSONL_PATH}, skipping CSV.") as you se this is based on search query i wanna have same pipline but rather i wanna craee tag list json container onlly tag and then i will visite this "https://www.biostars.org/tag/rna-seq/" for a given tag and collect all available artice

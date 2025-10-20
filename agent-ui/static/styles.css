@@ -1366,3 +1366,6 @@ button-stop,
     background: #fff;
 }
 
+.session-item .open{
+    width: 100%;
+}
