@@ -10,3 +10,8 @@ Reddit r/bioinformatics,https://www.reddit.com/r/bioinformatics/,Community Forum
 ResearchGate Discussions,https://www.researchgate.net/topics/Metagenomics,General Discussion,Q&A about metagenomics methods and interpretation,Login Required,Difficult to scrape automatically – best via manual export or web automation respecting ToS,false
 Illumina Community,https://support.illumina.com/community.html,Vendor Forum,Sequencing platform troubleshooting, library prep, contamination,Public (account optional),Access requires authentication for some threads; scrape manually or via approved API if available,false
 Oxford Nanopore Community,https://community.nanoporetech.com,Vendor Forum,Long-read metagenomic assembly, basecalling errors, ONT workflows,Public (login required),Login-gated content – scraping not advised without explicit permission,false
+
+
+MEGAN Community (PAID OR FREE)
+Uncertainty quantification in output from biotools using models (llm)
+
