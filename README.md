@@ -163,6 +163,42 @@ BIOAGENT_RUNTIME_ENV_HOME=."/runtime/envs"
 BIOAGENT_TMP_DIR="/tmp/bioagent"
 ```
 
+## Project Structure
+
+```bash
+.
+├── agent-ui/              # Frontend application (UI for agent interaction)
+│   ├── app/
+│   ├── static/
+│   ├── uploads
+│   └── ...
+│
+├── datasets/              # Genomic datasets, benchmarks, evaluation data
+│   ├── 01-webcurator/     # app for currating data with expert review ( not used actually)
+│   ├── 02-datasource/
+│   ├── 03-scripts/
+│   ├── 04-output/
+│   │   ├── db/             # second filter and final quality assesment by LLM
+│   │   ├── hq/             # first filter layer
+│   │   └── raw             # raw data scrapped
+│   ├── 05-test-external/   # Different other script (forrpaper retrieval, pdf retrieval and Q&A generator)
+│   └── README.md
+│
+├── genomer/               # Python agentic core system (main library)
+│   ├── src/genomeer   
+│   │   ├── agent/            
+│   │   ├── model/            
+│   │   ├── runtime/            
+│   │   ├── tools/            
+│   │   ├── utils/            
+│   │   └── ...        
+│   ├── tests/
+│   ├── .env/        
+│   ├── MANIFEST.in/
+│   └── pyproject.toml     # pip package dependencies definition
+│
+├── README.md              # Project documentation
+```
 <br>
 
 ## 📚 Documentation
