@@ -1,15 +1,21 @@
 Name,URL,Type,Focus/Content,Accessibility,Scraping Description,done
 Biostars,https://www.biostars.org,Specialized Q&A Site,Bioinformatics and genomics Q&A (metagenomics, microbiome, assembly),Public,Has public JSON API (https://www.biostars.org/info/api/) – can query questions, answers, tags by keywords like “metagenome”,false
 Bioinformatics Stack Exchange,https://bioinformatics.stackexchange.com,Specialized Q&A Site,Metagenome assembly, taxonomy, tool usage, parameter selection,Public,Use Stack Exchange API (site=bioinformatics.stackexchange.com) with tags “metagenome”, “metagenomics” to fetch Q&A in JSON,false
-QIIME 2 Forum,https://forum.qiime2.org,Tool-specific Forum,Workflow interpretation, contamination, parameter tuning,Public,Runs on Discourse – append .json to URLs or use /latest.json to fetch threads and replies by category,false
-Mothur Forum,https://forum.mothur.org,Tool-specific Forum,OTU clustering, contamination filtering, command troubleshooting,Public,Also Discourse-based – use same API endpoints as QIIME2 for threads, posts, and solved replies,false
 Bioconductor Support Forum,https://support.bioconductor.org,Tool/Mailing List,Questions on R-based microbiome tools (phyloseq, DADA2),Public,Exposes JSON feeds (Biostar-style backend) – scrape via /api or RSS for posts tagged “microbiome”, “phyloseq”, “dada2”,false
-SEQanswers,https://seqanswers.com,General NGS Forum,All aspects of high-throughput sequencing, metagenomics threads,Public,Classic forum (vBulletin/XenForo) – scrape thread lists and replies via BeautifulSoup; paginate by forum section “Metagenomics”,false
-Stack Overflow (bioinformatics tag),https://stackoverflow.com/questions/tagged/bioinformatics,General Q&A,Programming and parsing tasks in metagenomics workflows,Public,Use Stack Exchange API (site=stackoverflow) with tags “bioinformatics”, “metagenomics”,false
-Reddit r/bioinformatics,https://www.reddit.com/r/bioinformatics/,Community Forum,Informal discussion, troubleshooting, dataset sharing,Public,Use Reddit JSON API (append .json to URLs or query via Pushshift API for “metagenomics”, “assembly”, “QC”),false
+QIIME 2 Forum,https://forum.qiime2.org,Tool-specific Forum,Workflow interpretation, contamination, parameter tuning,Public,Runs on Discourse – append .json to URLs or use /latest.json to fetch threads and replies by category,false
+
+
+++++
 ResearchGate Discussions,https://www.researchgate.net/topics/Metagenomics,General Discussion,Q&A about metagenomics methods and interpretation,Login Required,Difficult to scrape automatically – best via manual export or web automation respecting ToS,false
+SEQanswers,https://seqanswers.com,General NGS Forum,All aspects of high-throughput sequencing, metagenomics threads,Public,Classic forum (vBulletin/XenForo) – scrape thread lists and replies via BeautifulSoup; paginate by forum section “Metagenomics”,false
+
+
+---
+Reddit r/bioinformatics,https://www.reddit.com/r/bioinformatics/,Community Forum,Informal discussion, troubleshooting, dataset sharing,Public,Use Reddit JSON API (append .json to URLs or query via Pushshift API for “metagenomics”, “assembly”, “QC”),false
+Stack Overflow (bioinformatics tag),https://stackoverflow.com/questions/tagged/bioinformatics,General Q&A,Programming and parsing tasks in metagenomics workflows,Public,Use Stack Exchange API (site=stackoverflow) with tags “bioinformatics”, “metagenomics”,false
 Illumina Community,https://support.illumina.com/community.html,Vendor Forum,Sequencing platform troubleshooting, library prep, contamination,Public (account optional),Access requires authentication for some threads; scrape manually or via approved API if available,false
 Oxford Nanopore Community,https://community.nanoporetech.com,Vendor Forum,Long-read metagenomic assembly, basecalling errors, ONT workflows,Public (login required),Login-gated content – scraping not advised without explicit permission,false
+Mothur Forum,https://forum.mothur.org,Tool-specific Forum,OTU clustering, contamination filtering, command troubleshooting,Public,Also Discourse-based – use same API endpoints as QIIME2 for threads, posts, and solved replies,false
 
 
 MEGAN Community (PAID OR FREE)
