@@ -1,0 +1,454 @@
+{
+  "genomeer_extraction_sources": {
+
+    "MetaSPAdes": {
+      "bash_commands": [
+        {
+          "source": "Official Documentation",
+          "url": "https://ablab.github.io/spades/running.html",
+          "extract": "all command flags and usage examples"
+        },
+        {
+          "source": "GitHub README",
+          "url": "https://github.com/ablab/spades#readme",
+          "extract": "basic and advanced usage examples"
+        },
+        {
+          "source": "ATLAS Snakemake Rules",
+          "url": "https://github.com/metagenome-atlas/atlas/blob/master/workflow/rules/assemble.smk",
+          "extract": "real bash commands with input/output paths"
+        },
+        {
+          "source": "nf-core/mag assemble module",
+          "url": "https://github.com/nf-core/mag/blob/master/modules/nf-core/spades/main.nf",
+          "extract": "production-ready commands with real parameters"
+        }
+      ],
+      "troubleshooting": [
+        {
+          "source": "GitHub Issues closed",
+          "url": "https://github.com/ablab/spades/issues?q=is:issue+is:closed",
+          "extract": "error log + solution pairs",
+          "filter": "closed only — confirmed solution"
+        },
+        {
+          "source": "Google Group SPAdes Support",
+          "url": "https://groups.google.com/g/spades-support",
+          "extract": "user problems + developer answers"
+        },
+        {
+          "source": "Biostars SPAdes tag",
+          "url": "https://www.biostars.org/t/spades/",
+          "extract": "Q&A accepted answers only",
+          "filter": "accepted=True OR score>=3"
+        },
+        {
+          "source": "SEQanswers",
+          "url": "https://www.seqanswers.com/search?q=metaspades+error",
+          "extract": "forum threads with solutions"
+        },
+        {
+          "source": "Reddit r/bioinformatics",
+          "url": "https://www.reddit.com/r/bioinformatics/search/?q=metaspades+error",
+          "extract": "real user errors with community solutions"
+        }
+      ],
+      "errors_known": [
+        "Not enough memory",
+        "FileNotFoundError: contigs.fasta not found",
+        "k-mer size too large for reads",
+        "Cannot find reads in input file",
+        "Segmentation fault during assembly",
+        "Error in graph construction stage",
+        "Paired reads mismatch"
+      ],
+      "scientific_papers": [
+        {
+          "title": "metaSPAdes: a new versatile metagenomic assembler",
+          "authors": "Nurk et al. 2017",
+          "pmc": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5411777/",
+          "extract": "algorithm explanation, parameter tuning Q&A"
+        }
+      ]
+    },
+
+    "MaxBin2": {
+      "bash_commands": [
+        {
+          "source": "SourceForge README",
+          "url": "https://sourceforge.net/projects/maxbin2/files/README.txt/download",
+          "extract": "all flags and usage examples"
+        },
+        {
+          "source": "Bioconda recipe",
+          "url": "https://bioconda.github.io/recipes/maxbin2/README.html",
+          "extract": "installation + basic usage"
+        },
+        {
+          "source": "ATLAS Snakemake Rules",
+          "url": "https://github.com/metagenome-atlas/atlas/blob/master/workflow/rules/binning.smk",
+          "extract": "real commands with abundance files and contig paths"
+        },
+        {
+          "source": "nf-core/mag binning module",
+          "url": "https://github.com/nf-core/mag/blob/master/modules/nf-core/maxbin2/main.nf",
+          "extract": "production commands with real parameters"
+        }
+      ],
+      "troubleshooting": [
+        {
+          "source": "SourceForge Discussion",
+          "url": "https://sourceforge.net/p/maxbin/discussion/",
+          "extract": "user problems with developer answers"
+        },
+        {
+          "source": "Biostars MaxBin tag",
+          "url": "https://www.biostars.org/t/maxbin/",
+          "extract": "Q&A accepted answers",
+          "filter": "accepted=True OR score>=3"
+        },
+        {
+          "source": "GitHub Issues assemblerflow",
+          "url": "https://github.com/assemblerflow/maxbin2/issues",
+          "extract": "error + solution pairs"
+        },
+        {
+          "source": "Reddit r/bioinformatics",
+          "url": "https://www.reddit.com/r/bioinformatics/search/?q=maxbin2",
+          "extract": "real user issues with community solutions"
+        }
+      ],
+      "errors_known": [
+        "No bins generated",
+        "abundance file format error",
+        "contig file not found",
+        "Perl dependency missing",
+        "FragGeneScan not found",
+        "HMMER not in PATH",
+        "Empty output directory after run"
+      ],
+      "scientific_papers": [
+        {
+          "title": "MaxBin 2.0: an automated binning algorithm",
+          "authors": "Wu et al. 2016",
+          "pmc": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4817949/",
+          "extract": "algorithm, parameters explanation Q&A"
+        }
+      ]
+    },
+
+    "CheckM": {
+      "bash_commands": [
+        {
+          "source": "Official Wiki — Workflows",
+          "url": "https://github.com/Ecogenomics/CheckM/wiki/Workflows",
+          "extract": "all workflow commands step by step"
+        },
+        {
+          "source": "Official Wiki — Commands",
+          "url": "https://github.com/Ecogenomics/CheckM/wiki/Genome-Quality-Commands",
+          "extract": "all quality commands with flags"
+        },
+        {
+          "source": "GitHub README",
+          "url": "https://github.com/Ecogenomics/CheckM#readme",
+          "extract": "quick start and advanced usage"
+        },
+        {
+          "source": "ATLAS Snakemake Rules",
+          "url": "https://github.com/metagenome-atlas/atlas/blob/master/workflow/rules/genomes.smk",
+          "extract": "real commands with bin paths and output dirs"
+        },
+        {
+          "source": "nf-core/mag checkm module",
+          "url": "https://github.com/nf-core/mag/blob/master/modules/nf-core/checkm/lineagewf/main.nf",
+          "extract": "production-ready checkm commands"
+        }
+      ],
+      "troubleshooting": [
+        {
+          "source": "GitHub Issues closed",
+          "url": "https://github.com/Ecogenomics/CheckM/issues?q=is:issue+is:closed",
+          "extract": "error log + confirmed solution",
+          "filter": "closed issues only"
+        },
+        {
+          "source": "CheckM2 GitHub Issues",
+          "url": "https://github.com/chklovski/CheckM2/issues?q=is:issue+is:closed",
+          "extract": "CheckM2 specific errors and fixes"
+        },
+        {
+          "source": "Biostars CheckM tag",
+          "url": "https://www.biostars.org/t/checkm/",
+          "extract": "Q&A accepted answers",
+          "filter": "accepted=True OR score>=3"
+        },
+        {
+          "source": "SEQanswers",
+          "url": "https://www.seqanswers.com/search?q=checkm+error",
+          "extract": "forum threads with solutions"
+        },
+        {
+          "source": "Reddit r/bioinformatics",
+          "url": "https://www.reddit.com/r/bioinformatics/search/?q=checkm+error",
+          "extract": "real user problems with community solutions"
+        }
+      ],
+      "errors_known": [
+        "Database not found — checkm data not set",
+        "Pplacer not in PATH",
+        "prodigal not found",
+        "HMMER hmmsearch not found",
+        "Insufficient memory for pplacer",
+        "No marker genes identified",
+        "Completeness 0% for all bins",
+        "tree command fails on large datasets"
+      ],
+      "scientific_papers": [
+        {
+          "title": "CheckM: assessing the quality of microbial genomes",
+          "authors": "Parks et al. 2015",
+          "pmc": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4484387/",
+          "extract": "completeness/contamination metrics explanation Q&A"
+        },
+        {
+          "title": "CheckM2: a rapid scalable tool",
+          "authors": "Chklovski et al. 2023",
+          "url": "https://www.nature.com/articles/s41592-023-01940-w",
+          "extract": "difference CheckM vs CheckM2, when to use which"
+        }
+      ]
+    },
+
+    "FastP": {
+      "bash_commands": [
+        {
+          "source": "GitHub README — All Options",
+          "url": "https://github.com/OpenGene/fastp#all-options",
+          "extract": "every flag with description"
+        },
+        {
+          "source": "GitHub README — Examples",
+          "url": "https://github.com/OpenGene/fastp#examples",
+          "extract": "real use case examples"
+        },
+        {
+          "source": "ATLAS Snakemake QC rules",
+          "url": "https://github.com/metagenome-atlas/atlas/blob/master/workflow/rules/qc.smk",
+          "extract": "real fastp commands with adapter trimming"
+        },
+        {
+          "source": "nf-core/mag fastp module",
+          "url": "https://github.com/nf-core/mag/blob/master/modules/nf-core/fastp/main.nf",
+          "extract": "production fastp commands"
+        }
+      ],
+      "troubleshooting": [
+        {
+          "source": "GitHub Issues closed",
+          "url": "https://github.com/OpenGene/fastp/issues?q=is:issue+is:closed",
+          "extract": "error + confirmed fix pairs",
+          "filter": "closed issues only"
+        },
+        {
+          "source": "Biostars FastP tag",
+          "url": "https://www.biostars.org/t/fastp/",
+          "extract": "Q&A accepted answers",
+          "filter": "accepted=True OR score>=3"
+        },
+        {
+          "source": "Reddit r/bioinformatics",
+          "url": "https://www.reddit.com/r/bioinformatics/search/?q=fastp+error",
+          "extract": "real user issues with community solutions"
+        }
+      ],
+      "errors_known": [
+        "Failed to open file — wrong path",
+        "Output file already exists",
+        "Adapter detection failed",
+        "Read length too short after trimming",
+        "JSON report parse error",
+        "Thread count exceeds available cores",
+        "Paired reads count mismatch"
+      ],
+      "scientific_papers": [
+        {
+          "title": "fastp: an ultra-fast all-in-one FASTQ preprocessor",
+          "authors": "Chen et al. 2018",
+          "pmc": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6129281/",
+          "extract": "quality filtering parameters Q&A"
+        }
+      ]
+    },
+
+    "FastQC": {
+      "bash_commands": [
+        {
+          "source": "Official Help Docs",
+          "url": "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/Help/",
+          "extract": "all command line options"
+        },
+        {
+          "source": "Running Non-Interactively",
+          "url": "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/Help/2%20Basic%20Operations/2.2%20Running%20FastQC%20Non%20Interactively.html",
+          "extract": "batch mode commands"
+        },
+        {
+          "source": "GitHub README",
+          "url": "https://github.com/s-andrews/FastQC#readme",
+          "extract": "basic usage and flags"
+        },
+        {
+          "source": "nf-core/mag fastqc module",
+          "url": "https://github.com/nf-core/mag/blob/master/modules/nf-core/fastqc/main.nf",
+          "extract": "production fastqc commands"
+        }
+      ],
+      "troubleshooting": [
+        {
+          "source": "GitHub Issues closed",
+          "url": "https://github.com/s-andrews/FastQC/issues?q=is:issue+is:closed",
+          "extract": "error + confirmed fix pairs"
+        },
+        {
+          "source": "Biostars FastQC tag",
+          "url": "https://www.biostars.org/t/fastqc/",
+          "extract": "Q&A accepted answers",
+          "filter": "accepted=True OR score>=3"
+        },
+        {
+          "source": "SEQanswers",
+          "url": "https://www.seqanswers.com/search?q=fastqc+error",
+          "extract": "forum threads with solutions"
+        },
+        {
+          "source": "Reddit r/bioinformatics",
+          "url": "https://www.reddit.com/r/bioinformatics/search/?q=fastqc",
+          "extract": "real issues with community solutions"
+        }
+      ],
+      "errors_known": [
+        "Java heap space — OutOfMemoryError",
+        "Unrecognised file format",
+        "Failed to process file",
+        "Permission denied on output directory",
+        "Skipped — file is empty",
+        "Invalid Phred encoding detected",
+        "Cannot read compressed file"
+      ],
+      "scientific_papers": [
+        {
+          "title": "FastQC: A Quality Control Tool for High Throughput Sequence Data",
+          "authors": "Andrews et al. 2010",
+          "url": "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/",
+          "extract": "quality metrics interpretation Q&A"
+        }
+      ]
+    },
+
+    "Trimmomatic": {
+      "bash_commands": [
+        {
+          "source": "Official Manual PDF",
+          "url": "http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/TrimmomaticManual_V0.32.pdf",
+          "extract": "all ILLUMINACLIP, SLIDINGWINDOW, MINLEN parameters"
+        },
+        {
+          "source": "GitHub README",
+          "url": "https://github.com/usadellab/Trimmomatic#readme",
+          "extract": "basic and advanced usage"
+        },
+        {
+          "source": "Adapters Reference",
+          "url": "https://github.com/usadellab/Trimmomatic/tree/main/adapters",
+          "extract": "which adapter file to use per sequencer"
+        },
+        {
+          "source": "ATLAS Snakemake QC rules",
+          "url": "https://github.com/metagenome-atlas/atlas/blob/master/workflow/rules/qc.smk",
+          "extract": "real trimmomatic commands with parameters"
+        },
+        {
+          "source": "nf-core/mag trimmomatic module",
+          "url": "https://github.com/nf-core/mag/blob/master/modules/nf-core/trimmomatic/main.nf",
+          "extract": "production trimmomatic commands"
+        }
+      ],
+      "troubleshooting": [
+        {
+          "source": "GitHub Issues closed",
+          "url": "https://github.com/usadellab/Trimmomatic/issues?q=is:issue+is:closed",
+          "extract": "error + confirmed fix pairs"
+        },
+        {
+          "source": "SourceForge Discussion",
+          "url": "https://sourceforge.net/p/trimmomatic/discussion/",
+          "extract": "user problems with developer answers"
+        },
+        {
+          "source": "Biostars Trimmomatic tag",
+          "url": "https://www.biostars.org/t/trimmomatic/",
+          "extract": "Q&A accepted answers",
+          "filter": "accepted=True OR score>=3"
+        },
+        {
+          "source": "SEQanswers",
+          "url": "https://www.seqanswers.com/search?q=trimmomatic+error",
+          "extract": "forum threads with solutions"
+        },
+        {
+          "source": "Reddit r/bioinformatics",
+          "url": "https://www.reddit.com/r/bioinformatics/search/?q=trimmomatic+error",
+          "extract": "real issues with community solutions"
+        }
+      ],
+      "errors_known": [
+        "Error: Unable to detect quality encoding",
+        "Adapter file not found",
+        "Insufficient reads surviving trimming",
+        "java.lang.OutOfMemoryError",
+        "Paired output files size mismatch",
+        "ILLUMINACLIP: no adapters found",
+        "Input file is empty after filtering"
+      ],
+      "scientific_papers": [
+        {
+          "title": "Trimmomatic: a flexible trimmer for Illumina sequence data",
+          "authors": "Bolger, Lohse & Usadel 2014",
+          "pmc": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4103590/",
+          "extract": "parameter tuning and adapter trimming Q&A"
+        }
+      ]
+    },
+
+    "complete_pipelines": {
+      "description": "Sources for multi-step pipeline records — extract full instruction/input/output sequences",
+      "sources": [
+        {
+          "name": "nf-core/mag",
+          "url": "https://github.com/nf-core/mag",
+          "docs": "https://nf-co.re/mag/docs/usage",
+          "pipeline_steps": [
+            "FastQC → FastP → MetaSPAdes → MaxBin2 → CheckM"
+          ]
+        },
+        {
+          "name": "ATLAS Metagenomics",
+          "url": "https://github.com/metagenome-atlas/atlas",
+          "docs": "https://metagenome-atlas.readthedocs.io/",
+          "snakemake_rules": "https://github.com/metagenome-atlas/atlas/tree/master/workflow/rules",
+          "pipeline_steps": [
+            "FastQC → FastP → MetaSPAdes → MaxBin2 → MetaBAT2 → CheckM"
+          ]
+        },
+        {
+          "name": "SqueezeMeta",
+          "url": "https://github.com/jtamames/SqueezeMeta",
+          "pipeline_steps": [
+            "FastQC → Trimmomatic → MetaSPAdes → MaxBin2 → CheckM"
+          ]
+        }
+      ]
+    }
+  }
+}
