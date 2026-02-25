@@ -1,0 +1,450 @@
+[
+  {
+    "uid": "41367410",
+    "pmid": "41367410",
+    "doi": "10.1080/20002297.2025.2589656",
+    "source": "pubmed",
+    "title": "Geographic signatures in the oral resistome: a comparative metagenomic analysis of healthy individuals from Thailand and Norway.",
+    "abstract": "BACKGROUND: The oral cavity is an important yet understudied reservoir of antimicrobial resistance genes (ARGs), potentially shaped by geographic variation in antibiotic usage. OBJECTIVE: To compare the oral resistomes of healthy adults from Thailand and Norway, two countries with contrasting antimicrobial use practices, using shotgun metagenomic sequencing. DESIGN: Stimulated saliva samples were collected from healthy adults in Thailand (n = 43) and Norway (n = 50). ARGs were identified with AMRPlusPlus against the MEGARes database, and microbial taxonomy was profiled with KrakenUniq. Diversity metrics, ordination, and clustering analyses assessed resistome and microbiome structures. RESULTS: Thai samples exhibited significantly greater ARG richness, evenness, and diversity (p < 0.001), driven by higher abundances of multi-biocide, nucleoside, and copper resistance genes. Norwegian samples were enriched in aminoglycoside, sulfonamide, and quaternary ammonium compound resistance genes. Both cohorts shared core oral genera, but Thai samples showed greater taxonomic richness without differences in overall microbiome diversity. Non-metric multidimensional scaling and PERMANOVA revealed stronger geographic separation for resistomes (R(2) = 0.639) than microbiomes (R(2) = 0.382). Co-occurrence networks highlighted structured associations between ARG groups and bacterial genera, suggesting ecological influences beyond taxonomic composition. CONCLUSIONS: These results reveal distinct geographic signatures in the oral resistome that are not fully explained by microbiome structure, reflecting the influence of local ecological and societal factors, including antimicrobial exposure. The findings highlight the oral cavity as a dynamic ARG reservoir and support its inclusion in regional antimicrobial resistance surveillance to inform public health strategies.",
+    "semantic_category": "differential_abundance, taxonomy, shotgun, clinical_microbiome, cancer_microbiome, pediatric_microbiome",
+    "semantic_scores_raw": [
+      [
+        "differential_abundance",
+        0.5081428289413452
+      ],
+      [
+        "taxonomy",
+        0.5
+      ],
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "clinical_microbiome",
+        0.5
+      ],
+      [
+        "cancer_microbiome",
+        0.4629278779029846
+      ],
+      [
+        "pediatric_microbiome",
+        0.45678040385246277
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41366253",
+    "pmid": "41366253",
+    "doi": "10.1038/s41538-025-00624-3",
+    "source": "pubmed",
+    "title": "Water kefir multi-omics reveals functional redundancies despite taxonomic differences and the underappreciated contribution of yeast.",
+    "abstract": "Water kefir (WK) is a fermented beverage produced by a complex symbiotic community of microbes, including yeasts, lactic acid bacteria (LAB), and acetic acid bacteria (AAB). Here, we combined shotgun metagenomics, NMR metabolomics, GC-MS volatile organic compound (VOC) analysis, and metaproteomics to investigate microbial succession, functional dynamics, and the roles of yeasts and Zymomonas in WK fermentations representative of two WK types, i.e., one dominated by yeast-LAB-AAB and another by Zymomonas. Metagenomic profiling revealed that yeast-LAB-AAB communities exhibited dynamic microbial succession, whereas Zymomonas-dominated communities remained stable. Despite differing microbial compositions, both fermentations maintained consistent global metabolic functions, although specialized metabolic pathways and VOC profiles diverged. Metaproteomic analysis revealed a strong underappreciation of yeast contributions in metagenomic datasets, with yeasts representing a larger fraction of the proteome than predicted by DNA-based abundance. Lentilactobacillus hilgardii was enriched on WK grains, suggesting a specialized niche role. Our findings highlight the value of integrating multi-omics approaches to uncover microbial activity and community function in fermented foods and offer insights for the design of tailored WK starter cultures.",
+    "semantic_category": "review, taxonomy, benchmarking, shotgun, genome_resolved, differential_abundance, binning",
+    "semantic_scores_raw": [
+      [
+        "review",
+        0.5663543939590454
+      ],
+      [
+        "taxonomy",
+        0.548957347869873
+      ],
+      [
+        "benchmarking",
+        0.5393333435058594
+      ],
+      [
+        "shotgun",
+        0.5135728120803833
+      ],
+      [
+        "genome_resolved",
+        0.4829913377761841
+      ],
+      [
+        "differential_abundance",
+        0.48046600818634033
+      ],
+      [
+        "binning",
+        0.43939802050590515
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41365917",
+    "pmid": "41365917",
+    "doi": "10.1038/s41522-025-00860-1",
+    "source": "pubmed",
+    "title": "Longitudinal study of the udder microbiome using genome-centric metagenomics uncovers pathogen-driven adaptation and succession.",
+    "abstract": "Bovine mastitis remains a major disease affecting dairy herds globally due to its complex and multi-etiological nature. To address gaps in microbial and immunological understanding, this longitudinal study examined the udder microbiome across lactation in 24 Norwegian Red cows. Somatic cell count (SCC) and microbiota composition varied by lactation stage, with low SCC ( < 100,000 cells/mL) more frequent in early (80%) and middle (78.9%) than late lactation (53%) and dry-off (53.1%). Microbial diversity was shaped by SCC, lactation stage, and individual variability. Temporal profiling identified persistent infections involving Staphylococcus aureus and Staphylococcus chromogenes, while samples with low SCC were enriched in beneficial genera including Corynebacterium, Bradyrhizobium, and Lactococcus. Shotgun metagenomics revealed pathogen-specific metabolic traits, and genome-centric analysis recovered 142 MAGs characterized via sequence typing, virulence, and resistance profiling. These findings offer valuable insights into microbial adaptation and succession, informing strategies to better manage and prevent mastitis.",
+    "semantic_category": "shotgun, differential_abundance, machine_learning, cancer_microbiome, pediatric_microbiome, review",
+    "semantic_scores_raw": [
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "differential_abundance",
+        0.4614335894584656
+      ],
+      [
+        "machine_learning",
+        0.45619750022888184
+      ],
+      [
+        "cancer_microbiome",
+        0.45373106002807617
+      ],
+      [
+        "pediatric_microbiome",
+        0.4433354437351227
+      ],
+      [
+        "review",
+        0.42757028341293335
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 142,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41365804",
+    "pmid": "41365804",
+    "doi": "10.1111/1758-2229.70249",
+    "source": "pubmed",
+    "title": "Evidence for Trace Gas Metabolism and Widespread Antibiotic Synthesis in an Abiotically Driven, Antarctic Soil Ecosystem.",
+    "abstract": "The McMurdo Dry Valleys (MDVs) of Antarctica are a uniquely pristine, low-biodiversity model system for understanding fundamental ecological phenomena, the impact of a warming climate on ecosystem functioning, community structure and composition and the dynamics of adaptation. Despite the scientific value of this system, we still know little about the functional ecology of its biota, especially the bacteria. Here, we analysed the bacterial taxonomic and functional diversity of 18 shotgun metagenomes using the VEBA metagenome processing pipeline. We recovered 701 medium-to-high quality metagenome-assembled genomes (MAGs) (>/= 50% completeness and contamination < 10%) and 201 high-quality MAGs (>/= 80% completeness and < 10% contamination), almost 50% more than found in similar sites previously. We found that: (1) community composition shifts along environmental gradients correlated with soil moisture, elevation and distance to the coast; (2) many MDV bacteria are capable of performing trace gas metabolism; (3) genes associated with antibiotic-mediated competitive interactions (e.g., antibiotic biosynthesis and antibiotic resistance genes) are widespread; and (4) MDV bacteria employ survival strategies common to bacteria in similarly extreme environments. This study provides novel insight into microbial survival strategies in extreme environments and lays the groundwork for a more comprehensive understanding of the autecology of MDV bacteria.",
+    "semantic_category": "differential_abundance, genome_resolved, shotgun, review, benchmarking, taxonomy, binning, machine_learning",
+    "semantic_scores_raw": [
+      [
+        "differential_abundance",
+        0.5450854897499084
+      ],
+      [
+        "genome_resolved",
+        0.5302282571792603
+      ],
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "review",
+        0.4956175684928894
+      ],
+      [
+        "benchmarking",
+        0.489257276058197
+      ],
+      [
+        "taxonomy",
+        0.48010921478271484
+      ],
+      [
+        "binning",
+        0.4503020644187927
+      ],
+      [
+        "machine_learning",
+        0.42205992341041565
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41364990",
+    "pmid": "41364990",
+    "doi": "10.1016/j.scitotenv.2025.181145",
+    "source": "pubmed",
+    "title": "Carrier-resolved metagenomics suggests the dual \"filter-hub\" function of a large freshwater lake toward incoming antibiotic resistance genes.",
+    "abstract": "Rivers and wastewater-treatment plants (WWTPs) convey antibiotic resistance genes (ARGs) to lakes. Studies simultaneously profiling ARGs and their carriers and tracking their persistence in lakes remain scarce. We collected cell- and virus-size fractions from Lake Biwa, Japan, 11 in-flowing rivers, and one WWTP for shotgun metagenomic sequencing. We reconstructed 326 bacterial metagenome-assembled genomes, 7917 plasmid contigs (472 harboring conjugation genes), and 32,375 viral contigs. The chromosomes contained 1502 ARGs (predominantly fluoroquinolone and glycopeptide resistance). The plasmids encoded efflux- and target-alteration determinants spanning 25 drug classes. Only 3.6 % of the viral genomes carried ARGs, chiefly qnr and dfr. ARG class composition differed among carriers, forming a spatial mosaic unrelated to land use or livestock density. Of the ARG-carrying cells and viruses, 85-97 % were undetectable in the lake, suggesting dilution and adaptation failure. Chromosome comparison identified 1809 putative horizontal gene transfer events, 2.1 % of which bridged lake-resident and external taxa. ARG profiles differed according to carrier type. Thus, Lake Biwa might function simultaneously as a filter, removing incoming ARG-carrying cells and viral particles, and as a \"silent hub,\" potentially integrating external ARGs into lake-resident bacteria through horizontal gene transfer. These data provide a foundation for assessing and managing antimicrobial resistance in large freshwater ecosystems.",
+    "semantic_category": "genome_resolved, shotgun, assembly, benchmarking, review",
+    "semantic_scores_raw": [
+      [
+        "genome_resolved",
+        0.5232133865356445
+      ],
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "assembly",
+        0.5
+      ],
+      [
+        "benchmarking",
+        0.49190467596054077
+      ],
+      [
+        "review",
+        0.4877648949623108
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41360901",
+    "pmid": "41360901",
+    "doi": "10.1038/s41598-025-30604-2",
+    "source": "pubmed",
+    "title": "Rumen microbiome profiles of dairy cattle are affected by the presence of, and vaccination against, the abomasal parasitic nematode Ostertagia ostertagi.",
+    "abstract": "Ostertagia ostertagi is a highly prevalent nematode that affects grazing cattle and impacts performance and welfare by reducing appetite and hindering weight gain. Despite its economic significance, the influence of the abomasal parasite O. ostertagi on the rumen microbiome remains unexplored. We examined the effects of subclinical O. ostertagi infection and vaccination on the rumen microbiome at taxonomic and functional levels. In an experimental trial, calves treated with vaccine or adjuvant-only were orally challenged with O. ostertagi larvae daily for 25 days; 4 groups of animals (UNF: unvaccinated, unchallenged; VAC: vaccinated, challenged; CHE: unvaccinated, challenged, high cumulative faecal egg counts (cFEC), and CLE: unvaccinated, challenged, low cFEC) were selected for whole shotgun metagenomic sequencing. Using a rigorous permutation test based on partial least squares discriminant analyses, we identified 36 (91), 38 (31), 21 (57), 41 (64) and 29 (57) microbial genera (genes) that distinguished VAC, CHE and CLE from UNF, CHE from CLE, and CHE from VAC, respectively. The subclinical infection reshaped the rumen microbiome; enrichment of opportunistic pathogens such as Listeria, and depletion of Filifactor in infected animals were identified as potential biomarkers for host immune response, whereas Actinomyces and Microspora were potential biomarkers of resistance to infection. Microbial biochemical pathways like acetogenesis (e.g., Elusimicrobium, nrfA), pectin and hemicellulose degradation (e.g., Sphaerochaeta), and phosphorus and sulphur metabolism (e.g., Candidatus Accumulibacter and Desulfatibacillum) were also affected by parasitism. Both infection and vaccination altered methanogens, methanotrophs and the methane metabolism pathway, highlighted by distinct gene clustering patterns between infected and uninfected animals. Clustering patterns of infected and vaccinated animals exhibited some similarities, which may reflect immune system modulation of the ruminal microbiome as a result of an abomasal infection. This study unveils critical changes in the rumen microbiome due to the infection by and vaccination against the abomasal parasite O. ostertagi. Our results highlight the importance of monitoring microbial dynamics in the development of effective anthelmintic treatments and vaccines.",
+    "semantic_category": "shotgun, clinical_microbiome",
+    "semantic_scores_raw": [
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "clinical_microbiome",
+        0.5
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41360290",
+    "pmid": "41360290",
+    "doi": "10.1016/j.idnow.2025.105223",
+    "source": "pubmed",
+    "title": "Digital severity scoring and viral metagenomics: A feasibility study on integrated diagnosis of pediatric influenza-like illness.",
+    "abstract": "INTRODUCTION: Metagenomic next-generation sequencing (mNGS) holds promise for identifying diverse pathogens in complex cases of influenza-like illness (ILI). Interpreting results requires comprehensive clinical context. We aimed to explore the feasibility of an integrated diagnostic approach by linking shotgun viral mNGS with standardized clinical data for unbiased ascertainment and hypothesis generation in pediatric ILI patients. PATIENTS AND METHODS: We studied a cohort of 6,073 pediatric ILI patients (mean age 3.1 years, range 0-18.8 years), assessed using the VIVI ScoreApp for immediate computation of Disease Severity and Risk Factor Scores. Nasopharyngeal samples were tested for nine respiratory viruses by PCR. In a nested pilot feasibility study, we linked the clinical dataset of 100 ILI patients with neurological complications (mean age 3.9 years, range 0-17.8 years) to additional viral mNGS. PCR and mNGS were compared by agreement rates and Cohen's kappa for inter-method reliability. RESULTS: In the pilot feasibility study, the mean VIVI Disease Severity Score was above the cohort average (>67th percentile, p < 0.0001), with 'age < 2 years' as the most prevalent risk factor (n = 44/100). mNGS identified 15 viruses, expanding the range of viral identifications by six viruses compared to PCR. Linking VIVI Scores with mNGS-discovered viruses suggested high disease severity. Sensitivity of mNGS was relatively low; overall agreement with PCR was 77-98 % and overall reliability was 'moderate' (kappa scores of 0.1-0.85). CONCLUSIONS: Digital surveillance tools can successfully integrate with mNGS to capture complex clinical patterns and generate data-driven hypotheses. Large-scale investigation and technical refinement are warranted.",
+    "semantic_category": "shotgun, pediatric_microbiome, clinical_microbiome, review, benchmarking",
+    "semantic_scores_raw": [
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "pediatric_microbiome",
+        0.5
+      ],
+      [
+        "clinical_microbiome",
+        0.5
+      ],
+      [
+        "review",
+        0.43366217613220215
+      ],
+      [
+        "benchmarking",
+        0.4279950261116028
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41358671",
+    "pmid": "41358671",
+    "doi": "10.1080/19490976.2025.2587966",
+    "source": "pubmed",
+    "title": "Infection with gut parasites correlates with gut microbiome diversity across human populations in Africa.",
+    "abstract": "Soil-transmitted helminths (STH) are common in (sub)tropical regions and primarily affect impoverished populations. These parasites reside in the gut, where they interact with both the microbiota and host immunity. Clinical STH detection is laborious and often not performed within the context of gut microbiome studies. Here, we present a proof-of-concept study assessing whether fecal metagenome data could be used to assess STH infection, and to relate STH infection to microbiome features. We leveraged 310 gut metagenomes obtained from mother-child pairs in two different locations in Gabon: one rural and one semi-urban, and assessed the presence of four STH species (Ascaris lumbricoides, Strongyloides stercoralis, Trichuris trichiura, and Necator americanus) using qPCR. Sequence data were used to characterize the microbiomes and to detect these parasites. Metagenomic read mapping and genome coverage metrics closely matched qPCR detection patterns. Within-location analyses revealed that parasite species richness was associated with microbiome diversity and taxonomic composition, with the strongest associations observed in children from the rural site. Applying this approach to published data from five additional African cohorts identified context-specific parasite-microbiome associations, as well as a modest but reproducible association between microbiome alpha diversity and parasite infection. These findings highlight the potential of shotgun metagenomics for concurrent parasite detection and microbiome profiling across diverse geographic and demographic contexts.",
+    "semantic_category": "pediatric_microbiome, differential_abundance, clinical_microbiome, shotgun, cancer_microbiome, review, benchmarking, machine_learning, taxonomy",
+    "semantic_scores_raw": [
+      [
+        "pediatric_microbiome",
+        0.5390666723251343
+      ],
+      [
+        "differential_abundance",
+        0.5220576524734497
+      ],
+      [
+        "clinical_microbiome",
+        0.5163899064064026
+      ],
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "cancer_microbiome",
+        0.48507264256477356
+      ],
+      [
+        "review",
+        0.4567416310310364
+      ],
+      [
+        "benchmarking",
+        0.4540666341781616
+      ],
+      [
+        "machine_learning",
+        0.45264068245887756
+      ],
+      [
+        "taxonomy",
+        0.4502594470977783
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41354993",
+    "pmid": "41354993",
+    "doi": "10.1038/s41598-025-25645-6",
+    "source": "pubmed",
+    "title": "Dynamics of the gut microbiome and resistome in response to prophylactic antibiotic treatment in post-surgical giant pandas.",
+    "abstract": "For giant pandas, the ecological impact of prophylactic postoperative antibiotics on their gut microbial communities and resistome is not well characterized. Here, we assessed the impact of intravenous cefotaxime administration by analyzing longitudinal fecal samples from five giant pandas via 16 S rRNA sequencing (n = 304 samples) and shotgun metagenomics (n = 22 samples). 16 S-based analysis revealed that antibiotic exposure significantly altered bacterial community structure, resulting in a pronounced increase in the abundance of Pseudomonadota (from 50% +/- 24% to 60% +/- 38%; P < 0.001) and a reduction in Shannon diversity (from 2.8 +/- 0.4 to 2.4 +/- 1.3; P < 0.05). In contrast, metagenomic analysis indicated that cefotaxime exposure did not significantly increase the overall diversity of antimicrobial resistance genes (ARGs) or virulence factor genes (VFGs). However, we observed a marked expansion in the diversity of the CTX-M beta-lactamase family (bla(CTX-M)), which persisted into the recovery phase. We also recovered 10 metagenome-assembled genomes (MAGs) harboring both ARGs and VFGs, identifying them as potential antibiotic-resistant pathogens (ARPs). Their abundance, however, remained unchanged throughout treatment. These findings provide new insights into the effects of short-term antibiotic exposure in giant pandas, highlighting its transient effect on microbial community structure and a limited effect on resistome diversity.",
+    "semantic_category": "cancer_microbiome, shotgun, differential_abundance, pediatric_microbiome, taxonomy, clinical_microbiome, review, machine_learning",
+    "semantic_scores_raw": [
+      [
+        "cancer_microbiome",
+        0.5441691875457764
+      ],
+      [
+        "shotgun",
+        0.5
+      ],
+      [
+        "differential_abundance",
+        0.4741210341453552
+      ],
+      [
+        "pediatric_microbiome",
+        0.47140175104141235
+      ],
+      [
+        "taxonomy",
+        0.4424378573894501
+      ],
+      [
+        "clinical_microbiome",
+        0.4390295743942261
+      ],
+      [
+        "review",
+        0.4358587861061096
+      ],
+      [
+        "machine_learning",
+        0.4258231520652771
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 10,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  },
+  {
+    "uid": "41354674",
+    "pmid": "41354674",
+    "doi": "10.1038/s41522-025-00879-4",
+    "source": "pubmed",
+    "title": "Enriched Streptococcus alactolyticus in non-cub giant panda gut contributes to the regulation of tryptophan and its neuromodulatory derivatives.",
+    "abstract": "Despite feeding on a high-lignocellulose bamboo diet, the giant panda (Ailuropoda melanoleuca) retains a typical gut microbiome of Carnivora. We conducted shotgun metagenomic sequencing and functional validation of the giant panda's gut microbiome to elucidate its physiological roles and explore its functional adaptation to the species' specialized diet. Our results revealed that Streptococcus alactolyticus significantly increased in the guts of subadult, adult, and elderly individuals versus that in cubs. The gut microbiome of these non-cub giant pandas was significantly enriched in pathways and modules associated with tryptophan biosynthesis. Whole-genome sequencing and in vitro fermentation of S. alactolyticus demonstrated its ability to biosynthesize tryptophan. Gavage of S. alactolyticus in mice led to the enrichment of aromatic amino acid metabolism pathways in gut microbiome, accompanied by significantly elevated levels of 5-hydroxyindole acetic acid and kynurenine in fecal and/or serum samples (p < 0.05). Transcriptome sequencing of colons from mice revealed that most significant upregulated Gene Ontology (GO) terms mainly were related to spindle checkpoint signaling and chromosome segregation, while most significant downregulated GO terms mainly involved synaptic functional regulation. These findings suggest that S. alactolyticus enriched in the non-cub giant panda gut can regulate tryptophan, influencing host gut physiology via tryptophan metabolites.",
+    "semantic_category": "shotgun",
+    "semantic_scores_raw": [
+      [
+        "shotgun",
+        0.5
+      ]
+    ],
+    "tools_detected_raw": [],
+    "mag_count": 0,
+    "assembly_count": 0,
+    "assembly_tools": "",
+    "mapping_tools": "",
+    "binning_tools": "",
+    "profiling_tools": "",
+    "taxonomy_tools": "",
+    "qc_tools": "",
+    "alignment_tools": "",
+    "other_tools": ""
+  }
+]

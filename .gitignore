@@ -328,9 +328,8 @@ dataset/05-test-external/pdf_retrieval/Fatima
 dataset/05-test-external/pdf_retrieval/Fatima2/pdfs
 dataset/05-test-external/pdf_retrieval/Test/
 dataset/05-test-external/pdf_retrieval/Local/pdfs
-dataset/05-test-external/Literature_mining/output/
 dataset/05-test-external/Literature_mining/output--/
 dataset/05-test-external/Q&A generator evaluation/dataset_output/
-dataset/05-test-external/Q&A generator evaluation/pdfs_batch1/
+dataset/05-test-external/Q&A generator evaluation/pdfs_batch1/**.pdf
 dataset/05-test-external/Q&A generator evaluation/trash/
 dataset/05-test-external/Literature_mining/.vscode
