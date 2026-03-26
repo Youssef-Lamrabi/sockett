@@ -55,7 +55,7 @@ def extract_pdf_link(html, base_url, publisher):
     return None, "No PDF link exposed"
 
 
-#  STAGE 2 PIPELINE 
+
 
 with open(STAGE1_REPORT, newline="", encoding="utf-8") as infile, \
      open(REPORT_FILE, "w", newline="", encoding="utf-8") as outfile:
