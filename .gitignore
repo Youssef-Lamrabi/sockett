@@ -335,3 +335,5 @@ dataset/05-test-external/Q&A generator evaluation/trash/
 dataset/05-test-external/Literature_mining/.vscode
 
 # dataset/06-quality-check/input/dataset/**.jsonl
+dataset/06-quality-check/input/dataset copy
+dataset/06-quality-check/input/scored copy

@@ -2,6 +2,32 @@
 
 This folder contains scripts and utilities for **quality assessment and filtering** of datasets used for fine-tuning (SFT).
 
+## Script version
+In this benchmark max_worker=4
+```bash
+time python run_judge_v1.py 
+Processing benchmark.jsonl: 100%|███████████████| 4/4 [01:29<00:00, 22.25s/it]
+real    1m29.228s
+user    0m0.224s
+sys     0m0.024s
+```
+```bash
+time python run_judge_v2_parallele.py 
+Processing benchmark.jsonl: 100%|███████████████| 4/4 [01:07<00:00, 16.99s/it]
+real    1m8.184s
+user    0m0.229s
+sys     0m0.038s
+```
+```bash
+time python run_judge_v3_parallele.py 
+Processing benchmark.jsonl: 100%|███████████████| 4/4 [01:07<00:00, 16.79s/it]
+real    1m7.393s
+user    0m0.228s
+sys     0m0.025s
+```
+
+We go for parallele v3 then.
+
 ## Data Types
 We evaluate multiple dataset formats:
 - **QA data** (forum-derived question–answer pairs)
