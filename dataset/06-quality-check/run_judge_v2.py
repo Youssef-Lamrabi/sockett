@@ -16,7 +16,9 @@ INPUT_PATHS = [
     "./input/dataset/biostackexchange.jsonl",
     "./input/dataset/conceptual.jsonl"
 ]
+
 OUTPUT_DIR = "./input/scored"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # -----------------------------------------------
 # DATASET-SPECIFIC FIELD MAP
@@ -60,7 +62,7 @@ def extract_fields(sample, keys):
             if i == 0:
                 values.append(text)
             else:
-                values.append(f"Context: ({text})")
+                values.append(f"\nContext:\n{text}")
     return "\n".join(values)
 
 def extract_source(sample, source_map):
@@ -90,39 +92,33 @@ def parse_json(text):
             return None
 
 # -----------------------------------------------
-# PROMPT
+# PROMPT BUILDERS (ONE PER METRIC)
 # -----------------------------------------------
-def build_prompt(sample):
+
+def base_rules():
+    return """
+You are a STRICT evaluator for dataset quality.
+
+RULES:
+- Use ONLY the provided SOURCE
+- NO external knowledge
+- If not supported → treat as incorrect
+- Be strict and critical
+"""
+
+def prompt_correctness(sample):
     return f"""
-You are a STRICT evaluation model for dataset quality.
+{base_rules()}
 
-You MUST ONLY use the provided SOURCE.
-DO NOT use external knowledge.
+TASK: Evaluate ANSWER CORRECTNESS
 
-Evaluate:
-1. answer_correctness (0-2)
-2. answer_completeness (0-2)
-3. question_clarity (0-2)
-4. faithfulness (0-2)
+Definition:
+- 0 = incorrect or contradicts SOURCE
+- 1 = partially correct OR missing support
+- 2 = fully correct and supported by SOURCE
 
-Scoring rules:
-0 = bad
-1 = partial
-2 = good
-
-Return STRICT JSON ONLY:
-{{
-  "answer_correctness": int,
-  "answer_completeness": int,
-  "question_clarity": int,
-  "faithfulness": int,
-  "reasoning": {{
-    "correctness": "...",
-    "completeness": "...",
-    "clarity": "...",
-    "faithfulness": "..."
-  }}
-}}
+Return JSON:
+{{"score": int, "reason": "..."}}
 
 QUESTION:
 {sample['question']}
@@ -134,90 +130,58 @@ SOURCE:
 {sample['source']}
 """
 
-def build_prompt(sample):
+def prompt_completeness(sample):
     return f"""
-You are a STRICT, CRITICAL evaluator for dataset quality used in supervised fine-tuning (SFT).
+{base_rules()}
 
-Your job is to detect errors, weak answers, unclear questions, and hallucinations.
+TASK: Evaluate ANSWER COMPLETENESS
 
-CORE RULES:
-- You MUST ONLY use the provided SOURCE.
-- You MUST NOT use external knowledge.
-- If something is not supported by SOURCE → treat it as NOT VERIFIED.
-- Be strict. Do NOT be generous.
+Definition:
+- 0 = does not answer question
+- 1 = partial / lacks reasoning
+- 2 = complete and well explained
 
-EVALUATION CRITERIA:
-1) ANSWER_CORRECTNESS (0-2)
-Does the answer contain factually correct statements supported by the SOURCE?
-
-- 0 = Incorrect or contradicts SOURCE
-- 1 = Partially correct OR missing key support from SOURCE
-- 2 = Fully correct AND all key claims are supported by SOURCE
-
-If the answer includes claims not found in SOURCE → penalize.
-
-
-2) ANSWER_COMPLETENESS (0-2)
-Does the answer fully resolve the question?
-
-- 0 = Does not answer the question OR irrelevant
-- 1 = Partially answers OR lacks explanation / reasoning
-- 2 = Fully answers with clear explanation or steps
-
-If important parts of the question are ignored → penalize.
-
-
-3) QUESTION_CLARITY (0-2)
-Is the question understandable and well-formed?
-
-- 0 = अस्पष्ट / missing key context / ambiguous
-- 1 = somewhat clear but incomplete or poorly structured
-- 2 = clear, specific, and self-contained
-
-If context is missing or confusing → score ≤1.
-
-
-4) FAITHFULNESS (0-2)
-Is the answer grounded in the SOURCE without hallucination?
-
-- 0 = contains hallucinations or unsupported claims
-- 1 = mostly grounded but includes minor unsupported details
-- 2 = fully grounded in SOURCE with no hallucination
-
-ANY unsupported technical claim → reduce score.
-
-
-⚠️ IMPORTANT EVALUATION LOGIC:
-- Be skeptical: assume errors unless clearly supported.
-- Do NOT reward style—only factual grounding and usefulness.
-- If SOURCE is weak or incomplete → reflect that in scoring.
-- Prefer lower scores over uncertain high scores.
-
-
-OUTPUT FORMAT (STRICT JSON ONLY):
-{{
-  "answer_correctness": 0|1|2,
-  "answer_completeness": 0|1|2,
-  "question_clarity": 0|1|2,
-  "faithfulness": 0|1|2,
-  "reasoning": {{
-    "correctness": "...short justification...",
-    "completeness": "...short justification...",
-    "clarity": "...short justification...",
-    "faithfulness": "...short justification..."
-  }}
-}}
-
-NO text before or after JSON.
-NO markdown.
-NO explanations outside JSON.
-
-----------------------------------------
-DATA TO EVALUATE
-----------------------------------------
+Return JSON:
+{{"score": int, "reason": "..."}}
 
 QUESTION:
 {sample['question']}
+
+ANSWER:
+{sample['answer']}
+"""
+
+def prompt_clarity(sample):
+    return f"""
+{base_rules()}
+
+TASK: Evaluate QUESTION CLARITY
+
+Definition:
+- 0 = unclear / ambiguous / missing context
+- 1 = somewhat clear but incomplete
+- 2 = clear and self-contained
+
+Return JSON:
+{{"score": int, "reason": "..."}}
+
+QUESTION:
+{sample['question']}
+"""
+
+def prompt_faithfulness(sample):
+    return f"""
+{base_rules()}
+
+TASK: Evaluate FAITHFULNESS TO SOURCE
+
+Definition:
+- 0 = hallucinated / unsupported claims
+- 1 = minor unsupported details
+- 2 = fully grounded in SOURCE
+
+Return JSON:
+{{"score": int, "reason": "..."}}
 
 ANSWER:
 {sample['answer']}
@@ -229,7 +193,7 @@ SOURCE:
 # -----------------------------------------------
 # LLM CALL
 # -----------------------------------------------
-def call_llm_judge(prompt):
+def call_llm(prompt):
     for _ in range(MAX_RETRIES):
         try:
             response = requests.post(
@@ -244,7 +208,6 @@ def call_llm_judge(prompt):
             )
 
             text = response.json().get("response", "").strip()
-
             if text:
                 return text
 
@@ -253,17 +216,44 @@ def call_llm_judge(prompt):
 
     return None
 
+# -----------------------------------------------
+# METRIC EVALUATION
+# -----------------------------------------------
+def evaluate_sample(sample):
+    results = {}
+
+    prompts = {
+        "answer_correctness": prompt_correctness(sample),
+        "answer_completeness": prompt_completeness(sample),
+        "question_clarity": prompt_clarity(sample),
+        "faithfulness": prompt_faithfulness(sample),
+    }
+
+    for key, prompt in prompts.items():
+        output = call_llm(prompt)
+        parsed = parse_json(output) if output else None
+
+        if parsed:
+            results[key] = parsed.get("score", -1)
+            results[f"{key}_reason"] = parsed.get("reason", "")
+        else:
+            results[key] = -1
+            results[f"{key}_reason"] = "parse_error"
+
+    return results
 
 # -----------------------------------------------
-# MAIN PIPELINE 
+# MAIN PIPELINE (STREAMING)
 # -----------------------------------------------
 def process_file(input_path):
     filename = os.path.basename(input_path)
+
     if filename not in FIELD_MAP:
-        print(f"Skipping {filename} (no config)")
+        print(f"Skipping {filename}")
         return
 
     config = FIELD_MAP[filename]
+
     out_path = os.path.join(
         OUTPUT_DIR,
         filename.replace(".jsonl", "_scored.jsonl")
@@ -277,34 +267,18 @@ def process_file(input_path):
                 continue
 
             sample = normalize_sample(raw, config)
-            print("\n---- DEBUG ---\n")
-            print(sample)
-            print("--------------\n\n")
+
             if not sample["question"] or not sample["answer"]:
                 continue
 
-            prompt = build_prompt(sample)
-            print("\n\n----")
-            print(prompt)
-            output = call_llm_judge(prompt)
-            print("\n\n----")
-            print(output)
-            
-            if not output:
-                continue
-            scores = parse_json(output)
-            if not scores:
-                continue
+            scores = evaluate_sample(sample)
 
             raw["quality_scores"] = scores
+
             outfile.write(json.dumps(raw) + "\n")
             outfile.flush()
-            
-            print('\n---end---')
-            break #debug
 
     print(f"Saved: {out_path}")
-
 
 # -----------------------------------------------
 # RUN
