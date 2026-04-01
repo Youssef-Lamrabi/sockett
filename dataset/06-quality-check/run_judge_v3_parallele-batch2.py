@@ -11,20 +11,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ------------------------------------------------
 # CONFIG
 # ------------------------------------------------
-API_URL = "http://10.52.88.105:11434/api/generate"
+API_URL = "http://10.52.88.106:11434/api/generate"
 MODEL_NAME = "gpt-oss:20b"
 TIMEOUT = 60
 MAX_RETRIES = 3
 
 INPUT_PATHS = [
     #"./input/dataset/biostackexchange.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/bioconductor.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/biostackexchange.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/biostar.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/qiime2.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/github.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_conceptual/conceptual.jsonl",
-    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_conceptual/factual.jsonl",
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/bioconductor.jsonl",
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/biostackexchange.jsonl",
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/biostar.jsonl",
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/qiime2.jsonl",
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_troubleshooting/github.jsonl",
+    
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_conceptual/conceptual.jsonl",
+    #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_conceptual/factual.jsonl",
+    
+    "/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_conceptual/factual_remaining_batch2.jsonl",
+    
     #"/mnt/nfs/llmhub/Genomeer/dataset/06-quality-check/input/dataset/db_2/qa_workflows/workflow.jsonl",
 ]
 
@@ -84,6 +88,22 @@ FIELD_MAP = {
         }
     },
     "factual.jsonl": {
+        "question": ["question"],
+        "answer": ["answer"],
+        "source": {
+            "pdf_evidence": "extracted_from.evidence",
+            "pdf_claim": "extracted_from.claim",
+        }
+    },
+    "factual_remaining_batch1.jsonl": {
+        "question": ["question"],
+        "answer": ["answer"],
+        "source": {
+            "pdf_evidence": "extracted_from.evidence",
+            "pdf_claim": "extracted_from.claim",
+        }
+    },
+    "factual_remaining_batch2.jsonl": {
         "question": ["question"],
         "answer": ["answer"],
         "source": {
