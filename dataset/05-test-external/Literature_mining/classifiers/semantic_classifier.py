@@ -3,10 +3,10 @@ from typing import List, Tuple, Dict
 from sentence_transformers import SentenceTransformer, util
 
 
-# Load model once at import time
+
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Categories with example sentences
+
 CATEGORY_EXAMPLES: Dict[str, List[str]] = {
     "taxonomy": [
         "taxonomic profiling with Kraken2",
