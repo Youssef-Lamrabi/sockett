@@ -71,8 +71,18 @@ Each sample is augmented with:
 
 ```json
 "quality_scores": {
-  "answer_correctness": 0-2,
-  "answer_completeness": 0-2,
   "question_clarity": 0-2,
-  "faithfulness": 0-2
+  "question_faithfulness": 0-2,
+  "answer_completeness": 0-2,
+  "answer_faithfulness": 0-2,
 }
+```
+
+## Filtering
+
+After that we will filter to have different quality dataset:
+- db_v2
+- db_v2_allminscore_1
+- db_v2_allminscore_2
+
+
