@@ -337,3 +337,8 @@ dataset/05-test-external/Literature_mining/.vscode
 # dataset/06-quality-check/input/dataset/**.jsonl
 dataset/06-quality-check/input/dataset copy
 dataset/06-quality-check/input/scored copy
+
+dataset/06-quality-check/input/dataset/db_2
+dataset/06-quality-check/input/dataset/biostackexchange.jsonl
+dataset/06-quality-check/input/scored
+dataset/06-quality-check/input/final
