@@ -1,0 +1,15 @@
+name: btools_env_py310
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - cnvkit
+  - samtools
+  - bedtools
+  - bwa
+  - optitype
+  - pip
+  - pip:
+      - rich
