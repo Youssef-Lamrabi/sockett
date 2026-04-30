@@ -34,11 +34,13 @@ from genomeer.tools.registry import ToolRegistry
 from genomeer.utils.stream.shared import REGISTRY
 from genomeer.agent.v2.utils import instructions
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
+from genomeer.runtime.env_resolver import resolve_env_for_code
 from genomeer.model.feedback import FeedbackParser
 
 # -----------------------------------------------
 # UTILS
 # -----------------------------------------------
+
 dotenv_path = find_dotenv()
 if dotenv_path:
     load_dotenv(dotenv_path, override=False)
@@ -81,6 +83,105 @@ class AgentState(TypedDict):
     diagnostic_mode: bool
     diagnostic_code: str | None
     diagnostic_observation: str | None
+    
+    
+    # ---------------------------------------------------------------------------
+# METAGENOMICS ENV AUTO-DETECTION
+# ---------------------------------------------------------------------------
+ 
+# CLI tools that require meta-env1
+_META_ENV_BINS = {
+    "fastp", "fastqc", "multiqc", "nanostat", "nanoplot", "trim_galore",
+    "metaspades.py", "spades.py", "megahit", "flye",
+    "minimap2", "bowtie2", "bwa", "bwa-mem2",
+    "kraken2", "kraken2-build", "bracken", "metaphlan", "gtdbtk",
+    "ktimporttaxonomy", "ktimporttext",
+    "metabat2", "jgi_summarize_bam_contig_depths", "das_tool", "checkm2",
+    "prokka", "prodigal", "diamond", "hmmsearch", "hmmscan",
+    "humann", "humann_renorm_table", "humann_join_tables",
+    "amrfinder", "amrfinderplus", "rgi",
+    "prefetch", "fasterq-dump", "fastq-dump",
+    "seqtk", "pigz",
+    # wrapper function imports also indicate meta-env1
+    "run_fastp", "run_kraken2", "run_metaspades", "run_megahit", "run_flye",
+    "run_minimap2", "run_bowtie2", "run_metaphlan4", "run_gtdbtk",
+    "run_metabat2", "run_das_tool", "run_checkm2", "run_prokka",
+    "run_prodigal", "run_diamond", "run_hmmer", "run_humann3",
+    "run_amrfinderplus", "run_rgi_card", "run_bracken", "run_krona",
+    "run_fastqc", "run_multiqc", "run_nanostat",
+    "from genomeer.tools.function.metagenomics",
+}
+ 
+# Adaptive timeouts for heavy metagenomics steps (seconds)
+_HEAVY_STEPS = {
+    "assembly": 21600,      # 6h — metaSPAdes / MEGAHIT
+    "assembl":  21600,
+    "metaspades": 21600,
+    "megahit":  14400,
+    "flye":     21600,
+    "assemble": 21600,
+    "binning":  7200,       # 2h — MetaBAT2
+    "metabat":  7200,
+    "das_tool": 7200,
+    "checkm":   3600,       # 1h
+    "gtdbtk":   10800,      # 3h
+    "humann":   10800,
+    "diamond":  7200,
+    "hmmer":    3600,
+    "download": 3600,       # 1h — large DB downloads
+    "kraken2":  1800,       # 30min
+    "metaphlan":1800,
+    "annotation": 3600,
+    "annotate": 3600,
+    "prokka":   3600,
+}
+ 
+def _adaptive_timeout(step_title: str, default: int = 600) -> int:
+    """Return an appropriate timeout in seconds based on the step title."""
+    t = step_title.lower()
+    for keyword, timeout in _HEAVY_STEPS.items():
+        if keyword in t:
+            return max(timeout, default)
+    return default
+ 
+ 
+def resolve_env_for_code(
+    code: str,
+    lang: str | None,
+    env_hint: str | None,
+    current_env: str,
+) -> str:
+    """
+    Determine the correct micromamba environment for a code block.
+ 
+    Priority order:
+      1. Explicit env="..." attribute in <EXECUTE> tag  → use as-is
+      2. Code mentions meta-env1 CLI tools             → return "meta-env1"
+      3. Code is #!R                                   → return "bio-agent-env1" (has Rscript)
+      4. Keep current_env                              → no change needed
+    """
+    # 1. LLM explicitly declared the env in the tag
+    if env_hint:
+        return env_hint
+ 
+    # 2. Scan code for metagenomics tool usage
+    if code:
+        code_lower = code.lower()
+        for tool in _META_ENV_BINS:
+            if tool in code_lower:
+                return "meta-env1"
+ 
+    # 3. R code always runs in bio-agent-env1
+    if lang == "R":
+        return "bio-agent-env1"
+ 
+    # 4. No change needed
+    return current_env
+
+ 
+    
+    
+    
     
     
 # -----------------------------------------------
@@ -852,12 +953,28 @@ class BioAgent:
             resp = self._llm_invoke(node, "code_gen", msgs)
     
             sanitized_block = StateGraphHelper.sanitize_execute_block(resp.content)
-            code, lang = StateGraphHelper.parse_execute(sanitized_block)
-            
+            code, lang, env_hint = StateGraphHelper.parse_execute(sanitized_block)
+        
+            # AUTO-DETECT best environment from generated code
+            resolved_env = resolve_env_for_code(
+                code=code or "",
+                lang=lang,
+                env_hint=env_hint,
+                current_env=env_name,
+            )
+            self._log("ENV RESOLVED", body=f"current={env_name} → resolved={resolved_env}", node=node)
+        
+            # ADAPTIVE TIMEOUT: long-running metagenomics steps get more time
+            step_title_lower = step["title"].lower()
+            adaptive_timeout = _adaptive_timeout(step_title_lower, manifest.get("timeout_seconds", 600))
+            new_manifest = dict(manifest)
+            new_manifest["timeout_seconds"] = adaptive_timeout
+        
             code_key = "diagnostic_code" if is_diagnostic else "pending_code"
             updates = {
                 code_key: code,
-                "env_name": env_name,
+                "env_name": resolved_env,
+                "manifest": new_manifest,
                 "next_step": "ensure_env",
                 "messages": [AIMessage(content=sanitized_block)],
             }

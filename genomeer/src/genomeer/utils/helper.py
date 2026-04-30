@@ -366,6 +366,8 @@ def read_module2api():
     fields = [
         "ncbi",
         "basic",
+        "metagenomics",       
+        "metagenomics_db",
         # "artifacts",
         # "literature",
         # "biochemistry",

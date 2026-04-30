@@ -1,6 +1,6 @@
 envs:
   - name: bio-agent-env1
-    description: "General-purpose Python 3.11 agent environment (LLM + analytics + notebooks)."
+    description: "General-purpose Python 3.11 agent environment (LLM + analytics + notebooks). Default env for Python/R scripts, data processing, visualization, and NCBI downloads."
     spec: "default-agent.yaml"
     python: "3.11"
     provides_bins:
@@ -8,6 +8,10 @@ envs:
       - pip
       - jupyter
       - jupyter-notebook
+      - ncbi-genome-download
+      - samtools
+      - bowtie2
+      - Rscript
     provides_py:
       - numpy==2.1
       - pandas
@@ -39,10 +43,86 @@ envs:
       - mcp
       - tooluniverse
       - python-dotenv
+      - biopython
+    provides_r:
+      - ggplot2
+      - vegan
+      - phyloseq
+      - DESeq2
+      - edgeR
+
+  - name: meta-env1
+    description: "Metagenomics specialized environment. Contains ALL metagenomics CLI tools: fastp, FastQC, MultiQC, NanoStat, metaSPAdes, MEGAHIT, Flye, minimap2, Bowtie2, samtools, Kraken2, Bracken, MetaPhlAn4, GTDB-Tk, Krona, MetaBAT2, DAS_Tool, CheckM2, Prokka, Prodigal, DIAMOND, HMMER, HUMAnN3, AMRFinderPlus, RGI. Use for any metagenomics pipeline step."
+    spec: "metagenomics-env.yaml"
+    python: "3.11"
+    provides_bins:
+      # QC
+      - fastp
+      - fastqc
+      - multiqc
+      - NanoStat
+      - NanoPlot
+      - trim_galore
+      # Assembly
+      - metaspades.py
+      - spades.py
+      - megahit
+      - flye
+      # Mapping
+      - minimap2
+      - bowtie2
+      - bowtie2-build
+      - bwa
+      - bwa-mem2
+      - samtools
+      - bedtools
+      # Taxonomic classification
+      - kraken2
+      - kraken2-build
+      - bracken
+      - metaphlan
+      - gtdbtk
+      - ktImportTaxonomy
+      - ktImportText
+      # Binning
+      - metabat2
+      - jgi_summarize_bam_contig_depths
+      - DAS_Tool
+      - checkm2
+      # Annotation
+      - prokka
+      - prodigal
+      - diamond
+      - hmmsearch
+      - hmmscan
+      - hmmpress
+      - humann
+      - humann_renorm_table
+      - humann_join_tables
+      # AMR / Virulence
+      - amrfinder
+      - amrfinderplus
+      - rgi
+      # SRA tools
+      - prefetch
+      - fasterq-dump
+      - fastq-dump
+      # Utils
+      - seqtk
+      - pigz
+      - parallel
+    provides_py:
+      - numpy
+      - pandas
+      - matplotlib
+      - scipy
+      - seaborn
+      - biopython
+      - pysam
     provides_r: []
 
   - name: btools_env_py310
-    description: "Bioinformatics CLI stack with CNVkit, BWA, samtools, bedtools, and OptiType (Python 3.10)."
+    description: "Clinical genomics / HLA typing environment (Python 3.10). Contains CNVkit, BWA, samtools, bedtools, and OptiType. Use for HLA typing and CNV analysis."
     spec: "hla-tools.yaml"
     python: "3.10"
     provides_bins:

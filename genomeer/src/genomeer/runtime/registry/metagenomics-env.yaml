@@ -1,0 +1,35 @@
+# metagenomics-env.yaml
+name: meta-env1
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  # QC
+  - fastp
+  - multiqc
+  - nanostat        # long-reads
+  # Assemblage
+  - spades          # inclut metaspades
+  - megahit
+  # Mapping
+  - minimap2
+  - samtools
+  - bwa
+  # Taxonomie
+  - kraken2
+  - bracken
+  - metaphlan       # metaphlan4
+  - diamond
+  # Binning
+  - metabat2
+  - das_tool
+  # Annotation
+  - prokka
+  - hmmer
+  # Stats microbiome
+  - qiime2          # via pip ou channel séparé
+  - pip:
+      - multiqc
+      - humann
