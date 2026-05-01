@@ -15,6 +15,13 @@ from langgraph.graph import END, START, StateGraph
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage 
 from langgraph.checkpoint.memory import MemorySaver
 
+
+
+from genomeer.agent.v2.utils.structured_output import RobustLLMParser, patch_state_graph_helper
+from genomeer.agent.v2.utils.state_graph import StateGraphHelper
+patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalement
+_robust_parser = RobustLLMParser()
+
 # ── AXE 2.3: SqliteSaver for cross-session persistence ──
 try:
     from langgraph.checkpoint.sqlite import SqliteSaver
@@ -297,7 +304,7 @@ class BioAgent:
 
         # show agent-specific LLM if different from default
         if agent_llm != settings.llm or agent_source != settings.source:
-            print("\n🤖 AGENT LLM (Constructor Override):")
+            print("\n AGENT LLM (Constructor Override):")
             print(f"  LLM Model: {agent_llm}")
             if agent_source is not None:
                 print(f"  Source: {agent_source}")
@@ -350,6 +357,15 @@ class BioAgent:
         if auto_start_artifacts:
             self._start_artifacts_server_in_bg(host=artifacts_host, port=artifacts_port, prefix=artifacts_prefix)
 
+        # BIO RAG
+        import threading
+        from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever
+        self.bio_rag_store = BioRAGStore(persist_dir=str(Path(self.path) / ".genomeer_rag_cache"))
+        threading.Thread(
+            target=lambda: self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"]),
+            daemon=True
+        ).start()
+        self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
 
     # LOGS UTILS [DEV-ONLY]
     def _set_debug_log(self, path: str | None = None):
