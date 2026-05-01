@@ -241,7 +241,7 @@ if __name__ == "__main__":
 # Determines correct micromamba env for a generated code block.
 # Priority: env_hint > meta-env1 tool scan > R lang > keep current_env
 # ---------------------------------------------------------------------------
-_META_ENV_BINS_LIGHT = {
+META_ENV_SIGNALS = {
     # CLI binaries
     "fastp", "fastqc", "multiqc", "nanostat", "nanoplot", "trim-galore",
     "metaspades.py", "megahit", "flye",
@@ -285,7 +285,7 @@ def resolve_env_for_code(
     # 2. Scan code for metagenomics tool usage
     if code:
         code_lower = code.lower()
-        for tool in _META_ENV_BINS_LIGHT:
+        for tool in META_ENV_SIGNALS:
             if tool in code_lower:
                 return "meta-env1"
 

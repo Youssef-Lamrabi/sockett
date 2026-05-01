@@ -129,27 +129,7 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
  
 # CLI tools that require meta-env1
-_META_ENV_BINS = {
-    "fastp", "fastqc", "multiqc", "nanostat", "nanoplot", "trim_galore",
-    "metaspades.py", "spades.py", "megahit", "flye",
-    "minimap2", "bowtie2", "bwa", "bwa-mem2",
-    "kraken2", "kraken2-build", "bracken", "metaphlan", "gtdbtk",
-    "ktimporttaxonomy", "ktimporttext",
-    "metabat2", "jgi_summarize_bam_contig_depths", "das_tool", "checkm2",
-    "prokka", "prodigal", "diamond", "hmmsearch", "hmmscan",
-    "humann", "humann_renorm_table", "humann_join_tables",
-    "amrfinder", "amrfinderplus", "rgi",
-    "prefetch", "fasterq-dump", "fastq-dump",
-    "seqtk", "pigz",
-    # wrapper function imports also indicate meta-env1
-    "run_fastp", "run_kraken2", "run_metaspades", "run_megahit", "run_flye",
-    "run_minimap2", "run_bowtie2", "run_metaphlan4", "run_gtdbtk",
-    "run_metabat2", "run_das_tool", "run_checkm2", "run_prokka",
-    "run_prodigal", "run_diamond", "run_hmmer", "run_humann3",
-    "run_amrfinderplus", "run_rgi_card", "run_bracken", "run_krona",
-    "run_fastqc", "run_multiqc", "run_nanostat",
-    "from genomeer.tools.function.metagenomics",
-}
+from genomeer.runtime.env_resolver import META_ENV_SIGNALS as _META_ENV_BINS
  
 # Adaptive timeouts for heavy metagenomics steps (seconds)
 _HEAVY_STEPS = {
@@ -346,8 +326,9 @@ class BioAgent:
         self.configure()
         
         # [DEV-ONLY] logs
-        # self._set_debug_log("/home/biolab-office-1/DATALAB/2025/Genomeer/genomeer/src/genomeer/agent/v2/agent_debug.log")
         self._set_debug_log("./agent_debug.log")
+        self._log_buffer = []
+        self._log_buffer_lock = threading.Lock()
         
         # CONSTANTS
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics
@@ -380,6 +361,23 @@ class BioAgent:
         with open(self.debug_log_path, "w", encoding="utf-8") as f:
             f.write("\n===== NEW SESSION =====\n")
 
+    def _slim_manifest(self, manifest: dict, node: str) -> dict:
+        if node in ("observer", "generator", "diagnostics"):
+            return {
+                "input_state":      manifest.get("input_state"),
+                "timeout_seconds":  manifest.get("timeout_seconds"),
+                "retry_count":      manifest.get("retry_count"),
+                "quality_signals":  manifest.get("quality_signals"),
+            }
+        if node == "finalizer":
+            return {
+                "quality_signals":      manifest.get("quality_signals"),
+                "amr_genes_detected":   manifest.get("amr_genes_detected"),
+                "top_pathways":         manifest.get("top_pathways"),
+                "observations":         manifest.get("observations"),
+            }
+        return manifest
+
     def _log(self, title: str, body: str = "", node: str | None = None, type: str = 'file'):
         """Append a structured block to the debug log."""
         line = ""
@@ -387,10 +385,22 @@ class BioAgent:
             line += "\n" + (">"*60)
         line += f"\n[{node or '-'}] {title}\n{body}\n" + ("-"*60) + "\n"
         if type == 'file':
-            with open(getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log")), "a", encoding="utf-8") as f:
-                f.write(line)
+            with getattr(self, "_log_buffer_lock", threading.Lock()):
+                if not hasattr(self, "_log_buffer"):
+                    self._log_buffer = []
+                self._log_buffer.append(line)
+                if len(self._log_buffer) >= 20:
+                    self._flush_log()
         elif type == 'stdout':
             print(line)
+
+    def _flush_log(self):
+        if not getattr(self, "_log_buffer", None):
+            return
+        path = getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.writelines(self._log_buffer)
+        self._log_buffer.clear()
 
     def _fmt_msgs(self, msgs):
         """Pretty format a LangChain message list for logging."""
@@ -1082,7 +1092,7 @@ class BioAgent:
                     content = instructions.GENERATOR_REPAIR_CTX_PROMPT.format(
                         user_goal=state['last_prompt'],
                         current_step_title=step['title'],
-                        manifest=manifest.get("input_state"),
+                        manifest=self._slim_manifest(manifest, "generator").get("input_state"),
                         run_temp_dir=temp_dir,
                         repair_feedback=repair_feedback,
                         previous_code=(state.get("pending_code") or "").strip(),
@@ -1094,7 +1104,7 @@ class BioAgent:
                 content = instructions.GENERATOR_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
-                    manifest=state['manifest'].get("input_state"),
+                    manifest=self._slim_manifest(state['manifest'], "generator").get("input_state"),
                     run_temp_dir=temp_dir,
                 )
             
@@ -1387,9 +1397,9 @@ class BioAgent:
                 payload = instructions.OBSERVER_DIAGNOSTIC_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
-                    manifest=state['manifest'],
+                    manifest=self._slim_manifest(state['manifest'], "observer"),
                     code=(state.get("pending_code") or "").strip(),
-                    result=state['last_result'],
+                    result=(state.get("last_result") or state.get("diagnostic_observation") or "(no output)"),
                     diagnostic_code=state.get("diagnostic_code").strip(),
                     diagnostic_output=state.get("diagnostic_observation").strip(),
                 )
@@ -1397,9 +1407,9 @@ class BioAgent:
                 payload = instructions.OBSERVER_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
-                    manifest=state['manifest'],
+                    manifest=self._slim_manifest(state['manifest'], "observer"),
                     code=(state.get("pending_code") or "").strip(),
-                    result=state['last_result'],
+                    result=(state.get("last_result") or state.get("diagnostic_observation") or "(no output)"),
                 )
             msgs = [
                 self.system_prompt,
@@ -1602,7 +1612,7 @@ class BioAgent:
         def _diagnostics(self, state: AgentState) -> AgentState:
             node = "diagnostics"
             step = state["plan"][state["current_idx"]]
-            manifest = state.get("manifest", {}) or {}
+            manifest = self._slim_manifest(state.get("manifest", {}), "diagnostics") or {}
             retry_count = manifest.get("retry_count", 0)
             observer_summary = manifest.get("repair_feedback", "").strip()
             last_code = (state.get("pending_code") or "").strip()
@@ -1854,6 +1864,7 @@ class BioAgent:
                 )
                 Path(_sqlite_path).parent.mkdir(parents=True, exist_ok=True)
                 _conn = sqlite3.connect(_sqlite_path, check_same_thread=False)
+                self._sqlite_path = _sqlite_path
                 self.checkpointer = SqliteSaver(_conn)
                 self._log("CHECKPOINTER", body=f"SqliteSaver → {_sqlite_path}", node="init")
             except Exception as _e:
@@ -1863,6 +1874,29 @@ class BioAgent:
             self.checkpointer = MemorySaver()
             self._log("CHECKPOINTER", body="MemorySaver (install langgraph-checkpoint-sqlite for persistence)", node="init")
         self.app.checkpointer = self.checkpointer
+
+        # Purge sessions LangGraph plus vieilles que 30 jours (non-bloquant)
+        def _purge_old_sessions(db_path, days=30):
+            try:
+                import sqlite3, time
+                cutoff = time.time() - (days * 86400)
+                conn = sqlite3.connect(db_path)
+                for table in ("checkpoints", "writes"):
+                    try:
+                        conn.execute(f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
+                    except Exception:
+                        pass
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+        if _SQLITE_OK and hasattr(self, '_sqlite_path'):
+            threading.Thread(
+                target=_purge_old_sessions,
+                args=(self._sqlite_path,),
+                daemon=True
+            ).start()
 
 
     # OTHER UTILS
@@ -2294,6 +2328,10 @@ class BioAgent:
             "diagnostic_code": None,
             "diagnostic_observation": None,
             "run_id": tmp.split(_os.sep)[-1],
+            "batch_mode": None,
+            "sample_manifest": None,
+            "current_sample_idx": None,
+            "per_sample_results": None,
         }
 
     def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
@@ -2319,30 +2357,7 @@ class BioAgent:
             
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
-                inputs = {
-                    "messages": [HumanMessage(content=prompt)], 
-                    "next_step": None, 
-                    "env_name": "bio-agent-env1", 
-                    "env_ready": False, 
-                    "pending_code": None,
-                    "manifest": {
-                        "timeout_seconds": self.timeout_seconds, 
-                        "observations": [], 
-                        "attachments": staged,
-                        "interaction_mode": getattr(self, "interaction_mode", "auto"),
-                    },
-                    "plan": [],
-                    "current_idx": 0,
-                    "last_prompt": None,
-                    "last_result": None,
-                    "missing": [],
-                    "run_temp_dir": tmp,
-                    "retry_counts": {},
-                    "diagnostic_mode": False,
-                    "diagnostic_code": None,
-                    "diagnostic_observation": None,
-                    "run_id": tmp.split(os.sep)[-1],  # safe: last path component e.g. 'run-<uuid>'
-                }
+                inputs = self._build_initial_state(prompt, staged, session_id, tmp)
             else:
                 # FOLLOW-UP TURN -> only append the new message and record any new attachments
                 msg_block = [HumanMessage(content=prompt)]
@@ -2378,7 +2393,8 @@ class BioAgent:
                 self._log("STEP SNAPSHOT", body=f"current_idx={curr_idx}\nnext_step={next_step}", node="driver")
                 # *******************************************
 
-            return self.log, last_msg_text #str(message.content)
+            self._flush_log()
+            return self.log, last_msg_text
     
     def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
@@ -2410,30 +2426,7 @@ class BioAgent:
             
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
-                inputs = {
-                    "messages": [HumanMessage(content=prompt)], 
-                    "next_step": None, 
-                    "env_name": "bio-agent-env1", 
-                    "env_ready": False, 
-                    "pending_code": None,
-                    "manifest": {
-                        "timeout_seconds": self.timeout_seconds, 
-                        "observations": [], 
-                        "attachments": staged,
-                        "interaction_mode": getattr(self, "interaction_mode", "auto"),
-                    },
-                    "plan": [],
-                    "current_idx": 0,
-                    "last_prompt": None,
-                    "last_result": None,
-                    "missing": [],
-                    "run_temp_dir": tmp,
-                    "retry_counts": {},
-                    "diagnostic_mode": False,
-                    "diagnostic_code": None,
-                    "diagnostic_observation": None,
-                    "run_id": tmp.split(os.sep)[-1],  # safe: last path component e.g. 'run-<uuid>'
-                }
+                inputs = self._build_initial_state(prompt, staged, session_id, tmp)
             else:
                 # FOLLOW-UP TURN -> only append the new message and record any new attachments
                 msg_block = [HumanMessage(content=prompt)]
@@ -2475,4 +2468,4 @@ class BioAgent:
                             yield {"type": "think", "tag": tag, "text": seg["text"]}
                         else:
                             yield {"type": "block", "tag": tag, "text": seg["text"]}
-    
+            self._flush_log()

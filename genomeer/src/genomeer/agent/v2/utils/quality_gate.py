@@ -177,6 +177,36 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         ),
     },
 
+    "run_gtdbtk": {
+        "metric_key":     "n_classified",
+        "metric_label":   "MAGs classified by GTDB-Tk",
+        "warn_threshold": 1,
+        "fail_threshold": 0,
+        "fail_on_zero":   True,
+        "parse_regex":    r"(\d+)\s+(?:genomes?|MAGs?)\s+(?:classified|processed)",
+        "fix_hint": (
+            "GTDB-Tk classified 0 MAGs. Check: "
+            "(1) CheckM2 output bins exist and are in FASTA format. "
+            "(2) The GTDB database path is set correctly (GTDBTK_DATA_PATH env var). "
+            "(3) Bins are > 50% complete (CheckM2 filter)."
+        ),
+    },
+
+    "run_das_tool": {
+        "metric_key":     "n_bins_refined",
+        "metric_label":   "Bins after DAS_Tool refinement",
+        "warn_threshold": 1,
+        "fail_threshold": 0,
+        "fail_on_zero":   True,
+        "parse_regex":    r"(\d+)\s+(?:bins?|genomes?)\s+(?:written|selected|scored)",
+        "fix_hint": (
+            "DAS_Tool produced 0 refined bins. Check: "
+            "(1) At least one binner produced bins (MetaBAT2 output not empty). "
+            "(2) Scaffold2bin files were correctly formatted. "
+            "(3) Score threshold (--score_threshold) may be too strict — try 0.3."
+        ),
+    },
+
 }
 
 

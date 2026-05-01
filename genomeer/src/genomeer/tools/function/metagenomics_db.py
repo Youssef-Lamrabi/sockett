@@ -27,6 +27,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    from genomeer.agent.v2.utils.cache import get_cache as _get_cache
+    _DB_CACHE = _get_cache()
+except Exception:
+    _DB_CACHE = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,6 +77,12 @@ def query_ncbi_taxonomy(
     import urllib.request
     import urllib.parse
 
+    # Cache check
+    if _DB_CACHE:
+        cached = _DB_CACHE.api.get(url="ncbi_taxonomy_search", params={"query": query, "db": db, "retmax": retmax})
+        if cached:
+            return cached
+
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
     # Search step
@@ -101,7 +113,13 @@ def query_ncbi_taxonomy(
             "rank": ranks[i] if i < len(ranks) else "unknown",
         })
 
-    return {"query": query, "db": db, "n_found": len(results), "results": results}
+    result = {"query": query, "db": db, "n_found": len(results), "results": results}
+    
+    # Cache save
+    if _DB_CACHE and result:
+        _DB_CACHE.api.set(url="ncbi_taxonomy_search", value=result, params={"query": query, "db": db, "retmax": retmax})
+        
+    return result
 
 
 # ===========================================================================
