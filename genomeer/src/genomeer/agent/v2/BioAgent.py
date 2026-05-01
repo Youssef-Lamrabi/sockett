@@ -1209,6 +1209,7 @@ class BioAgent:
             if not state.get("run_temp_dir"):
                 _fallback_tmp = os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
                 self._log("RUN_TEMP_DIR FIX", body=f"run_temp_dir was None, using fallback: {_fallback_tmp}", node=node)
+                state = {**state, "run_temp_dir": _fallback_tmp}
             env = state["env_name"]
             timeout = state["manifest"].get("timeout_seconds", 600)
             last_result = ""
@@ -1237,7 +1238,7 @@ class BioAgent:
                 if os.path.exists(f)
             ]
             _tool_key = self._cache.tool.make_key(_tool_name, _input_files, params={})
-            _cached_tool = self._cache.tool.get(_tool_key, output_dir=state.get('run_temp_dir', ''))
+            _cached_tool = self._cache.tool.get(_tool_key, output_dir=state.get('run_temp_dir'))
             if _cached_tool:
                 self._log("TOOL CACHE HIT", body=f"{_tool_name} key={_tool_key[:8]}", node=node)
                 last_result = f"[CACHE HIT] {_tool_name}: results restored from cache.\n{str(_cached_tool)[:300]}"
@@ -1329,7 +1330,7 @@ class BioAgent:
                     self._cache.tool.set(
                         _tool_key, _tool_name,
                         result={"stdout": last_result[:300], "status": "success"},
-                        output_dir=state.get('run_temp_dir', ''),
+                        output_dir=state.get('run_temp_dir'),
                     )
                 except Exception:
                     pass
@@ -1626,7 +1627,7 @@ class BioAgent:
                 self._log("PUBLISH ERROR", body=str(e), node=node)
                 artifacts = {"artifacts": [], "error": str(e)}
 
-        # ── RAG CONTEXT pour interprétation biologique sourcée ──────────────
+            # ── RAG CONTEXT pour interprétation biologique sourcée ──────────────
             rag_context = ""
             if hasattr(self, "bio_retriever"):
                 try:
@@ -1641,8 +1642,8 @@ class BioAgent:
                     rag_context = build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
                     if rag_context:
                         self._log("RAG CONTEXT", body=f"Injected {len(rag_context)} chars of bio context", node=node)
-                except Exception as _re:
-                    self._log("RAG CONTEXT (warn)", body=str(_re), node=node)
+                except Exception as _rag_exc:
+                    self._log("RAG CONTEXT (warn)", body=str(_rag_exc), node=node)
             # ── END RAG CONTEXT ──────────────────────────────────────────────────
         
             msgs = [
