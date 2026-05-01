@@ -56,6 +56,14 @@ class TemplateLibrary:
         task_type: Optional[str] = None,
     ) -> None:
         """Persist a successful plan for future reuse."""
+        t_used = tools_used or self._extract_tools_from_steps(steps)
+        seq_type = "unknown"
+        txt = (task_summary + " " + " ".join(t_used)).lower()
+        if "flye" in txt or "nanopore" in txt or "ont" in txt:
+            seq_type = "nanopore"
+        elif "metaspades" in txt or "megahit" in txt or "illumina" in txt:
+            seq_type = "illumina"
+
         template = {
             "id": f"tpl_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "run_date": datetime.now().isoformat(),
@@ -65,8 +73,9 @@ class TemplateLibrary:
                 {"title": s.get("title", ""), "status": s.get("status", "done")}
                 for s in steps
             ],
-            "tools_used": tools_used or self._extract_tools_from_steps(steps),
+            "tools_used": t_used,
             "success_metrics": success_metrics or {},
+            "sequencer_type": seq_type,
         }
         self._templates.append(template)
         # Keep only last 100 templates
@@ -79,16 +88,38 @@ class TemplateLibrary:
         if not self._templates:
             return []
 
+        # Extract sequence type from query
+        q_seq_type = "unknown"
+        q_txt = query.lower()
+        if "nanopore" in q_txt or "ont" in q_txt or "flye" in q_txt:
+            q_seq_type = "nanopore"
+        elif "illumina" in q_txt or "metaspades" in q_txt or "megahit" in q_txt:
+            q_seq_type = "illumina"
+
+        results = []
         # Try embedding-based retrieval
         try:
             embedder = self._get_embedder()
             if embedder is not None:
-                return self._embedding_retrieval(query, n, embedder)
+                results = self._embedding_retrieval(query, len(self._templates), embedder)
         except Exception:
             pass
 
         # Fallback: keyword overlap
-        return self._keyword_retrieval(query, n)
+        if not results:
+            results = self._keyword_retrieval(query, len(self._templates))
+            
+        # Re-rank based on sequencer type mismatch penalty
+        scored = []
+        for i, tpl in enumerate(results):
+            base_score = -i # original rank score (higher is better)
+            t_seq_type = tpl.get("sequencer_type", "unknown")
+            if q_seq_type != "unknown" and t_seq_type != "unknown" and q_seq_type != t_seq_type:
+                base_score -= 1000 # heavily penalize mismatch
+            scored.append((base_score, tpl))
+        
+        scored.sort(key=lambda x: -x[0])
+        return [t for _, t in scored[:n]]
 
     def format_for_planner(self, query: str, n: int = 3) -> str:
         """Return formatted examples ready to inject into PLANNER_PROMPT."""
@@ -98,7 +129,7 @@ class TemplateLibrary:
         lines = ["\n=== SIMILAR PAST PIPELINES (use as reference, adapt as needed) ==="]
         for i, tpl in enumerate(similar, 1):
             lines.append(f"\nExample {i}: {tpl['task_summary']}")
-            lines.append(f"Type: {tpl['task_type']} | Date: {tpl['run_date'][:10]}")
+            lines.append(f"Type: {tpl['task_type']} | Date: {tpl['run_date'][:10]} | Seq: {tpl.get('sequencer_type', 'unknown')}")
             lines.append(f"Tools used: {', '.join(tpl['tools_used'][:8])}")
             lines.append("Steps:")
             for s in tpl["steps"][:8]:

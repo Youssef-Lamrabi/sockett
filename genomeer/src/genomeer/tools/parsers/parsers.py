@@ -440,6 +440,10 @@ def _parse_amr(stdout: str, result: dict, output_dir: Optional[str]) -> str:
                     genes.append(gene)
                     if drug and drug != "?":
                         drug_classes.update(drug.split(", "))
+            # Persister les gènes dans result_dict pour remontée dans le manifest
+            if isinstance(result, dict):
+                result["amr_genes_detected"] = genes
+                result["amr_drug_classes"] = sorted(drug_classes)
             lines = [
                 f"[AMR Detection]",
                 f"  AMR genes detected: {len(genes)}",

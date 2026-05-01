@@ -365,7 +365,6 @@ def run_with_timeout(
 def read_module2api():
     fields = [
         "ncbi",
-        "basic",
         "metagenomics",
         "metagenomics_db",
         "genomics",         # Enabled: 1710L scRNA-seq, Hi-C, ChIP-seq, epigenomics wrappers (GAP5 fixed)

@@ -21,7 +21,7 @@ from genomeer.agent.v2.utils.cache import get_cache
 from genomeer.agent.v2.utils.structured_output import RobustLLMParser, patch_state_graph_helper
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
 patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalement
-_robust_parser = RobustLLMParser()
+_robust_parser = RobustLLMParser(strict_validation=False)
 
 # ── AXE 2.3: SqliteSaver for cross-session persistence ──
 try:
@@ -367,8 +367,8 @@ class BioAgent:
             daemon=True
         ).start()
         self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
-        
-            # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
+
+        # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
         self._cache = get_cache()
         self._log("CACHE", body=f"Cache dir: {self._cache.cache_dir}", node="init")
 
@@ -926,16 +926,50 @@ class BioAgent:
             state["current_idx"] = idx
             
             if idx >= len(plan):
+                # ── Isolation d'état en batch_mode ──────────────────────────────────────
+                if state.get("batch_mode") and state.get("sample_manifest"):
+                    curr_sample_idx = state.get("current_sample_idx") or 0
+                    samples = state["sample_manifest"]
+                    sample_id = samples[curr_sample_idx].get("id", f"sample_{curr_sample_idx}")
+                    
+                    per_sample = dict(state.get("per_sample_results") or {})
+                    manifest = dict(state.get("manifest") or {})
+                    
+                    per_sample[sample_id] = {
+                        "quality_signals": manifest.get("quality_signals", {}),
+                        "amr_genes_detected": manifest.get("amr_genes_detected", []),
+                        "observations": manifest.get("observations", []),
+                        "retry_counts": state.get("retry_counts", {})
+                    }
+                    
+                    if curr_sample_idx < len(samples) - 1:
+                        manifest.pop("quality_signals", None)
+                        manifest.pop("amr_genes_detected", None)
+                        manifest.pop("observations", None)
+                        
+                        new_plan = [{**p, "status": "todo", "notes": ""} for p in plan]
+                        
+                        self._log("BATCH MODE", body=f"Sample {sample_id} done. Advancing to sample {curr_sample_idx + 1}", node=node)
+                        return {
+                            "current_idx": 0,
+                            "current_sample_idx": curr_sample_idx + 1,
+                            "per_sample_results": per_sample,
+                            "manifest": manifest,
+                            "retry_counts": {},
+                            "plan": new_plan,
+                            "next_step": "input_guard",
+                            "messages": [AIMessage(content=f"<observe>Starting next sample: {samples[curr_sample_idx+1].get('id', 'unknown')}</observe>")]
+                        }
+                    else:
+                        # Update state with the final sample's results before finalizing
+                        state["per_sample_results"] = per_sample
+                        # Let it fall through to FINALIZER
+
                 # all steps are done -> hand off to FINALIZER
-                # initially this was QA's responsibility, but we'll ease that up for this
-                # new_manifest = {
-                #     **state["manifest"],
-                #     "route_hint": "finalize",
-                #     "qa_payload": "All steps completed. Provide a clean final answer.",
-                # }
                 self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
                 return {
                     "current_idx": idx,
+                    "per_sample_results": state.get("per_sample_results"),
                     "next_step": "finalizer",
                     "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
                 }
@@ -1061,7 +1095,7 @@ class BioAgent:
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
                     manifest=state['manifest'].get("input_state"),
-                    run_temp_dir=state['run_temp_dir'],
+                    run_temp_dir=temp_dir,
                 )
             
             msgs = [
@@ -1446,6 +1480,26 @@ class BioAgent:
             next_idx = state["current_idx"] + (0 if status == "blocked" else 1)
             
             new_manifest = dict(state["manifest"])
+
+            # ── Extraire et persister les quality_signals dans le manifest ──────────
+            _obs_parsed = _robust_parser.parse_observer_output(resp.content, step_title=step["title"])
+            if _obs_parsed.quality_signals:
+                new_manifest["quality_signals"] = {
+                    **dict(state["manifest"].get("quality_signals") or {}),
+                    **_obs_parsed.quality_signals,
+                }
+
+            # ── Extraire les gènes AMR détectés et les persister ───────────────────
+            _amr_pattern = re.compile(
+                r'\b(bla[A-Z]{2,6}|van[A-Z]|mec[A-Z]|mcr-\d|erm[A-Z]|tet[A-Z]|qnr[A-Z]|sul\d|aac|aph|cfr)\b',
+                re.IGNORECASE
+            )
+            _last_result_text = (state.get("last_result") or "")
+            _found_amr = list(set(_amr_pattern.findall(_last_result_text)))
+            if _found_amr:
+                _existing_amr = list(new_manifest.get("amr_genes_detected") or [])
+                new_manifest["amr_genes_detected"] = list(set(_existing_amr + _found_amr))
+
             rc = dict(state.get("retry_counts") or {})
             diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
             if status == "blocked":
@@ -1507,7 +1561,9 @@ class BioAgent:
                     "stdout": (state.get("last_result") or "")[:12000],
                     "files_snapshot": self._list_ctx_files(state.get("run_temp_dir","")),
                 }
-                new_manifest["observations"] = list(new_manifest.get("observations", [])) + [obs]
+                # Garder seulement les 5 dernières observations pour éviter l'explosion token
+                _all_obs = list(new_manifest.get("observations", [])) + [obs]
+                new_manifest["observations"] = _all_obs[-5:]
 
 
             plan = list(state["plan"])
@@ -1670,6 +1726,7 @@ class BioAgent:
                             task_summary=(state.get("last_prompt") or "")[:200],
                             steps=plan_steps,
                             tools_used=tools_used,
+                            success_metrics=manifest.get("quality_signals") or {},
                         )
                         self._log("TEMPLATE SAVED", body=f"Saved pipeline. Total templates: {_TEMPLATE_LIB.count()}", node=node)
                 except Exception as _te:

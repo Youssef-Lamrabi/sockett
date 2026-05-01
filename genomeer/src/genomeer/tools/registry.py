@@ -74,13 +74,23 @@ class ToolRegistry:
         return False
 
     def save_registry(self, filename):
-        with open(filename, "wb") as file:
-            pickle.dump(self, file)
+        import json
+        with open(filename, "w") as file:
+            json.dump({"tools": self.tools, "next_id": self.next_id}, file, indent=2)
 
-    # def get_langchain_tool_by_id(self, id):
-    #     return self.langchain_tools[id]
-
-    @staticmethod
-    def load_registry(filename):
-        with open(filename, "rb") as file:
-            return pickle.load(file)
+    @classmethod
+    def load_registry(cls, filename):
+        import json
+        with open(filename, "r") as file:
+            data = json.load(file)
+            
+        instance = cls({})
+        instance.tools = data["tools"]
+        instance.next_id = data["next_id"]
+        
+        import pandas as pd
+        docs = []
+        for tool_id in range(len(instance.tools)):
+            docs.append([int(tool_id), instance.get_tool_by_id(int(tool_id))])
+        instance.document_df = pd.DataFrame(docs, columns=["docid", "document_content"])
+        return instance
