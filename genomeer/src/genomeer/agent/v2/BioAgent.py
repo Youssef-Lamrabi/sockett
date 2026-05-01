@@ -16,6 +16,7 @@ from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AI
 from langgraph.checkpoint.memory import MemorySaver
 
 
+from genomeer.agent.v2.utils.cache import get_cache
 
 from genomeer.agent.v2.utils.structured_output import RobustLLMParser, patch_state_graph_helper
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
@@ -366,6 +367,10 @@ class BioAgent:
             daemon=True
         ).start()
         self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
+        
+            # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
+        self._cache = get_cache()
+        self._log("CACHE", body=f"Cache dir: {self._cache.cache_dir}", node="init")
 
     # LOGS UTILS [DEV-ONLY]
     def _set_debug_log(self, path: str | None = None):
@@ -400,13 +405,35 @@ class BioAgent:
     # SYSTEM SETUP
     def _llm_invoke(self, node: str, purpose: str, msgs, verbose=True):
         """
-        Central LLM call: logs the full prompt and the raw LLM text response.
-        Use this instead of self.llm.invoke(...) everywhere.
+        Central LLM call with cache layer.
+        Cache skipped for: planner, orchestrator, finalizer (non-deterministic nodes).
         """
-        if verbose: prompt_txt = self._fmt_msgs(msgs)
-        if verbose: self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
+        # ── Cache lookup ────────────────────────────────────────────────────
+        sys_msg  = next((getattr(m, "content", "") for m in msgs if getattr(m, "type", "") == "system"), "")
+        user_msg = next((getattr(m, "content", "") for m in reversed(msgs) if getattr(m, "type", "") == "human"), "")
+        model_name = str(getattr(self.llm, "model_name", self.llm.__class__.__name__))
+        cache_key = self._cache.llm.make_key(model_name, sys_msg, user_msg)
+ 
+        cached = self._cache.llm.get(cache_key)
+        if cached:
+            self._log(f"LLM CACHE HIT ({purpose})", cached[:200], node=node)
+            from langchain_core.messages import AIMessage as _AIMsg
+            return _AIMsg(content=cached)
+        # ── End cache lookup ────────────────────────────────────────────────
+ 
+        if verbose:
+            prompt_txt = self._fmt_msgs(msgs)
+            self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
+ 
         resp = self.llm.invoke(msgs)
-        if verbose: self._log(f"LLM RESPONSE ({purpose})", getattr(resp, "content", str(resp)), node=node)
+        content = getattr(resp, "content", str(resp))
+ 
+        if verbose:
+            self._log(f"LLM RESPONSE ({purpose})", content, node=node)
+ 
+        # ── Cache save (skips planner/orchestrator/finalizer automatiquement) ──
+        self._cache.llm.set(cache_key, content, model=model_name, node=node)
+ 
         return resp
     
     def _generate_system_prompt(
@@ -929,7 +956,7 @@ class BioAgent:
             manifest = dict(state.get("manifest") or {})
 
             # current run storage home lsdir
-            temp_dir = state.get("run_temp_dir", "")
+            temp_dir = state.get("run_temp_dir") or os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
             files = self._list_ctx_files(temp_dir)
             files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
 
@@ -1178,6 +1205,10 @@ class BioAgent:
             code = (state.get("pending_code") or "").strip()
             diagnostic_code = (state.get("diagnostic_code") or "").strip()
             diagnostic_mode = state.get("diagnostic_mode")
+             # Fix run_temp_dir None bug
+            if not state.get("run_temp_dir"):
+                _fallback_tmp = os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
+                self._log("RUN_TEMP_DIR FIX", body=f"run_temp_dir was None, using fallback: {_fallback_tmp}", node=node)
             env = state["env_name"]
             timeout = state["manifest"].get("timeout_seconds", 600)
             last_result = ""
@@ -1196,6 +1227,27 @@ class BioAgent:
 
             if diagnostic_mode:
                 code = diagnostic_code
+                
+            # ── TOOL CACHE — skip execution si déjà fait sur les mêmes fichiers ──
+            import re as _re
+            _tool_match = _re.search(r'(run_\w+|fastp|kraken2|metaspades|megahit|flye|minimap2|checkm2|metabat2|prokka|diamond|hmmer|humann|amrfinder)\b', code or '')
+            _tool_name  = _tool_match.group(1) if _tool_match else "generic"
+            _input_files = [
+                f for f in _re.findall(r'["\']([^"\']+\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))["\']', code or '')
+                if os.path.exists(f)
+            ]
+            _tool_key = self._cache.tool.make_key(_tool_name, _input_files, params={})
+            _cached_tool = self._cache.tool.get(_tool_key, output_dir=state.get('run_temp_dir', ''))
+            if _cached_tool:
+                self._log("TOOL CACHE HIT", body=f"{_tool_name} key={_tool_key[:8]}", node=node)
+                last_result = f"[CACHE HIT] {_tool_name}: results restored from cache.\n{str(_cached_tool)[:300]}"
+                self._log("EXIT NODE", body="next_step=observer (from cache)", node=node)
+                result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
+                return {
+                    "next_step": "observer",
+                    result_key: last_result,
+                    "messages": [AIMessage(content=f"<observe>{last_result}</observe>")],
+                }
                 
             try:
                 if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
@@ -1269,7 +1321,19 @@ class BioAgent:
                 last_result = f"[EXECUTION ERROR] {type(e).__name__}: {e}\n"
                 last_result += f"traceback: {tb}"
                 self._log("EXECUTION ERROR", body=last_result, node=node)
-                
+            
+            
+            # ── TOOL CACHE — sauvegarder si succès ─────────────────────────────
+            if last_result and '[ERROR]' not in last_result and '[EXECUTION ERROR]' not in last_result:
+                try:
+                    self._cache.tool.set(
+                        _tool_key, _tool_name,
+                        result={"stdout": last_result[:300], "status": "success"},
+                        output_dir=state.get('run_temp_dir', ''),
+                    )
+                except Exception:
+                    pass
+            # ── END TOOL CACHE SAVE ──────────────────────────────────────────────
             self._log("EXIT NODE", body="next_step=observer", node=node)
             result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
             updates = {
@@ -1562,13 +1626,33 @@ class BioAgent:
                 self._log("PUBLISH ERROR", body=str(e), node=node)
                 artifacts = {"artifacts": [], "error": str(e)}
 
+        # ── RAG CONTEXT pour interprétation biologique sourcée ──────────────
+            rag_context = ""
+            if hasattr(self, "bio_retriever"):
+                try:
+                    from genomeer.model.bio_rag import build_finalizer_rag_context
+                    _pipeline_results = {
+                        "amr_genes":         manifest.get("amr_genes_detected", []),
+                        "pathways":          manifest.get("top_pathways", []),
+                        "assembly_n50":      manifest.get("quality_signals", {}).get("n50_bp"),
+                        "mean_completeness": manifest.get("quality_signals", {}).get("mean_completeness"),
+                        "classified_pct":    manifest.get("quality_signals", {}).get("classified_pct"),
+                    }
+                    rag_context = build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
+                    if rag_context:
+                        self._log("RAG CONTEXT", body=f"Injected {len(rag_context)} chars of bio context", node=node)
+                except Exception as _re:
+                    self._log("RAG CONTEXT (warn)", body=str(_re), node=node)
+            # ── END RAG CONTEXT ──────────────────────────────────────────────────
+        
             msgs = [
                 SystemMessage(content=instructions.FINALIZER_PROMPT),
                 HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
                     user_goal=state.get("last_prompt"),
                     plan=state.get("plan"),
                     observation=observations,
-                    artifacts=artifacts
+                    artifacts=artifacts,
+                    biological_context=rag_context,
                 ))
             ]
             resp = self._llm_invoke(node, "final_report", msgs)

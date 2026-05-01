@@ -582,7 +582,10 @@ OBSERVATION_AT_EACH_STEP:
 ARTIFACTS:
 {artifacts}
 
+{biological_context}
+
 Use all this to produce a scientifically informative report as response to the user.
+If BIOLOGICAL DATABASE CONTEXT is present above, use it to make interpretations precise and sourced.
 """
 
 # --------------------------------------------------------------------------------------------------------
