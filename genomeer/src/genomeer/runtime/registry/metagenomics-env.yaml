@@ -1,4 +1,6 @@
 # metagenomics-env.yaml
+# meta-env1 — Metagenomics Specialized Environment
+# Aligned with index.yaml provides_bins spec (all 35 tools)
 name: meta-env1
 channels:
   - bioconda
@@ -6,30 +8,77 @@ channels:
   - defaults
 dependencies:
   - python=3.11
-  # QC
-  - fastp
-  - multiqc
-  - nanostat        # long-reads
-  # Assemblage
-  - spades          # inclut metaspades
-  - megahit
-  # Mapping
-  - minimap2
-  - samtools
-  - bwa
-  # Taxonomie
-  - kraken2
-  - bracken
-  - metaphlan       # metaphlan4
-  - diamond
-  # Binning
-  - metabat2
-  - das_tool
-  # Annotation
-  - prokka
-  - hmmer
-  # Stats microbiome
-  - qiime2          # via pip ou channel séparé
+
+  # ─── QC ────────────────────────────────────────────────────────────────────
+  - fastp                  # Ultra-fast adapter trimming (Illumina)
+  - fastqc                 # Per-file quality assessment (FIXED: was missing)
+  - multiqc                # Aggregate QC reports into HTML
+  - nanostat               # QC stats for Nanopore long reads
+  - nanoplot               # QC plots for Nanopore long reads (FIXED: was missing)
+  - trim-galore            # Trimmomatic wrapper + FastQC (FIXED: was missing)
+
+  # ─── Assembly ──────────────────────────────────────────────────────────────
+  - spades                 # Includes metaspades.py
+  - megahit                # Fast memory-efficient assembler
+  - flye                   # Long-read assembler (FIXED: was missing)
+
+  # ─── Mapping ───────────────────────────────────────────────────────────────
+  - minimap2               # Multi-purpose aligner (short/long reads)
+  - bowtie2                # Short-read aligner (FIXED: was missing)
+  - bwa                    # BWA-MEM aligner (FIXED: was missing)
+  - bwa-mem2               # BWA-MEM2 faster aligner (FIXED: was missing)
+  - samtools               # BAM/SAM/CRAM manipulation
+  - bedtools               # Genome arithmetic (FIXED: was missing)
+
+  # ─── Taxonomic Classification ──────────────────────────────────────────────
+  - kraken2=2.1.3            # FIX G12: pinned — report format stable at 2.1.x
+  - bracken=2.9              # FIX G12: pinned
+  - metaphlan=4.1.0          # FIX G12: pinned — profile format changed in 4.x
+  - gtdbtk=2.4.0             # FIX G12: pinned — 70GB DB tied to version
+  - krona                    # FIX G12: less critical (visualization only)
+
+  # ─── Binning ───────────────────────────────────────────────────────────────
+  - metabat2               # Coverage + composition binning
+  - das_tool               # Bin dereplication and refinement
+  - checkm2                # ML-based MAG quality assessment (FIXED: was missing)
+
+  # ─── Functional Annotation ─────────────────────────────────────────────────
+  - prokka                 # Rapid prokaryotic annotation
+  - prodigal               # Ab-initio gene prediction (FIXED: was missing)
+  - diamond                # Ultra-fast protein alignment
+  - hmmer                  # HMM-profile annotation (Pfam, TIGRFAM)
+
+  # ─── AMR / Virulence ───────────────────────────────────────────────────────
+  - rgi                    # Resistance Gene Identifier (CARD) (FIXED: was missing)
+  - ncbi-amrfinderplus     # AMRFinderPlus (FIXED: was missing)
+
+  # ─── SRA Tools ─────────────────────────────────────────────────────────────
+  - sra-tools              # prefetch + fasterq-dump + fastq-dump (FIXED: was missing)
+
+  # ─── Utilities ─────────────────────────────────────────────────────────────
+  - seqtk                  # Fast sequence toolkit (FIXED: was missing)
+  - pigz                   # Parallel gzip (FIXED: was missing)
+  - parallel               # GNU parallel for multi-sample loops (FIXED: was missing)
+
+  # ─── Python packages ───────────────────────────────────────────────────────
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - seaborn
+  - biopython
+  - pysam
+
+  # ─── Pip packages ──────────────────────────────────────────────────────────
   - pip:
-      - multiqc
-      - humann
+      - humann              # HUMAnN3 functional profiling
+      - multiqc             # ensure latest version
+
+  # ─── Phase 5: R statistical packages ───────────────────────────────────────
+  - r-base                 # R language runtime
+  - r-vegan                # PERMANOVA (adonis2), ordination, diversity
+  - r-phyloseq             # Microbiome data container (required by ANCOM-BC)
+  - r-ggplot2              # ANCOM-BC volcano plots
+  - r-data.table           # Fast TSV I/O for R scripts
+  - bioconductor-ancombc   # ANCOM-BC differential abundance (compositional)
+  - lefse                  # LEfSe biomarker discovery (bioconda)

@@ -234,3 +234,64 @@ if __name__ == "__main__":
     kind = sys.argv[2]
     reg = sys.argv[3] if len(sys.argv) > 3 else REGISTRY_PATH
     print(resolve_env(tool, kind, reg))
+
+
+# ---------------------------------------------------------------------------
+# FIX G_ENV1: resolve_env_for_code — imported by BioAgent.py (line 46)
+# Determines correct micromamba env for a generated code block.
+# Priority: env_hint > meta-env1 tool scan > R lang > keep current_env
+# ---------------------------------------------------------------------------
+_META_ENV_BINS_LIGHT = {
+    # CLI binaries
+    "fastp", "fastqc", "multiqc", "nanostat", "nanoplot", "trim-galore",
+    "metaspades.py", "megahit", "flye",
+    "minimap2", "bowtie2", "bwa", "bwa-mem2", "samtools", "bedtools",
+    "kraken2", "bracken", "metaphlan", "gtdbtk", "krona",
+    "metabat2", "das_tool", "checkm2",
+    "prokka", "prodigal", "diamond", "hmmsearch", "hmmscan",
+    "humann", "amrfinder", "rgi",
+    "prefetch", "fasterq-dump", "seqtk", "pigz",
+    # Python wrapper names
+    "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
+    "run_metaspades", "run_megahit", "run_flye", "run_minimap2",
+    "run_bowtie2", "run_bwa_mem", "run_metabat2", "run_das_tool",
+    "run_checkm2", "run_prokka", "run_prodigal", "run_diamond",
+    "run_hmmer", "run_humann3", "run_amrfinderplus", "run_rgi_card",
+    "run_bracken", "run_gtdbtk", "run_krona", "run_nanostat",
+    "run_multiqc", "compute_coverage_samtools",
+    "from genomeer.tools.function.metagenomics",
+}
+
+
+def resolve_env_for_code(
+    code: str,
+    lang: str | None,
+    env_hint: str | None,
+    current_env: str,
+) -> str:
+    """
+    Determine the correct micromamba environment for a generated code block.
+
+    Priority order:
+      1. Explicit env="..." attribute in <EXECUTE> tag  → use as-is
+      2. Code mentions meta-env1 CLI tools             → return "meta-env1"
+      3. Code is R                                     → return "bio-agent-env1"
+      4. Keep current_env                              → no change needed
+    """
+    # 1. LLM explicitly declared the env in the tag
+    if env_hint:
+        return env_hint
+
+    # 2. Scan code for metagenomics tool usage
+    if code:
+        code_lower = code.lower()
+        for tool in _META_ENV_BINS_LIGHT:
+            if tool in code_lower:
+                return "meta-env1"
+
+    # 3. R code always runs in bio-agent-env1 (has Rscript + R packages)
+    if lang and lang.upper() == "R":
+        return "bio-agent-env1"
+
+    # 4. No change needed
+    return current_env

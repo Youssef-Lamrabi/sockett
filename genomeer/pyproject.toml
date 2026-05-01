@@ -24,7 +24,7 @@ dependencies = [
     "scipy",
     "statsmodels",
     "scikit-learn",
-    "gradio", #tobedelete
+    # gradio removed — replaced by FastAPI SSE interface
     "langchain",
     "langgraph==0.3.18",
     "langchain-openai",
@@ -48,8 +48,12 @@ dependencies = [
     "mcp",
     "tooluniverse",
     "python-dotenv",
-    "pydantic", 
-    "ipython"
+    "pydantic",
+    "ipython",
+    # ── Phase 1: FAISS semantic retriever ──
+    "faiss-cpu",
+    "sentence-transformers",
+    "biopython",
 ]
 
 [project.urls]
@@ -80,6 +84,7 @@ line-length = 120
 [project.optional-dependencies]
 r = ["rpy2"]
 dev = ["pytest", "pytest-cov", "ruff", "mypy"]
+server = ["fastapi", "uvicorn[standard]", "sse-starlette"]  # for agent-ui
 
 [tool.ruff.lint]
 select = [

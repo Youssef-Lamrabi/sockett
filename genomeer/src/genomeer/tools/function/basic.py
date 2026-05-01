@@ -2,15 +2,24 @@
 bioagent_tools.py
 ------------------
 A lightweight, dependency-minimal toolbox for agentic workflows in bioinformatics & metagenomics.
-These implementations are intentionally simple "baselines" or "stubs" that produce usable artifacts
-(TSV/FASTA/FASTQ/PNG placeholders, simple text reports) without requiring heavy third-party tools.
 
-All functions return small JSON-like dicts or strings designed to be easy for LLM agents to consume.
+This module contains TWO categories of functions:
 
-NOTE:
-- FASTA/FASTQ parsing here is basic and assumes reasonably well-formed files.
-- Alignment, variant calling, binning, assembly, and annotation are toy approximations to support demos.
-- Wherever performance matters, replace with domain tools. These functions aim for clarity + zero deps.
+[SAFE — Use freely]
+  Sequence I/O and parsing, FASTA/FASTQ readers/writers, k-mer profiling, GC content,
+  ORF translation, deduplication, interval/BED operations, overlap analysis, reporting.
+
+[DISABLED STUBS — Do NOT use for metagenomics]
+  The following functions raise NotImplementedError and redirect to the real wrappers:
+    - align_reads_minimap2_like   → use run_minimap2()       in genomeer.tools.function.metagenomics
+    - compute_coverage            → use compute_coverage_samtools() in genomeer.tools.function.metagenomics
+    - call_variants_simple        → use samtools/bcftools via run_bash_script()
+    - classify_reads_kmer         → use run_kraken2()         in genomeer.tools.function.metagenomics
+    - bin_contigs_basic           → use run_metabat2()        in genomeer.tools.function.metagenomics
+    - assemble_greedy_baseline    → use run_metaspades() or run_megahit() in metagenomics
+    - annotate_functions_hmm      → use run_hmmer()           in genomeer.tools.function.metagenomics
+    - predict_genes_baseline      → use run_prodigal()        in genomeer.tools.function.metagenomics
+    - contamination_screen        → use run_minimap2() + samtools view -f 4 in metagenomics
 """
 
 from __future__ import annotations
@@ -412,33 +421,41 @@ def deduplicate_sequences(input_path: str, output_path: str, min_count: int = 1)
 
 def align_reads_minimap2_like(reads: List[str], reference_fasta: str, output_bam: str,
                               preset: str = "sr", threads: int = 2):
-    # Toy: produce a fake BAM placeholder and a tiny summary.
-    bam_path = output_bam
-    Path(bam_path).write_text("@FAKE\tThis is a placeholder BAM. Replace with a real aligner.\n")
-    return {"bam_path": bam_path, "index_created": False, "summary": "Toy aligner wrote a placeholder BAM."}
+    """[DISABLED STUB] This toy function returned fake BAM data.
+    Use the real wrapper instead:
+        from genomeer.tools.function.metagenomics import run_minimap2
+        run_minimap2(reads=reads[0], reference=reference_fasta, output_bam=output_bam,
+                     preset=preset, threads=threads)
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] align_reads_minimap2_like() returns fake data. "
+        "Use run_minimap2() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 def compute_coverage(bam_path: str, reference_fasta: str, window: Optional[int] = None,
                      bed_regions: Optional[str] = None):
-    # Toy: uniform coverage = 0 across reference
-    rows = []
-    for h, s in _iter_fasta(reference_fasta):
-        if window:
-            for i, wseq in _sliding_windows(s, window, window):
-                rows.append({"contig": h, "start": i, "end": i+len(wseq), "cov": 0})
-        else:
-            rows.append({"contig": h, "start": 0, "end": len(s), "cov": 0})
-    out = str(Path(bam_path).with_suffix(".cov.tsv"))
-    _write_tsv(rows, out)
-    return {"coverage_tsv": out, "plots": []}
+    """[DISABLED STUB] This toy function returned coverage=0 for all contigs.
+    Use the real wrapper instead:
+        from genomeer.tools.function.metagenomics import compute_coverage_samtools
+        compute_coverage_samtools(bam_path=bam_path, output_tsv='coverage.tsv')
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] compute_coverage() returns fake zeros. "
+        "Use compute_coverage_samtools() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 def call_variants_simple(bam_path: str, reference_fasta: str, output_vcf: str,
                          min_depth: int = 5, min_alt_frac: float = 0.2):
-    # Toy: emit empty VCF header
-    with open(output_vcf, "w") as out:
-        out.write("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
-    return {"vcf_path": output_vcf, "summary": "Toy variant caller emitted empty VCF."}
+    """[DISABLED STUB] This toy function emitted an empty VCF with no real variants.
+    Use bcftools mpileup + call via run_bash_script() in meta-env1 instead:
+        bcftools mpileup -f ref.fa sorted.bam | bcftools call -mv -o variants.vcf
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] call_variants_simple() emits empty VCF. "
+        "Use bcftools mpileup | bcftools call via run_bash_script(env_name='meta-env1') instead."
+    )
 
 
 # -----------------------------
@@ -446,28 +463,28 @@ def call_variants_simple(bam_path: str, reference_fasta: str, output_vcf: str,
 # -----------------------------
 
 def classify_reads_kmer(reads: List[str], db_path: str, k: int = 31, min_hits: int = 3, top_n: int = 1):
-    # Toy: assign all reads to 'unknown'
-    out = str(Path(reads[0]).with_suffix(".assign.tsv"))
-    _write_tsv([{"read": Path(r).stem, "taxon": "unknown", "score": 0} for r in reads], out)
-    unclassified = str(Path(reads[0]).with_suffix(".unclassified.txt"))
-    Path(unclassified).write_text("\n".join(reads) + "\n")
-    return {"assignments_tsv": out, "unclassified_path": unclassified, "summary": "Toy k-mer classifier."}
+    """[DISABLED STUB] This toy function assigned all reads to 'unknown'.
+    Use the real Kraken2 wrapper instead:
+        from genomeer.tools.function.metagenomics import run_kraken2
+        run_kraken2(reads_r1=reads[0], db_path=db_path, output_dir='kraken2_out')
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] classify_reads_kmer() assigns all reads to 'unknown'. "
+        "Use run_kraken2() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 def bin_contigs_basic(contigs_fasta: str, coverage_tsv: Optional[str] = None, min_len: int = 1500,
                       clusters: Optional[int] = None):
-    # Toy: single bin with contigs >= min_len
-    bin_dir = str(Path(contigs_fasta).with_suffix(".bins"))
-    Path(bin_dir).mkdir(parents=True, exist_ok=True)
-    kept = []
-    for h, s in _iter_fasta(contigs_fasta):
-        if len(s) >= min_len:
-            kept.append((h, s))
-    out_fa = str(Path(bin_dir) / "bin1.fasta")
-    _write_fasta(kept, out_fa)
-    map_tsv = str(Path(bin_dir) / "bin_map.tsv")
-    _write_tsv([{"contig": h, "bin": "bin1"} for h, _ in kept], map_tsv)
-    return {"bins_fasta_dir": bin_dir, "bin_map_tsv": map_tsv, "summary": f"Toy binning: {len(kept)} contigs -> bin1."}
+    """[DISABLED STUB] This toy function put all contigs in a single fake bin.
+    Use the real MetaBAT2 wrapper instead:
+        from genomeer.tools.function.metagenomics import run_metabat2
+        run_metabat2(assembly_fasta=contigs_fasta, output_dir='bins_out', min_contig=min_len)
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] bin_contigs_basic() puts all contigs in one fake bin. "
+        "Use run_metabat2() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 def estimate_complexity(assignments_tsv: str, metric: str = "shannon"):
@@ -507,33 +524,27 @@ def contamination_screen(input_path: str, contaminant_ref: str, clean_path: str,
 # -----------------------------
 
 def predict_genes_baseline(contigs_fasta: str, min_aa: int = 60, genetic_code: int = 11):
-    res = translate_orfs(contigs_fasta, min_aa=min_aa, genetic_code=genetic_code, strand="both")
-    # Reuse ORFs as genes (toy)
-    gff = str(Path(contigs_fasta).with_suffix(".genes.gff"))
-    rows = []
-    with open(gff, "w") as out:
-        out.write("##gff-version 3\n")
-    # Convert bed rows to GFF-like (if they exist)
-    try:
-        import csv
-        with open(res["orfs_bed"], newline="") as fh, open(gff, "a") as out:
-            reader = csv.DictReader(fh, delimiter="\t")
-            for r in reader:
-                attrs = f"ID={r['name']};product=hypothetical_protein"
-                out.write(f"{r['chrom']}\ttoy\tCDS\t{int(r['start'])+1}\t{int(r['end'])}\t.\t{r['strand']}\t0\t{attrs}\n")
-    except Exception:
-        pass
-    return {"genes_gff": gff, "proteins_faa": res["proteins_faa"], "summary": "Toy gene finder using ORFs."}
+    """[DISABLED STUB] This toy function used a naive ORF finder instead of Prodigal.
+    Use the real wrapper instead:
+        from genomeer.tools.function.metagenomics import run_prodigal
+        run_prodigal(input_fasta=contigs_fasta, output_dir='prodigal_out', mode='meta')
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] predict_genes_baseline() uses a naive ORF finder. "
+        "Use run_prodigal() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 def annotate_functions_hmm(proteins_faa: str, db_path: str, evalue: float = 1e-5, top_n: int = 1):
-    # Toy: assign "unknown_function" to all proteins
-    out = str(Path(proteins_faa).with_suffix(".annot.tsv"))
-    rows = []
-    for h, s in _iter_fasta(proteins_faa):
-        rows.append({"protein": h, "hit": "unknown_function", "score": 0.0, "evalue": 1.0})
-    _write_tsv(rows, out)
-    return {"annotations_tsv": out, "summary": "Toy HMM/BLAST annotator (all unknown)."}
+    """[DISABLED STUB] This toy function marked all proteins as 'unknown_function'.
+    Use the real wrapper instead:
+        from genomeer.tools.function.metagenomics import run_hmmer
+        run_hmmer(query_fasta=proteins_faa, hmm_db=db_path, output_dir='hmmer_out', evalue=evalue)
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] annotate_functions_hmm() annotates everything as 'unknown'. "
+        "Use run_hmmer() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 # -----------------------------
@@ -648,23 +659,18 @@ def intersect_regions(a_bed: str, b_bed: str, output_path: str, mode: str = "wo"
 # -----------------------------
 
 def assemble_greedy_baseline(reads: List[str], output_fasta: str, min_overlap: int = 30, max_reads: Optional[int] = None):
-    # Toy: concatenate first N reads as one contig
-    seqs = []
-    taken = 0
-    for r in reads:
-        fmt = _detect_seq_format(r)
-        it = _iter_fasta(r) if fmt == "fasta" else _iter_fastq(r)
-        for rec in it:
-            s = rec[1]
-            seqs.append(s)
-            taken += 1
-            if max_reads and taken >= max_reads:
-                break
-        if max_reads and taken >= max_reads:
-            break
-    contig = "".join(seqs)
-    _write_fasta([("contig1", contig)], output_fasta)
-    return {"contigs_fasta": output_fasta, "n_contigs": 1, "summary": f"Toy assembler produced 1 contig of length {len(contig)}."}
+    """[DISABLED STUB] This toy function concatenated reads into one fake contig.
+    Use the real assembler wrappers instead:
+        from genomeer.tools.function.metagenomics import run_metaspades, run_megahit
+        # For Illumina short reads:
+        run_metaspades(reads_r1=reads[0], reads_r2=reads[1], output_dir='assembly_out')
+        # OR for large datasets / low memory:
+        run_megahit(reads_r1=reads[0], reads_r2=reads[1], output_dir='megahit_out')
+    """
+    raise NotImplementedError(
+        "[STUB DISABLED] assemble_greedy_baseline() concatenates reads into one fake contig. "
+        "Use run_metaspades() or run_megahit() from genomeer.tools.function.metagenomics instead."
+    )
 
 
 def scaffold_gc_link(contigs_fasta: str, coverage_tsv: Optional[str] = None, link_threshold: float = 0.8):

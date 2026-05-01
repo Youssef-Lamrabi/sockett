@@ -231,7 +231,7 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -
     - If env_name is provided: runs it in that micromamba env (fresh process).
     - If no env_name: runs in a persistent REPL namespace in the current process.
     """
-
+    path = None  # FIX G6: initialise before try so finally block never hits NameError
     code = code.strip("```").strip()
     try: 
         # --- Case 1: run in a micromamba environment ---
@@ -366,9 +366,10 @@ def read_module2api():
     fields = [
         "ncbi",
         "basic",
-        "metagenomics",       
+        "metagenomics",
         "metagenomics_db",
-        # "artifacts",
+        "genomics",         # Enabled: 1710L scRNA-seq, Hi-C, ChIP-seq, epigenomics wrappers (GAP5 fixed)
+        # "artifacts",      # Pending: description file not yet created
         # "literature",
         # "biochemistry",
         # "bioengineering",
@@ -377,7 +378,6 @@ def read_module2api():
         # "cell_biology",
         # "molecular_biology",
         # "genetics",
-        # "genomics",
         # "immunology",
         # "microbiology",
         # "pathology",
@@ -392,8 +392,12 @@ def read_module2api():
     module2api = {}
     for field in fields:
         module_name = f"genomeer.tools.description.{field}"
-        module = importlib.import_module(module_name)
-        module2api[f"genomeer.tools.function.{field}"] = module.description
+        try:
+            module = importlib.import_module(module_name)
+            module2api[f"genomeer.tools.function.{field}"] = module.description
+        except ImportError:
+            import warnings
+            warnings.warn(f"[read_module2api] Could not import '{module_name}' — skipping.", stacklevel=2)
     return module2api
 
 

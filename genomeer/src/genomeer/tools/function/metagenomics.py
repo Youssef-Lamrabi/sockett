@@ -129,12 +129,25 @@ def run_fastp(
         with open(json_path) as f:
             stats = json.load(f)
 
+    # FIX G8: expose q30_rate at top-level so quality_gate can read it directly
+    # fastp JSON structure: stats["summary"]["before_filtering"]["q30_rate"]
+    q30_before = 0.0
+    q30_after  = 0.0
+    try:
+        q30_before = float(stats["summary"]["before_filtering"]["q30_rate"])
+        q30_after  = float(stats["summary"]["after_filtering"]["q30_rate"])
+    except (KeyError, TypeError, ValueError):
+        pass
+
     return {
         "out_r1": out_r1,
         "out_r2": out_r2,
         "json_report": json_path,
         "html_report": html_path,
         "summary": stats.get("summary", {}),
+        "q30_rate": q30_after if q30_after > 0 else q30_before,  # quality gate reads this key
+        "q30_rate_before": q30_before,
+        "q30_rate_after":  q30_after,
     }
 
 
@@ -213,7 +226,8 @@ def run_metaspades(
     Returns dict with contigs_fasta, scaffolds_fasta, assembly_graph, and log.
     """
     out = _ensure_dir(output_dir)
-    cmd = ["metaspades.py", "-o", str(out), "-t", str(threads), "-m", str(memory_gb)]
+    # FIX G11: --meta flag is required for metagenome mode in metaSPAdes
+    cmd = ["metaspades.py", "--meta", "-o", str(out), "-t", str(threads), "-m", str(memory_gb)]
     if reads_r1:
         cmd += ["-1", reads_r1]
     if reads_r2:
@@ -479,16 +493,26 @@ def run_kraken2(
     proc = _run(cmd)
     _assert_ok(proc, "Kraken2")
 
-    stats = {}
+    # FIX G9: parse classified_pct as float so quality_gate can apply threshold
+    classified_pct: Optional[float] = None
+    classification_summary_str = ""
     for line in proc.stderr.splitlines():
         if "classified" in line.lower():
-            stats["classification_summary"] = line.strip()
+            classification_summary_str = line.strip()
+            import re as _re
+            m = _re.search(r"([0-9]+\.[0-9]+)%\s+of\s+sequences\s+classified", line, _re.IGNORECASE)
+            if m:
+                try:
+                    classified_pct = float(m.group(1))
+                except ValueError:
+                    pass
 
     return {
         "report": report,
         "output": output_file,
         "db_used": db_path,
-        "classification_summary": stats.get("classification_summary", proc.stderr[:500]),
+        "classified_pct": classified_pct,            # FIX G9: float for quality gate
+        "classification_summary": classification_summary_str or proc.stderr[:500],
     }
 
 
@@ -1153,3 +1177,196 @@ print(json.dumps(results))
 
     result["output_dir"] = str(out)
     return result
+
+
+# =============================================================================
+# Phase 5: Advanced Statistical Methods (Publication-Grade)
+# =============================================================================
+
+def run_permanova(
+    distance_matrix_tsv: str,
+    metadata_tsv: str,
+    group_column: str,
+    output_dir: str,
+    permutations: int = 9999,
+    strata_column: Optional[str] = None,
+) -> dict:
+    """
+    Run PERMANOVA via R vegan::adonis2() to test if communities differ between groups.
+
+    Parameters
+    ----------
+    distance_matrix_tsv : Path to symmetric TSV distance matrix (sample x sample)
+    metadata_tsv        : Sample metadata TSV (sample IDs as first column)
+    group_column        : Column in metadata to test (e.g. "treatment")
+    output_dir          : Directory to write results
+    permutations        : Number of permutations (default 9999)
+    strata_column       : Optional stratification column (e.g. "patient_id")
+
+    Returns dict with: permanova_tsv, r2, p_value, f_statistic, output_dir
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    strata_line = f"strata = metadata${strata_column}," if strata_column else ""
+    r_script = f"""
+library(vegan); library(data.table)
+dist_mat <- as.dist(as.matrix(fread("{distance_matrix_tsv}", header=TRUE, row.names=1)))
+metadata <- as.data.frame(fread("{metadata_tsv}", header=TRUE))
+rownames(metadata) <- metadata[,1]
+result <- adonis2(dist_mat ~ {group_column}, data=metadata, permutations={permutations}, {strata_line}method="bray")
+out_df <- as.data.frame(result); out_df$Statistic <- rownames(out_df)
+write.table(out_df, "{out}/permanova_results.tsv", sep="\\t", quote=FALSE, row.names=FALSE)
+cat(sprintf('{{"r2":%f,"f_statistic":%f,"p_value":%f}}',
+    result["Model","R2"], result["Model","F"], result["Model","Pr(>F)"]))
+"""
+    s = str(out / "_permanova.R")
+    Path(s).write_text(r_script)
+    proc = _run(["Rscript", s], env_name=_META_ENV)
+    _assert_ok(proc, "permanova")
+    Path(s).unlink(missing_ok=True)
+    try:
+        stats = json.loads(proc.stdout.strip().split("\n")[-1])
+    except Exception:
+        stats = {}
+    return {
+        "permanova_tsv": str(out / "permanova_results.tsv"),
+        "r2": stats.get("r2"), "p_value": stats.get("p_value"),
+        "f_statistic": stats.get("f_statistic"),
+        "group_column": group_column, "permutations": permutations,
+        "output_dir": str(out),
+    }
+
+
+def run_lefse(
+    otu_table_tsv: str,
+    metadata_tsv: str,
+    class_column: str,
+    output_dir: str,
+    subject_column: Optional[str] = None,
+    lda_threshold: float = 2.0,
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Run LEfSe for microbial biomarker discovery (LDA + Kruskal-Wallis).
+
+    Parameters
+    ----------
+    otu_table_tsv  : OTU/taxa table (features x samples) TSV
+    metadata_tsv   : Sample metadata TSV
+    class_column   : Column defining the class grouping
+    output_dir     : Directory to write results
+    lda_threshold  : Minimum LDA score threshold (default 2.0)
+    alpha          : Statistical significance threshold (default 0.05)
+
+    Returns dict with: biomarkers_tsv, n_biomarkers, plot_png, output_dir
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    input_lefse = str(out / "lefse_input.txt")
+    result_file = str(out / "lefse_results.txt")
+    plot_file   = str(out / "lefse_biomarkers.png")
+
+    prep = f"""
+import pandas as pd
+meta = pd.read_csv("{metadata_tsv}", sep="\\t", index_col=0)
+otu = pd.read_csv("{otu_table_tsv}", sep="\\t", index_col=0)
+common = meta.index.intersection(otu.columns)
+rows = [meta["{class_column}"].rename("class")]
+{"rows.append(meta['" + subject_column + "'].rename('subject'))" if subject_column else ""}
+rows += [otu[f] for f in otu.index if f in common]
+pd.DataFrame(rows, columns=common).to_csv("{input_lefse}", sep="\\t", header=False)
+"""
+    pp = str(out / "_lefse_prep.py"); Path(pp).write_text(prep)
+    _run(["python", pp], env_name=_META_ENV); Path(pp).unlink(missing_ok=True)
+
+    proc = _run(["lefse-run.py", input_lefse, result_file,
+                 "--lefse_alpha", str(alpha), "--lda_abs_th", str(lda_threshold)], env_name=_META_ENV)
+    _assert_ok(proc, "lefse")
+    _run(["lefse-plot_res.py", result_file, plot_file, "--format", "png"], env_name=_META_ENV)
+
+    n = 0
+    try:
+        with open(result_file) as f:
+            n = sum(1 for l in f if l.strip() and len(l.split("\t")) > 2 and l.split("\t")[2])
+    except Exception:
+        pass
+
+    return {
+        "biomarkers_tsv": result_file, "n_biomarkers": n,
+        "plot_png": plot_file if Path(plot_file).exists() else None,
+        "lda_threshold": lda_threshold, "output_dir": str(out),
+    }
+
+
+def run_ancom_bc(
+    count_table_tsv: str,
+    metadata_tsv: str,
+    group_column: str,
+    output_dir: str,
+    formula: Optional[str] = None,
+    p_adj_method: str = "BH",
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Run ANCOM-BC (compositional differential abundance) via R.
+
+    The most rigorous library-size-corrected test for compositional microbiome data.
+    No rarefaction required.
+
+    Parameters
+    ----------
+    count_table_tsv : Raw count table (features x samples) TSV
+    metadata_tsv    : Sample metadata TSV
+    group_column    : Column defining the comparison group
+    output_dir      : Directory to write results
+    formula         : R formula string (default: group_column only)
+    p_adj_method    : P-value adjustment ("BH", "bonferroni", "holm")
+    alpha           : Significance threshold (default 0.05)
+
+    Returns dict with: results_tsv, n_significant, volcano_plot_png, output_dir
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    formula_str = formula or group_column
+
+    r_script = f"""
+suppressPackageStartupMessages({{library(ANCOMBC);library(phyloseq);library(data.table);library(ggplot2)}})
+counts <- as.matrix(fread("{count_table_tsv}", header=TRUE, row.names=1))
+meta   <- as.data.frame(fread("{metadata_tsv}", header=TRUE)); rownames(meta) <- meta[,1]; meta <- meta[,-1]
+common <- intersect(colnames(counts), rownames(meta))
+ps <- phyloseq(otu_table(counts[,common], taxa_are_rows=TRUE), sample_data(meta[common,,drop=FALSE]))
+meta(sample_data(ps))${group_column} <- as.factor(sample_data(ps)${group_column})
+out_ancom <- ancombc(phyloseq=ps, formula="{formula_str}", p_adj_method="{p_adj_method}", alpha={alpha}, verbose=FALSE)
+res <- out_ancom$res
+df <- data.frame(feature=rownames(res$lfc), lfc=res$lfc[,1], se=res$se[,1],
+                 W=res$W[,1], p_value=res$p_val[,1], p_adj=res$q_val[,1], diff_abund=res$diff_abn[,1])
+df <- df[order(df$p_adj),]
+write.table(df, "{out}/ancombc_results.tsv", sep="\\t", quote=FALSE, row.names=FALSE)
+n_sig <- sum(df$diff_abund, na.rm=TRUE)
+cat(sprintf('{{"n_significant":%d}}', n_sig))
+df$log10_padj <- -log10(df$p_adj+1e-300)
+df$sig <- ifelse(df$diff_abund, "Significant", "Not significant")
+p <- ggplot(df,aes(lfc,log10_padj,color=sig))+geom_point(size=2,alpha=0.8)+
+     scale_color_manual(values=c("Significant"="#e74c3c","Not significant"="#95a5a6"))+
+     geom_hline(yintercept=-log10({alpha}),linetype="dashed")+
+     labs(title="ANCOM-BC",x="Log Fold Change",y="-log10(adj.p)")+theme_bw()
+ggsave("{out}/ancombc_volcano.png",p,width=8,height=6,dpi=150)
+"""
+    s = str(out / "_ancombc.R"); Path(s).write_text(r_script)
+    proc = _run(["Rscript", s], env_name=_META_ENV)
+    _assert_ok(proc, "ancom_bc")
+    Path(s).unlink(missing_ok=True)
+    try:
+        n_sig = json.loads(proc.stdout.strip().split("\n")[-1]).get("n_significant", 0)
+    except Exception:
+        n_sig = 0
+    return {
+        "results_tsv": str(out / "ancombc_results.tsv"),
+        "n_significant": n_sig,
+        "volcano_plot_png": str(out / "ancombc_volcano.png"),
+        "group_column": group_column, "formula": formula_str,
+        "p_adj_method": p_adj_method, "alpha": alpha,
+        "output_dir": str(out),
+    }

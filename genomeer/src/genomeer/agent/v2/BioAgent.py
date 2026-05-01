@@ -15,6 +15,14 @@ from langgraph.graph import END, START, StateGraph
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage 
 from langgraph.checkpoint.memory import MemorySaver
 
+# ── AXE 2.3: SqliteSaver for cross-session persistence ──
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    import sqlite3
+    _SQLITE_OK = True
+except ImportError:
+    _SQLITE_OK = False
+
 from genomeer.config import settings
 from genomeer.tools.software.resources import data_lake_dict, library_content_dict, runtime_envs_dicts
 from genomeer.utils.llm import SourceType, get_llm
@@ -34,8 +42,25 @@ from genomeer.tools.registry import ToolRegistry
 from genomeer.utils.stream.shared import REGISTRY
 from genomeer.agent.v2.utils import instructions
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
+from genomeer.agent.v2.utils.quality_gate import check_quality, format_quality_message  # GAP4 fix
 from genomeer.runtime.env_resolver import resolve_env_for_code
 from genomeer.model.feedback import FeedbackParser
+# ── AXE 3.3: Intelligent output parsers ──
+try:
+    from genomeer.tools.parsers import parse_tool_output as _smart_parse_output
+    _PARSERS_OK = True
+except ImportError:
+    _PARSERS_OK = False
+    def _smart_parse_output(tool, stdout, result=None, output_dir=None):
+        return stdout[:2000] if stdout else ""
+# ── AXE 2.1: Template Library ──
+try:
+    from genomeer.memory.template_library import TemplateLibrary as _TemplateLibrary
+    _TEMPLATE_LIB = _TemplateLibrary()
+    _TEMPLATE_OK = True
+except Exception:
+    _TEMPLATE_OK = False
+    _TEMPLATE_LIB = None
 
 # -----------------------------------------------
 # UTILS
@@ -59,6 +84,7 @@ class AgentState(TypedDict):
         "qa",
         "planner",
         "orchestrator",
+        "batch_orchestrator",
         "input_guard",
         "generator",
         "ensure_env",
@@ -83,6 +109,11 @@ class AgentState(TypedDict):
     diagnostic_mode: bool
     diagnostic_code: str | None
     diagnostic_observation: str | None
+    # ── Phase 2: multi-sample / batch support ──────────────────────────────
+    batch_mode: bool | None
+    sample_manifest: List[Dict[str, Any]] | None  # [{id, r1, r2, metadata}]
+    current_sample_idx: int | None
+    per_sample_results: Dict[str, Any] | None     # {sample_id: {step_results}}
     
     
     # ---------------------------------------------------------------------------
@@ -135,6 +166,54 @@ _HEAVY_STEPS = {
     "annotate": 3600,
     "prokka":   3600,
 }
+
+# ---------------------------------------------------------------------------
+# Phase 3: Adaptive retry escalation
+# When a step keeps failing, suggest a different strategy instead of retrying
+# the exact same approach. Format: {keyword_in_step_title: {retry_n: hint}}
+# ---------------------------------------------------------------------------
+RETRY_ESCALATION: Dict[str, Dict[int, str]] = {
+    "metaspades": {
+        2: "[ESCALATION] metaSPAdes failed twice. Try MEGAHIT (lower RAM): run_megahit() instead.",
+        3: "[ESCALATION] Both assemblers failed. Subsample reads to 20% and retry: seqtk sample -s 42 reads.fq 0.2",
+    },
+    "megahit": {
+        2: "[ESCALATION] MEGAHIT failed. Try with fewer threads (--num-cpu-threads 4) or more memory.",
+        3: "[ESCALATION] Assembly failed 3 times. Check read quality with FastQC before retrying.",
+    },
+    "kraken2": {
+        2: "[ESCALATION] Kraken2 classification very low. Try --confidence 0.05 or switch to MetaPhlAn4: run_metaphlan4().",
+        3: "[ESCALATION] Taxonomic classification failed. The database may be incompatible; try run_bracken() re-estimation on existing output.",
+    },
+    "metabat": {
+        2: "[ESCALATION] MetaBAT2 produced 0 bins. Increase min-contig to 2500bp and ensure coverage file is correct.",
+        3: "[ESCALATION] Binning failed repeatedly. Check coverage depth — must be >5X for reliable bins.",
+    },
+    "binning": {
+        2: "[ESCALATION] Binning failed. Verify that jgi_summarize_bam_contig_depths was run and produced a valid depth file.",
+        3: "[ESCALATION] Binning failed 3 times. Run DAS_Tool with existing bins from any previous partial runs.",
+    },
+    "checkm": {
+        2: "[ESCALATION] CheckM2 failed. Ensure the database was downloaded: checkm2 database --download.",
+        3: "[ESCALATION] Quality assessment failed. Try CheckM1 lineage_wf as fallback.",
+    },
+    "gtdbtk": {
+        2: "[ESCALATION] GTDB-Tk failed. Check GTDBTK_DATA_PATH env var; database may not be downloaded.",
+        3: "[ESCALATION] Taxonomy classification failed. Use NCBI lineage as fallback via run_ncbi_taxonomy().",
+    },
+    "humann": {
+        2: "[ESCALATION] HUMAnN3 failed. Try with --bypass-nucleotide-index and --metaphlan-options '--index latest'.",
+        3: "[ESCALATION] Functional profiling failed. Use KEGG annotation via run_diamond() + KEGG DB as fallback.",
+    },
+    "prokka": {
+        2: "[ESCALATION] Prokka annotation failed. Try --compliant flag or check if contigs have non-standard characters.",
+        3: "[ESCALATION] Prokka failed 3 times. Use Prodigal gene prediction as partial fallback: run_prodigal().",
+    },
+    "diamond": {
+        2: "[ESCALATION] DIAMOND failed. Try --more-sensitive flag or reduce --threads.",
+        3: "[ESCALATION] DIAMOND failed 3 times. Ensure database is compiled for this DIAMOND version: diamond makedb.",
+    },
+}
  
 def _adaptive_timeout(step_title: str, default: int = 600) -> int:
     """Return an appropriate timeout in seconds based on the step title."""
@@ -144,40 +223,9 @@ def _adaptive_timeout(step_title: str, default: int = 600) -> int:
             return max(timeout, default)
     return default
  
- 
-def resolve_env_for_code(
-    code: str,
-    lang: str | None,
-    env_hint: str | None,
-    current_env: str,
-) -> str:
-    """
-    Determine the correct micromamba environment for a code block.
- 
-    Priority order:
-      1. Explicit env="..." attribute in <EXECUTE> tag  → use as-is
-      2. Code mentions meta-env1 CLI tools             → return "meta-env1"
-      3. Code is #!R                                   → return "bio-agent-env1" (has Rscript)
-      4. Keep current_env                              → no change needed
-    """
-    # 1. LLM explicitly declared the env in the tag
-    if env_hint:
-        return env_hint
- 
-    # 2. Scan code for metagenomics tool usage
-    if code:
-        code_lower = code.lower()
-        for tool in _META_ENV_BINS:
-            if tool in code_lower:
-                return "meta-env1"
- 
-    # 3. R code always runs in bio-agent-env1
-    if lang == "R":
-        return "bio-agent-env1"
- 
-    # 4. No change needed
-    return current_env
-
+ # FIX G5: resolve_env_for_code is already imported from genomeer.runtime.env_resolver (line 46)
+ # The local re-definition below was silently masking that import — REMOVED.
+ # Use the canonical version from env_resolver.py going forward.
  
     
     
@@ -233,7 +281,7 @@ class BioAgent:
 
         # display configuration in a nice, readable format
         print("\n" + "=" * 50)
-        print("BioAgent_v1 CONFIGURATION")
+        print("BioAgent_v2 CONFIGURATION")
         print("=" * 50)
 
         # get the actual LLM values that will be used by the agent
@@ -641,6 +689,27 @@ class BioAgent:
             custom_data=custom_data if custom_data else None,
             custom_software=custom_software if custom_software else None,
         )
+
+        # ── Phase 1: Build FAISS semantic index (once, sub-ms per query after this) ──
+        if self.use_tool_retriever and hasattr(self, "retriever"):
+            # Build flat tool list from module2api for the retriever
+            all_tools = []
+            for module_path, api_list in self.module2api.items():
+                for entry in api_list:
+                    if isinstance(entry, dict):
+                        all_tools.append(entry)
+                    elif isinstance(entry, str):
+                        all_tools.append({"name": entry, "description": "", "module": module_path})
+            # Library list
+            all_libs = [
+                {"name": k, "description": v if isinstance(v, str) else str(v)}
+                for k, v in self.library_content_dict.items()
+            ]
+            try:
+                self.retriever.build_index(all_tools, data_lake_with_desc, all_libs)
+                self._log("FAISS INDEX", body=f"Built index: {len(all_tools)} tools, {len(data_lake_with_desc)} data items, {len(all_libs)} libs", node="configure")
+            except Exception as e:
+                self._log("FAISS INDEX (warn)", body=f"Index build failed (fallback to LLM): {e}", node="configure")
         
         
         # Define the nodes(functions)
@@ -667,6 +736,15 @@ class BioAgent:
                 self.system_prompt,
                 HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
             ]
+            # FIX G2a: Inject similar past pipelines from TemplateLibrary as few-shot examples
+            if _TEMPLATE_OK and _TEMPLATE_LIB:
+                try:
+                    template_hints = _TEMPLATE_LIB.format_for_planner(user_prompt, n=3)
+                    if template_hints:
+                        msgs.append(HumanMessage(content=template_hints))
+                        self._log("TEMPLATE HINTS", body=f"{_TEMPLATE_LIB.count()} templates available", node=node)
+                except Exception as _te:
+                    self._log("TEMPLATE HINTS (warn)", body=str(_te), node=node)
             
             # ------ Interactive mode ------
             if manifest.get("route_hint") == "await_user":
@@ -1149,8 +1227,23 @@ class BioAgent:
                         timeout=timeout
                     )
 
-                # bound size
-                if out and len(out) > 12000:
+                # ── AXE 3.3: Intelligent output parser instead of blind truncation ──
+                # FIX-2: retrieve step from state directly (step was undefined in this scope)
+                _current_plan = state.get("plan", [])
+                _current_idx  = state.get("current_idx", 0)
+                _step_obj     = _current_plan[_current_idx] if _current_plan and _current_idx < len(_current_plan) else {}
+                step_title    = _step_obj.get("title", "")
+                out_dir = state.get("run_temp_dir", "")
+                if _PARSERS_OK and out and len(out) > 2000:
+                    parsed = _smart_parse_output(
+                        step_title,
+                        out,
+                        result_dict=None,
+                        output_dir=out_dir,
+                    )
+                    if parsed and len(parsed) < len(out):
+                        out = parsed
+                elif out and len(out) > 12000:
                     out = out[:12000] + "\n...<truncated>"
                     
                 last_result = out or ""
@@ -1198,8 +1291,73 @@ class BioAgent:
                 HumanMessage(content=instructions.OBSERVER_PROMPT),
                 HumanMessage(content=payload),
             ]
-            
+
             self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nstep_title={step['title']}", node=node)
+
+            # ── Biological Quality Gate (GAP4 — multi-tool, FIX G10) ─────────────
+            import json as _json_qg
+            pending_code = (state.get("pending_code") or "").lower()
+            last_result_text = (state.get("last_result") or "")
+            quality_annotations = []
+            first_fail_msg: str | None = None
+
+            for tool_name in [
+                "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
+                "run_metaspades", "run_megahit", "run_flye",
+                "compute_coverage_samtools", "run_metabat2", "run_checkm2",
+                "run_bracken", "run_gtdbtk", "run_das_tool",
+            ]:
+                if tool_name not in pending_code:
+                    continue
+                # Try to extract result dict (nested JSON-aware)
+                result_dict = None
+                try:
+                    for _jm in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', last_result_text):
+                        try:
+                            result_dict = _json_qg.loads(_jm.group())
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                qa_level, qa_msg = check_quality(tool_name, result_dict, last_result_text)
+                quality_annotations.append(format_quality_message(qa_level, qa_msg))
+                self._log("QUALITY GATE", body=f"tool={tool_name} level={qa_level}\n{qa_msg}", node=node)
+                # FIX G10: collect ALL fails instead of breaking at first match
+                if qa_level == "fail" and first_fail_msg is None:
+                    first_fail_msg = qa_msg
+
+            quality_annotation = "\n".join(quality_annotations)
+
+            # Hard fail: any gate failure forces blocked immediately (skip LLM)
+            if first_fail_msg:
+                rc = dict(state.get("retry_counts") or {})
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest = dict(state["manifest"])
+                new_manifest["retry_count"] = rc[state["current_idx"]]
+                new_manifest["repair_feedback"] = first_fail_msg
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {**plan[state["current_idx"]], "status": "blocked", "notes": first_fail_msg}
+                next_step = "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator"
+                self._log("QUALITY GATE BLOCK", body=f"Forcing blocked: {first_fail_msg}", node=node)
+                return {
+                    "plan": plan,
+                    "current_idx": state["current_idx"],
+                    "next_step": next_step,
+                    "messages": [AIMessage(content=f"<observe>{quality_annotation}</observe>")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": False,
+                    "diagnostic_observation": False,
+                }
+            # ── End Quality Gate ─────────────────────────────────────────────────
+
+            # Prepend quality annotation to observer payload if we have one
+            if quality_annotation:
+                payload = f"{quality_annotation}\n\n{payload}"
+
             resp = self._llm_invoke(node, "observe_and_status", msgs)
                     
             status, summary = StateGraphHelper.parse_status(resp.content)
@@ -1211,10 +1369,27 @@ class BioAgent:
             diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
             if status == "blocked":
                 rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
-                new_manifest["retry_count"] = rc[state["current_idx"]]
-                new_manifest["repair_feedback"] = summary
+                current_retry = rc[state["current_idx"]]
+                new_manifest["retry_count"] = current_retry
                 new_manifest["repair_step_idx"] = state["current_idx"]
-                
+
+                # ── Phase 3: Adaptive escalation hint \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+                step_title_lower = step["title"].lower()
+                escalation_hint = ""
+                for keyword, hints in RETRY_ESCALATION.items():
+                    if keyword in step_title_lower:
+                        escalation_hint = hints.get(current_retry, "")
+                        if not escalation_hint and current_retry >= max(hints.keys()):
+                            escalation_hint = hints[max(hints.keys())]
+                        break
+                # Enrich repair_feedback with escalation hint if available
+                if escalation_hint:
+                    new_manifest["repair_feedback"] = f"{summary}\n\n{escalation_hint}"
+                    self._log("ESCALATION HINT", body=escalation_hint, node=node)
+                else:
+                    new_manifest["repair_feedback"] = summary
+                # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
                 # routing
                 if rc[state["current_idx"]] > self.MAX_STEP_RETRIES:
                     next_step = "diagnostics"
@@ -1222,10 +1397,11 @@ class BioAgent:
                 else:
                     next_step = "generator"
                     next_idx = state["current_idx"]
-                    
+
                 # logs
                 self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
                 self._log("EXIT NODE", body="next_step=input_guard (retry same step)", node=node)
+
             else:
                 new_manifest.pop("repair_feedback", None)
                 new_manifest.pop("repair_step_idx", None)
@@ -1381,6 +1557,23 @@ class BioAgent:
             ]
             resp = self._llm_invoke(node, "final_report", msgs)
             self._log("EXIT NODE", body="final report generated", node=node)
+
+            # FIX G2b: persist successful pipeline to TemplateLibrary for future few-shot reuse
+            if _TEMPLATE_OK and _TEMPLATE_LIB:
+                try:
+                    plan_steps = state.get("plan", [])
+                    all_done = plan_steps and all(s.get("status") == "done" for s in plan_steps)
+                    if all_done:
+                        tools_used = [obs.get("title", "") for obs in observations]
+                        _TEMPLATE_LIB.save(
+                            task_summary=(state.get("last_prompt") or "")[:200],
+                            steps=plan_steps,
+                            tools_used=tools_used,
+                        )
+                        self._log("TEMPLATE SAVED", body=f"Saved pipeline. Total templates: {_TEMPLATE_LIB.count()}", node=node)
+                except Exception as _te:
+                    self._log("TEMPLATE SAVE (warn)", body=str(_te), node=node)
+
             return {
                 "manifest": manifest,
                 "next_step": "end",
@@ -1494,7 +1687,23 @@ class BioAgent:
         # Compile the workflow
         # --------------------------------------------------------------------------------
         self.app = workflow.compile()
-        self.checkpointer = MemorySaver()
+
+        # ── AXE 2.3: SqliteSaver for cross-session persistence (fallback to MemorySaver) ──
+        if _SQLITE_OK:
+            try:
+                _sqlite_path = str(
+                    Path.home() / ".genomeer" / "checkpoints.db"
+                )
+                Path(_sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+                _conn = sqlite3.connect(_sqlite_path, check_same_thread=False)
+                self.checkpointer = SqliteSaver(_conn)
+                self._log("CHECKPOINTER", body=f"SqliteSaver → {_sqlite_path}", node="init")
+            except Exception as _e:
+                self.checkpointer = MemorySaver()
+                self._log("CHECKPOINTER", body=f"SqliteSaver failed ({_e}), fallback to MemorySaver", node="init")
+        else:
+            self.checkpointer = MemorySaver()
+            self._log("CHECKPOINTER", body="MemorySaver (install langgraph-checkpoint-sqlite for persistence)", node="init")
         self.app.checkpointer = self.checkpointer
 
 
@@ -1611,9 +1820,14 @@ class BioAgent:
             "libraries": library_descriptions,
         }
 
-        # Use prompt-based retrieval with the agent's LLM
-        selected_resources = self.retriever.prompt_based_retrieval(prompt, resources, llm=self.llm)
-        print("Using prompt-based retrieval with the agent's LLM")
+        # FIX G1: use FAISS semantic_retrieval (sub-ms, no tokens wasted)
+        # Falls back automatically to prompt_based_retrieval if index not built
+        if hasattr(self, "retriever") and self.retriever._index is not None:
+            step_query = prompt  # caller already combines user_goal + step title
+            selected_resources = self.retriever.semantic_retrieval(step_query, k=15)
+        else:
+            # Fallback: LLM-based retrieval (FAISS index not ready)
+            selected_resources = self.retriever.prompt_based_retrieval(prompt, resources, llm=self.llm)
 
         # Extract the names from the selected resources for the system prompt
         selected_resources_names = {
@@ -1893,6 +2107,37 @@ class BioAgent:
 
 
     # AGENT RUNNER
+    def _build_initial_state(self, prompt: str, staged: list, session_id: str | None, tmp: str) -> dict:
+        """
+        FIX-1: Single source of truth for the initial AgentState.
+        Eliminates the verbatim duplication between go() and go_stream().
+        """
+        import os as _os
+        return {
+            "messages": [HumanMessage(content=prompt)],
+            "next_step": None,
+            "env_name": "bio-agent-env1",
+            "env_ready": False,
+            "pending_code": None,
+            "manifest": {
+                "timeout_seconds": self.timeout_seconds,
+                "observations": [],
+                "attachments": staged,
+                "interaction_mode": getattr(self, "interaction_mode", "auto"),
+            },
+            "plan": [],
+            "current_idx": 0,
+            "last_prompt": None,
+            "last_result": None,
+            "missing": [],
+            "run_temp_dir": tmp,
+            "retry_counts": {},
+            "diagnostic_mode": False,
+            "diagnostic_code": None,
+            "diagnostic_observation": None,
+            "run_id": tmp.split(_os.sep)[-1],
+        }
+
     def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
         """Execute the agent with the given prompt.
         Args:
@@ -1938,7 +2183,7 @@ class BioAgent:
                     "diagnostic_mode": False,
                     "diagnostic_code": None,
                     "diagnostic_observation": None,
-                    "run_id": tmp.split('run')[1][1:],
+                    "run_id": tmp.split(os.sep)[-1],  # safe: last path component e.g. 'run-<uuid>'
                 }
             else:
                 # FOLLOW-UP TURN -> only append the new message and record any new attachments
@@ -2029,7 +2274,7 @@ class BioAgent:
                     "diagnostic_mode": False,
                     "diagnostic_code": None,
                     "diagnostic_observation": None,
-                    "run_id": tmp.split('run')[1][1:],
+                    "run_id": tmp.split(os.sep)[-1],  # safe: last path component e.g. 'run-<uuid>'
                 }
             else:
                 # FOLLOW-UP TURN -> only append the new message and record any new attachments

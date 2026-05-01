@@ -9,8 +9,10 @@ from contextlib import contextmanager
 #       storage) and generate download URLs. -- via artifact_servive helper
 # - [x] Clean up the temp dir
 # ------------------------------------------------------------------
- 
+
 BASE_TMP = os.environ.get("BIOAGENT_TMP_DIR", tempfile.gettempdir())
+# Set BIOAGENT_KEEP_RUNS=1 to preserve temp dirs for debugging
+KEEP_RUNS = os.environ.get("BIOAGENT_KEEP_RUNS", "0").strip() not in ("", "0", "false", "False")
 
 @contextmanager
 def run_workdir(prefix: str = "run", session_id: str | None = None):
@@ -28,6 +30,6 @@ def run_workdir(prefix: str = "run", session_id: str | None = None):
     try:
         yield path
     finally:
-        # DEBUG: keep it now for dev purpose
-        # _cleanup()
-        pass
+        if not KEEP_RUNS:
+            _cleanup()
+        # else: leave directory for debugging (set BIOAGENT_KEEP_RUNS=1)
