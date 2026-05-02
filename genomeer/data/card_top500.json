@@ -1,0 +1,95 @@
+{
+  "source_version": "CARD 2024 (built-in top list)",
+  "entries": [
+    {
+      "gene": "blaKPC",
+      "drug_class": "carbapenem",
+      "mechanism": "beta-lactamase",
+      "description": "KPC beta-lactamase hydrolyzes carbapenems. Common in Klebsiella pneumoniae. Clinical relevance: critical \u2014 associated with pan-drug-resistant infections."
+    },
+    {
+      "gene": "blaNDM",
+      "drug_class": "carbapenem",
+      "mechanism": "metallo-beta-lactamase",
+      "description": "NDM (New Delhi metallo-beta-lactamase) confers broad-spectrum carbapenem resistance. Encoded on mobile genetic elements. WHO critical priority pathogen marker."
+    },
+    {
+      "gene": "vanA",
+      "drug_class": "glycopeptide (vancomycin)",
+      "mechanism": "target alteration",
+      "description": "vanA mediates high-level vancomycin resistance by reprogramming peptidoglycan precursors (D-Ala-D-Lac). Found in Enterococcus faecium and faecalis. VRE clinical significance."
+    },
+    {
+      "gene": "mecA",
+      "drug_class": "methicillin/beta-lactam",
+      "mechanism": "target alteration",
+      "description": "mecA encodes PBP2a, a penicillin-binding protein with low affinity for beta-lactams. Marker of MRSA. Widespread in Staphylococcus aureus."
+    },
+    {
+      "gene": "blaCTX-M",
+      "drug_class": "extended-spectrum cephalosporins",
+      "mechanism": "beta-lactamase",
+      "description": "CTX-M ESBLs predominantly hydrolyze cefotaxime and ceftriaxone. Most prevalent ESBL worldwide. Common in E. coli from community and hospital environments."
+    },
+    {
+      "gene": "qnrS",
+      "drug_class": "fluoroquinolone",
+      "mechanism": "target protection",
+      "description": "qnrS encodes a pentapeptide repeat protein protecting DNA gyrase from quinolone inhibition. Plasmid-mediated quinolone resistance (PMQR). Horizontally transferable."
+    },
+    {
+      "gene": "aac(6')-Ib",
+      "drug_class": "aminoglycoside",
+      "mechanism": "enzymatic inactivation",
+      "description": "AAC(6')-Ib acetylates aminoglycosides (tobramycin, amikacin). Variant aac(6')-Ib-cr also inactivates fluoroquinolones \u2014 dual resistance marker."
+    },
+    {
+      "gene": "sul1",
+      "drug_class": "sulfonamide",
+      "mechanism": "target replacement",
+      "description": "sul1 encodes an alternative dihydropteroate synthase insensitive to sulfonamides. Associated with class 1 integrons. Indicator of anthropogenic contamination in environmental metagenomes."
+    },
+    {
+      "gene": "tetM",
+      "drug_class": "tetracycline",
+      "mechanism": "ribosomal protection",
+      "description": "TetM protects ribosomes from tetracycline binding. Carried on Tn916 transposon. Widely distributed across gram-positive and gram-negative bacteria."
+    },
+    {
+      "gene": "blaOXA-48",
+      "drug_class": "carbapenem",
+      "mechanism": "beta-lactamase",
+      "description": "OXA-48 is a class D carbapenemase with weak but clinically significant carbapenem-hydrolyzing activity. Endemic in Mediterranean and Middle Eastern hospitals. Often missed by phenotypic testing."
+    },
+    {
+      "gene": "mcr-1",
+      "drug_class": "colistin (last resort)",
+      "mechanism": "target modification",
+      "description": "mcr-1 phosphoethanolamine transferase modifies LPS, reducing colistin binding. First plasmid-mediated colistin resistance gene. Public health emergency \u2014 colistin is last-resort antibiotic."
+    },
+    {
+      "gene": "ermB",
+      "drug_class": "macrolide-lincosamide-streptogramin B (MLSB)",
+      "mechanism": "rRNA methylation",
+      "description": "ErmB methylates 23S rRNA, conferring MLSB resistance. Common in streptococci and enterococci. Associated with mobile genetic elements in gut microbiome."
+    },
+    {
+      "gene": "blaSHV",
+      "drug_class": "penicillins and cephalosporins",
+      "mechanism": "beta-lactamase",
+      "description": "SHV (sulfhydryl variable) beta-lactamases. SHV-1 encodes penicillinase; ESBL variants (SHV-5, SHV-12) extend spectrum to cephalosporins. Chromosomal in Klebsiella pneumoniae."
+    },
+    {
+      "gene": "aph(3')-Ia",
+      "drug_class": "kanamycin/aminoglycoside",
+      "mechanism": "phosphotransferase",
+      "description": "APH(3')-Ia phosphorylates aminoglycosides at 3'-OH, inactivating kanamycin and neomycin. Common in integrons and transposons. Useful marker of HGT in environmental samples."
+    },
+    {
+      "gene": "cfr",
+      "drug_class": "phenicols, lincosamides, oxazolidinones",
+      "mechanism": "rRNA methylation",
+      "description": "Cfr methylates 23S rRNA at A2503 conferring multidrug resistance including linezolid (PhLOPSA phenotype). Clinical concern in MRSA and VRE contexts."
+    }
+  ]
+}

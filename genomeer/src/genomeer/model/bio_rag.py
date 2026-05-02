@@ -74,7 +74,9 @@ class BioDocument:
     def to_context_snippet(self) -> str:
         """Format pour injection dans un prompt LLM."""
         src = self.metadata.get("url") or self.source
-        return f"[{self.source.upper()} — {self.category}] {self.text}\n(Source: {src})"
+        version = self.metadata.get("source_version")
+        version_str = f" v{version}" if version else ""
+        return f"[{self.source.upper()}{version_str} — {self.category}] {self.text}\n(Source: {src})"
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +471,44 @@ class BioRAGStore:
         self._embedder = None
         self._ready = False
 
+    def _load_static_bundles(self, sources: List[str]) -> List[BioDocument]:
+        import json
+        import os
+        docs = []
+        base_dir = Path(os.path.dirname(os.path.abspath(__file__))).parent.parent.parent / "data"
+        
+        if "card" in sources:
+            card_path = base_dir / "card_top500.json"
+            if card_path.exists():
+                with open(card_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    version = data.get("source_version", "CARD")
+                    for entry in data.get("entries", []):
+                        gene = entry.get("gene", "Unknown")
+                        doc_id = f"card_{gene.lower().replace(' ', '_')}"
+                        text = f"AMR gene: {gene} | Drug class: {entry.get('drug_class','')} | Mechanism: {entry.get('mechanism','')}. {entry.get('description','')}"
+                        docs.append(BioDocument(
+                            doc_id=doc_id, text=text, source="card", category="amr",
+                            metadata={"gene": gene, "drug_class": entry.get("drug_class"), "source_version": version}
+                        ))
+                        
+        if "kegg_pathways" in sources:
+            kegg_path = base_dir / "kegg_core_pathways.json"
+            if kegg_path.exists():
+                with open(kegg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    version = data.get("source_version", "KEGG")
+                    for entry in data.get("entries", []):
+                        pid = entry.get("pathway_id", "Unknown")
+                        doc_id = f"kegg_{pid}"
+                        text = f"KEGG Pathway {pid}: {entry.get('name','')}. {entry.get('description','')}"
+                        docs.append(BioDocument(
+                            doc_id=doc_id, text=text, source="kegg", category="pathway",
+                            metadata={"pathway_id": pid, "name": entry.get("name"), "source_version": version}
+                        ))
+                        
+        return docs
+
     def build(
         self,
         sources: Optional[List[str]] = None,
@@ -501,14 +541,25 @@ class BioRAGStore:
         
         is_offline = os.environ.get("GENOMEER_RAG_OFFLINE", "0") == "1"
 
+        # P4-C.3: Load static bundles as primary source
+        static_docs = self._load_static_bundles(sources)
+        static_ids = {d.doc_id for d in static_docs}
+        all_docs.extend(static_docs)
+        if static_docs:
+            logger.info(f"[BioRAG] Loaded {len(static_docs)} documents from static JSON bundles.")
+
         if "card" in sources:
-            all_docs.extend(_CARDFetcher.fetch())
+            fetched = _CARDFetcher.fetch()
+            all_docs.extend([d for d in fetched if d.doc_id not in static_ids])
         if "kegg_pathways" in sources and not is_offline:
-            all_docs.extend(_KEGGFetcher.fetch())
+            fetched = _KEGGFetcher.fetch()
+            all_docs.extend([d for d in fetched if d.doc_id not in static_ids])
         if "quality_thresholds" in sources:
-            all_docs.extend(_QualityThresholdsFetcher.fetch())
+            fetched = _QualityThresholdsFetcher.fetch()
+            all_docs.extend([d for d in fetched if d.doc_id not in static_ids])
         if "pubmed" in sources and not is_offline:
-            all_docs.extend(_PubMedFetcher.fetch())
+            fetched = _PubMedFetcher.fetch()
+            all_docs.extend([d for d in fetched if d.doc_id not in static_ids])
 
         if not all_docs:
             logger.warning("[BioRAG] No documents loaded — RAG store is empty")

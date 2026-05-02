@@ -1,0 +1,190 @@
+{
+  "source_version": "KEGG 2024-Q4 (priority pathways)",
+  "entries": [
+    {
+      "pathway_id": "ko00010",
+      "name": "Glycolysis / Gluconeogenesis",
+      "description": "Central carbon metabolism. High abundance in active microbial communities."
+    },
+    {
+      "pathway_id": "ko00020",
+      "name": "Citrate cycle (TCA cycle)",
+      "description": "Energy metabolism core pathway. Indicator of aerobic metabolism."
+    },
+    {
+      "pathway_id": "ko00030",
+      "name": "Pentose phosphate pathway",
+      "description": "Biosynthesis of nucleotides and NADPH. Important in stress response."
+    },
+    {
+      "pathway_id": "ko00190",
+      "name": "Oxidative phosphorylation",
+      "description": "Electron transport chain. Presence indicates aerobic respiration capacity."
+    },
+    {
+      "pathway_id": "ko00195",
+      "name": "Photosynthesis",
+      "description": "Carbon fixation via photosystems. Marker of phototrophic organisms in environmental samples."
+    },
+    {
+      "pathway_id": "ko00230",
+      "name": "Purine metabolism",
+      "description": "Nucleotide biosynthesis. Ubiquitous in active microbial communities."
+    },
+    {
+      "pathway_id": "ko00240",
+      "name": "Pyrimidine metabolism",
+      "description": "Nucleotide biosynthesis. Relevant for activity metrics."
+    },
+    {
+      "pathway_id": "ko00250",
+      "name": "Alanine, aspartate and glutamate metabolism",
+      "description": "Amino acid synthesis. Links carbon and nitrogen metabolism."
+    },
+    {
+      "pathway_id": "ko00260",
+      "name": "Glycine, serine and threonine metabolism",
+      "description": "One-carbon metabolism. Important in methanogens and soil bacteria."
+    },
+    {
+      "pathway_id": "ko00270",
+      "name": "Cysteine and methionine metabolism",
+      "description": "Sulfur amino acid metabolism. Relevant for sulfur cycling metagenomes."
+    },
+    {
+      "pathway_id": "ko00310",
+      "name": "Lysine biosynthesis",
+      "description": "Essential amino acid production. Marker of auxotrophic interactions."
+    },
+    {
+      "pathway_id": "ko00360",
+      "name": "Phenylalanine metabolism",
+      "description": "Aromatic compound degradation. Relevant in soil and wastewater metagenomes."
+    },
+    {
+      "pathway_id": "ko00500",
+      "name": "Starch and sucrose metabolism",
+      "description": "Polysaccharide degradation. Important in gut and soil microbiomes."
+    },
+    {
+      "pathway_id": "ko00520",
+      "name": "Amino sugar and nucleotide sugar metabolism",
+      "description": "Cell wall biosynthesis. Relevant for peptidoglycan production."
+    },
+    {
+      "pathway_id": "ko00540",
+      "name": "Lipopolysaccharide biosynthesis",
+      "description": "LPS production in gram-negative bacteria. Endotoxin precursor biosynthesis."
+    },
+    {
+      "pathway_id": "ko00550",
+      "name": "Peptidoglycan biosynthesis",
+      "description": "Cell wall synthesis. Target for beta-lactam antibiotics."
+    },
+    {
+      "pathway_id": "ko00620",
+      "name": "Pyruvate metabolism",
+      "description": "Central metabolic hub connecting glycolysis and TCA."
+    },
+    {
+      "pathway_id": "ko00630",
+      "name": "Glyoxylate and dicarboxylate metabolism",
+      "description": "Important in methylotrophic and lithoautotrophic bacteria."
+    },
+    {
+      "pathway_id": "ko00650",
+      "name": "Butanoate metabolism",
+      "description": "Short-chain fatty acid production. Key pathway in gut microbiome health."
+    },
+    {
+      "pathway_id": "ko00660",
+      "name": "C5-Branched dibasic acid metabolism",
+      "description": "Branched fatty acid metabolism. Important in Bacillus and Clostridium."
+    },
+    {
+      "pathway_id": "ko00670",
+      "name": "One carbon pool by folate",
+      "description": "Methyl group transfer. Linked to methanogenesis and acetogenesis."
+    },
+    {
+      "pathway_id": "ko00680",
+      "name": "Methane metabolism",
+      "description": "Methanogenesis and methane oxidation. Key in anaerobic environments."
+    },
+    {
+      "pathway_id": "ko00710",
+      "name": "Carbon fixation in photosynthetic organisms",
+      "description": "Autotrophic carbon fixation. Key in marine and soil metagenomes."
+    },
+    {
+      "pathway_id": "ko00720",
+      "name": "Carbon fixation pathways in prokaryotes",
+      "description": "Diverse CO2 fixation strategies (CBB, rTCA, WL). Chemolithoautotrophy marker."
+    },
+    {
+      "pathway_id": "ko00730",
+      "name": "Thiamine metabolism",
+      "description": "Vitamin B1 biosynthesis. Relevant for cross-feeding interactions."
+    },
+    {
+      "pathway_id": "ko00740",
+      "name": "Riboflavin metabolism",
+      "description": "Vitamin B2. Important for electron transfer chains."
+    },
+    {
+      "pathway_id": "ko00760",
+      "name": "Nicotinate and nicotinamide metabolism",
+      "description": "NAD+ biosynthesis. Energy metabolism."
+    },
+    {
+      "pathway_id": "ko00780",
+      "name": "Biotin metabolism",
+      "description": "Fatty acid synthesis cofactor. Marker of community-level complementarity."
+    },
+    {
+      "pathway_id": "ko00900",
+      "name": "Terpenoid backbone biosynthesis",
+      "description": "Isoprenoid production. Relevant in archaea and specialized bacteria."
+    },
+    {
+      "pathway_id": "ko00910",
+      "name": "Nitrogen metabolism",
+      "description": "Nitrification, denitrification, nitrogen fixation. Key in nitrogen cycling metagenomes."
+    },
+    {
+      "pathway_id": "ko00920",
+      "name": "Sulfur metabolism",
+      "description": "Sulfur oxidation and reduction. Key in hydrothermal, marine, and soil environments."
+    },
+    {
+      "pathway_id": "ko00930",
+      "name": "Caprolactam degradation",
+      "description": "Xenobiotic degradation. Pollution remediation marker."
+    },
+    {
+      "pathway_id": "ko01200",
+      "name": "Carbon metabolism",
+      "description": "Integrated carbon metabolism overview. Most comprehensive functional summary."
+    },
+    {
+      "pathway_id": "ko02010",
+      "name": "ABC transporters",
+      "description": "Nutrient uptake systems. Reflects substrate availability and community nutrition."
+    },
+    {
+      "pathway_id": "ko02020",
+      "name": "Two-component system",
+      "description": "Signal transduction. Environmental sensing capability."
+    },
+    {
+      "pathway_id": "ko02024",
+      "name": "Quorum sensing",
+      "description": "Cell density-dependent gene regulation. Community-level coordination."
+    },
+    {
+      "pathway_id": "ko02030",
+      "name": "Bacterial chemotaxis",
+      "description": "Motility and environmental response. Active community indicator."
+    }
+  ]
+}

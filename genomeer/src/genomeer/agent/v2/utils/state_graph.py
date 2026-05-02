@@ -31,12 +31,19 @@ class StateGraphHelper:
         m = StateGraphHelper.RX_NEXT.search(text or "")
         route = m.group(1).upper() if m else "ORCHESTRATOR"
         steps = []
+        phase_rx = re.compile(r"\(phase:\s*(\d+)\)", re.I)
         for line in (text or "").splitlines():
             line = line.strip()
             if line.startswith("- [ ]"):
                 title = line[5:].strip()
                 if title:
-                    steps.append({"title": title, "status": "todo", "notes": ""})
+                    phase = None
+                    pm = phase_rx.search(title)
+                    if pm:
+                        phase = int(pm.group(1))
+                        # Optionally remove the phase marker from the title to keep it clean
+                        title = phase_rx.sub("", title).strip()
+                    steps.append({"title": title, "status": "todo", "notes": "", "phase": phase})
         return steps, ("qa" if route == "QA" else "orchestrator")
 
     @staticmethod

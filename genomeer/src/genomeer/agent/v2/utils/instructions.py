@@ -35,6 +35,12 @@ STANDARD PIPELINE:
   Binning (MetaBAT2 → DAS_Tool) → Quality check (CheckM2) → Annotation (Prokka/Prodigal) →
   Taxonomy (Kraken2 → Bracken OR MetaPhlAn4) → Functional (HUMAnN3/DIAMOND) → Stats/Viz
 
+MULTI-SAMPLE BATCH MODE (batch_strategy == "coassembly"):
+  When running in co-assembly mode, the plan MUST be split into two phases:
+  - Phase 1 (Joint Processing): QC for all samples, Co-assembly combining all samples (e.g. MEGAHIT -1 R1_s1,R1_s2 -2 R2_s1,R2_s2), Mapping each sample individually back to the co-assembly (producing separate BAMs), and Co-abundance binning using depth profiles from all BAMs together.
+  - Phase 2 (Per-sample/Per-MAG Analysis): Quality check, Annotation, Taxonomy, and Functional profiling on the resulting MAGs/bins.
+  Make sure to assign phase: 1 or phase: 2 to each step appropriately.
+
 TOOL SELECTION RULES:
   Input validation (ALWAYS run before any pipeline):
     - For any FASTQ input: verify the file exists, is non-empty, and has valid FASTQ format.
@@ -195,16 +201,23 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     QC → Assembly → Mapping → Binning → CheckM2 → Annotation → Taxonomy → Stats
 
 # Standard pipeline templates (adapt as needed):
-  Full shotgun metagenomics:
-    - [ ] Run fastp for QC on input reads
-    - [ ] Run metaSPAdes (or MEGAHIT) for de-novo assembly
-    - [ ] Map reads to assembly with minimap2, sort/index BAM
-    - [ ] Compute coverage with samtools
-    - [ ] Run MetaBAT2 for binning
-    - [ ] Run CheckM2 to assess bin quality
-    - [ ] Run Prokka for gene annotation
-    - [ ] Run Kraken2 + Bracken for taxonomic profiling
-    - [ ] Generate MultiQC report and diversity stats
+  Full shotgun metagenomics (independent):
+    - [ ] Run fastp for QC on input reads (phase: 1)
+    - [ ] Run metaSPAdes (or MEGAHIT) for de-novo assembly (phase: 1)
+    - [ ] Map reads to assembly with minimap2, sort/index BAM (phase: 1)
+    - [ ] Compute coverage with samtools (phase: 1)
+    - [ ] Run MetaBAT2 for binning (phase: 1)
+    - [ ] Run CheckM2 to assess bin quality (phase: 2)
+    - [ ] Run Prokka for gene annotation (phase: 2)
+    - [ ] Run Kraken2 + Bracken for taxonomic profiling (phase: 2)
+    - [ ] Generate MultiQC report and diversity stats (phase: 2)
+
+  Multi-sample Co-assembly (batch_strategy == "coassembly"):
+    - [ ] Run fastp for QC on ALL samples (phase: 1)
+    - [ ] Run MEGAHIT for co-assembly of ALL samples (phase: 1)
+    - [ ] Map EACH sample individually to the co-assembly to produce separate BAMs (phase: 1)
+    - [ ] Run MetaBAT2 using depth from ALL BAMs for co-abundance binning (phase: 1)
+    - [ ] Run CheckM2, Prokka, GTDB-Tk on the resulting MAGs (phase: 2)
 
   Taxonomy only:
     - [ ] Run fastp for QC

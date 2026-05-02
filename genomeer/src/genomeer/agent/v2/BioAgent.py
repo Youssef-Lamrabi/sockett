@@ -85,6 +85,7 @@ class Step(TypedDict):
     title: str
     status: Literal["todo","done","blocked"]
     notes: str
+    phase: int | None
     
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages] # List[BaseMessage]
@@ -119,6 +120,7 @@ class AgentState(TypedDict):
     diagnostic_observation: str | None
     # ── Phase 2: multi-sample / batch support ──────────────────────────────
     batch_mode: bool | None
+    batch_strategy: Literal["independent", "coassembly"] | None
     sample_manifest: List[Dict[str, Any]] | None  # [{id, r1, r2, metadata}]
     current_sample_idx: int | None
     per_sample_results: Dict[str, Any] | None     # {sample_id: {step_results}}
@@ -942,9 +944,10 @@ class BioAgent:
             # -----------------------------
                 
             user_prompt = state["messages"][-1].content
+            batch_strategy = state.get("batch_strategy", "independent")
             msgs = [
                 self.system_prompt,
-                HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
+                HumanMessage(content=f"CURRENT BATCH STRATEGY: {batch_strategy}\n\n" + instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
             ]
             # FIX G2a: Inject similar past pipelines from TemplateLibrary as few-shot examples
             if _TEMPLATE_OK and _TEMPLATE_LIB:
@@ -1162,11 +1165,22 @@ class BioAgent:
                         manifest.pop("amr_genes_detected", None)
                         manifest.pop("observations", None)
                         
-                        new_plan = [{**p, "status": "todo", "notes": ""} for p in plan]
+                        # --- P4-B.3: Co-assembly Phase 1/Phase 2 transition ---
+                        restart_idx = 0
+                        if state.get("batch_strategy") == "coassembly":
+                            for i, p in enumerate(plan):
+                                if p.get("phase") == 2:
+                                    restart_idx = i
+                                    break
+                                    
+                        new_plan = list(plan)
+                        for i in range(restart_idx, len(plan)):
+                            new_plan[i] = {**new_plan[i], "status": "todo", "notes": ""}
+                        # --------------------------------------------------------
                         
                         self._log("BATCH MODE", body=f"Sample {sample_id} done. Advancing to sample {curr_sample_idx + 1}", node=node)
                         return {
-                            "current_idx": 0,
+                            "current_idx": restart_idx,
                             "current_sample_idx": curr_sample_idx + 1,
                             "per_sample_results": per_sample,
                             "manifest": manifest,
@@ -2783,6 +2797,7 @@ class BioAgent:
             "run_id": tmp.split(_os.sep)[-1],
             "run_started_at": time.time(),    # T6.3: global elapsed time guard
             "batch_mode": None,
+            "batch_strategy": "independent",
             "sample_manifest": None,
             "current_sample_idx": None,
             "per_sample_results": None,
