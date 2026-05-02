@@ -86,6 +86,23 @@ data_lake_dict = {
     #     "UniRef90 DIAMOND database for protein annotation. "
     #     "Use as db_path in run_diamond(mode='blastp')."
     # ),
+
+    # --- Viromics ---
+    "virsorter2": (
+        "[CLI · meta-env1] VirSorter2 — discover viral contigs from metagenomic assemblies. "
+        "Use run_virsorter2() Python wrapper. "
+        "Direct: virsorter run -w vs2_out -i contigs.fa --min-length 1500 -j 4 all"
+    ),
+    "checkv": (
+        "[CLI · meta-env1] CheckV — assess quality and completeness of viral contigs. "
+        "Use run_checkv() Python wrapper. "
+        "Direct: checkv end_to_end viral_contigs.fa checkv_out -t 4"
+    ),
+    "deepvirfinder": (
+        "[CLI · meta-env1] DeepVirFinder — predict viral sequences using deep learning. "
+        "Use run_deepvirfinder() Python wrapper. "
+        "Direct: python dvf.py -i contigs.fa -o dvf_out -c 4"
+    ),
 }
 
 
@@ -294,6 +311,23 @@ library_content_dict = {
         "Detects AMR genes in contigs or proteins. Use run_rgi_card() Python wrapper. "
         "Direct: rgi main -i contigs.fa -o rgi_output -t contig -a BLAST -n 4 --clean"
     ),
+
+    # --- Viromics ---
+    "virsorter2": (
+        "[CLI · meta-env1] VirSorter2 — discover viral contigs from metagenomic assemblies. "
+        "Use run_virsorter2() Python wrapper. "
+        "Direct: virsorter run -w vs2_out -i contigs.fa --min-length 1500 -j 4 all"
+    ),
+    "checkv": (
+        "[CLI · meta-env1] CheckV — assess quality and completeness of viral contigs. "
+        "Use run_checkv() Python wrapper. "
+        "Direct: checkv end_to_end viral_contigs.fa checkv_out -t 4"
+    ),
+    "deepvirfinder": (
+        "[CLI · meta-env1] DeepVirFinder — predict viral sequences using deep learning. "
+        "Use run_deepvirfinder() Python wrapper. "
+        "Direct: python dvf.py -i contigs.fa -o dvf_out -c 4"
+    ),
 }
 
 
@@ -318,7 +352,8 @@ runtime_envs_dicts = {
         "Kraken2, Bracken, MetaPhlAn4, GTDB-Tk, Krona (taxonomy), "
         "MetaBAT2, DAS_Tool, CheckM2 (binning), "
         "Prokka, Prodigal, DIAMOND, HMMER, HUMAnN3 (annotation), "
-        "AMRFinderPlus, RGI/CARD (AMR detection). "
+        "AMRFinderPlus, RGI/CARD (AMR detection), "
+        "VirSorter2, CheckV, DeepVirFinder (viromics). "
         "USE THIS ENVIRONMENT for any metagenomics pipeline step involving these tools. "
         "In code blocks: use #!BASH or #!CLI, or in #!PY call the wrapper functions from "
         "genomeer.tools.function.metagenomics"

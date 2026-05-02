@@ -15,6 +15,10 @@ from langgraph.graph import END, START, StateGraph
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage 
 from langgraph.checkpoint.memory import MemorySaver
 
+import hashlib
+import json as _json_cache
+from genomeer.utils.metrics import RunMetrics
+
 
 from genomeer.agent.v2.utils.cache import get_cache
 
@@ -22,6 +26,15 @@ from genomeer.agent.v2.utils.structured_output import RobustLLMParser, patch_sta
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
 patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalement
 _robust_parser = RobustLLMParser(strict_validation=True)
+
+
+# Nœuds pour lesquels le cache LLM est désactivé
+_NOCACHE_LLM_NODES = frozenset({
+    "planner",      # Plan dépend du contexte courant et des fichiers présents
+    "observer",     # Observation dépend du résultat réel de l'exécution
+    "finalizer",    # Rapport final dépend de TOUS les résultats du run
+    "orchestrator", # Routing dépend de l'état courant du plan
+})
 
 # ── AXE 2.3: SqliteSaver for cross-session persistence ──
 try:
@@ -462,7 +475,7 @@ class BioAgent:
                 if '<observe>' in m.content:
                     lower_content = m.content.lower()
                     if any(kw in lower_content for kw in ('n50', 'q30', 'contig', 'classified', 'genes', 'quality', 'metric', 'rate', 'reads')):
-                        important_older_ids.add(getattr(m, 'id', None))
+                        important_older_ids.add(getattr(m, 'id', None) or str(id(m)))
         
         try:
             from langchain_core.messages import RemoveMessage
@@ -472,6 +485,12 @@ class BioAgent:
         to_remove = []
         for m in older_msgs:
             m_id = getattr(m, 'id', None)
+            if not m_id:
+                # LangGraph usually assigns an ID. If missing, we use Python's id() as fallback.
+                # However, RemoveMessage might fail to match if the state doesn't track this ID.
+                self._log("TRIM MESSAGES", body=f"Warning: Message of type {getattr(m, 'type', 'unknown')} has no ID. Using id(m) fallback.", node="system")
+                m_id = str(id(m))
+                
             if m_id and m_id not in important_older_ids:
                 to_remove.append(RemoveMessage(id=m_id))
                 
@@ -524,16 +543,23 @@ class BioAgent:
         Cache skipped for: planner, orchestrator, finalizer (non-deterministic nodes).
         """
         # ── Cache lookup ────────────────────────────────────────────────────
+        _cache_eligible = node not in _NOCACHE_LLM_NODES
+        
         sys_msg  = next((getattr(m, "content", "") for m in msgs if getattr(m, "type", "") == "system"), "")
         user_msg = next((getattr(m, "content", "") for m in reversed(msgs) if getattr(m, "type", "") == "human"), "")
         model_name = str(getattr(self.llm, "model_name", self.llm.__class__.__name__))
         cache_key = self._cache.llm.make_key(model_name, sys_msg, user_msg)
  
-        cached = self._cache.llm.get(cache_key, node=node)
-        if cached:
-            self._log(f"LLM CACHE HIT ({purpose})", cached[:200], node=node)
-            from langchain_core.messages import AIMessage as _AIMsg
-            return _AIMsg(content=cached)
+        if _cache_eligible:
+            cached = self._cache.llm.get(cache_key, node=node)
+            if cached:
+                self._log(f"LLM CACHE HIT ({purpose})", cached[:200], node=node)
+                from langchain_core.messages import AIMessage as _AIMsg
+                if hasattr(self, "_run_metrics") and self._run_metrics:
+                    self._run_metrics.record_llm_call(cache_hit=True)
+                return _AIMsg(content=cached)
+        else:
+            self._log(f"LLM CACHE SKIP ({purpose})", body=f"node={node} is non-deterministic", node=node)
         # ── End cache lookup ────────────────────────────────────────────────
  
         if verbose:
@@ -547,8 +573,12 @@ class BioAgent:
             self._log(f"LLM RESPONSE ({purpose})", content, node=node)
  
         # ── Cache save (skips planner/orchestrator/finalizer automatiquement) ──
-        self._cache.llm.set(cache_key, content, model=model_name, node=node)
+        if _cache_eligible:
+            self._cache.llm.set(cache_key, content, model=model_name, node=node)
  
+        if hasattr(self, "_run_metrics") and self._run_metrics:
+            self._run_metrics.record_llm_call(cache_hit=False)
+
         return resp
     
     def _route_blocked_step(self, state, rc, diag_rounds, summary, step, new_manifest, node="observer"):
@@ -1034,6 +1064,36 @@ class BioAgent:
                 self._log("HITL: skip planner pause for QA", body=f"route={route}, steps={len(steps)}", node=node)
                 return updates
 
+
+            # --- FIX 5: Sauvegarde du Checkpoint ---
+            if status == "done":
+                from genomeer.utils.checkpoint import CheckpointManager
+                cp = CheckpointManager(state.get("run_temp_dir", ""), str(state.get("run_id", "unknown")))
+                # Fusionner l'état courant avec les updates pour avoir l'état complet
+                full_state = {**state, **updates}
+                cp.save(full_state, state["current_idx"])
+            
+            # --- FIX 8: Version Tracker ---
+            from genomeer.utils.version_tracker import VersionTracker
+            tracker = VersionTracker()
+            tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
+            
+            if "version_tracker" not in new_manifest:
+                new_manifest["version_tracker"] = tracker
+            else:
+                new_manifest["version_tracker"].tools.extend(tracker.tools)
+                new_manifest["version_tracker"].databases.extend(tracker.databases)
+
+            # --- FIX 9: Métriques ---
+            if hasattr(self, "_metrics") and self._metrics:
+                self._metrics.record_step_end(
+                    step_idx=state["current_idx"],
+                    step_title=step["title"],
+                    status=status,
+                    tool_name=step["title"], # or pending code tool
+                    quality_level="fail" if status == "blocked" else "ok"
+                )
+
             # ------ feedback replay mode check ------
             pause = self._maybe_pause(
                 state,
@@ -1206,15 +1266,19 @@ class BioAgent:
             
             if not has_env(env_name):
                 self._log("BATCH ENV", body=f"Pre-installing environment '{env_name}' before launching parallel threads...", node=node)
-                create_or_update_env(env_name)
+                try:
+                    create_or_update_env(env_name)
+                except Exception as e:
+                    self._log("BATCH ENV ERROR", body=f"Failed to install {env_name}: {e}", node=node)
+                    return {"next_step": "finalizer", "messages": [AIMessage(content=f"<observe>Fatal error: Failed to prepare environment {env_name}. Error: {e}</observe>")]}
                 
-            # Bug 1 Fix: pre-warm version cache for common tools
+            # Bug 1 Fix: pre-warm version cache for common tools in a background thread
             tools_to_cache = [
                 "fastp", "fastqc", "kraken2", "metaphlan4", "metaspades", "megahit", 
                 "flye", "bowtie2", "samtools", "metabat2", "checkm2", "bracken", 
                 "gtdbtk", "das_tool", "prokka", "diamond", "hmmer", "humann3"
             ]
-            preload_tool_versions(env_name, tools_to_cache)
+            threading.Thread(target=preload_tool_versions, args=(env_name, tools_to_cache), daemon=True, name="tool-version-preloader").start()
                 
             # P4-D.2: Semaphore for concurrency control
             concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
@@ -1542,6 +1606,36 @@ class BioAgent:
             # MAYBE: return to observer from here if no code;
             self._log("GENERATED CODE", body=code or "<empty>", node=node)
             
+
+            # --- FIX 5: Sauvegarde du Checkpoint ---
+            if status == "done":
+                from genomeer.utils.checkpoint import CheckpointManager
+                cp = CheckpointManager(state.get("run_temp_dir", ""), str(state.get("run_id", "unknown")))
+                # Fusionner l'état courant avec les updates pour avoir l'état complet
+                full_state = {**state, **updates}
+                cp.save(full_state, state["current_idx"])
+            
+            # --- FIX 8: Version Tracker ---
+            from genomeer.utils.version_tracker import VersionTracker
+            tracker = VersionTracker()
+            tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
+            
+            if "version_tracker" not in new_manifest:
+                new_manifest["version_tracker"] = tracker
+            else:
+                new_manifest["version_tracker"].tools.extend(tracker.tools)
+                new_manifest["version_tracker"].databases.extend(tracker.databases)
+
+            # --- FIX 9: Métriques ---
+            if hasattr(self, "_metrics") and self._metrics:
+                self._metrics.record_step_end(
+                    step_idx=state["current_idx"],
+                    step_title=step["title"],
+                    status=status,
+                    tool_name=step["title"], # or pending code tool
+                    quality_level="fail" if status == "blocked" else "ok"
+                )
+
             # ------ feedback replay mode check ------
             pause = self._maybe_pause(
                 state,
@@ -1677,6 +1771,9 @@ class BioAgent:
             
             last_result = ""
 
+            if hasattr(self, "_metrics") and self._metrics:
+                self._metrics.record_step_start(state.get("current_idx", 0), step_title)
+
             self._log("ENTER NODE", body=f"env={env}\ntimeout={timeout}s\nRUN_TEMP_DIR={_run_temp_dir}\ncode_preview=\n{code[:500] or '<no code>'}", node=node)
 
             if not code or (diagnostic_mode and not diagnostic_code):
@@ -1691,65 +1788,43 @@ class BioAgent:
             if diagnostic_mode:
                 code = diagnostic_code
                 
-            # ── TOOL CACHE — skip execution si déjà fait sur les mêmes fichiers ──
-            import re as _re
-            _tool_match = _re.search(r'(run_\w+|fastp|kraken2|metaspades|megahit|flye|minimap2|checkm2|metabat2|prokka|diamond|hmmer|humann|amrfinder)\b', code or '')
-            _tool_name  = _tool_match.group(1) if _tool_match else "generic"
-
-            
-            # P2-A.2: Get actual tool version from micromamba environment
-            from genomeer.utils.helper import get_tool_version
-            _real_tool_name = _tool_name.replace("run_", "") if _tool_name.startswith("run_") else _tool_name
-            _tool_version = get_tool_version(_real_tool_name, env)
-            
-            # P2-A.3: Include DB modification time for DB-dependent tools
-            _db_hash = ""
-            if _real_tool_name in ("kraken2", "checkm2", "gtdbtk", "humann", "metaphlan4"):
-                _db_match = _re.search(r'(?:--db|-d|--database|--bowtie2db)\s+(?:["\']?)(/[^\s"\']+)(?:["\']?)', code)
-                if _db_match:
-                    _db_path = _db_match.group(1)
-                    if os.path.exists(_db_path):
-                        _db_hash = str(os.path.getmtime(_db_path))
-            
-            _cache_db_version = f"{_tool_version}_{_db_hash}" if _db_hash else _tool_version
-            
-            _tool_key = self._cache.tool.make_key(_tool_name, _input_files, params={}, db_version=_cache_db_version)
-            _cached_tool = self._cache.tool.get(_tool_key, output_dir=state.get('run_temp_dir'))
-            if _cached_tool:
-                self._log("TOOL CACHE HIT", body=f"{_tool_name} key={_tool_key[:8]}", node=node)
-                last_result = f"[CACHE HIT] {_tool_name}: results restored from cache.\n{str(_cached_tool)[:300]}"
-                self._log("EXIT NODE", body="next_step=observer (from cache)", node=node)
-                result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
-                return {
-                    "next_step": "observer",
-                    result_key: last_result,
-                    "messages": [AIMessage(content=f"<observe>{last_result}</observe>")],
-                }
-                
             try:
                 import threading
                 _cancel_event = threading.Event()
                 state["cancel_event"] = _cancel_event
 
-                if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
-                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
-                    out = run_with_timeout(
-                        run_r_code,
-                        args=[r_code],
-                        kwargs={
-                            "env_name": env,
-                            "extra_env": _extra_env,      # T2.3
-                            "run_temp_dir": _run_temp_dir, # T2.1
-                        },
-                        timeout=timeout,
-                        cancel_event=_cancel_event,
-                    )
-                elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
-                    if code.strip().startswith("#!CLI"):
-                        cli_command = re.sub(r"^#!CLI", "", code, 1).strip().replace("\n", " ")  # noqa: B034
+                # ── TOOL OUTPUT CACHE (Fix 1) ──────────────────────────────────────────
+                _tool_cache_key = None
+                _cached_result = None
+                if hasattr(self, "_cache") and self._cache and self._cache.tool:
+                    try:
+                        import hashlib
+                        _code_hash = hashlib.sha256((state.get("pending_code") or "").encode()).hexdigest()[:16]
+                        _env_hash = str(env)
+                        _files_snapshot = sorted([
+                            f"{f['name']}:{f.get('size_bytes', 0)}"
+                            for f in self._list_ctx_files(state.get("run_temp_dir", ""))
+                        ])
+                        _tool_cache_key = self._cache.tool.make_key(
+                            step_title,
+                            {"code_hash": _code_hash, "env": _env_hash, "files": _files_snapshot},
+                            {},
+                        )
+                        _cached_result = self._cache.tool.get(_tool_cache_key)
+                        if _cached_result:
+                            self._log("TOOL CACHE HIT", body=f"step={step_title}", node=node)
+                            out = _cached_result
+                    except Exception as _ce:
+                        self._log("TOOL CACHE (warn)", body=str(_ce), node=node)
+                        _tool_cache_key = None
+                # ── END TOOL CACHE LOOKUP ──────────────────────────────────────────────
+
+                if not _cached_result:
+                    if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
+                        r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
                         out = run_with_timeout(
-                            run_bash_script,
-                            args=[cli_command],
+                            run_r_code,
+                            args=[r_code],
                             kwargs={
                                 "env_name": env,
                                 "extra_env": _extra_env,      # T2.3
@@ -1758,6 +1833,28 @@ class BioAgent:
                             timeout=timeout,
                             cancel_event=_cancel_event,
                         )
+                    elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
+                        if code.strip().startswith("#!CLI"):
+                            cli_command = re.sub(r"^#!CLI", "", code, 1).strip().replace("\n", " ")  # noqa: B034
+                            out = run_with_timeout(
+                                run_bash_script,
+                                args=[cli_command],
+                                kwargs={
+                                    "env_name": env,
+                                    "extra_env": _extra_env,      # T2.3
+                                    "run_temp_dir": _run_temp_dir, # T2.1
+                                },
+                                timeout=timeout,
+                                cancel_event=_cancel_event,
+                            )
+
+                # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────
+                if _tool_cache_key and not _cached_result and out:
+                    try:
+                        self._cache.tool.set(_tool_cache_key, out, ttl_seconds=3600 * 24 * 7)  # TTL 7j
+                    except Exception as _cse:
+                        self._log("TOOL CACHE SAVE (warn)", body=str(_cse), node=node)
+                # ── END TOOL CACHE SAVE ────────────────────────────────────────────────
                     else:
                         bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
                         out = run_with_timeout(
@@ -1839,17 +1936,6 @@ class BioAgent:
                 self._log("EXECUTION ERROR", body=last_result, node=node)
             
             
-            # ── TOOL CACHE — sauvegarder si succès ─────────────────────────────
-            if last_result and '[ERROR]' not in last_result and '[EXECUTION ERROR]' not in last_result:
-                try:
-                    self._cache.tool.set(
-                        _tool_key, _tool_name,
-                        result={"stdout": last_result[:300], "status": "success"},
-                        output_dir=state.get('run_temp_dir'),
-                    )
-                except Exception:
-                    pass
-            # ── END TOOL CACHE SAVE ──────────────────────────────────────────────
             self._log("EXIT NODE", body="next_step=observer", node=node)
             result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
             
@@ -2103,6 +2189,36 @@ class BioAgent:
                 "diagnostic_observation": False,
             }
             
+
+            # --- FIX 5: Sauvegarde du Checkpoint ---
+            if status == "done":
+                from genomeer.utils.checkpoint import CheckpointManager
+                cp = CheckpointManager(state.get("run_temp_dir", ""), str(state.get("run_id", "unknown")))
+                # Fusionner l'état courant avec les updates pour avoir l'état complet
+                full_state = {**state, **updates}
+                cp.save(full_state, state["current_idx"])
+            
+            # --- FIX 8: Version Tracker ---
+            from genomeer.utils.version_tracker import VersionTracker
+            tracker = VersionTracker()
+            tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
+            
+            if "version_tracker" not in new_manifest:
+                new_manifest["version_tracker"] = tracker
+            else:
+                new_manifest["version_tracker"].tools.extend(tracker.tools)
+                new_manifest["version_tracker"].databases.extend(tracker.databases)
+
+            # --- FIX 9: Métriques ---
+            if hasattr(self, "_metrics") and self._metrics:
+                self._metrics.record_step_end(
+                    step_idx=state["current_idx"],
+                    step_title=step["title"],
+                    status=status,
+                    tool_name=step["title"], # or pending code tool
+                    quality_level="fail" if status == "blocked" else "ok"
+                )
+
             # ------ feedback replay mode check ------
             if status == "blocked":
                 pause = self._maybe_pause(
@@ -2192,6 +2308,15 @@ class BioAgent:
 
             manifest = dict(state.get("manifest") or {})
             temp_dir = state.get("run_temp_dir", "")
+
+            # --- FIX 8 & 9: Sauvegarde Metrics & VersionTracker ---
+            if hasattr(self, "_metrics") and self._metrics:
+                self._metrics.save(temp_dir)
+            if "version_tracker" in manifest:
+                manifest["version_tracker"].save(temp_dir)
+                manifest["tool_versions"] = manifest["version_tracker"].as_dict()
+                del manifest["version_tracker"]
+
             run_id = state.get("run_id")
             pub = manifest.get("publisher") or {}
             base_url = (pub.get("base_url") or "").rstrip("/")
@@ -2974,17 +3099,32 @@ class BioAgent:
         with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
             
-            if not self._has_session_state(thread_id):
-                # FIRST TURN OF THIS SESSION -> full bootstrap state
-                inputs = self._build_initial_state(prompt, staged, session_id, tmp)
+            # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
+            from genomeer.utils.helper import _persistent_namespace
+            _persistent_namespace.clear()
+            
+            from genomeer.utils.checkpoint import CheckpointManager
+            from genomeer.utils.metrics import RunMetrics
+            
+            cp = CheckpointManager(tmp, thread_id)
+            if cp.exists():
+                inputs = cp.load()
+                self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
+                if not hasattr(self, "_metrics") or not self._metrics:
+                    self._metrics = RunMetrics(thread_id, tmp)
             else:
-                # FOLLOW-UP TURN -> only append the new message and record any new attachments
-                msg_block = [HumanMessage(content=prompt)]
-                if staged:
-                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {
-                    "messages": msg_block
-                }
+                if not self._has_session_state(thread_id):
+                    # FIRST TURN OF THIS SESSION -> full bootstrap state
+                    inputs = self._build_initial_state(prompt, staged, session_id, tmp)
+                    self._metrics = RunMetrics(thread_id, tmp)
+                else:
+                    # FOLLOW-UP TURN -> only append the new message and record any new attachments
+                    msg_block = [HumanMessage(content=prompt)]
+                    if staged:
+                        msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                    inputs = {
+                        "messages": msg_block
+                    }
                 
             config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             self.log = []
@@ -3043,17 +3183,32 @@ class BioAgent:
         with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
             
-            if not self._has_session_state(thread_id):
-                # FIRST TURN OF THIS SESSION -> full bootstrap state
-                inputs = self._build_initial_state(prompt, staged, session_id, tmp)
+            # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
+            from genomeer.utils.helper import _persistent_namespace
+            _persistent_namespace.clear()
+            
+            from genomeer.utils.checkpoint import CheckpointManager
+            from genomeer.utils.metrics import RunMetrics
+            
+            cp = CheckpointManager(tmp, thread_id)
+            if cp.exists():
+                inputs = cp.load()
+                self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
+                if not hasattr(self, "_metrics") or not self._metrics:
+                    self._metrics = RunMetrics(thread_id, tmp)
             else:
-                # FOLLOW-UP TURN -> only append the new message and record any new attachments
-                msg_block = [HumanMessage(content=prompt)]
-                if staged:
-                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {
-                    "messages": msg_block
-                }
+                if not self._has_session_state(thread_id):
+                    # FIRST TURN OF THIS SESSION -> full bootstrap state
+                    inputs = self._build_initial_state(prompt, staged, session_id, tmp)
+                    self._metrics = RunMetrics(thread_id, tmp)
+                else:
+                    # FOLLOW-UP TURN -> only append the new message and record any new attachments
+                    msg_block = [HumanMessage(content=prompt)]
+                    if staged:
+                        msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                    inputs = {
+                        "messages": msg_block
+                    }
 
             config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             last_msg_text = None

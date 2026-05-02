@@ -24,14 +24,16 @@ class api_schema(BaseModel):
     api_schema: str | None = Field(description="The api schema as a dictionary")
 
 _version_cache = {}
+_version_cache_lock = threading.Lock()
 
 def clear_version_cache(env_name: Optional[str] = None):
     """Clear the version cache for a specific environment or globally."""
     global _version_cache
-    if env_name:
-        _version_cache = {k: v for k, v in _version_cache.items() if not k.startswith(f"{env_name}::")}
-    else:
-        _version_cache.clear()
+    with _version_cache_lock:
+        if env_name:
+            _version_cache = {k: v for k, v in _version_cache.items() if not k.startswith(f"{env_name}::")}
+        else:
+            _version_cache.clear()
 
 def get_tool_version(tool_name: str, env_name: str) -> str:
     """Run `<tool> --version` inside the specified environment and cache the result."""
@@ -40,8 +42,9 @@ def get_tool_version(tool_name: str, env_name: str) -> str:
     
     # Check cache
     cache_key = f"{env_name}::{tool_name}"
-    if cache_key in _version_cache:
-        return _version_cache[cache_key]
+    with _version_cache_lock:
+        if cache_key in _version_cache:
+            return _version_cache[cache_key]
     
     try:
         proc = _run_in_env(env_name, [tool_name, "--version"], timeout=10.0)
@@ -51,11 +54,13 @@ def get_tool_version(tool_name: str, env_name: str) -> str:
         lines = [line.strip() for line in output.split("\n") if line.strip()]
         version_str = lines[0][:100] if lines else "unknown"
         
-        _version_cache[cache_key] = version_str
+        with _version_cache_lock:
+            _version_cache[cache_key] = version_str
         return version_str
     except Exception:
         # Fallback to unknown if the tool does not support --version or fails
-        _version_cache[cache_key] = "unknown"
+        with _version_cache_lock:
+            _version_cache[cache_key] = "unknown"
         return "unknown"
 
 def preload_tool_versions(env_name: str, tools: list[str]):
@@ -63,7 +68,8 @@ def preload_tool_versions(env_name: str, tools: list[str]):
     if not env_name or not tools:
         return
         
-    tools_to_check = [t for t in set(tools) if f"{env_name}::{t}" not in _version_cache]
+    with _version_cache_lock:
+        tools_to_check = [t for t in set(tools) if f"{env_name}::{t}" not in _version_cache]
     if not tools_to_check:
         return
         
@@ -84,14 +90,16 @@ def preload_tool_versions(env_name: str, tools: list[str]):
             
             if line.startswith("===TOOL:") and line.endswith("==="):
                 if current_tool:
-                    _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
+                    with _version_cache_lock:
+                        _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
                 current_tool = line[8:-3]
                 current_version = "unknown"
             elif current_tool and current_version == "unknown":
                 current_version = line
                 
         if current_tool:
-            _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
+            with _version_cache_lock:
+                _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
     except Exception:
         pass
 
@@ -332,6 +340,12 @@ def run_bash_script(
     script = (script or "").strip()
     if not script:
         return "Error: Empty script"
+
+    # --- FIX 2: SANDBOX / SÉCURITÉ ---
+    _BLOCKED = ["rm -rf /", "rm -rf *", "mkfs", "dd if=", "shutdown", "reboot", "chmod -R 777 /"]
+    for blocked in _BLOCKED:
+        if blocked in script:
+             return f"Error: Command '{blocked}' is restricted by security policy."
 
     with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
         if not script.startswith("#!/"):
@@ -609,6 +623,7 @@ def read_module2api():
         "metagenomics",
         "metagenomics_db",
         "genomics",         # Enabled: 1710L scRNA-seq, Hi-C, ChIP-seq, epigenomics wrappers (GAP5 fixed)
+        "viromics",         # Added Phase 3 viromics support
         # "artifacts",      # Pending: description file not yet created
         # "literature",
         # "biochemistry",

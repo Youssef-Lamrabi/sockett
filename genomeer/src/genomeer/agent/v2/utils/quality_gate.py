@@ -295,6 +295,10 @@ def check_quality(
     if gate is None:
         return ("ok", "")
 
+    # --- FIX 7: Strict check for missing metrics ---
+    if result_dict is None and gate.get("metric_key") is not None:
+        return ("fail", f"[QA-FAIL] Tool {tool_name} returned no valid JSON metrics. Execution probably failed or parser crashed.")
+
     result_dict = result_dict or {}
     stdout_text = stdout_text or ""
 
