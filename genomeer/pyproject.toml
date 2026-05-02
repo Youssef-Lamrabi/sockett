@@ -52,7 +52,7 @@ dependencies = [
     "ipython",
     # ── Phase 1: FAISS semantic retriever ──
     "faiss-cpu",
-    "sentence-transformers",
+    "sentence-transformers>=2.6.0,<3.0",
     "biopython",
 ]
 

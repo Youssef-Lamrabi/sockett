@@ -59,6 +59,22 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         ),
     },
 
+    # ── Host Decontamination ────────────────────────────────────────────────
+    "run_host_decontamination": {
+        "metric_key":     "microbial_pct",
+        "metric_label":   "% non-host reads retained",
+        "warn_threshold": 10.0,
+        "fail_threshold": 1.0,
+        "parse_regex":    r"microbial_pct[\"':,\s]+([0-9.]+)",
+        "fix_hint": (
+            "Very few non-host reads retained (<1%). The sample may be predominantly "
+            "host material with very low microbial biomass. Consider: "
+            "(1) Verify sample origin and collection method. "
+            "(2) Use a more sensitive metagenomic protocol. "
+            "(3) Check if the host index is correct for this organism."
+        ),
+    },
+
     # ── Taxonomic classification ─────────────────────────────────────────────
 
     "run_kraken2": {

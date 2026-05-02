@@ -36,9 +36,25 @@ STANDARD PIPELINE:
   Taxonomy (Kraken2 → Bracken OR MetaPhlAn4) → Functional (HUMAnN3/DIAMOND) → Stats/Viz
 
 TOOL SELECTION RULES:
+  Input validation (ALWAYS run before any pipeline):
+    - For any FASTQ input: verify the file exists, is non-empty, and has valid FASTQ format.
+      Python check: from genomeer.tools.function.metagenomics import validate_fastq_input
+      Bash check: [ -s file.fastq.gz ] && zcat file.fastq.gz | head -4 | grep -q '^@'
+    - If file is empty or malformed: STOP and ask the user to provide a valid file.
+    - Minimum reads threshold: warn if < 10,000 reads after fastp (insufficient for assembly).
+
   QC:
     - Short reads (Illumina): use fastp (preferred) or Trimmomatic
     - Long reads (Nanopore/PacBio): use NanoStat for stats, then proceed to Flye
+
+  Host decontamination (clinical/animal samples):
+    - If sample origin is human (gut, skin, respiratory, blood, clinical biopsy):
+      run Bowtie2 against hg38 BEFORE assembly to remove host reads.
+      Command: bowtie2 -x /path/to/hg38_index -1 R1_clean.fq -2 R2_clean.fq \
+               --un-conc-gz host_removed_R%.fq.gz -S /dev/null --threads 8
+    - If animal sample: use appropriate host genome index
+    - Environmental samples (soil, water, marine): skip host decontamination
+    - ALWAYS ask the user if the sample is clinical/host-derived before running assembly
   
   Assembly:
     - Short reads, complex community: metaSPAdes (best quality, high RAM ~50-100 GB for large samples)

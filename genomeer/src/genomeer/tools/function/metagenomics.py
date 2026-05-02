@@ -81,6 +81,94 @@ def _ensure_dir(path: str | Path) -> Path:
 # QC & PREPROCESSING
 # ===========================================================================
 
+def validate_fastq_input(
+    fastq_path: str,
+    min_reads: int = 1000,
+) -> Dict[str, Any]:
+    """
+    Quick validation of a FASTQ file before running the pipeline.
+    Checks: file exists, non-empty, valid FASTQ format (first 4 lines),
+    and estimates read count.
+    Returns dict(valid, n_reads_estimated, format_ok, file_size_mb, message).
+    """
+    p = Path(fastq_path)
+    if not p.exists():
+        return {"valid": False, "message": f"File not found: {fastq_path}"}
+    size_mb = p.stat().st_size / (1024 ** 2)
+    if size_mb == 0:
+        return {"valid": False, "message": f"File is empty: {fastq_path}"}
+
+    import gzip
+    try:
+        opener = gzip.open if fastq_path.endswith(".gz") else open
+        with opener(fastq_path, "rt", errors="replace") as fh:
+            lines = [fh.readline() for _ in range(8)]
+        if not lines[0].startswith("@"):
+            return {"valid": False, "message": "Not a valid FASTQ: first line must start with '@'"}
+        if not lines[2].startswith("+"):
+            return {"valid": False, "message": "Not a valid FASTQ: third line must start with '+'"}
+    except Exception as e:
+        return {"valid": False, "message": f"Could not read file: {e}"}
+
+    # Estimate read count from file size (rough: ~250 bytes per read compressed)
+    n_reads_est = int(size_mb * 1024 * 1024 / 250)
+    warn = n_reads_est < min_reads
+
+    return {
+        "valid": True,
+        "format_ok": True,
+        "file_size_mb": round(size_mb, 2),
+        "n_reads_estimated": n_reads_est,
+        "message": (
+            f"Valid FASTQ. ~{n_reads_est:,} reads estimated. "
+            + (f"WARNING: fewer than {min_reads} reads, may be insufficient for assembly." if warn else "")
+        ),
+    }
+
+
+def run_host_decontamination(
+    input_r1: str,
+    input_r2: str,
+    output_dir: str,
+    host_index: str,      # path to bowtie2 index prefix (e.g. /db/hg38/hg38)
+    threads: int = 8,
+) -> Dict[str, Any]:
+    """
+    Remove host reads using Bowtie2.
+    Outputs only unaligned reads (non-host = microbial) for downstream analysis.
+    Returns dict with clean_r1, clean_r2, host_reads_pct, n_reads_after.
+    """
+    import re
+    out = _ensure_dir(output_dir)
+    clean_r1 = str(out / "host_removed_R1.fastq.gz")
+    clean_r2 = str(out / "host_removed_R2.fastq.gz")
+    sam_out = "/dev/null"
+
+    cmd = [
+        "bowtie2", "-x", host_index,
+        "-1", input_r1, "-2", input_r2,
+        "--un-conc-gz", str(out / "host_removed_R%.fastq.gz"),
+        "-S", sam_out,
+        "--threads", str(threads),
+        "--very-sensitive"
+    ]
+    proc = _run(cmd, timeout=7200)
+    _assert_ok(proc, "bowtie2_host_decontam")
+
+    host_pct = 0.0
+    m = re.search(r"(\d+\.\d+)%\s+overall alignment rate", proc.stderr)
+    if m:
+        host_pct = float(m.group(1))
+
+    return {
+        "clean_r1": clean_r1,
+        "clean_r2": clean_r2,
+        "host_alignment_pct": host_pct,
+        "microbial_pct": round(100.0 - host_pct, 2),
+        "stdout": proc.stdout[-1000:],
+    }
+
+
 def run_fastp(
     input_r1: str,
     output_dir: str,

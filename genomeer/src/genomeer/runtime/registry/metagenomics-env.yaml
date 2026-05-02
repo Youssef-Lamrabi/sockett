@@ -24,7 +24,8 @@ dependencies:
 
   # ─── Mapping ───────────────────────────────────────────────────────────────
   - minimap2               # Multi-purpose aligner (short/long reads)
-  - bowtie2                # Short-read aligner (FIXED: was missing)
+  - bowtie2                # Short-read aligner + host decontamination (hg38 index needed separately)
+  - bowtie2-build          # Build custom Bowtie2 indexes for host genomes
   - bwa                    # BWA-MEM aligner (FIXED: was missing)
   - bwa-mem2               # BWA-MEM2 faster aligner (FIXED: was missing)
   - samtools               # BAM/SAM/CRAM manipulation

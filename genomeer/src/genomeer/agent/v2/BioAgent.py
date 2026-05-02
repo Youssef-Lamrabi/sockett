@@ -327,8 +327,6 @@ class BioAgent:
         
         # [DEV-ONLY] logs
         self._set_debug_log("./agent_debug.log")
-        self._log_buffer = []
-        self._log_buffer_lock = threading.Lock()
         
         # CONSTANTS
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics
@@ -360,6 +358,8 @@ class BioAgent:
         os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
         with open(self.debug_log_path, "w", encoding="utf-8") as f:
             f.write("\n===== NEW SESSION =====\n")
+        self._log_buffer = []
+        self._log_buffer_lock = threading.Lock()
 
     def _slim_manifest(self, manifest: dict, node: str) -> dict:
         if node in ("observer", "generator", "diagnostics"):
@@ -368,6 +368,7 @@ class BioAgent:
                 "timeout_seconds":  manifest.get("timeout_seconds"),
                 "retry_count":      manifest.get("retry_count"),
                 "quality_signals":  manifest.get("quality_signals"),
+                "repair_feedback":  manifest.get("repair_feedback"),
             }
         if node == "finalizer":
             return {
@@ -397,10 +398,16 @@ class BioAgent:
     def _flush_log(self):
         if not getattr(self, "_log_buffer", None):
             return
-        path = getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log"))
-        with open(path, "a", encoding="utf-8") as f:
-            f.writelines(self._log_buffer)
-        self._log_buffer.clear()
+        lock = getattr(self, "_log_buffer_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if not self._log_buffer:
+                return
+            path = getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log"))
+            with open(path, "a", encoding="utf-8") as f:
+                f.writelines(self._log_buffer)
+            self._log_buffer.clear()
 
     def _fmt_msgs(self, msgs):
         """Pretty format a LangChain message list for logging."""
@@ -1089,10 +1096,12 @@ class BioAgent:
                     )
                 else:
                     prompt = instructions.GENERATOR_PROMPT_REPAIR
+                    _slim_gen = self._slim_manifest(manifest, "generator")
+                    _input_state_for_prompt = _slim_gen.get("input_state") or {"root_dir": temp_dir, "files": files}
                     content = instructions.GENERATOR_REPAIR_CTX_PROMPT.format(
                         user_goal=state['last_prompt'],
                         current_step_title=step['title'],
-                        manifest=self._slim_manifest(manifest, "generator").get("input_state"),
+                        manifest=_input_state_for_prompt,
                         run_temp_dir=temp_dir,
                         repair_feedback=repair_feedback,
                         previous_code=(state.get("pending_code") or "").strip(),
@@ -1612,9 +1621,9 @@ class BioAgent:
         def _diagnostics(self, state: AgentState) -> AgentState:
             node = "diagnostics"
             step = state["plan"][state["current_idx"]]
-            manifest = self._slim_manifest(state.get("manifest", {}), "diagnostics") or {}
-            retry_count = manifest.get("retry_count", 0)
-            observer_summary = manifest.get("repair_feedback", "").strip()
+            _slim = self._slim_manifest(state.get("manifest", {}), "diagnostics") or {}
+            retry_count = _slim.get("retry_count", 0)
+            observer_summary = _slim.get("repair_feedback", "").strip()
             last_code = (state.get("pending_code") or "").strip()
 
             prompt = instructions.DIAGNOSTICS_PROMPT
@@ -1637,7 +1646,7 @@ class BioAgent:
 
             # Reuse GENERATOR to actually produce the probe code
             # We piggyback repair flow by stuffing the plan into 'repair_feedback'
-            new_manifest = dict(manifest)
+            new_manifest = dict(state.get("manifest", {}))
             new_manifest["repair_feedback"] = f"DIAGNOSTICS_REQUEST:\n{resp.content}"
             new_manifest["repair_step_idx"] = state["current_idx"]
 
@@ -1671,6 +1680,26 @@ class BioAgent:
                 return not any(x in name for x in SKIP)
 
             expose_paths = [f["name"] for f in files if _want(f["name"])]
+
+            # Auto-évaluation quantifiée post-pipeline
+            try:
+                from genomeer.evaluation.benchmark import PipelineOutputEval
+                _eval_metrics = {
+                    **(manifest.get("quality_signals") or {}),
+                    "amr_genes_detected": manifest.get("amr_genes_detected", []),
+                    "output_files": [str(Path(temp_dir) / p) for p in expose_paths[:20]],
+                }
+                _eval_report = PipelineOutputEval().evaluate(_eval_metrics)
+                manifest["eval_score"]  = round(_eval_report.overall_score, 3)
+                manifest["eval_fails"]  = _eval_report.fail_count
+                manifest["eval_warns"]  = _eval_report.warn_count
+                self._log(
+                    "PIPELINE EVAL",
+                    body=_eval_report.summary(),
+                    node=node
+                )
+            except Exception as _eval_exc:
+                self._log("PIPELINE EVAL (warn)", body=str(_eval_exc), node=node)
 
             artifacts = {}
             observations = manifest.get("observations", [])
@@ -2444,6 +2473,7 @@ class BioAgent:
                 # bail if canceled
                 if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
                     yield {"type": "message", "text": "<observe>Request canceled by client.</observe>"}
+                    self._flush_log()
                     return
                 
                 message = s["messages"][-1]

@@ -12,6 +12,41 @@ description = [
     # QC & PREPROCESSING
     # =========================================================================
     {
+        "name": "validate_fastq_input",
+        "description": (
+            "Quick validation of a FASTQ file before running the pipeline. "
+            "Checks: file exists, is non-empty, has valid FASTQ format, and estimates read count. "
+            "Run this as the FIRST step of any pipeline that takes FASTQ input."
+        ),
+        "required_parameters": [
+            {"name": "fastq_path", "type": "str", "description": "Path to the FASTQ file (.fastq or .fastq.gz)."},
+        ],
+        "optional_parameters": [
+            {"name": "min_reads", "type": "int", "default": 1000, "description": "Minimum reads threshold for a warning."},
+        ],
+        "returns": "dict(valid, format_ok, file_size_mb, n_reads_estimated, message)",
+    },
+    {
+        "name": "run_host_decontamination",
+        "description": (
+            "Remove host DNA reads from metagenomic FASTQ files using Bowtie2. "
+            "MANDATORY for clinical samples (human gut, skin, respiratory, blood). "
+            "Maps reads against a host genome index (e.g., hg38 for human). "
+            "Returns only the unaligned (non-host / microbial) reads for assembly. "
+            "Run AFTER fastp QC and BEFORE assembly for clinical samples."
+        ),
+        "required_parameters": [
+            {"name": "input_r1", "type": "str", "description": "Path to R1 FASTQ (after fastp)."},
+            {"name": "input_r2", "type": "str", "description": "Path to R2 FASTQ (after fastp)."},
+            {"name": "output_dir", "type": "str", "description": "Output directory."},
+            {"name": "host_index", "type": "str", "description": "Bowtie2 index prefix for the host genome (e.g., /db/hg38/hg38)."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
+        ],
+        "returns": "dict(clean_r1, clean_r2, host_alignment_pct, microbial_pct)",
+    },
+    {
         "name": "run_fastp",
         "description": (
             "Run fastp for adapter trimming and quality control on Illumina FASTQ reads. "
