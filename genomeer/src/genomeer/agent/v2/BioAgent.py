@@ -435,7 +435,7 @@ class BioAgent:
         model_name = str(getattr(self.llm, "model_name", self.llm.__class__.__name__))
         cache_key = self._cache.llm.make_key(model_name, sys_msg, user_msg)
  
-        cached = self._cache.llm.get(cache_key)
+        cached = self._cache.llm.get(cache_key, node=node)
         if cached:
             self._log(f"LLM CACHE HIT ({purpose})", cached[:200], node=node)
             from langchain_core.messages import AIMessage as _AIMsg
@@ -1168,6 +1168,14 @@ class BioAgent:
             files = self._list_ctx_files(temp_dir)
             files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
 
+            # T8.4 (Residual): Format file registry for the context prompt in both normal and repair modes
+            _file_registry = manifest.get("file_registry", {})
+            _freg_str = "\n".join(
+                f"  [{step_name}]: {', '.join(paths)}"
+                for step_name, paths in _file_registry.items()
+            ) or "<none>"
+            files_str = f"{files_str}\n\nFiles produced by previous steps:\n{_freg_str}"
+
             if repair_feedback:
                 if is_diagnostic:
                     prompt = instructions.GENERATOR_PROMPT
@@ -1191,19 +1199,12 @@ class BioAgent:
             else:
                 prompt = instructions.GENERATOR_PROMPT
                 
-                # T8.4: Format file registry for the context prompt
-                fr = manifest.get("file_registry", {})
-                fr_str = ""
-                for step_name, paths in fr.items():
-                    fr_str += f"Produced by '{step_name}':\n" + "\n".join(f"  - {p}" for p in paths) + "\n"
-                fr_str = fr_str.strip() or "<none>"
-
                 content = instructions.GENERATOR_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
                     manifest=self._slim_manifest(state['manifest'], "generator").get("input_state"),
                     run_temp_dir=temp_dir,
-                    file_registry=fr_str,
+                    file_registry=_freg_str,
                 )
             
             msgs = [
