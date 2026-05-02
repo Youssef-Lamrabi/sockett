@@ -58,6 +58,43 @@ def get_tool_version(tool_name: str, env_name: str) -> str:
         _version_cache[cache_key] = "unknown"
         return "unknown"
 
+def preload_tool_versions(env_name: str, tools: list[str]):
+    """Run `<tool> --version` for multiple tools in a single subprocess to warm the cache."""
+    if not env_name or not tools:
+        return
+        
+    tools_to_check = [t for t in set(tools) if f"{env_name}::{t}" not in _version_cache]
+    if not tools_to_check:
+        return
+        
+    cmds = []
+    for t in tools_to_check:
+        cmds.append(f"echo '===TOOL:{t}===' && {t} --version")
+    
+    script = "\n".join(cmds)
+    try:
+        proc = _run_in_env(env_name, ["bash", "-c", script], timeout=30.0)
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        
+        current_tool = None
+        current_version = "unknown"
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line: continue
+            
+            if line.startswith("===TOOL:") and line.endswith("==="):
+                if current_tool:
+                    _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
+                current_tool = line[8:-3]
+                current_version = "unknown"
+            elif current_tool and current_version == "unknown":
+                current_version = line
+                
+        if current_tool:
+            _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
+    except Exception:
+        pass
+
 # ------------------------------------------------------------------------------------------
 # internal utility to run in env
 # ------------------------------------------------------------------------------------------

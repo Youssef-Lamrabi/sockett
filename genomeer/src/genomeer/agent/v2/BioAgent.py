@@ -1174,7 +1174,7 @@ class BioAgent:
                     "current_idx": idx,
                     "per_sample_results": state.get("per_sample_results"),
                     "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")] + trim_msgs,
+                    "messages": trim_msgs + [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
                 }
             
             # otherwise go check inputs
@@ -1183,7 +1183,7 @@ class BioAgent:
             return {
                 "current_idx": idx,
                 "next_step": "input_guard",
-                "messages": [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")] + trim_msgs,
+                "messages": trim_msgs + [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
             }
 
         def _batch_orchestrator(self, state: AgentState) -> AgentState:
@@ -1198,6 +1198,23 @@ class BioAgent:
             samples = state.get("sample_manifest") or []
             if not samples:
                 return {"next_step": "finalizer", "messages": [AIMessage(content="<observe>Error: batch_orchestrator called without sample_manifest.</observe>")]}
+
+            # Bug 4 Fix: pre-install environment once before parallel threads
+            env_name = state.get("env_name", "bio-agent-env1")
+            from genomeer.runtime.env_manager import has_env, create_or_update_env
+            from genomeer.utils.helper import preload_tool_versions
+            
+            if not has_env(env_name):
+                self._log("BATCH ENV", body=f"Pre-installing environment '{env_name}' before launching parallel threads...", node=node)
+                create_or_update_env(env_name)
+                
+            # Bug 1 Fix: pre-warm version cache for common tools
+            tools_to_cache = [
+                "fastp", "fastqc", "kraken2", "metaphlan4", "metaspades", "megahit", 
+                "flye", "bowtie2", "samtools", "metabat2", "checkm2", "bracken", 
+                "gtdbtk", "das_tool", "prokka", "diamond", "hmmer", "humann3"
+            ]
+            preload_tool_versions(env_name, tools_to_cache)
                 
             # P4-D.2: Semaphore for concurrency control
             concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
@@ -1232,8 +1249,17 @@ class BioAgent:
                     local_state["run_temp_dir"] = os.path.join(state["run_temp_dir"], sample_id)
                     os.makedirs(local_state["run_temp_dir"], exist_ok=True)
                     
+                    # Bug 3 Fix: global iterations cap to avoid infinite loops across step retries
+                    max_iterations = self.MAX_STEP_RETRIES * len(local_state["plan"]) * 3
+                    iteration_count = 0
+                    
                     # Manual node chaining loop for this sub-plan
                     while local_state["current_idx"] < len(local_state["plan"]):
+                        if iteration_count > max_iterations:
+                            self._log("BATCH FATAL", body=f"Sample {sample_id} exceeded max iterations ({max_iterations}). Breaking out.", node=node)
+                            break
+                        iteration_count += 1
+                        
                         curr_idx = local_state["current_idx"]
                         step = local_state["plan"][curr_idx]
                         if step["status"] != "todo":
@@ -1636,12 +1662,13 @@ class BioAgent:
             env = state["env_name"]
             _default_timeout = state["manifest"].get("timeout_seconds", 600)
             
-            # P2-B.2: Pre-extract input files to estimate dynamic timeout
+            # P2-B.2 & Point Faible 1: Extract input files including paths without quotes
             import re as _re
-            _input_files = [
-                f for f in _re.findall(r'["\']([^"\']+\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))["\']', code or '')
-                if os.path.exists(f)
-            ]
+            _matches = _re.findall(
+                r'(?:["\']([^"\']+\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))["\'])|((?:/[^/\s][^\n=]+|\w:[^\n=]+)\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))', 
+                code or ''
+            )
+            _input_files = [m[0] or m[1] for m in _matches if os.path.exists(m[0] or m[1])]
             
             step = self._get_current_step(state)
             step_title = step["title"] if step else "unknown step"
