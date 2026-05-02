@@ -2367,9 +2367,9 @@ class BioAgent:
             rag_context = ""
             if hasattr(self, "bio_retriever"):
                 if hasattr(self, "_rag_build_thread") and self._rag_build_thread.is_alive():
-                    self._rag_build_thread.join(timeout=10)
+                    self._rag_build_thread.join(timeout=30)
                     if self._rag_build_thread.is_alive():
-                        self._log("BIO RAG (warn)", body="RAG build still in progress after 10s — using partial index", node=node)
+                        self._log("BIO RAG (warn)", body="RAG build still in progress after 30s — using partial index", node=node)
                 try:
                     from genomeer.model.bio_rag import build_finalizer_rag_context
                     _pipeline_results = {

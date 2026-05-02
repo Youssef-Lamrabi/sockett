@@ -230,6 +230,14 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     - [ ] Run DIAMOND for functional annotation
     - [ ] Run AMRFinderPlus for resistance genes
 
+  Viral metagenomics:
+    - [ ] Run fastp for QC (phase: 1)
+    - [ ] Run metaSPAdes for assembly (phase: 1)
+    - [ ] Run VirSorter2 for viral contig identification (phase: 2)
+    - [ ] Run CheckV for viral genome quality assessment (phase: 2)
+    - [ ] Run DeepVirFinder for additional viral identification (phase: 2)
+    - [ ] Run Prokka for annotation of viral MAGs (phase: 2)
+
 End your checklist with exactly one routing tag on its own line:
 <next:QA> or <next:ORCHESTRATOR>
 """
