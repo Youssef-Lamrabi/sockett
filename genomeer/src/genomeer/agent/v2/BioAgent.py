@@ -401,13 +401,13 @@ class BioAgent:
             
         self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
 
-    @property
-    def bio_rag_status(self) -> str:
-        return getattr(self, "_bio_rag_status", "offline")
-
         # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
         self._cache = get_cache()
         self._log("CACHE", body=f"Cache dir: {self._cache.cache_dir}", node="init")
+
+    @property
+    def bio_rag_status(self) -> str:
+        return getattr(self, "_bio_rag_status", "offline")
 
     # LOGS UTILS [DEV-ONLY]
     def _set_debug_log(self, path: str | None = None):
@@ -1174,7 +1174,7 @@ class BioAgent:
                     "current_idx": idx,
                     "per_sample_results": state.get("per_sample_results"),
                     "next_step": "finalizer",
-                    "messages": trim_msgs + [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
+                    "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")] + trim_msgs,
                 }
             
             # otherwise go check inputs
@@ -1183,7 +1183,7 @@ class BioAgent:
             return {
                 "current_idx": idx,
                 "next_step": "input_guard",
-                "messages": trim_msgs + [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
+                "messages": [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")] + trim_msgs,
             }
 
         def _batch_orchestrator(self, state: AgentState) -> AgentState:
@@ -1220,6 +1220,9 @@ class BioAgent:
                     local_state["manifest"].pop("observations", None)
                     
                     local_state["plan"] = copy.deepcopy(plan)
+                    local_state["messages"] = []  # Point Faible 1: prevent data race on messages list
+                    import time as _time
+                    local_state["run_started_at"] = _time.time()  # Point Faible 4: reset global timeout timer
                     local_state["current_idx"] = idx
                     local_state["retry_counts"] = {}
                     local_state["current_sample_id"] = sample_id
@@ -1267,8 +1270,21 @@ class BioAgent:
                         updates = self._observer(local_state)
                         local_state.update(updates)
                         
-                        # Observer naturally handles retries via updates to current_idx
-                        # and plan[curr_idx]["status"]
+                        # Bug 2: handle observer's next_step routing for retries
+                        next_step = local_state.get("next_step")
+                        
+                        if next_step == "diagnostics":
+                            updates = self._diagnostics(local_state)
+                            local_state.update(updates)
+                            next_step = local_state.get("next_step")
+                            
+                        if next_step == "generator":
+                            # Force status to todo so the while loop picks it up for retry
+                            local_state["plan"][curr_idx]["status"] = "todo"
+                            # Do NOT increment current_idx
+                        else:
+                            # success (orchestrator) or final failure
+                            local_state["current_idx"] += 1
                         
                     # Extract sample results
                     manifest = local_state.get("manifest", {})
@@ -1597,6 +1613,9 @@ class BioAgent:
             code = (state.get("pending_code") or "").strip()
             diagnostic_code = (state.get("diagnostic_code") or "").strip()
             diagnostic_mode = state.get("diagnostic_mode")
+
+            # Point Faible 3: use external cancel_event if provided
+            _cancel_event = getattr(self, "current_cancel_event", None) or threading.Event()
 
             # T2.5: Assert/fallback for run_temp_dir before any subprocess is launched.
             # Fix it at the process level so subprocesses always inherit RUN_TEMP_DIR.
@@ -2914,6 +2933,7 @@ class BioAgent:
         """
         self.critic_count = 0
         self.user_task = prompt
+        self.current_cancel_event = cancel_event
         thread_id = session_id or str(uuid4())
         
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
