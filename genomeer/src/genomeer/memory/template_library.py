@@ -77,10 +77,28 @@ class TemplateLibrary:
             "success_metrics": success_metrics or {},
             "sequencer_type": seq_type,
         }
+        template["quality_score"] = self._compute_quality_score(template)
+        
         self._templates.append(template)
-        # Keep only last 100 templates
+        # Keep top 100 templates based on combined quality and recency score
         if len(self._templates) > 100:
-            self._templates = self._templates[-100:]
+            now = datetime.now()
+            scored_templates = []
+            for t in self._templates:
+                q_score = t.get("quality_score", 0.5)
+                try:
+                    run_date = datetime.fromisoformat(t.get("run_date", now.isoformat()))
+                    days_ago = max(0, (now - run_date).days)
+                    r_score = 1.0 / (1.0 + days_ago)
+                except Exception:
+                    r_score = 0.0
+                
+                combined = (q_score * 0.7) + (r_score * 0.3)
+                scored_templates.append((combined, t))
+            
+            scored_templates.sort(key=lambda x: -x[0])
+            self._templates = [t for _, t in scored_templates[:100]]
+            
         self._save()
 
     def get_similar(self, query: str, n: int = 3) -> List[Dict[str, Any]]:
@@ -109,10 +127,15 @@ class TemplateLibrary:
         if not results:
             results = self._keyword_retrieval(query, len(self._templates))
             
-        # Re-rank based on sequencer type mismatch penalty
+        # Re-rank based on combined similarity, quality, and sequencer type mismatch penalty
         scored = []
         for i, tpl in enumerate(results):
-            base_score = -i # original rank score (higher is better)
+            # approximate semantic similarity score by index
+            sim_score = 1.0 - (i / max(1, len(results)))
+            q_score = tpl.get("quality_score", 0.5)
+            
+            base_score = (sim_score * 0.6) + (q_score * 0.4)
+            
             t_seq_type = tpl.get("sequencer_type", "unknown")
             if q_seq_type != "unknown" and t_seq_type != "unknown" and q_seq_type != t_seq_type:
                 base_score -= 1000 # heavily penalize mismatch
@@ -142,6 +165,31 @@ class TemplateLibrary:
 
     def count(self) -> int:
         return len(self._templates)
+
+    def stats(self) -> dict:
+        """P3-B.4: Provide stats including average quality score and >0.7 threshold counts."""
+        if not self._templates:
+            return {"count": 0}
+            
+        scores = [t.get("quality_score", 0.5) for t in self._templates]
+        avg_score = sum(scores) / len(scores)
+        best_template = max(self._templates, key=lambda t: t.get("quality_score", 0.5))
+        
+        seq_types = {}
+        for t in self._templates:
+            st = t.get("sequencer_type", "unknown")
+            seq_types[st] = seq_types.get(st, 0) + 1
+            
+        high_quality = sum(1 for s in scores if s > 0.7)
+        
+        return {
+            "count": len(self._templates),
+            "average_quality_score": round(avg_score, 3),
+            "best_template_id": best_template.get("id"),
+            "best_template_score": round(best_template.get("quality_score", 0.5), 3),
+            "high_quality_count": high_quality,
+            "sequencer_types": seq_types,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -208,6 +256,26 @@ class TemplateLibrary:
         if "qc" in s or "fastp" in s or "trimming" in s:
             return "qc"
         return "full_pipeline"
+
+    @staticmethod
+    def _compute_quality_score(template: dict) -> float:
+        """P3-B.1: Compute composite score from success_metrics."""
+        metrics = template.get("success_metrics")
+        if not metrics:
+            return 0.5
+            
+        try:
+            c_pct = float(metrics.get("classified_pct", 0)) / 100.0 * 0.3
+            n50 = float(metrics.get("n50_bp", 0))
+            n_score = min(n50 / 50000.0, 1.0) * 0.3
+            comp = float(metrics.get("mean_completeness", 0)) / 100.0 * 0.2
+            
+            contam_raw = float(metrics.get("mean_contamination", 0))
+            contam_score = max(0.0, 1.0 - (contam_raw / 10.0)) * 0.2
+            
+            return c_pct + n_score + comp + contam_score
+        except Exception:
+            return 0.5
 
     @staticmethod
     def _extract_tools_from_steps(steps: List[Dict]) -> List[str]:

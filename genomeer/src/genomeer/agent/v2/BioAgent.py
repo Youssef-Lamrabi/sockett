@@ -21,7 +21,7 @@ from genomeer.agent.v2.utils.cache import get_cache
 from genomeer.agent.v2.utils.structured_output import RobustLLMParser, patch_state_graph_helper
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
 patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalement
-_robust_parser = RobustLLMParser(strict_validation=False)
+_robust_parser = RobustLLMParser(strict_validation=True)
 
 # ── AXE 2.3: SqliteSaver for cross-session persistence ──
 try:
@@ -370,14 +370,37 @@ class BioAgent:
         import threading
         from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever
         self.bio_rag_store = BioRAGStore(persist_dir=str(Path(self.path) / ".genomeer_rag_cache"))
-        self._rag_build_thread = threading.Thread(
-            target=lambda: self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"]),
-            daemon=True,
-            name="bio-rag-builder"
-        )
-        self._rag_build_thread.start()
+        
+        self._bio_rag_status = "offline" if os.environ.get("GENOMEER_RAG_OFFLINE", "0") == "1" else "building"
+        
+        if self._bio_rag_status != "offline":
+            def _build_rag():
+                try:
+                    self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"])
+                    if self.bio_rag_store.ready:
+                        self._bio_rag_status = "ready"
+                    else:
+                        self._bio_rag_status = "partial"
+                except Exception as e:
+                    self._log("BIORAG THREAD", f"Failed to build BioRAG: {e}", type="file")
+                    self._bio_rag_status = "offline"
+                    
+            self._rag_build_thread = threading.Thread(
+                target=_build_rag,
+                daemon=True,
+                name="bio-rag-builder"
+            )
+            self._rag_build_thread.start()
+            self._log("BIO RAG", body="Index build started in background (daemon thread)", node="init")
+        else:
+            self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"])
+            self._log("BIO RAG", body="Started in offline mode (GENOMEER_RAG_OFFLINE=1). Using cache only.", node="init")
+            
         self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
-        self._log("BIO RAG", body="Index build started in background (daemon thread)", node="init")
+
+    @property
+    def bio_rag_status(self) -> str:
+        return getattr(self, "_bio_rag_status", "offline")
 
         # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
         self._cache = get_cache()
@@ -2086,7 +2109,12 @@ class BioAgent:
                         "mean_completeness": manifest.get("quality_signals", {}).get("mean_completeness"),
                         "classified_pct":    manifest.get("quality_signals", {}).get("classified_pct"),
                     }
-                    rag_context = build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
+                    
+                    self._log("FINALIZER", body=f"BioRAG status: {self.bio_rag_status}", node=node)
+                    if self.bio_rag_status != "ready":
+                        rag_context += f"Note: Biological context database is incomplete (status: {self.bio_rag_status}). Interpretations may rely on fallback offline thresholds.\n\n"
+                    
+                    rag_context += build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
                     if rag_context:
                         self._log("RAG CONTEXT", body=f"Injected {len(rag_context)} chars of bio context", node=node)
                 except Exception as _rag_exc:

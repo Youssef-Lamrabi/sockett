@@ -498,14 +498,16 @@ class BioRAGStore:
 
         # Fetch des documents
         all_docs: List[BioDocument] = []
+        
+        is_offline = os.environ.get("GENOMEER_RAG_OFFLINE", "0") == "1"
 
         if "card" in sources:
             all_docs.extend(_CARDFetcher.fetch())
-        if "kegg_pathways" in sources:
+        if "kegg_pathways" in sources and not is_offline:
             all_docs.extend(_KEGGFetcher.fetch())
         if "quality_thresholds" in sources:
             all_docs.extend(_QualityThresholdsFetcher.fetch())
-        if "pubmed" in sources:
+        if "pubmed" in sources and not is_offline:
             all_docs.extend(_PubMedFetcher.fetch())
 
         if not all_docs:
