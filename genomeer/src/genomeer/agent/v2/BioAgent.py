@@ -123,6 +123,7 @@ class AgentState(TypedDict):
     batch_strategy: Literal["independent", "coassembly"] | None
     sample_manifest: List[Dict[str, Any]] | None  # [{id, r1, r2, metadata}]
     current_sample_idx: int | None
+    current_sample_id: str | None
     per_sample_results: Dict[str, Any] | None     # {sample_id: {step_results}}
     
     
@@ -1144,57 +1145,29 @@ class BioAgent:
             state["current_idx"] = idx
             
             if idx >= len(plan):
-                # ── Isolation d'état en batch_mode ──────────────────────────────────────
-                if state.get("batch_mode") and state.get("sample_manifest"):
-                    curr_sample_idx = state.get("current_sample_idx") or 0
-                    samples = state["sample_manifest"]
-                    sample_id = samples[curr_sample_idx].get("id", f"sample_{curr_sample_idx}")
-                    
-                    per_sample = dict(state.get("per_sample_results") or {})
-                    manifest = dict(state.get("manifest") or {})
-                    
-                    per_sample[sample_id] = {
-                        "quality_signals": manifest.get("quality_signals", {}),
-                        "amr_genes_detected": manifest.get("amr_genes_detected", []),
-                        "observations": manifest.get("observations", []),
-                        "retry_counts": state.get("retry_counts", {})
-                    }
-                    
-                    if curr_sample_idx < len(samples) - 1:
-                        manifest.pop("quality_signals", None)
-                        manifest.pop("amr_genes_detected", None)
-                        manifest.pop("observations", None)
-                        
-                        # --- P4-B.3: Co-assembly Phase 1/Phase 2 transition ---
-                        restart_idx = 0
-                        if state.get("batch_strategy") == "coassembly":
-                            for i, p in enumerate(plan):
-                                if p.get("phase") == 2:
-                                    restart_idx = i
-                                    break
-                                    
-                        new_plan = list(plan)
-                        for i in range(restart_idx, len(plan)):
-                            new_plan[i] = {**new_plan[i], "status": "todo", "notes": ""}
-                        # --------------------------------------------------------
-                        
-                        self._log("BATCH MODE", body=f"Sample {sample_id} done. Advancing to sample {curr_sample_idx + 1}", node=node)
-                        return {
-                            "current_idx": restart_idx,
-                            "current_sample_idx": curr_sample_idx + 1,
-                            "per_sample_results": per_sample,
-                            "manifest": manifest,
-                            "retry_counts": {},
-                            "plan": new_plan,
-                            "next_step": "input_guard",
-                            "messages": [AIMessage(content=f"<observe>Starting next sample: {samples[curr_sample_idx+1].get('id', 'unknown')}</observe>")]
-                        }
-                    else:
-                        # Update state with the final sample's results before finalizing
-                        state["per_sample_results"] = per_sample
-                        # Let it fall through to FINALIZER
-
                 # all steps are done -> hand off to FINALIZER
+                self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
+                trim_msgs = self._trim_messages(state.get("messages", []))
+                return {
+                    "current_idx": idx,
+                    "per_sample_results": state.get("per_sample_results"),
+                    "next_step": "finalizer",
+                    "messages": trim_msgs + [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
+                }
+            
+            # P4-D: Parallel Batch Mode detection
+            if state.get("batch_mode") and state.get("sample_manifest"):
+                is_coassembly_phase2 = state.get("batch_strategy") == "coassembly" and plan[idx].get("phase") == 2
+                is_independent = state.get("batch_strategy") == "independent"
+                
+                if is_coassembly_phase2 or is_independent:
+                    self._log("BATCH DISPATCH", body=f"Delegating parallel execution to batch_orchestrator (idx={idx})", node=node)
+                    return {
+                        "current_idx": idx,
+                        "next_step": "batch_orchestrator",
+                        "messages": [AIMessage(content="<observe>Dispatching independent steps in parallel.</observe>")]
+                    }
+
                 self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
                 trim_msgs = self._trim_messages(state.get("messages", []))
                 return {
@@ -1212,9 +1185,123 @@ class BioAgent:
                 "next_step": "input_guard",
                 "messages": trim_msgs + [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
             }
+
+        def _batch_orchestrator(self, state: AgentState) -> AgentState:
+            import os
+            import copy
+            import threading
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            node = "batch_orchestrator"
+            self._log("ENTER NODE", body="Starting parallel execution of independent steps", node=node)
+            
+            samples = state.get("sample_manifest") or []
+            if not samples:
+                return {"next_step": "finalizer", "messages": [AIMessage(content="<observe>Error: batch_orchestrator called without sample_manifest.</observe>")]}
+                
+            # P4-D.2: Semaphore for concurrency control
+            concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
+            semaphore = threading.Semaphore(concurrency)
+            
+            per_sample = dict(state.get("per_sample_results") or {})
+            idx = state["current_idx"]
+            plan = state["plan"]
+            
+            def process_sample(sample_idx: int, sample_dict: dict) -> tuple:
+                with semaphore:
+                    sample_id = sample_dict.get("id", f"sample_{sample_idx}")
+                    
+                    # Clone state to isolate thread execution
+                    local_state = dict(state)
+                    local_state["manifest"] = copy.deepcopy(state.get("manifest", {}))
+                    # Wipe global quality signals so they don't bleed between samples
+                    local_state["manifest"].pop("quality_signals", None)
+                    local_state["manifest"].pop("amr_genes_detected", None)
+                    local_state["manifest"].pop("observations", None)
+                    
+                    local_state["plan"] = copy.deepcopy(plan)
+                    local_state["current_idx"] = idx
+                    local_state["retry_counts"] = {}
+                    local_state["current_sample_id"] = sample_id
+                    local_state["current_sample_idx"] = sample_idx
+                    
+                    # P4-D.3: Isolated run_temp_dir
+                    local_state["run_temp_dir"] = os.path.join(state["run_temp_dir"], sample_id)
+                    os.makedirs(local_state["run_temp_dir"], exist_ok=True)
+                    
+                    # Manual node chaining loop for this sub-plan
+                    while local_state["current_idx"] < len(local_state["plan"]):
+                        curr_idx = local_state["current_idx"]
+                        step = local_state["plan"][curr_idx]
+                        if step["status"] != "todo":
+                            local_state["current_idx"] += 1
+                            continue
+                            
+                        # _input_guard
+                        updates = self._input_guard(local_state)
+                        local_state.update(updates)
+                        if local_state.get("next_step") == "qa":
+                            step["status"] = "error"
+                            step["notes"] = "QA requested during batch parallel execution (unsupported)."
+                            local_state["current_idx"] += 1
+                            continue
+                            
+                        # _generator
+                        updates = self._generator(local_state)
+                        local_state.update(updates)
+                        if local_state.get("next_step") == "qa":
+                            step["status"] = "error"
+                            step["notes"] = "QA requested during generation (unsupported)."
+                            local_state["current_idx"] += 1
+                            continue
+                            
+                        # _ensure_env
+                        updates = self._ensure_env(local_state)
+                        local_state.update(updates)
+                        
+                        # _executor
+                        updates = self._executor(local_state)
+                        local_state.update(updates)
+                        
+                        # _observer
+                        updates = self._observer(local_state)
+                        local_state.update(updates)
+                        
+                        # Observer naturally handles retries via updates to current_idx
+                        # and plan[curr_idx]["status"]
+                        
+                    # Extract sample results
+                    manifest = local_state.get("manifest", {})
+                    result = {
+                        "quality_signals": manifest.get("quality_signals", {}),
+                        "amr_genes_detected": manifest.get("amr_genes_detected", []),
+                        "observations": manifest.get("observations", []),
+                        "retry_counts": local_state.get("retry_counts", {})
+                    }
+                    return sample_id, result
+                    
+            # Launch ThreadPool
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [executor.submit(process_sample, i, s) for i, s in enumerate(samples)]
+                for future in as_completed(futures):
+                    try:
+                        sample_id, res = future.result()
+                        per_sample[sample_id] = res
+                        self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
+                    except Exception as e:
+                        self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}", node=node)
+                        
+            self._log("EXIT NODE", body="All parallel samples completed. Routing to finalizer.", node=node)
+            return {
+                "per_sample_results": per_sample,
+                "current_idx": len(plan), # mark plan as complete
+                "next_step": "finalizer",
+                "messages": [AIMessage(content=f"<observe>Processed {len(samples)} samples in parallel mode.</observe>")]
+            }
         
         def _input_guard(self, state: AgentState) -> AgentState:
-            node = "input_guard"
+            sid = state.get("current_sample_id")
+            node = f"input_guard|{sid}" if sid else "input_guard"
 
             # T7: Safe step accessor
             step = self._get_current_step(state)
@@ -1299,7 +1386,8 @@ class BioAgent:
                 }
         
         def _generator(self, state: AgentState) -> AgentState:
-            node = "generator"
+            sid = state.get("current_sample_id")
+            node = f"generator|{sid}" if sid else "generator"
 
             # T7: Safe step accessor
             step = self._get_current_step(state)
@@ -1430,7 +1518,8 @@ class BioAgent:
             return updates
         
         def _ensure_env(self, state: AgentState) -> AgentState:
-            # Todos: (MVP) mark ready; replace with env manager later
+            sid = state.get("current_sample_id")
+            node = f"ensure_env|{sid}" if sid else "ensure_env"
             # state["env_ready"] = True
             # state["next_step"] = "executor"
             # return state
@@ -1503,7 +1592,8 @@ class BioAgent:
                 }
         
         def _executor(self, state: AgentState) -> AgentState:
-            node = "executor"
+            sid = state.get("current_sample_id")
+            node = f"executor|{sid}" if sid else "executor"
             code = (state.get("pending_code") or "").strip()
             diagnostic_code = (state.get("diagnostic_code") or "").strip()
             diagnostic_mode = state.get("diagnostic_mode")
@@ -1727,7 +1817,8 @@ class BioAgent:
             return updates
         
         def _observer(self, state: AgentState) -> AgentState:
-            node = "observer"
+            sid = state.get("current_sample_id")
+            node = f"observer|{sid}" if sid else "observer"
 
             # T7: Safe step accessor — prevents IndexError when current_idx >= len(plan)
             step = self._get_current_step(state)
@@ -1982,7 +2073,8 @@ class BioAgent:
             return updates
         
         def _diagnostics(self, state: AgentState) -> AgentState:
-            node = "diagnostics"
+            sid = state.get("current_sample_id")
+            node = f"diagnostics|{sid}" if sid else "diagnostics"
 
             # T7: Safe step accessor
             step = self._get_current_step(state)
@@ -2184,6 +2276,7 @@ class BioAgent:
         self.observer = types.MethodType(_observer, self)
         self.diagnostics = types.MethodType(_diagnostics, self)
         self.finalizer = types.MethodType(_finalizer, self)
+        self.batch_orchestrator = types.MethodType(_batch_orchestrator, self)
         
         # Create the workflow
         # --------------------------------------------------------------------------------
@@ -2198,6 +2291,7 @@ class BioAgent:
         workflow.add_node("observer", self.observer)
         workflow.add_node("diagnostics", self.diagnostics)
         workflow.add_node("finalizer", self.finalizer)
+        workflow.add_node("batch_orchestrator", self.batch_orchestrator)
 
         # defining workflow edges
         workflow.add_edge(START, "planner")
@@ -2219,6 +2313,14 @@ class BioAgent:
             {
                 "planner": "planner",
                 "input_guard": "input_guard",
+                "batch_orchestrator": "batch_orchestrator",
+                "finalizer": "finalizer",
+            },
+        )
+        workflow.add_conditional_edges(
+            "batch_orchestrator",
+            lambda s: s["next_step"],
+            {
                 "finalizer": "finalizer",
             },
         )
@@ -2800,6 +2902,7 @@ class BioAgent:
             "batch_strategy": "independent",
             "sample_manifest": None,
             "current_sample_idx": None,
+            "current_sample_id": None,
             "per_sample_results": None,
         }
 
