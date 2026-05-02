@@ -316,6 +316,14 @@ def ensure_env(name: str, auto_install: bool  = True, log_cb: Optional[Callable[
             spec = spec_path(rec["spec"])
             ch = rec.get("channels")
             create_or_update_env(name, spec, ch, log_cb=log_cb)
+            
+            # P2-A.4: clear version cache when env is updated
+            try:
+                from genomeer.utils.helper import clear_version_cache
+                clear_version_cache(name)
+            except ImportError:
+                pass
+                
             return prefix, True, f"Environment '{name}' created."
     else:
         raise KeyError(f"Env '{name}' not found in registry. Consider enable auto_install if you wanna install this env.")

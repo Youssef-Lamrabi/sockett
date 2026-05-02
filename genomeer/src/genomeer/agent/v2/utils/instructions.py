@@ -349,6 +349,7 @@ GENERATOR_CTX_PROMPT = """
 USER_INITAL_GOAL: {user_goal}
 CURRENT_STEP: {current_step_title}
 MANIFEST: {manifest}
+DIAGNOSTIC_ROUND: {diag_round}
 
 AVAILABLE_FILES_BY_STEP (file_registry):
 {file_registry}
@@ -387,9 +388,13 @@ USER_INITIAL_GOAL: {user_goal}
 CURRENT_STEP: {current_step_title}
 MANIFEST: {manifest}
 RUN_TEMP_DIR: {run_temp_dir}
+DIAGNOSTIC_ROUND: {diag_round}
 
 REPAIR_FEEDBACK (from OBSERVER):
 {repair_feedback}
+
+AVAILABLE_FILES_BY_STEP (file_registry):
+{file_registry}
 
 PREVIOUS_CODE:
 {previous_code}
@@ -534,6 +539,11 @@ STRICT RULES:
 
 CONTEXT (from DIAGNOSTICS_PLANNER):
 {diagnostics_feedback}
+
+RUN_TEMP_DIR: {run_temp_dir}
+
+AVAILABLE_FILES_BY_STEP (file_registry):
+{file_registry}
 
 Always end with a valid </EXECUTE> closing tag.
 """

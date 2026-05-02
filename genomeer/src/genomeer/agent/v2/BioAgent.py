@@ -155,6 +155,34 @@ _HEAVY_STEPS = {
     "prokka":   3600,
 }
 
+def _estimate_timeout(step_title: str, input_files: list, default: int) -> int:
+    """Dynamically estimates timeout based on step type and input file sizes (P2-B)."""
+    import os
+    
+    # P2-B.3: GENOMEER_TIMEOUT_SCALE_FACTOR
+    scale_factor = float(os.environ.get("GENOMEER_TIMEOUT_SCALE_FACTOR", "1.0"))
+    max_timeout = 48 * 3600
+    
+    # Base timeout detection
+    base_timeout = default
+    step_lower = step_title.lower()
+    for kw, t in _HEAVY_STEPS.items():
+        if kw in step_lower:
+            base_timeout = t
+            break
+            
+    # Calculate input size in GB
+    total_size_gb = 0.0
+    for f in input_files:
+        if os.path.exists(f):
+            total_size_gb += os.path.getsize(f) / (1024**3)
+            
+    # Scale based on size (base assumes ~5GB of data)
+    size_multiplier = max(1.0, total_size_gb / 5.0)
+    
+    timeout = int(base_timeout * size_multiplier * scale_factor)
+    return min(timeout, max_timeout)
+
 # ---------------------------------------------------------------------------
 # Phase 3: Adaptive retry escalation
 # When a step keeps failing, suggest a different strategy instead of retrying
@@ -367,13 +395,17 @@ class BioAgent:
 
     def _slim_manifest(self, manifest: dict, node: str) -> dict:
         if node in ("observer", "generator", "diagnostics"):
-            return {
+            out = {
                 "input_state":      manifest.get("input_state"),
                 "timeout_seconds":  manifest.get("timeout_seconds"),
                 "retry_count":      manifest.get("retry_count"),
                 "quality_signals":  manifest.get("quality_signals"),
                 "repair_feedback":  manifest.get("repair_feedback"),
             }
+            if node == "generator":
+                out["diagnostics_rounds"] = manifest.get("diagnostics_rounds")
+                out["file_registry"] = manifest.get("file_registry")
+            return out
         if node == "finalizer":
             return {
                 "quality_signals":      manifest.get("quality_signals"),
@@ -382,6 +414,42 @@ class BioAgent:
                 "observations":         manifest.get("observations"),
             }
         return manifest
+
+    def _trim_messages(self, messages: list, keep_first: int = 1, keep_last: int = 30) -> list:
+        """P3-A: Trim messages to prevent context explosion on long runs."""
+        import os
+        keep_last = int(os.environ.get("GENOMEER_MAX_MESSAGES", str(keep_last)))
+        
+        if len(messages) <= keep_first + keep_last:
+            return []
+            
+        first_msgs = messages[:keep_first]
+        remaining_msgs = messages[keep_first:]
+        
+        cutoff_idx = len(remaining_msgs) - keep_last
+        older_msgs = remaining_msgs[:cutoff_idx]
+        
+        # Priority 3: Do not delete AIMessages with <observe> tags containing biological metrics
+        important_older_ids = set()
+        for m in older_msgs:
+            if hasattr(m, 'content') and getattr(m, 'type', '') == 'ai':
+                if '<observe>' in m.content:
+                    lower_content = m.content.lower()
+                    if any(kw in lower_content for kw in ('n50', 'q30', 'contig', 'classified', 'genes', 'quality', 'metric', 'rate', 'reads')):
+                        important_older_ids.add(getattr(m, 'id', None))
+        
+        try:
+            from langchain_core.messages import RemoveMessage
+        except ImportError:
+            return []
+            
+        to_remove = []
+        for m in older_msgs:
+            m_id = getattr(m, 'id', None)
+            if m_id and m_id not in important_older_ids:
+                to_remove.append(RemoveMessage(id=m_id))
+                
+        return to_remove
 
     def _log(self, title: str, body: str = "", node: str | None = None, type: str = 'file'):
         """Append a structured block to the debug log."""
@@ -457,6 +525,50 @@ class BioAgent:
  
         return resp
     
+    def _route_blocked_step(self, state, rc, diag_rounds, summary, step, new_manifest, node="observer"):
+        """Unified routing for blocked steps. Handles retry counts, escalation hints, and the diag_rounds cap (T1.2/P1-C)."""
+        rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+        current_retry = rc[state["current_idx"]]
+        new_manifest["retry_count"] = current_retry
+        new_manifest["repair_step_idx"] = state["current_idx"]
+
+        # Phase 3: Adaptive escalation hint
+        step_title_lower = step["title"].lower()
+        escalation_hint = ""
+        for keyword, hints in RETRY_ESCALATION.items():
+            if keyword in step_title_lower:
+                escalation_hint = hints.get(current_retry, "")
+                if not escalation_hint and current_retry >= max(hints.keys()):
+                    escalation_hint = hints[max(hints.keys())]
+                break
+        
+        if escalation_hint:
+            new_manifest["repair_feedback"] = f"{summary}\n\n{escalation_hint}"
+            self._log("ESCALATION HINT", body=escalation_hint, node=node)
+        else:
+            new_manifest["repair_feedback"] = summary
+
+        # T1.2 / P1-C: Check diag_rounds cap BEFORE routing to diagnostics
+        _diag_count = diag_rounds.get(state["current_idx"], 0)
+        if current_retry > self.MAX_STEP_RETRIES and _diag_count >= self.MAX_DIAG_ROUNDS_PER_STEP:
+            self._log(
+                "DIAG ROUNDS CAP",
+                body=f"step_idx={state['current_idx']} diag_rounds={_diag_count} >= cap={self.MAX_DIAG_ROUNDS_PER_STEP}. Escalating to QA.",
+                node=node,
+            )
+            new_manifest["route_hint"] = "finalize"
+            new_manifest["qa_payload"] = (
+                f"Step '{step['title']}' failed after {current_retry} retries "
+                f"and {_diag_count} diagnostic rounds. Last error:\n{summary}\n\n"
+                "The pipeline cannot continue automatically. Please review the logs and try a different approach."
+            )
+            return "qa"
+        elif current_retry > self.MAX_STEP_RETRIES:
+            return "diagnostics"
+        else:
+            return "generator"
+
+
     def _generate_system_prompt(
         self,
         tool_desc,
@@ -1047,19 +1159,21 @@ class BioAgent:
 
                 # all steps are done -> hand off to FINALIZER
                 self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
+                trim_msgs = self._trim_messages(state.get("messages", []))
                 return {
                     "current_idx": idx,
                     "per_sample_results": state.get("per_sample_results"),
                     "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
+                    "messages": trim_msgs + [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
                 }
             
             # otherwise go check inputs
             self._log("EXIT NODE", body=f"all_done=False\ncurrent_idx={idx}\nnext_step=input_guard", node=node)
+            trim_msgs = self._trim_messages(state.get("messages", []))
             return {
                 "current_idx": idx,
                 "next_step": "input_guard",
-                "messages": [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
+                "messages": trim_msgs + [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
             }
         
         def _input_guard(self, state: AgentState) -> AgentState:
@@ -1175,12 +1289,17 @@ class BioAgent:
                 for step_name, paths in _file_registry.items()
             ) or "<none>"
             files_str = f"{files_str}\n\nFiles produced by previous steps:\n{_freg_str}"
+            
+            _diag_rounds_dict = manifest.get("diagnostics_rounds", {})
+            _diag_round = _diag_rounds_dict.get(state["current_idx"], 0)
 
             if repair_feedback:
                 if is_diagnostic:
                     prompt = instructions.GENERATOR_PROMPT
                     content = instructions.GENERATOR_DIAGNOSTICS_MODE_PROMPT.format(
                         diagnostics_feedback=repair_feedback,
+                        run_temp_dir=temp_dir,
+                        file_registry=_freg_str,
                     )
                 else:
                     prompt = instructions.GENERATOR_PROMPT_REPAIR
@@ -1195,6 +1314,8 @@ class BioAgent:
                         previous_code=(state.get("pending_code") or "").strip(),
                         last_result=(state.get("last_result") or "").strip(),
                         files_str=files_str,
+                        file_registry=_freg_str,
+                        diag_round=_diag_round,
                     )
             else:
                 prompt = instructions.GENERATOR_PROMPT
@@ -1205,6 +1326,7 @@ class BioAgent:
                     manifest=self._slim_manifest(state['manifest'], "generator").get("input_state"),
                     run_temp_dir=temp_dir,
                     file_registry=_freg_str,
+                    diag_round=_diag_round,
                 )
             
             msgs = [
@@ -1366,7 +1488,20 @@ class BioAgent:
             _extra_env = {"RUN_TEMP_DIR": _run_temp_dir}
 
             env = state["env_name"]
-            timeout = state["manifest"].get("timeout_seconds", 600)
+            _default_timeout = state["manifest"].get("timeout_seconds", 600)
+            
+            # P2-B.2: Pre-extract input files to estimate dynamic timeout
+            import re as _re
+            _input_files = [
+                f for f in _re.findall(r'["\']([^"\']+\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))["\']', code or '')
+                if os.path.exists(f)
+            ]
+            
+            step = self._get_current_step(state)
+            step_title = step["title"] if step else "unknown step"
+            
+            timeout = _estimate_timeout(step_title, _input_files, _default_timeout)
+            
             last_result = ""
 
             self._log("ENTER NODE", body=f"env={env}\ntimeout={timeout}s\nRUN_TEMP_DIR={_run_temp_dir}\ncode_preview=\n{code[:500] or '<no code>'}", node=node)
@@ -1387,11 +1522,25 @@ class BioAgent:
             import re as _re
             _tool_match = _re.search(r'(run_\w+|fastp|kraken2|metaspades|megahit|flye|minimap2|checkm2|metabat2|prokka|diamond|hmmer|humann|amrfinder)\b', code or '')
             _tool_name  = _tool_match.group(1) if _tool_match else "generic"
-            _input_files = [
-                f for f in _re.findall(r'["\']([^"\']+\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))["\']', code or '')
-                if os.path.exists(f)
-            ]
-            _tool_key = self._cache.tool.make_key(_tool_name, _input_files, params={})
+
+            
+            # P2-A.2: Get actual tool version from micromamba environment
+            from genomeer.utils.helper import get_tool_version
+            _real_tool_name = _tool_name.replace("run_", "") if _tool_name.startswith("run_") else _tool_name
+            _tool_version = get_tool_version(_real_tool_name, env)
+            
+            # P2-A.3: Include DB modification time for DB-dependent tools
+            _db_hash = ""
+            if _real_tool_name in ("kraken2", "checkm2", "gtdbtk", "humann", "metaphlan4"):
+                _db_match = _re.search(r'(?:--db|-d|--database|--bowtie2db)\s+(?:["\']?)(/[^\s"\']+)(?:["\']?)', code)
+                if _db_match:
+                    _db_path = _db_match.group(1)
+                    if os.path.exists(_db_path):
+                        _db_hash = str(os.path.getmtime(_db_path))
+            
+            _cache_db_version = f"{_tool_version}_{_db_hash}" if _db_hash else _tool_version
+            
+            _tool_key = self._cache.tool.make_key(_tool_name, _input_files, params={}, db_version=_cache_db_version)
             _cached_tool = self._cache.tool.get(_tool_key, output_dir=state.get('run_temp_dir'))
             if _cached_tool:
                 self._log("TOOL CACHE HIT", body=f"{_tool_name} key={_tool_key[:8]}", node=node)
@@ -1405,6 +1554,10 @@ class BioAgent:
                 }
                 
             try:
+                import threading
+                _cancel_event = threading.Event()
+                state["cancel_event"] = _cancel_event
+
                 if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
                     r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
                     out = run_with_timeout(
@@ -1416,6 +1569,7 @@ class BioAgent:
                             "run_temp_dir": _run_temp_dir, # T2.1
                         },
                         timeout=timeout,
+                        cancel_event=_cancel_event,
                     )
                 elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
                     if code.strip().startswith("#!CLI"):
@@ -1429,6 +1583,7 @@ class BioAgent:
                                 "run_temp_dir": _run_temp_dir, # T2.1
                             },
                             timeout=timeout,
+                            cancel_event=_cancel_event,
                         )
                     else:
                         bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
@@ -1441,6 +1596,7 @@ class BioAgent:
                                 "run_temp_dir": _run_temp_dir, # T2.1
                             },
                             timeout=timeout,
+                            cancel_event=_cancel_event,
                         )
                 else:
                     # Inject custom functions into the Python execution environment
@@ -1466,6 +1622,7 @@ class BioAgent:
                             "step_namespace": _step_namespace, # T4
                         },
                         timeout=timeout,
+                        cancel_event=_cancel_event,
                     )
 
                 # ── AXE 3.3: Intelligent output parser instead of blind truncation ──
@@ -1611,14 +1768,15 @@ class BioAgent:
             # Hard fail: any gate failure forces blocked immediately (skip LLM)
             if first_fail_msg:
                 rc = dict(state.get("retry_counts") or {})
-                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                diag_rounds = dict(state.get("manifest", {}).get("diagnostics_rounds", {}))
                 new_manifest = dict(state["manifest"])
-                new_manifest["retry_count"] = rc[state["current_idx"]]
-                new_manifest["repair_feedback"] = first_fail_msg
-                new_manifest["repair_step_idx"] = state["current_idx"]
+                
+                next_step = self._route_blocked_step(
+                    state, rc, diag_rounds, first_fail_msg, step, new_manifest, node="observer"
+                )
+                
                 plan = list(state["plan"])
                 plan[state["current_idx"]] = {**plan[state["current_idx"]], "status": "blocked", "notes": first_fail_msg}
-                next_step = "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator"
                 self._log("QUALITY GATE BLOCK", body=f"Forcing blocked: {first_fail_msg}", node=node)
                 return {
                     "plan": plan,
@@ -1657,9 +1815,11 @@ class BioAgent:
                     status, summary = StateGraphHelper.parse_status(_retry_resp.content)
                     if status == "unknown":
                         # Still unknown after retry — default to blocked to be safe
-                        self._log("STATUS UNKNOWN (retry)", body="Still unknown after retry. Defaulting to blocked.", node=node)
+                        self._log("STATUS UNKNOWN \u2192 FORCED BLOCKED", body="Still unknown after retry. Defaulting to blocked.", node=node)
                         status = "blocked"
-                        summary = "[STATUS UNKNOWN] Observer did not produce a valid status tag after two attempts."
+                        summary = f"[OBSERVER FALLBACK] Status unclear after two LLM calls. Treating as blocked. Raw: {_retry_resp.content[:200]}"
+                    else:
+                        self._log("STATUS UNKNOWN \u2192 CLARIFIED", body=f"Clarified as {status}", node=node)
                 except Exception as _retry_exc:
                     self._log("STATUS UNKNOWN (retry error)", body=str(_retry_exc), node=node)
                     status = "blocked"
@@ -1690,58 +1850,15 @@ class BioAgent:
                 new_manifest["amr_genes_detected"] = list(set(_existing_amr + _found_amr))
 
             rc = dict(state.get("retry_counts") or {})
-            diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
+            diag_rounds = dict(state.get("manifest", {}).get("diagnostics_rounds", {}))
             if status == "blocked":
-                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
-                current_retry = rc[state["current_idx"]]
-                new_manifest["retry_count"] = current_retry
-                new_manifest["repair_step_idx"] = state["current_idx"]
-
-                # ── Phase 3: Adaptive escalation hint \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                step_title_lower = step["title"].lower()
-                escalation_hint = ""
-                for keyword, hints in RETRY_ESCALATION.items():
-                    if keyword in step_title_lower:
-                        escalation_hint = hints.get(current_retry, "")
-                        if not escalation_hint and current_retry >= max(hints.keys()):
-                            escalation_hint = hints[max(hints.keys())]
-                        break
-                # Enrich repair_feedback with escalation hint if available
-                if escalation_hint:
-                    new_manifest["repair_feedback"] = f"{summary}\n\n{escalation_hint}"
-                    self._log("ESCALATION HINT", body=escalation_hint, node=node)
-                else:
-                    new_manifest["repair_feedback"] = summary
-                # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-                # T1.2: Check diag_rounds cap BEFORE routing to diagnostics
-                # If we've already exhausted MAX_DIAG_ROUNDS_PER_STEP for this step,
-                # stop retrying and escalate to QA with a full summary of what was attempted.
-                _diag_count = diag_rounds.get(state["current_idx"], 0)
-                if rc[state["current_idx"]] > self.MAX_STEP_RETRIES and _diag_count >= self.MAX_DIAG_ROUNDS_PER_STEP:
-                    self._log(
-                        "DIAG ROUNDS CAP",
-                        body=f"step_idx={state['current_idx']} diag_rounds={_diag_count} >= cap={self.MAX_DIAG_ROUNDS_PER_STEP}. Escalating to QA.",
-                        node=node,
-                    )
-                    new_manifest["route_hint"] = "finalize"
-                    new_manifest["qa_payload"] = (
-                        f"Step '{step['title']}' failed after {rc[state['current_idx']]} retries "
-                        f"and {_diag_count} diagnostic rounds. Last error:\n{summary}\n\n"
-                        "The pipeline cannot continue automatically. Please review the logs and try a different approach."
-                    )
-                    next_step = "qa"
-                    next_idx = state["current_idx"]
-                elif rc[state["current_idx"]] > self.MAX_STEP_RETRIES:
-                    next_step = "diagnostics"
-                    next_idx = state["current_idx"]
-                else:
-                    next_step = "generator"
-                    next_idx = state["current_idx"]
-
+                next_step = self._route_blocked_step(
+                    state, rc, diag_rounds, summary, step, new_manifest, node="observer"
+                )
+                
                 # logs
                 self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
-                self._log("EXIT NODE", body="next_step=input_guard (retry same step)", node=node)
+                self._log("EXIT NODE", body=f"next_step={next_step} (retry same step)", node=node)
 
             else:
                 new_manifest.pop("repair_feedback", None)

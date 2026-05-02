@@ -23,6 +23,41 @@ class api_schema(BaseModel):
     """api schema specification."""
     api_schema: str | None = Field(description="The api schema as a dictionary")
 
+_version_cache = {}
+
+def clear_version_cache(env_name: Optional[str] = None):
+    """Clear the version cache for a specific environment or globally."""
+    global _version_cache
+    if env_name:
+        _version_cache = {k: v for k, v in _version_cache.items() if not k.startswith(f"{env_name}::")}
+    else:
+        _version_cache.clear()
+
+def get_tool_version(tool_name: str, env_name: str) -> str:
+    """Run `<tool> --version` inside the specified environment and cache the result."""
+    if not env_name or not tool_name:
+        return "unknown"
+    
+    # Check cache
+    cache_key = f"{env_name}::{tool_name}"
+    if cache_key in _version_cache:
+        return _version_cache[cache_key]
+    
+    try:
+        proc = _run_in_env(env_name, [tool_name, "--version"], timeout=10.0)
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        
+        # Take the first non-empty line as version, capped to 100 chars to avoid huge hashes
+        lines = [line.strip() for line in output.split("\n") if line.strip()]
+        version_str = lines[0][:100] if lines else "unknown"
+        
+        _version_cache[cache_key] = version_str
+        return version_str
+    except Exception:
+        # Fallback to unknown if the tool does not support --version or fails
+        _version_cache[cache_key] = "unknown"
+        return "unknown"
+
 # ------------------------------------------------------------------------------------------
 # internal utility to run in env
 # ------------------------------------------------------------------------------------------
@@ -218,9 +253,9 @@ def run_r_code(
         return _format_proc_error(
             "Error running Bash script",
             [path],
-            res.returncode,
-            res.stdout or "",
-            res.stderr or "",
+            res_returncode,
+            res_stdout or "",
+            res_stderr or "",
         )
     except Exception as e:
         tb = traceback.format_exc()
@@ -243,6 +278,7 @@ def run_bash_script(
     env_name: Optional[str] = None,
     extra_env: Optional[dict] = None,
     run_temp_dir: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
     log_cb=None,
 ) -> str:
     """Run a bash script, optionally inside a micromamba env.
@@ -330,9 +366,9 @@ def run_bash_script(
         return _format_proc_error(
             "Error running Bash script",
             [path],
-            res.returncode,
-            res.stdout or "",
-            res.stderr or "",
+            res_returncode,
+            res_stdout or "",
+            res_stderr or "",
         )
     except Exception as e:
         tb = traceback.format_exc()
