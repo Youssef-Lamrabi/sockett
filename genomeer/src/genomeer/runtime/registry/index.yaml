@@ -43,6 +43,8 @@ envs:
       - tooluniverse
       - python-dotenv
       - biopython
+      - faiss-cpu
+      - sentence-transformers
     provides_r:
       - ggplot2
       - vegan

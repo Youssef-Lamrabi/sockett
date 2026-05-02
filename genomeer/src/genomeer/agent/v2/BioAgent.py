@@ -341,11 +341,14 @@ class BioAgent:
         import threading
         from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever
         self.bio_rag_store = BioRAGStore(persist_dir=str(Path(self.path) / ".genomeer_rag_cache"))
-        threading.Thread(
+        self._rag_build_thread = threading.Thread(
             target=lambda: self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"]),
-            daemon=True
-        ).start()
+            daemon=True,
+            name="bio-rag-builder"
+        )
+        self._rag_build_thread.start()
         self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
+        self._log("BIO RAG", body="Index build started in background (daemon thread)", node="init")
 
         # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
         self._cache = get_cache()
@@ -780,6 +783,17 @@ class BioAgent:
 
             # ------ RESUME FAST-PATH ------
             manifest = state.get("manifest") or {}
+
+            # Si le plan existe déjà et des steps sont en cours, ne pas re-planifier
+            existing_plan = state.get("plan", [])
+            todo_steps = [s for s in existing_plan if s.get("status") == "todo"]
+            if existing_plan and todo_steps and not manifest.get("route_hint"):
+                self._log("PLANNER SKIP", body=f"Plan already exists with {len(todo_steps)} pending steps. Routing directly to orchestrator.", node=node)
+                return {
+                    "next_step": "orchestrator",
+                    "messages": [AIMessage(content=f"<observe>Resuming existing plan ({len(todo_steps)} steps remaining).</observe>")],
+                }
+
             if manifest.get("route_hint") == "ask_for_missing":
                 # user likely provided the missing info in the latest message.
                 # we don’t re-plan; we jump back into the current step’s guard.
@@ -938,6 +952,21 @@ class BioAgent:
 
             idx = state["current_idx"]
             plan = state["plan"]
+
+            if not plan:
+                self._log("ORCHESTRATOR WARN", body="Empty plan received from planner. Routing to QA for clarification.", node=node)
+                new_manifest = dict(state.get("manifest") or {})
+                new_manifest["route_hint"] = "finalize"
+                new_manifest["qa_payload"] = (
+                    "The planner could not generate a step-by-step plan for your request. "
+                    "Please rephrase your request or provide more details about the data and goal."
+                )
+                return {
+                    "manifest": new_manifest,
+                    "next_step": "qa",
+                    "messages": [AIMessage(content="<observe>No plan generated. Asking user for clarification.</observe>")],
+                }
+
             while idx < len(plan) and plan[idx]["status"] != "todo":
                 idx += 1
             state["current_idx"] = idx
@@ -1390,10 +1419,13 @@ class BioAgent:
             # ── END TOOL CACHE SAVE ──────────────────────────────────────────────
             self._log("EXIT NODE", body="next_step=observer", node=node)
             result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
+            
+            _stored_result = last_result[:4000] + "\n...<truncated for state storage>" if len(last_result) > 4000 else last_result
+            
             updates = {
                 "next_step": "observer", #end
                 result_key: last_result,
-                "messages": [AIMessage(content=f"<observe>Code Execution output:  '{last_result}'</observe>")],
+                "messages": [AIMessage(content=f"<observe>Code Execution output: '{_stored_result}'</observe>")],
             }
             return updates
         
@@ -1409,8 +1441,8 @@ class BioAgent:
                     manifest=self._slim_manifest(state['manifest'], "observer"),
                     code=(state.get("pending_code") or "").strip(),
                     result=(state.get("last_result") or state.get("diagnostic_observation") or "(no output)"),
-                    diagnostic_code=state.get("diagnostic_code").strip(),
-                    diagnostic_output=state.get("diagnostic_observation").strip(),
+                    diagnostic_code=(state.get("diagnostic_code") or "").strip(),
+                    diagnostic_output=(state.get("diagnostic_observation") or "").strip(),
                 )
             else:
                 payload = instructions.OBSERVER_CTX_PROMPT.format(
@@ -1438,6 +1470,7 @@ class BioAgent:
             for tool_name in [
                 "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
                 "run_metaspades", "run_megahit", "run_flye",
+                "run_host_decontamination",
                 "compute_coverage_samtools", "run_metabat2", "run_checkm2",
                 "run_bracken", "run_gtdbtk", "run_das_tool",
             ]:
@@ -1725,6 +1758,10 @@ class BioAgent:
             # ── RAG CONTEXT pour interprétation biologique sourcée ──────────────
             rag_context = ""
             if hasattr(self, "bio_retriever"):
+                if hasattr(self, "_rag_build_thread") and self._rag_build_thread.is_alive():
+                    self._rag_build_thread.join(timeout=10)
+                    if self._rag_build_thread.is_alive():
+                        self._log("BIO RAG (warn)", body="RAG build still in progress after 10s — using partial index", node=node)
                 try:
                     from genomeer.model.bio_rag import build_finalizer_rag_context
                     _pipeline_results = {
@@ -2076,8 +2113,20 @@ class BioAgent:
         Intended for local/dev workflows. In production, prefer mounting the router in main API.
         """
         def _run():
-            from genomeer.agent.v2.utils.artifacts_service import start_artifacts_server
-            start_artifacts_server(host=host, port=port, prefix=prefix)
+            try:
+                import uvicorn
+                from fastapi import FastAPI
+                from genomeer.agent.v2.utils.artifacts_service import create_artifacts_router
+            except ImportError:
+                self._log(
+                    "ARTIFACTS SERVER (warn)",
+                    body="fastapi/uvicorn not installed. Run: pip install genomeer[server]",
+                    node="init"
+                )
+                return
+            app = FastAPI()
+            app.include_router(create_artifacts_router(prefix=prefix))
+            uvicorn.run(app, host=host, port=port, log_level="warning")
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         self._log("ARTIFACT SERVER", f"Started on http://{host}:{port}{prefix}", node="driver")

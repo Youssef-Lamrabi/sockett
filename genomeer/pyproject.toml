@@ -54,6 +54,9 @@ dependencies = [
     "faiss-cpu",
     "sentence-transformers>=2.6.0,<3.0",
     "biopython",
+    "fastapi",
+    "uvicorn[standard]",
+    "sse-starlette",
 ]
 
 [project.urls]
@@ -84,7 +87,7 @@ line-length = 120
 [project.optional-dependencies]
 r = ["rpy2"]
 dev = ["pytest", "pytest-cov", "ruff", "mypy"]
-server = ["fastapi", "uvicorn[standard]", "sse-starlette"]  # for agent-ui
+# server dependencies moved to main dependencies
 
 [tool.ruff.lint]
 select = [
