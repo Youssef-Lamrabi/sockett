@@ -342,6 +342,10 @@ class BioAgent:
 
         # [helper] to import tools-mapper, llm
         self.path = os.path.join(path, "bioagent_data")
+        
+        from genomeer.utils.version_tracker import VersionTracker
+        self._version_tracker = VersionTracker()
+        
         self.module2api = read_module2api()
         self.llm = get_llm(
             llm,
@@ -1074,15 +1078,8 @@ class BioAgent:
                 cp.save(full_state, state["current_idx"])
             
             # --- FIX 8: Version Tracker ---
-            from genomeer.utils.version_tracker import VersionTracker
-            tracker = VersionTracker()
-            tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
-            
-            if "version_tracker" not in new_manifest:
-                new_manifest["version_tracker"] = tracker
-            else:
-                new_manifest["version_tracker"].tools.extend(tracker.tools)
-                new_manifest["version_tracker"].databases.extend(tracker.databases)
+            if hasattr(self, "_version_tracker"):
+                self._version_tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
 
             # --- FIX 9: Métriques ---
             if hasattr(self, "_metrics") and self._metrics:
@@ -1616,15 +1613,8 @@ class BioAgent:
                 cp.save(full_state, state["current_idx"])
             
             # --- FIX 8: Version Tracker ---
-            from genomeer.utils.version_tracker import VersionTracker
-            tracker = VersionTracker()
-            tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
-            
-            if "version_tracker" not in new_manifest:
-                new_manifest["version_tracker"] = tracker
-            else:
-                new_manifest["version_tracker"].tools.extend(tracker.tools)
-                new_manifest["version_tracker"].databases.extend(tracker.databases)
+            if hasattr(self, "_version_tracker"):
+                self._version_tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
 
             # --- FIX 9: Métriques ---
             if hasattr(self, "_metrics") and self._metrics:
@@ -1848,13 +1838,7 @@ class BioAgent:
                                 cancel_event=_cancel_event,
                             )
 
-                # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────
-                if _tool_cache_key and not _cached_result and out:
-                    try:
-                        self._cache.tool.set(_tool_cache_key, out, ttl_seconds=3600 * 24 * 7)  # TTL 7j
-                    except Exception as _cse:
-                        self._log("TOOL CACHE SAVE (warn)", body=str(_cse), node=node)
-                # ── END TOOL CACHE SAVE ────────────────────────────────────────────────
+                # ── TOOL CACHE SAVE block moved ─────────────────────────────────────────
                     else:
                         bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
                         out = run_with_timeout(
@@ -2099,13 +2083,30 @@ class BioAgent:
                 }
 
             # ── Extraire les gènes AMR détectés et les persister ───────────────────
-            _amr_pattern = re.compile(
-                r'\b(bla[A-Z]{2,6}|van[A-Z]|mec[A-Z]|mcr-\d|erm[A-Z]|tet[A-Z]|qnr[A-Z]|sul\d|aac|aph|cfr)\b',
-                re.IGNORECASE
-            )
-            _last_result_text = (state.get("last_result") or "")
-            _found_amr = list(set(_amr_pattern.findall(_last_result_text)))
+            _found_amr = []
+            try:
+                from genomeer.tools.function.viromics import parse_amr_tsv
+                import glob
+                _tmp = state.get("run_temp_dir", "")
+                _tsv_files = glob.glob(os.path.join(_tmp, "**", "*.tsv"), recursive=True) + glob.glob(os.path.join(_tmp, "**", "*.txt"), recursive=True)
+                for _tsv in _tsv_files:
+                    if "amr" in _tsv.lower() or "rgi" in _tsv.lower() or "card" in _tsv.lower():
+                        res = parse_amr_tsv(_tsv)
+                        if res.get("genes"):
+                            _found_amr.extend(res["genes"])
+            except Exception:
+                pass
+
+            if not _found_amr:
+                _amr_pattern = re.compile(
+                    r'\b(bla[A-Z]{2,6}|van[A-Z]|mec[A-Z]|mcr-\d|erm[A-Z]|tet[A-Z]|qnr[A-Z]|sul\d|aac|aph|cfr)\b',
+                    re.IGNORECASE
+                )
+                _last_result_text = (state.get("last_result") or "")
+                _found_amr = list(set(_amr_pattern.findall(_last_result_text)))
+
             if _found_amr:
+                _found_amr = list(set(_found_amr))
                 _existing_amr = list(new_manifest.get("amr_genes_detected") or [])
                 new_manifest["amr_genes_detected"] = list(set(_existing_amr + _found_amr))
 
@@ -2199,15 +2200,8 @@ class BioAgent:
                 cp.save(full_state, state["current_idx"])
             
             # --- FIX 8: Version Tracker ---
-            from genomeer.utils.version_tracker import VersionTracker
-            tracker = VersionTracker()
-            tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
-            
-            if "version_tracker" not in new_manifest:
-                new_manifest["version_tracker"] = tracker
-            else:
-                new_manifest["version_tracker"].tools.extend(tracker.tools)
-                new_manifest["version_tracker"].databases.extend(tracker.databases)
+            if hasattr(self, "_version_tracker"):
+                self._version_tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
 
             # --- FIX 9: Métriques ---
             if hasattr(self, "_metrics") and self._metrics:
@@ -2312,10 +2306,9 @@ class BioAgent:
             # --- FIX 8 & 9: Sauvegarde Metrics & VersionTracker ---
             if hasattr(self, "_metrics") and self._metrics:
                 self._metrics.save(temp_dir)
-            if "version_tracker" in manifest:
-                manifest["version_tracker"].save(temp_dir)
-                manifest["tool_versions"] = manifest["version_tracker"].as_dict()
-                del manifest["version_tracker"]
+            if hasattr(self, "_version_tracker") and self._version_tracker:
+                self._version_tracker.save(temp_dir)
+                manifest["tool_versions"] = self._version_tracker.as_dict()
 
             run_id = state.get("run_id")
             pub = manifest.get("publisher") or {}
