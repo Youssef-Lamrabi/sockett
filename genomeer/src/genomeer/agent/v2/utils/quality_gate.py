@@ -15,7 +15,10 @@ Usage (inside observer node):
 
 from __future__ import annotations
 import re
+import logging
 from typing import Tuple, Dict, Any, Optional
+
+logger = logging.getLogger("genomeer.quality_gate")
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,46 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         ),
     },
 
+    # ── Annotation & Profiling ───────────────────────────────────────────────
+
+    "run_prokka": {
+        "metric_key":     "n_genes_predicted",
+        "metric_label":   "Number of genes predicted",
+        "warn_threshold": 100,
+        "fail_threshold": 10,
+        "parse_regex":    r"(\d+)\s+genes? predicted",
+        "fix_hint": (
+            "Prokka predicted very few genes. Check: "
+            "(1) Assembly quality (N50, total length). "
+            "(2) Correct domain specification (e.g., Archaea vs Bacteria)."
+        ),
+    },
+
+    "run_diamond": {
+        "metric_key":     "hit_rate_pct",
+        "metric_label":   "DIAMOND hit rate (%)",
+        "warn_threshold": 20.0,
+        "fail_threshold": 5.0,
+        "parse_regex":    r"hit_rate[\"':,\s]+([0-9.]+)",
+        "fix_hint": (
+            "DIAMOND found very few functional hits. "
+            "Consider using a more sensitive mode (--sensitive or --more-sensitive) "
+            "or check if the correct reference database was used."
+        ),
+    },
+
+    "run_humann3": {
+        "metric_key":     "mapped_reads_pct",
+        "metric_label":   "% reads mapped to pathways",
+        "warn_threshold": 10.0,
+        "fail_threshold": 1.0,
+        "parse_regex":    r"mapped_reads_pct[\"':,\s]+([0-9.]+)",
+        "fix_hint": (
+            "HUMAnN3 mapped very few reads to functional pathways. "
+            "This may indicate a high proportion of novel or uncharacterized genes."
+        ),
+    },
+
     # ── Binning ───────────────────────────────────────────────────────────────
 
     "run_metabat2": {
@@ -287,9 +330,11 @@ def check_quality(
             except (ValueError, IndexError):
                 pass
 
-    # ── If we couldn't extract a number, just return ok ───────────────────
+    # ── If we couldn't extract a number, log a warning and return warn ────────
     if value is None:
-        return ("ok", f"{metric_label}: could not extract metric (skipping gate)")
+        msg = f"[QA-WARN] {metric_label}: metric could not be extracted. Manual verification recommended. {fix_hint}"
+        logger.warning(f"Quality gate metric extraction failed for {tool_name}: {metric_label}")
+        return ("warn", msg)
 
     # ── Threshold comparisons ─────────────────────────────────────────────
     # Handle special case for warn/fail below explicit fields

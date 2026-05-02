@@ -350,8 +350,12 @@ USER_INITAL_GOAL: {user_goal}
 CURRENT_STEP: {current_step_title}
 MANIFEST: {manifest}
 
+AVAILABLE_FILES_BY_STEP (file_registry):
+{file_registry}
+
 IMPORTANT:
 - Any script that downloads data or saves output must use this folder: {run_temp_dir}
+- MANDATORY [T2.4]: All generated Python scripts must start with: `import os; run_dir = os.environ.get("RUN_TEMP_DIR", "/tmp/bioagent")` and all generated Bash scripts must start with: `RUN_TEMP_DIR="${{RUN_TEMP_DIR:-/tmp/bioagent}}"`
 - Each code you generate should focus only on CURRENT_STEP goal. Not less. Not more.
 - If this step involves metagenomics CLI tools (fastp, kraken2, metaspades, etc.),
   the code runs in meta-env1. Use #!BASH for CLI pipelines.
@@ -425,6 +429,7 @@ Rules:
 - If execution succeeded → summarize and mark <STATUS:done>.
 - If execution failed or results are unusable → summarize the issue and give a clear
   instruction for CODE_GENERATOR, then mark <STATUS:blocked>.
+- IMPORTANT: Si tu omets le tag <STATUS:...>, le step sera automatiquement marqué comme échoué. Le tag est OBLIGATOIRE, même si le résultat est partiel.
 """
 
 OBSERVER_CTX_PROMPT = """

@@ -1,5 +1,6 @@
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
+import logging
 import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys
 from typing import Any, Callable, Iterable, Mapping, Optional
 from pydantic import BaseModel, Field, ValidationError
@@ -12,7 +13,12 @@ from genomeer.runtime.env_manager import (
     ensure_env,
     ENVS_DIR
 )
-_persistent_namespace = {} 
+
+logger = logging.getLogger("genomeer.helper")
+
+# Persistent namespace used ONLY for custom function injection via _inject_custom_functions_to_repl().
+# Do NOT use this for per-step code execution — use isolated step namespaces instead (T4).
+_persistent_namespace = {}
 class api_schema(BaseModel):
     """api schema specification."""
     api_schema: str | None = Field(description="The api schema as a dictionary")
@@ -26,35 +32,94 @@ def _run_in_env(
     *,
     timeout: float,
     extra_env: Optional[Mapping[str, str]] = None,
+    run_temp_dir: Optional[str] = None,
     check: bool = False,
     input_text: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> subprocess.CompletedProcess[str]:
     """
     Run argv inside micromamba env <env_name> and capture output.
+
+    Parameters
+    ----------
+    env_name     : Name of the micromamba environment.
+    argv         : Command + arguments to execute.
+    timeout      : Max seconds before subprocess.TimeoutExpired is raised.
+    extra_env    : Additional environment variables to inject into the subprocess.
+    run_temp_dir : If provided, exported as RUN_TEMP_DIR in the subprocess env.
+                   This ensures LLM-generated code can always find the working directory.
+    check        : Raise CalledProcessError on non-zero exit code.
+    input_text   : Text to pass on stdin.
     """
     exe = ensure_micromamba()
     prefix = ENVS_DIR / env_name
 
     # micromamba run -p <prefix> -- <argv...>
     cmd = [str(exe), "run", "-p", str(prefix), *argv]
-    print('---------------------------------')
-    print(cmd)
-    print('---------------------------------')
+    # T3: replaced print() debug with logging.debug() — do NOT revert to print()
+    logger.debug("[_run_in_env] cmd=%s", " ".join(str(x) for x in cmd))
 
     env = dict(os.environ)
     env.pop("CONDA_PREFIX", None)
     env["MAMBA_ROOT_PREFIX"] = str(ENVS_DIR.parent.parent)
+
+    # T2.1: Always inject RUN_TEMP_DIR into the subprocess environment so that
+    # LLM-generated code using os.environ.get("RUN_TEMP_DIR") never gets None.
+    if run_temp_dir:
+        env["RUN_TEMP_DIR"] = run_temp_dir
     if extra_env:
         env.update(extra_env)
+    # If RUN_TEMP_DIR still not set, use a safe fallback
+    if "RUN_TEMP_DIR" not in env:
+        env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
 
-    return subprocess.run(
+    import time
+    proc = subprocess.Popen(
         cmd,
-        input=input_text,
-        capture_output=True,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=check,
-        timeout=timeout,
+        env=env,
     )
+
+    try:
+        if cancel_event is not None:
+            # Poll loop checking cancel_event
+            start_time = time.time()
+            stdout_buf, stderr_buf = [], []
+            while True:
+                if cancel_event.is_set():
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                if time.time() - start_time > timeout:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    outs, errs = proc.communicate(input=input_text, timeout=0.5)
+                    stdout_buf.append(outs or "")
+                    stderr_buf.append(errs or "")
+                    input_text = None  # consumed
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+            stdout = "".join(stdout_buf)
+            stderr = "".join(stderr_buf)
+        else:
+            stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        outs, errs = proc.communicate()
+        exc.stdout = outs
+        exc.stderr = errs
+        raise
+
+    retcode = proc.poll()
+    if check and retcode:
+        raise subprocess.CalledProcessError(retcode, cmd, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(proc.args, retcode, stdout, stderr)
     
 def _tail(text: str, limit: int = 20000) -> str:
     if not text:
@@ -77,21 +142,36 @@ def _format_proc_error(title: str, cmd: list[str] | str, rc: int, stdout: str, s
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+def run_r_code(
+    code: str,
+    *,
+    env_name: Optional[str] = None,
+    extra_env: Optional[dict] = None,
+    run_temp_dir: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
+    log_cb=None,
+) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     code = (code or "").strip()
-    if not code: 
+    if not code:
         return "Error: Empty script"
-    
+
     try:
         with tempfile.NamedTemporaryFile(suffix=".R", mode="w", dir=settings.run_dir, delete=False) as f:
-            f.write(code); path = f.name
-            
+            f.write(code)
+            path = f.name
+
         if env_name:
             if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available." 
-            proc = _run_in_env(env_name, ["Rscript", path], timeout=settings.timeout_seconds)
-            cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
+                return f"Environment '{env_name}' is not available."
+            proc = _run_in_env(
+                env_name, ["Rscript", path],
+                timeout=settings.timeout_seconds,
+                extra_env=extra_env,
+                run_temp_dir=run_temp_dir,
+                cancel_event=cancel_event,
+            )
+            cmd_display = proc.args if hasattr(proc, "args") else ["Rscript", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
             return _format_proc_error(
@@ -102,16 +182,39 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
                 proc.stderr or "",
             )
 
-        # fallback: host R
-        res = subprocess.run(
+        import time
+        proc = subprocess.Popen(
             ["Rscript", path],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=settings.timeout_seconds,
         )
-        if res.returncode == 0:
-            return res.stdout or ""
+        try:
+            if cancel_event is not None:
+                start_time = time.time()
+                stdout_buf, stderr_buf = [], []
+                while True:
+                    if cancel_event.is_set() or time.time() - start_time > settings.timeout_seconds:
+                        proc.kill()
+                        proc.wait(1.0)
+                        break
+                    try:
+                        outs, errs = proc.communicate(timeout=0.5)
+                        stdout_buf.append(outs or "")
+                        stderr_buf.append(errs or "")
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                res_stdout, res_stderr = "".join(stdout_buf), "".join(stderr_buf)
+            else:
+                res_stdout, res_stderr = proc.communicate(timeout=settings.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            res_stdout, res_stderr = proc.communicate()
+        res_returncode = proc.poll()
+
+        if res_returncode == 0:
+            return res_stdout or ""
         return _format_proc_error(
             "Error running Bash script",
             [path],
@@ -120,9 +223,8 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
             res.stderr or "",
         )
     except Exception as e:
-        # return f"Error running R code: {e}"
         tb = traceback.format_exc()
-        return f"Error running Bash script: {tb}"
+        return f"Error running R script: {tb}"
     finally:
         try:
             os.unlink(path)
@@ -135,24 +237,50 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+def run_bash_script(
+    script: str,
+    *,
+    env_name: Optional[str] = None,
+    extra_env: Optional[dict] = None,
+    run_temp_dir: Optional[str] = None,
+    log_cb=None,
+) -> str:
+    """Run a bash script, optionally inside a micromamba env.
+
+    Parameters
+    ----------
+    script       : Bash script content.
+    env_name     : Micromamba env name. If None, uses host bash.
+    extra_env    : Extra environment variables to inject (T2.2).
+    run_temp_dir : Exported as RUN_TEMP_DIR in the subprocess (T2.1).
+    log_cb       : Optional streaming log callback.
+    """
     os.makedirs(settings.run_dir, exist_ok=True)
     script = (script or "").strip()
-    if not script: 
+    if not script:
         return "Error: Empty script"
-    
+
     with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
-        if not script.startswith("#!/"): f.write("#!/bin/bash\n")
-        if "set -e" not in script: f.write("set -euo pipefail\n")
-        f.write(script); path = f.name
+        if not script.startswith("#!/"):
+            f.write("#!/bin/bash\n")
+        if "set -e" not in script:
+            f.write("set -euo pipefail\n")
+        f.write(script)
+        path = f.name
     os.chmod(path, 0o755)
-    
+
     try:
         if env_name:
             if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available."
 
-            proc = _run_in_env(env_name, ["bash", path], timeout=settings.timeout_seconds)
+            proc = _run_in_env(
+                env_name, ["bash", path],
+                timeout=settings.timeout_seconds,
+                extra_env=extra_env,
+                run_temp_dir=run_temp_dir,
+                cancel_event=cancel_event,
+            )
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -165,16 +293,40 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
             )
 
         # fallback: host bash
-        res = subprocess.run(
+        import time
+        proc = subprocess.Popen(
             [path],
             shell=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=settings.timeout_seconds,
         )
-        if res.returncode == 0:
-            return res.stdout or ""
+        try:
+            if cancel_event is not None:
+                start_time = time.time()
+                stdout_buf, stderr_buf = [], []
+                while True:
+                    if cancel_event.is_set() or time.time() - start_time > settings.timeout_seconds:
+                        proc.kill()
+                        proc.wait(1.0)
+                        break
+                    try:
+                        outs, errs = proc.communicate(timeout=0.5)
+                        stdout_buf.append(outs or "")
+                        stderr_buf.append(errs or "")
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                res_stdout, res_stderr = "".join(stdout_buf), "".join(stderr_buf)
+            else:
+                res_stdout, res_stderr = proc.communicate(timeout=settings.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            res_stdout, res_stderr = proc.communicate()
+        res_returncode = proc.poll()
+
+        if res_returncode == 0:
+            return res_stdout or ""
         return _format_proc_error(
             "Error running Bash script",
             [path],
@@ -183,9 +335,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
             res.stderr or "",
         )
     except Exception as e:
-        # traceback.print_exc()
         tb = traceback.format_exc()
-        # return f"Error running Bash script: {e}"
         return f"Error running Bash script: {tb}"
     finally:
         try:
@@ -225,28 +375,56 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
 # ------------------------------------------------------------------------------------------
-def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+def run_python_code(
+    code: str,
+    *,
+    env_name: Optional[str] = None,
+    extra_env: Optional[dict] = None,
+    run_temp_dir: Optional[str] = None,
+    step_namespace: Optional[dict] = None,
+    cancel_event: Optional[threading.Event] = None,
+    log_cb=None,
+) -> str:
     """
     Executes the provided Python code.
+
     - If env_name is provided: runs it in that micromamba env (fresh process).
-    - If no env_name: runs in a persistent REPL namespace in the current process.
+      RUN_TEMP_DIR is always exported into the subprocess env (T2.1).
+    - If no env_name: runs in an isolated namespace per call (T4).
+      Pass step_namespace to control what variables are pre-injected.
+      Falls back to _persistent_namespace only for legacy custom function calls.
+
+    Parameters
+    ----------
+    code           : Python code string to execute.
+    env_name       : Micromamba env name. If None, runs in-process.
+    extra_env      : Extra env vars for subprocess (T2.2).
+    run_temp_dir   : Exported as RUN_TEMP_DIR in subprocess (T2.1).
+    step_namespace : If provided, used as exec namespace (T4 isolation).
+                     If None and no env_name, falls back to _persistent_namespace.
+    log_cb         : Optional streaming log callback.
     """
-    path = None  # FIX G6: initialise before try so finally block never hits NameError
+    path = None
     code = code.strip("```").strip()
-    try: 
+    try:
         # --- Case 1: run in a micromamba environment ---
         if env_name:
             if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
                 return f"Environment '{env_name}' is not available."
 
-            # Write the code to a temp file
             os.makedirs(settings.run_dir, exist_ok=True)
             with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
                 f.write(code)
                 path = f.name
 
             try:
-                proc = _run_in_env(env_name, ["python", path], timeout=settings.timeout_seconds)
+                proc = _run_in_env(
+                    env_name, ["python", path],
+                    timeout=settings.timeout_seconds,
+                    extra_env=extra_env,
+                    run_temp_dir=run_temp_dir,
+                    cancel_event=cancel_event,
+                )
             except subprocess.TimeoutExpired as te:
                 cmd_display = getattr(te, "cmd", ["python", path])
                 return (
@@ -268,16 +446,24 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -
                 proc.stderr or "",
             )
 
+        # --- Case 2: run in-process (no micromamba env) ---
+        # T4: Use an isolated namespace per call to prevent variable leakage between steps.
+        # If step_namespace is provided (from _executor), use it; otherwise create a fresh one.
+        # _persistent_namespace is only used when step_namespace is explicitly None AND
+        # we are in a legacy custom-function-injection context.
+        exec_namespace = step_namespace if step_namespace is not None else {
+            "__builtins__": __builtins__,
+        }
+        # Inject RUN_TEMP_DIR into the in-process namespace as well
+        if run_temp_dir and "run_dir" not in exec_namespace:
+            exec_namespace["run_dir"] = run_temp_dir
 
-        # --- Case 2: run in persistent in-process REPL ---
         stdout_buf, stderr_buf = StringIO(), StringIO()
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
             try:
-                # compile first to get better syntax errors with filename "<repl>"
                 compiled = compile(code, "<repl>", "exec")
-                exec(compiled, _persistent_namespace)
+                exec(compiled, exec_namespace)
             except Exception:
-                # include full traceback + whatever was printed so far
                 tb = traceback.format_exc()
                 out = stdout_buf.getvalue()
                 err = stderr_buf.getvalue()
@@ -288,28 +474,10 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -
                     f"\n--- STDERR (so far) ---\n{_tail(err)}"
                 ).strip()
 
-        # success: return combined stdout+stderr (stderr might contain warnings/prints)
         out = stdout_buf.getvalue()
         err = stderr_buf.getvalue()
         return (out + (("\n" + err) if err else "")).rstrip("\n")
-    
-        # else:
-        #     def execute_in_repl(command: str) -> str:
-        #         """Helper to execute inside persistent namespace."""
-        #         old_stdout = sys.stdout
-        #         sys.stdout = mystdout = StringIO()
 
-        #         global _persistent_namespace
-        #         try:
-        #             exec(command, _persistent_namespace)
-        #             output = mystdout.getvalue()
-        #         except Exception as e:
-        #             output = f"Error: {str(e)}"
-        #         finally:
-        #             sys.stdout = old_stdout
-        #         return output
-        #     return execute_in_repl(code)
-        
     except Exception as e:
         tb = traceback.format_exc()
         return f"Error running Python script: {tb}"

@@ -126,7 +126,8 @@ class LLMResponseCache:
 
     # Nœuds dont les réponses NE doivent PAS être cachées
     # (trop dépendants du contexte runtime)
-    _SKIP_NODES = {"planner", "orchestrator", "finalizer"}
+    # T5.2: Add "generator" to avoid hallucinated paths from previous runs
+    _SKIP_NODES = {"planner", "orchestrator", "finalizer", "generator"}
 
     def __init__(self, db_path: str, ttl: int = _LLM_TTL):
         self.db_path = db_path
@@ -160,17 +161,23 @@ class LLMResponseCache:
     def make_key(self, model: str, system_prompt: str, user_message: str) -> str:
         return _hash(model, system_prompt[:2000], user_message[:2000])
 
-    def get(self, key: str) -> Optional[str]:
+    def get(self, key: str, node: str = "") -> Optional[str]:
+        # T5.1: Added node parameter to prevent cross-node cache leakage
         if _CACHE_DISABLED:
             return None
         try:
             conn = self._conn_get()
             row = conn.execute(
-                "SELECT value, created FROM llm_cache WHERE key=?", (key,)
+                "SELECT value, created, node FROM llm_cache WHERE key=?", (key,)
             ).fetchone()
             if row is None:
                 return None
-            value, created = row
+            value, created, cached_node = row
+            # If node was provided, ensure it matches the cached node
+            if node and cached_node and node != cached_node:
+                logger.debug(f"[LLMCache] Miss node mismatch (wanted {node}, got {cached_node}) for key={key[:8]}")
+                return None
+
             if time.time() - created > self.ttl:
                 conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
                 conn.commit()
@@ -206,6 +213,17 @@ class LLMResponseCache:
             conn.commit()
         except Exception:
             pass
+
+    def invalidate_node(self, node: str):
+        # T5.4: Utility to invalidate all cached responses for a specific node
+        try:
+            conn = self._conn_get()
+            deleted = conn.execute("DELETE FROM llm_cache WHERE node=?", (node,)).rowcount
+            conn.commit()
+            if deleted:
+                logger.info(f"[LLMCache] Invalidate: purged {deleted} entries for node '{node}'")
+        except Exception as e:
+            logger.warning(f"[LLMCache] invalidate_node failed: {e}")
 
     def stats(self) -> dict:
         try:
@@ -345,6 +363,16 @@ class ToolOutputCache:
 
             result = json.loads(result_json)
 
+            # T9.2/9.3: Vérification stricte des fichiers de sortie
+            _verify_files = os.environ.get("GENOMEER_TOOL_CACHE_VERIFY_FILES", "1").strip() in ("1", "true", "True")
+            if _verify_files:
+                expected_files = result.get("__cached_files__", [])
+                missing_files = [f for f in expected_files if not os.path.exists(f)]
+                if missing_files:
+                    logger.info(f"[ToolCache] MISS key={key[:8]} — {len(missing_files)} missing files (e.g. {missing_files[0]})")
+                    self._delete(key)
+                    return None
+
             # Copier les fichiers de sortie si output_dir fourni
             if output_dir and cached_output_dir and Path(cached_output_dir).exists():
                 self._restore_outputs(cached_output_dir, output_dir, result)
@@ -376,6 +404,12 @@ class ToolOutputCache:
         if _CACHE_DISABLED:
             return
         try:
+            # T9.1: Enregistrement des chemins absolus des fichiers présents
+            produced_files = []
+            if output_dir and Path(output_dir).exists():
+                produced_files = [str(p.absolute()) for p in Path(output_dir).rglob("*") if p.is_file()]
+            result["__cached_files__"] = produced_files
+
             # Copier les outputs dans le cache
             cached_output_dir = None
             if output_dir and Path(output_dir).exists():

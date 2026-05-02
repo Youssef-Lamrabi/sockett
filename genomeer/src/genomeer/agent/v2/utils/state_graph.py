@@ -22,7 +22,9 @@ class StateGraphHelper:
     RX_PRESENT = re.compile(r"<PRESENT>(.*?)</PRESENT>", re.S | re.I)
     RX_OK      = re.compile(r"<OK\s*/\s*>", re.I)
     RX_STATUS_WRAPPED = re.compile(r"<STATUS\s*:\s*(done|blocked)\s*>(.*?)</STATUS>", re.S | re.I)
-    RX_STATUS_INLINE  = re.compile(r"<STATUS\s*:\s*(done|blocked)\s*>", re.I)
+    RX_STATUS_INLINE = re.compile(r'<\s*STATUS\s*:\s*(done|blocked)\s*>', re.IGNORECASE)
+    _RX_STATUS_DONE = re.compile(r'<\s*STATUS\s*:\s*(?:done|success|completed?)\s*>', re.IGNORECASE)
+    _RX_STATUS_BLOCKED = re.compile(r'<\s*STATUS\s*:\s*(?:blocked|failed|error)\s*>', re.IGNORECASE)
 
     @staticmethod
     def parse_checklist_and_route(text: str):
@@ -110,4 +112,12 @@ class StateGraphHelper:
             summary = re.sub(r"</?[^>]+>", "", summary).strip()
             return status, summary
 
-        return "blocked", "Could not parse OBSERVER status."
+        if StateGraphHelper._RX_STATUS_DONE.search(txt):
+            summary = re.sub(r"</?[^>]+>", "", txt).strip()
+            return "done", summary
+            
+        if StateGraphHelper._RX_STATUS_BLOCKED.search(txt):
+            summary = re.sub(r"</?[^>]+>", "", txt).strip()
+            return "blocked", summary
+
+        return "unknown", "Could not parse OBSERVER status."
