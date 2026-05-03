@@ -744,7 +744,7 @@ class EndToEndBenchmark:
             try:
                 import uuid
                 session_id = str(uuid.uuid4())
-                output = self.agent.run(pipeline_prompt, session_id=session_id)
+                output = list(self.agent.go_stream(pipeline_prompt, session_id=session_id))
                 results_container["output"] = output
             except Exception as e:
                 results_container["error"] = str(e)

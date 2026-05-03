@@ -51,7 +51,6 @@ from genomeer.utils.helper import (
     pretty_print,
     run_r_code,
     run_bash_script,
-    run_cli_command,
     run_python_code,
     run_with_timeout,
     function_to_api_schema,
@@ -1368,6 +1367,15 @@ class BioAgent:
                         sample_id, res = future.result()
                         per_sample[sample_id] = res
                         self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
+                        
+                        try:
+                            from genomeer.utils.checkpoint import CheckpointManager
+                            cp = CheckpointManager(state.get("run_temp_dir", ""), state.get("session_id") or state.get("run_id") or "unknown")
+                            _tmp_state = dict(state)
+                            _tmp_state["per_sample_results"] = per_sample
+                            cp.save(_tmp_state, state["current_idx"])
+                        except Exception as cp_err:
+                            self._log("BATCH CHECKPOINT (warn)", body=str(cp_err), node=node)
                     except Exception as e:
                         self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}", node=node)
                         
@@ -2154,13 +2162,13 @@ class BioAgent:
                         env_name=state.get("env_name", "meta-env1")
                     )
 
-                if hasattr(self, "_metrics") and self._metrics:
-                    self._metrics.record_step_end(
-                        state["current_idx"],
-                        step["title"],
-                        status="done",
-                        tool_name=""
-                    )
+            if hasattr(self, "_metrics") and self._metrics:
+                self._metrics.record_step_end(
+                    state["current_idx"],
+                    step["title"],
+                    status=status,
+                    tool_name=""
+                )
 
             plan = list(state["plan"])
             plan[state["current_idx"]] = {
@@ -2380,7 +2388,8 @@ class BioAgent:
                     plan_steps = state.get("plan", [])
                     all_done = plan_steps and all(s.get("status") == "done" for s in plan_steps)
                     if all_done:
-                        tools_used = [obs.get("title", "") for obs in observations]
+                        tv = manifest.get("tool_versions", {})
+                        tools_used = list(tv.keys()) if tv else [obs.get("title", "") for obs in observations]
                         _TEMPLATE_LIB.save(
                             task_summary=(state.get("last_prompt") or "")[:200],
                             steps=plan_steps,

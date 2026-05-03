@@ -159,7 +159,7 @@ _META_ENV_SIGNALS = {
     "metaspades.py", "spades.py", "megahit", "flye",
     "minimap2", "bowtie2", "bwa", "samtools", "bedtools",
     "kraken2", "bracken", "metaphlan", "gtdbtk",
-    "metabat2", "das_tool", "checkm2",
+    "metabat2", "das_tool", "checkm2", "virsorter2", "checkv", "deepvirfinder",
     "prokka", "prodigal", "diamond", "hmmsearch", "humann",
     "amrfinder", "rgi",
     # wrappers Python

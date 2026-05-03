@@ -247,7 +247,7 @@ META_ENV_SIGNALS = {
     "metaspades.py", "megahit", "flye",
     "minimap2", "bowtie2", "bwa", "bwa-mem2", "samtools", "bedtools",
     "kraken2", "bracken", "metaphlan", "gtdbtk", "krona",
-    "metabat2", "das_tool", "checkm2",
+    "metabat2", "das_tool", "checkm2", "virsorter2", "checkv", "deepvirfinder",
     "prokka", "prodigal", "diamond", "hmmsearch", "hmmscan",
     "humann", "amrfinder", "rgi",
     "prefetch", "fasterq-dump", "seqtk", "pigz",

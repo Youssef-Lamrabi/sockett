@@ -431,31 +431,7 @@ def run_bash_script(
             pass
 
 
-# ------------------------------------------------------------------------------------------
-# Function: run_cli_command
-# Desc: Helper function for LLM to run command in shell while using tools
-# TODO: This tool doesn't accept input agrs yet. To be done.
-# UPDATE: Stop maintaining this helper 25.09.25
-# ------------------------------------------------------------------------------------------
-def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
-    os.makedirs(settings.run_dir, exist_ok=True)
-    try:
-        command = (command or "").strip()
-        if not command: 
-            return "Error: Empty command"
-        argv = shlex.split(command)
-        
-        if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
-            proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
-            return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
 
-        # fallback: host
-        res = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
-        return res.stdout if res.returncode == 0 else f"Error running command '{command}':\n{res.stderr}"
-    except Exception as e:
-        return f"Error running command '{command}': {e}"
     
     
 # ------------------------------------------------------------------------------------------
