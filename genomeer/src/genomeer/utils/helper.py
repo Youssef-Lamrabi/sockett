@@ -431,9 +431,36 @@ def run_bash_script(
             pass
 
 
+# ------------------------------------------------------------------------------------------
+# Function: run_cli_command
+# Desc: Helper function for LLM to run command in shell while using tools
+# DEPRECATED: Do not use for new code. Kept for backward compatibility. Secured.
+# ------------------------------------------------------------------------------------------
+def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+    from genomeer.utils.security import check_bash_script
+    _is_safe, _reason = check_bash_script(command)
+    if not _is_safe:
+        return f"Error: {_reason}\nRewrite the command without the dangerous operation."
 
-    
-    
+    os.makedirs(settings.run_dir, exist_ok=True)
+    try:
+        command = (command or "").strip()
+        if not command: 
+            return "Error: Empty command"
+        argv = shlex.split(command)
+        
+        if env_name:
+            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
+                return f"Environment '{env_name}' is not available."
+            proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
+            return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
+
+        # fallback: host
+        res = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
+        return res.stdout if res.returncode == 0 else f"Error running command '{command}':\n{res.stderr}"
+    except Exception as e:
+        return f"Error running command '{command}': {e}"
+
 # ------------------------------------------------------------------------------------------
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
