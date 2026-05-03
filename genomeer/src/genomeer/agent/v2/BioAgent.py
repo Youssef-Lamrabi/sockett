@@ -559,8 +559,8 @@ class BioAgent:
             if cached:
                 self._log(f"LLM CACHE HIT ({purpose})", cached[:200], node=node)
                 from langchain_core.messages import AIMessage as _AIMsg
-                if hasattr(self, "_run_metrics") and self._run_metrics:
-                    self._run_metrics.record_llm_call(cache_hit=True)
+                if hasattr(self, "_metrics") and self._metrics:
+                    self._metrics.record_llm_call(cache_hit=True)
                 return _AIMsg(content=cached)
         else:
             self._log(f"LLM CACHE SKIP ({purpose})", body=f"node={node} is non-deterministic", node=node)
@@ -580,8 +580,8 @@ class BioAgent:
         if _cache_eligible:
             self._cache.llm.set(cache_key, content, model=model_name, node=node)
  
-        if hasattr(self, "_run_metrics") and self._run_metrics:
-            self._run_metrics.record_llm_call(cache_hit=False)
+        if hasattr(self, "_metrics") and self._metrics:
+            self._metrics.record_llm_call(cache_hit=False)
 
         return resp
     
