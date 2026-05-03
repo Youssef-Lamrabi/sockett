@@ -1716,7 +1716,7 @@ class BioAgent:
             last_result = ""
 
             if hasattr(self, "_metrics") and self._metrics:
-                self._metrics.record_step_start(state.get("current_idx", 0), step_title)
+                pass # moved after cache lookup
 
             self._log("ENTER NODE", body=f"env={env}\ntimeout={timeout}s\nRUN_TEMP_DIR={_run_temp_dir}\ncode_preview=\n{code[:500] or '<no code>'}", node=node)
 
@@ -1754,14 +1754,16 @@ class BioAgent:
                             {"code_hash": _code_hash, "env": _env_hash, "files": _files_snapshot},
                             {},
                         )
-                        _cached_result = self._cache.tool.get(_tool_cache_key)
+                        _cached_result = self._cache.tool.get(_tool_cache_key, output_dir=_run_temp_dir)
                         if _cached_result:
                             self._log("TOOL CACHE HIT", body=f"step={step_title}", node=node)
-                            out = _cached_result
+                            out = _cached_result.get("output", "") if isinstance(_cached_result, dict) else str(_cached_result)
                     except Exception as _ce:
                         self._log("TOOL CACHE (warn)", body=str(_ce), node=node)
                         _tool_cache_key = None
                 # ── END TOOL CACHE LOOKUP ──────────────────────────────────────────────
+                if hasattr(self, "_metrics") and self._metrics:
+                    self._metrics.record_step_start(state.get("current_idx", 0), step_title)
 
                 if not _cached_result:
                     if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
@@ -1832,6 +1834,19 @@ class BioAgent:
                         timeout=timeout,
                         cancel_event=_cancel_event,
                     )
+
+                # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────────
+                if _tool_cache_key and not _cached_result and out:
+                    try:
+                        self._cache.tool.set(
+                            _tool_cache_key,
+                            step_title,
+                            {"output": out},
+                            output_dir=_run_temp_dir,
+                        )
+                        self._log("TOOL CACHE SAVED", body=f"step={step_title}", node=node)
+                    except Exception as _cse:
+                        self._log("TOOL CACHE SAVE (warn)", body=str(_cse), node=node)
 
                 # ── AXE 3.3: Intelligent output parser instead of blind truncation ──
                 # FIX-2: retrieve step from state directly (step was undefined in this scope)
