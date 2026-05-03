@@ -38,6 +38,7 @@ _SERIALIZABLE_FIELDS = {
     "last_prompt", "last_result", "run_temp_dir",
     "retry_counts", "batch_strategy", "run_started_at",
     "next_step", "diagnostic_mode", "session_id",
+    "run_id",
 }
 
 

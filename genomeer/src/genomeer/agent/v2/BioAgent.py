@@ -1068,29 +1068,6 @@ class BioAgent:
                 self._log("HITL: skip planner pause for QA", body=f"route={route}, steps={len(steps)}", node=node)
                 return updates
 
-
-            # --- FIX 5: Sauvegarde du Checkpoint ---
-            if status == "done":
-                from genomeer.utils.checkpoint import CheckpointManager
-                cp = CheckpointManager(state.get("run_temp_dir", ""), str(state.get("run_id", "unknown")))
-                # Fusionner l'état courant avec les updates pour avoir l'état complet
-                full_state = {**state, **updates}
-                cp.save(full_state, state["current_idx"])
-            
-            # --- FIX 8: Version Tracker ---
-            if hasattr(self, "_version_tracker"):
-                self._version_tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
-
-            # --- FIX 9: Métriques ---
-            if hasattr(self, "_metrics") and self._metrics:
-                self._metrics.record_step_end(
-                    step_idx=state["current_idx"],
-                    step_title=step["title"],
-                    status=status,
-                    tool_name=step["title"], # or pending code tool
-                    quality_level="fail" if status == "blocked" else "ok"
-                )
-
             # ------ feedback replay mode check ------
             pause = self._maybe_pause(
                 state,
@@ -1602,29 +1579,6 @@ class BioAgent:
             
             # MAYBE: return to observer from here if no code;
             self._log("GENERATED CODE", body=code or "<empty>", node=node)
-            
-
-            # --- FIX 5: Sauvegarde du Checkpoint ---
-            if status == "done":
-                from genomeer.utils.checkpoint import CheckpointManager
-                cp = CheckpointManager(state.get("run_temp_dir", ""), str(state.get("run_id", "unknown")))
-                # Fusionner l'état courant avec les updates pour avoir l'état complet
-                full_state = {**state, **updates}
-                cp.save(full_state, state["current_idx"])
-            
-            # --- FIX 8: Version Tracker ---
-            if hasattr(self, "_version_tracker"):
-                self._version_tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
-
-            # --- FIX 9: Métriques ---
-            if hasattr(self, "_metrics") and self._metrics:
-                self._metrics.record_step_end(
-                    step_idx=state["current_idx"],
-                    step_title=step["title"],
-                    status=status,
-                    tool_name=step["title"], # or pending code tool
-                    quality_level="fail" if status == "blocked" else "ok"
-                )
 
             # ------ feedback replay mode check ------
             pause = self._maybe_pause(
@@ -2189,29 +2143,6 @@ class BioAgent:
                 "diagnostic_code": False,
                 "diagnostic_observation": False,
             }
-            
-
-            # --- FIX 5: Sauvegarde du Checkpoint ---
-            if status == "done":
-                from genomeer.utils.checkpoint import CheckpointManager
-                cp = CheckpointManager(state.get("run_temp_dir", ""), str(state.get("run_id", "unknown")))
-                # Fusionner l'état courant avec les updates pour avoir l'état complet
-                full_state = {**state, **updates}
-                cp.save(full_state, state["current_idx"])
-            
-            # --- FIX 8: Version Tracker ---
-            if hasattr(self, "_version_tracker"):
-                self._version_tracker.auto_record_from_step(step["title"], pending_code, env_name=state.get("env_name", "meta-env1"))
-
-            # --- FIX 9: Métriques ---
-            if hasattr(self, "_metrics") and self._metrics:
-                self._metrics.record_step_end(
-                    step_idx=state["current_idx"],
-                    step_title=step["title"],
-                    status=status,
-                    tool_name=step["title"], # or pending code tool
-                    quality_level="fail" if status == "blocked" else "ok"
-                )
 
             # ------ feedback replay mode check ------
             if status == "blocked":

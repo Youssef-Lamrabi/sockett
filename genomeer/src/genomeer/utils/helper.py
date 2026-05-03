@@ -342,10 +342,10 @@ def run_bash_script(
         return "Error: Empty script"
 
     # --- FIX 2: SANDBOX / SÉCURITÉ ---
-    _BLOCKED = ["rm -rf /", "rm -rf *", "mkfs", "dd if=", "shutdown", "reboot", "chmod -R 777 /"]
-    for blocked in _BLOCKED:
-        if blocked in script:
-             return f"Error: Command '{blocked}' is restricted by security policy."
+    from genomeer.utils.security import check_bash_script
+    _is_safe, _reason = check_bash_script(script)
+    if not _is_safe:
+        return f"Error: {_reason}\nRewrite the script without the dangerous command."
 
     with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
         if not script.startswith("#!/"):
@@ -493,6 +493,13 @@ def run_python_code(
     """
     path = None
     code = code.strip("```").strip()
+    
+    # Vérification sécurité avant exec
+    from genomeer.utils.security import check_python_code
+    _is_safe, _reason = check_python_code(code)
+    if not _is_safe:
+        return f"Error: {_reason}\nRewrite the Python code without the dangerous operation."
+        
     try:
         # --- Case 1: run in a micromamba environment ---
         if env_name:
