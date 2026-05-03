@@ -2141,6 +2141,27 @@ class BioAgent:
                     self._log("FILE REGISTRY (warn)", body=str(_freg_exc), node=node)
 
 
+            if status == "done":
+                # --- FIX 5: Sauvegarde du Checkpoint ---
+                from genomeer.utils.checkpoint import CheckpointManager
+                cp = CheckpointManager(state.get("run_temp_dir", ""), state.get("session_id") or state.get("run_id") or "unknown")
+                cp.save(state, state["current_idx"])
+
+                if hasattr(self, "_version_tracker"):
+                    self._version_tracker.auto_record_from_step(
+                        step["title"],
+                        state.get("pending_code", ""),
+                        env_name=state.get("env_name", "meta-env1")
+                    )
+
+                if hasattr(self, "_metrics") and self._metrics:
+                    self._metrics.record_step_end(
+                        state["current_idx"],
+                        step["title"],
+                        status="done",
+                        tool_name=""
+                    )
+
             plan = list(state["plan"])
             plan[state["current_idx"]] = {
                 **plan[state["current_idx"]],
@@ -2245,6 +2266,9 @@ class BioAgent:
         def _finalizer(self, state: AgentState) -> AgentState:
             node = "finalizer"
             self._log("ENTER NODE", body="publishing artifacts + generating report", node=node)
+
+            if getattr(self, "_rag_build_thread", None):
+                self._rag_build_thread.join(timeout=30)
 
             manifest = dict(state.get("manifest") or {})
             temp_dir = state.get("run_temp_dir", "")
@@ -3049,8 +3073,7 @@ class BioAgent:
             if cp.exists():
                 inputs = cp.load()
                 self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
-                if not hasattr(self, "_metrics") or not self._metrics:
-                    self._metrics = RunMetrics(thread_id, tmp)
+                self._metrics = RunMetrics(thread_id, tmp)
             else:
                 if not self._has_session_state(thread_id):
                     # FIRST TURN OF THIS SESSION -> full bootstrap state
@@ -3133,8 +3156,7 @@ class BioAgent:
             if cp.exists():
                 inputs = cp.load()
                 self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
-                if not hasattr(self, "_metrics") or not self._metrics:
-                    self._metrics = RunMetrics(thread_id, tmp)
+                self._metrics = RunMetrics(thread_id, tmp)
             else:
                 if not self._has_session_state(thread_id):
                     # FIRST TURN OF THIS SESSION -> full bootstrap state
