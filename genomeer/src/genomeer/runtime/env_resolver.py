@@ -249,7 +249,7 @@ META_ENV_SIGNALS = {
     "kraken2", "bracken", "metaphlan", "gtdbtk", "krona",
     "metabat2", "das_tool", "checkm2", "virsorter2", "checkv", "deepvirfinder",
     "prokka", "prodigal", "diamond", "hmmsearch", "hmmscan",
-    "humann", "amrfinder", "rgi",
+    "humann", "amrfinder", "rgi", "virsorter", "dvf.py",
     "prefetch", "fasterq-dump", "seqtk", "pigz",
     # Python wrapper names
     "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
@@ -259,7 +259,9 @@ META_ENV_SIGNALS = {
     "run_hmmer", "run_humann3", "run_amrfinderplus", "run_rgi_card",
     "run_bracken", "run_gtdbtk", "run_krona", "run_nanostat",
     "run_multiqc", "compute_coverage_samtools",
+    "run_virsorter2", "run_checkv", "run_deepvirfinder",
     "from genomeer.tools.function.metagenomics",
+    "from genomeer.tools.function.viromics",
 }
 
 

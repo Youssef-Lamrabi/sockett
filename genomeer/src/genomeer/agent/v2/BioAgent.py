@@ -51,6 +51,7 @@ from genomeer.utils.helper import (
     pretty_print,
     run_r_code,
     run_bash_script,
+    run_cli_command,
     run_python_code,
     run_with_timeout,
     function_to_api_schema,
@@ -1222,6 +1223,7 @@ class BioAgent:
         def _batch_orchestrator(self, state: AgentState) -> AgentState:
             import os
             import copy
+            import json
             import threading
             from concurrent.futures import ThreadPoolExecutor, as_completed
             
@@ -1231,6 +1233,25 @@ class BioAgent:
             samples = state.get("sample_manifest") or []
             if not samples:
                 return {"next_step": "finalizer", "messages": [AIMessage(content="<observe>Error: batch_orchestrator called without sample_manifest.</observe>")]}
+
+            session_id = state.get("session_id") or state.get("run_id") or "unknown"
+            progress_file = os.path.join(state.get("run_temp_dir", ""), f".batch_progress_{session_id}.json")
+            
+            if os.path.exists(progress_file):
+                with open(progress_file) as f:
+                    per_sample = json.load(f)
+                # Ne relancer que les samples non encore complétés
+                remaining_samples = [s for s in samples if s.get("id") not in per_sample]
+            else:
+                per_sample = dict(state.get("per_sample_results") or {})
+                remaining_samples = samples
+
+            def _save_batch_progress(results: dict, run_temp_dir: str, sid: str) -> None:
+                try:
+                    with open(progress_file, "w") as f:
+                        json.dump(results, f, default=str)
+                except Exception:
+                    pass
 
             # Bug 4 Fix: pre-install environment once before parallel threads
             env_name = state.get("env_name", "bio-agent-env1")
@@ -1256,8 +1277,6 @@ class BioAgent:
             # P4-D.2: Semaphore for concurrency control
             concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
             semaphore = threading.Semaphore(concurrency)
-            
-            per_sample = dict(state.get("per_sample_results") or {})
             idx = state["current_idx"]
             plan = state["plan"]
             
@@ -1361,25 +1380,31 @@ class BioAgent:
                     
             # Launch ThreadPool
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [executor.submit(process_sample, i, s) for i, s in enumerate(samples)]
+                futures = []
+                for s in remaining_samples:
+                    orig_i = next((i for i, xs in enumerate(samples) if xs.get("id") == s.get("id")), 0)
+                    futures.append(executor.submit(process_sample, orig_i, s))
+                    
                 for future in as_completed(futures):
                     try:
                         sample_id, res = future.result()
                         per_sample[sample_id] = res
                         self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
                         
-                        try:
-                            from genomeer.utils.checkpoint import CheckpointManager
-                            cp = CheckpointManager(state.get("run_temp_dir", ""), state.get("session_id") or state.get("run_id") or "unknown")
-                            _tmp_state = dict(state)
-                            _tmp_state["per_sample_results"] = per_sample
-                            cp.save(_tmp_state, state["current_idx"])
-                        except Exception as cp_err:
-                            self._log("BATCH CHECKPOINT (warn)", body=str(cp_err), node=node)
+                        _save_batch_progress(
+                            per_sample,
+                            state.get("run_temp_dir", "/tmp"),
+                            session_id
+                        )
                     except Exception as e:
                         self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}", node=node)
                         
             self._log("EXIT NODE", body="All parallel samples completed. Routing to finalizer.", node=node)
+            try:
+                if os.path.exists(progress_file):
+                    os.remove(progress_file)
+            except Exception:
+                pass
             return {
                 "per_sample_results": per_sample,
                 "current_idx": len(plan), # mark plan as complete
@@ -2098,6 +2123,20 @@ class BioAgent:
                 self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
                 self._log("EXIT NODE", body=f"next_step={next_step} (retry same step)", node=node)
 
+                if hasattr(self, "_metrics") and self._metrics:
+                    try:
+                        self._metrics.record_step_end(
+                            step_idx=state["current_idx"],
+                            step_title=step["title"],
+                            status="blocked",
+                            tool_name=step.get("title", ""),
+                            retry_count=rc.get(state["current_idx"], 0),
+                            quality_level="fail",
+                            env_used=state.get("env_name"),
+                        )
+                    except Exception:
+                        pass
+
             else:
                 new_manifest.pop("repair_feedback", None)
                 new_manifest.pop("repair_step_idx", None)
@@ -2162,13 +2201,13 @@ class BioAgent:
                         env_name=state.get("env_name", "meta-env1")
                     )
 
-            if hasattr(self, "_metrics") and self._metrics:
-                self._metrics.record_step_end(
-                    state["current_idx"],
-                    step["title"],
-                    status=status,
-                    tool_name=""
-                )
+                if hasattr(self, "_metrics") and self._metrics:
+                    self._metrics.record_step_end(
+                        state["current_idx"],
+                        step["title"],
+                        status="done",
+                        tool_name=""
+                    )
 
             plan = list(state["plan"])
             plan[state["current_idx"]] = {
@@ -2236,6 +2275,7 @@ class BioAgent:
                 HumanMessage(content=prompt),
                 HumanMessage(content=ctx) 
             ]
+            msgs = self._trim_messages(msgs, keep_first=1, keep_last=10)
             self._log("ENTER NODE", body=f"retry_count={retry_count}\nstep={step['title']}", node=node)
             resp = self._llm_invoke(node, "diagnostics_plan", msgs)
 

@@ -744,8 +744,14 @@ class EndToEndBenchmark:
             try:
                 import uuid
                 session_id = str(uuid.uuid4())
-                output = list(self.agent.go_stream(pipeline_prompt, session_id=session_id))
-                results_container["output"] = output
+                outputs = []
+                for chunk in self.agent.go_stream(
+                    pipeline_prompt,
+                    session_id=session_id,
+                    mode="prod",
+                ):
+                    outputs.append(chunk.get("text", ""))
+                results_container["output"] = "\n".join(outputs)
             except Exception as e:
                 results_container["error"] = str(e)
 
