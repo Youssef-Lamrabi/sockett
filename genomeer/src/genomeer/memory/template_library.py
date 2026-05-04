@@ -101,7 +101,7 @@ class TemplateLibrary:
             
         self._save()
 
-    def get_similar(self, query: str, n: int = 3) -> List[Dict[str, Any]]:
+    def get_similar(self, query: str, n: int = 3, embed_fn: Optional[Any] = None) -> List[Dict[str, Any]]:
         """Return the n most similar templates to the query."""
         if not self._templates:
             return []
@@ -117,9 +117,12 @@ class TemplateLibrary:
         results = []
         # Try embedding-based retrieval
         try:
-            embedder = self._get_embedder()
-            if embedder is not None:
-                results = self._embedding_retrieval(query, len(self._templates), embedder)
+            if embed_fn is not None:
+                results = self._embedding_retrieval(query, len(self._templates), embed_fn=embed_fn)
+            else:
+                embedder = self._get_embedder()
+                if embedder is not None:
+                    results = self._embedding_retrieval(query, len(self._templates), embedder=embedder)
         except Exception:
             pass
 
@@ -144,9 +147,9 @@ class TemplateLibrary:
         scored.sort(key=lambda x: -x[0])
         return [t for _, t in scored[:n]]
 
-    def format_for_planner(self, query: str, n: int = 3) -> str:
+    def format_for_planner(self, query: str, n: int = 3, embed_fn: Optional[Any] = None) -> str:
         """Return formatted examples ready to inject into PLANNER_PROMPT."""
-        similar = self.get_similar(query, n)
+        similar = self.get_similar(query, n, embed_fn=embed_fn)
         if not similar:
             return ""
         lines = ["\n=== SIMILAR PAST PIPELINES (use as reference, adapt as needed) ==="]
@@ -219,11 +222,18 @@ class TemplateLibrary:
                 self._embedder = False   # not available
         return self._embedder if self._embedder else None
 
-    def _embedding_retrieval(self, query: str, n: int, embedder) -> List[Dict[str, Any]]:
+    def _embedding_retrieval(self, query: str, n: int, embedder=None, embed_fn=None) -> List[Dict[str, Any]]:
         import numpy as np
-        q_emb = embedder.encode(query, normalize_embeddings=True)
+        
         summaries = [t["task_summary"] for t in self._templates]
-        t_embs = embedder.encode(summaries, normalize_embeddings=True, batch_size=64)
+        
+        if embed_fn is not None:
+            q_emb = embed_fn([query])[0]
+            t_embs = embed_fn(summaries)
+        else:
+            q_emb = embedder.encode(query, normalize_embeddings=True)
+            t_embs = embedder.encode(summaries, normalize_embeddings=True, batch_size=64)
+            
         scores = t_embs @ q_emb
         top_idx = np.argsort(scores)[::-1][:n]
         return [self._templates[i] for i in top_idx]

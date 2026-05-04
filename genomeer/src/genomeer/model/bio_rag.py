@@ -480,6 +480,11 @@ class BioRAGStore:
         if "card" in sources:
             card_path = base_dir / "card_top500.json"
             if card_path.exists():
+                import time
+                mtime = card_path.stat().st_mtime
+                days_old = (time.time() - mtime) / 86400
+                if days_old > 180:
+                    logger.warning(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old:.0f} days old. Context may be outdated.")
                 with open(card_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     version = data.get("source_version", "CARD")
@@ -495,6 +500,11 @@ class BioRAGStore:
         if "kegg_pathways" in sources:
             kegg_path = base_dir / "kegg_core_pathways.json"
             if kegg_path.exists():
+                import time
+                mtime = kegg_path.stat().st_mtime
+                days_old = (time.time() - mtime) / 86400
+                if days_old > 180:
+                    logger.warning(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old:.0f} days old. Context may be outdated.")
                 with open(kegg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     version = data.get("source_version", "KEGG")

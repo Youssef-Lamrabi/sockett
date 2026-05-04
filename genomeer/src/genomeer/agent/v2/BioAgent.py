@@ -987,7 +987,10 @@ class BioAgent:
             # FIX G2a: Inject similar past pipelines from TemplateLibrary as few-shot examples
             if _TEMPLATE_OK and _TEMPLATE_LIB:
                 try:
-                    template_hints = _TEMPLATE_LIB.format_for_planner(user_prompt, n=3)
+                    embed_fn = None
+                    if hasattr(self, "bio_retriever") and hasattr(self.bio_retriever, "_embed"):
+                        embed_fn = self.bio_retriever._embed
+                    template_hints = _TEMPLATE_LIB.format_for_planner(user_prompt, n=3, embed_fn=embed_fn)
                     if template_hints:
                         msgs.append(HumanMessage(content=template_hints))
                         self._log("TEMPLATE HINTS", body=f"{_TEMPLATE_LIB.count()} templates available", node=node)
@@ -1173,6 +1176,27 @@ class BioAgent:
                     "next_step": "qa",
                     "messages": [AIMessage(content="<observe>No plan generated. Asking user for clarification.</observe>")],
                 }
+
+            # --- TÂCHE 7: Planning adaptatif mid-pipeline ---
+            if idx < len(plan) and plan[idx].get("status") == "done":
+                step_title = plan[idx].get("title", "").lower()
+                step_code = plan[idx].get("code", "").lower()
+                if "metaspades" in step_title or "metaspades" in step_code:
+                    qs = state.get("manifest", {}).get("quality_signals", {})
+                    n50 = qs.get("assembly_n50")
+                    if n50 is not None and n50 < 1000:
+                        already_injected = any("megahit" in s.get("title", "").lower() for s in plan)
+                        if not already_injected:
+                            self._log("ADAPTIVE PLAN", body=f"metaSPAdes N50={n50} < 1000. Injecting MEGAHIT.", node=node)
+                            plan.insert(idx + 1, {
+                                "title": "Run MEGAHIT (Fallback Assembly)",
+                                "description": "metaSPAdes produced highly fragmented assembly (N50 < 1000). Falling back to MEGAHIT.",
+                                "status": "todo"
+                            })
+                            state.setdefault("messages", []).append(
+                                AIMessage(content=f"<observe>[ADAPTIVE PLAN] metaSPAdes assembly N50={n50} is too low (<1000). Injecting MEGAHIT alternative step.</observe>")
+                            )
+            # --------------------------------------------------
 
             while idx < len(plan) and plan[idx]["status"] != "todo":
                 idx += 1
@@ -2428,8 +2452,12 @@ class BioAgent:
                     plan_steps = state.get("plan", [])
                     all_done = plan_steps and all(s.get("status") == "done" for s in plan_steps)
                     if all_done:
-                        tv = manifest.get("tool_versions", {})
-                        tools_used = list(tv.keys()) if tv else [obs.get("title", "") for obs in observations]
+                        import re
+                        tools_used = []
+                        for s in plan_steps:
+                            for m in re.findall(r"\brun_[a-zA-Z0-9_]+\b", s.get("code", "")):
+                                if m not in tools_used:
+                                    tools_used.append(m)
                         _TEMPLATE_LIB.save(
                             task_summary=(state.get("last_prompt") or "")[:200],
                             steps=plan_steps,

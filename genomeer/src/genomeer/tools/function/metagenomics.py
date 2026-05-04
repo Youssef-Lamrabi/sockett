@@ -595,6 +595,13 @@ def run_kraken2(
                 except ValueError:
                     pass
 
+    # FIX: Enregistrer la DB kraken2 avec checksum
+    try:
+        from genomeer.utils.version_tracker import VersionTracker
+        VersionTracker().record_db("kraken2_standard", db_path, compute_checksum=True)
+    except Exception:
+        pass
+
     return {
         "report": report,
         "output": output_file,
@@ -1091,6 +1098,13 @@ def run_amrfinderplus(
     except Exception:
         pass
 
+    if db_path:
+        try:
+            from genomeer.utils.version_tracker import VersionTracker
+            VersionTracker().record_db("amrfinder_db", db_path, compute_checksum=True)
+        except Exception:
+            pass
+
     return {"amr_report_tsv": report, "n_hits": max(0, n_hits), "stdout": proc.stdout}
 
 
@@ -1131,6 +1145,13 @@ def run_rgi_card(
             n_hits = sum(1 for l in f if not l.startswith("ORF_ID")) - 1
     except Exception:
         pass
+
+    if db_path:
+        try:
+            from genomeer.utils.version_tracker import VersionTracker
+            VersionTracker().record_db("card_db", db_path, compute_checksum=True)
+        except Exception:
+            pass
 
     return {
         "rgi_tsv": tsv if Path(tsv).exists() else None,
