@@ -65,6 +65,7 @@ import logging
 import os
 import pickle
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -133,6 +134,7 @@ class LLMResponseCache:
         self.db_path = db_path
         self.ttl = ttl
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
         self._init_db()
 
     def _conn_get(self) -> sqlite3.Connection:
@@ -144,7 +146,8 @@ class LLMResponseCache:
 
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = self._conn_get()
+        with self._lock:
+            conn = self._conn_get()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS llm_cache (
                 key       TEXT PRIMARY KEY,
@@ -179,12 +182,14 @@ class LLMResponseCache:
                 return None
 
             if time.time() - created > self.ttl:
-                conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
-                conn.commit()
+                with self._lock:
+                    conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
+                    conn.commit()
                 return None
             # Update hit count
-            conn.execute("UPDATE llm_cache SET hits=hits+1 WHERE key=?", (key,))
-            conn.commit()
+            with self._lock:
+                conn.execute("UPDATE llm_cache SET hits=hits+1 WHERE key=?", (key,))
+                conn.commit()
             logger.debug(f"[LLMCache] HIT key={key[:8]}")
             return value
         except Exception as e:
@@ -197,29 +202,32 @@ class LLMResponseCache:
         if node in self._SKIP_NODES:
             return   # Ne pas cacher ces nœuds
         try:
-            conn = self._conn_get()
-            conn.execute(
-                "INSERT OR REPLACE INTO llm_cache(key,value,model,node,created) VALUES(?,?,?,?,?)",
-                (key, value, model, node, time.time()),
-            )
-            conn.commit()
+            with self._lock:
+                conn = self._conn_get()
+                conn.execute(
+                    "INSERT OR REPLACE INTO llm_cache(key,value,model,node,created) VALUES(?,?,?,?,?)",
+                    (key, value, model, node, time.time()),
+                )
+                conn.commit()
         except Exception as e:
             logger.warning(f"[LLMCache] set failed: {e}")
 
     def invalidate(self, key: str):
         try:
-            conn = self._conn_get()
-            conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
-            conn.commit()
+            with self._lock:
+                conn = self._conn_get()
+                conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
+                conn.commit()
         except Exception:
             pass
 
     def invalidate_node(self, node: str):
         # T5.4: Utility to invalidate all cached responses for a specific node
         try:
-            conn = self._conn_get()
-            deleted = conn.execute("DELETE FROM llm_cache WHERE node=?", (node,)).rowcount
-            conn.commit()
+            with self._lock:
+                conn = self._conn_get()
+                deleted = conn.execute("DELETE FROM llm_cache WHERE node=?", (node,)).rowcount
+                conn.commit()
             if deleted:
                 logger.info(f"[LLMCache] Invalidate: purged {deleted} entries for node '{node}'")
         except Exception as e:
@@ -237,12 +245,13 @@ class LLMResponseCache:
 
     def purge_expired(self):
         try:
-            conn = self._conn_get()
-            cutoff = time.time() - self.ttl
-            deleted = conn.execute(
-                "DELETE FROM llm_cache WHERE created < ?", (cutoff,)
-            ).rowcount
-            conn.commit()
+            with self._lock:
+                conn = self._conn_get()
+                cutoff = time.time() - self.ttl
+                deleted = conn.execute(
+                    "DELETE FROM llm_cache WHERE created < ?", (cutoff,)
+                ).rowcount
+                conn.commit()
             if deleted:
                 logger.info(f"[LLMCache] Purged {deleted} expired entries")
         except Exception as e:
@@ -288,22 +297,24 @@ class ToolOutputCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.default_ttl = ttl
         self._meta_db = str(self.cache_dir / "tool_meta.db")
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
-        conn = sqlite3.connect(self._meta_db)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tool_cache (
-                key        TEXT PRIMARY KEY,
-                tool_name  TEXT,
-                result_json TEXT NOT NULL,
-                output_dir TEXT,
-                created    REAL NOT NULL,
-                hits       INTEGER DEFAULT 0
-            )
-        """)
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = sqlite3.connect(self._meta_db, check_same_thread=False)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tool_cache (
+                    key        TEXT PRIMARY KEY,
+                    tool_name  TEXT,
+                    result_json TEXT NOT NULL,
+                    output_dir TEXT,
+                    created    REAL NOT NULL,
+                    hits       INTEGER DEFAULT 0
+                )
+            """)
+            conn.commit()
+            conn.close()
 
     def make_key(
         self,
@@ -344,7 +355,7 @@ class ToolOutputCache:
         if _CACHE_DISABLED:
             return None
         try:
-            conn = sqlite3.connect(self._meta_db)
+            conn = sqlite3.connect(self._meta_db, check_same_thread=False)
             row = conn.execute(
                 "SELECT result_json, output_dir, created, tool_name FROM tool_cache WHERE key=?",
                 (key,)
@@ -367,7 +378,10 @@ class ToolOutputCache:
             _verify_files = os.environ.get("GENOMEER_TOOL_CACHE_VERIFY_FILES", "1").strip() in ("1", "true", "True")
             if _verify_files:
                 expected_files = result.get("__cached_files__", [])
-                missing_files = [f for f in expected_files if not os.path.exists(f)]
+                if cached_output_dir:
+                    missing_files = [f for f in expected_files if not (Path(cached_output_dir) / f).exists()]
+                else:
+                    missing_files = []
                 if missing_files:
                     logger.info(f"[ToolCache] MISS key={key[:8]} — {len(missing_files)} missing files (e.g. {missing_files[0]})")
                     self._delete(key)
@@ -378,10 +392,11 @@ class ToolOutputCache:
                 self._restore_outputs(cached_output_dir, output_dir, result)
 
             # Update hits
-            conn2 = sqlite3.connect(self._meta_db)
-            conn2.execute("UPDATE tool_cache SET hits=hits+1 WHERE key=?", (key,))
-            conn2.commit()
-            conn2.close()
+            with self._lock:
+                conn2 = sqlite3.connect(self._meta_db, check_same_thread=False)
+                conn2.execute("UPDATE tool_cache SET hits=hits+1 WHERE key=?", (key,))
+                conn2.commit()
+                conn2.close()
 
             logger.info(f"[ToolCache] HIT {tool_name} key={key[:8]}")
             return result
@@ -404,10 +419,10 @@ class ToolOutputCache:
         if _CACHE_DISABLED:
             return
         try:
-            # T9.1: Enregistrement des chemins absolus des fichiers présents
+            # T9.1: Enregistrement des chemins relatifs des fichiers présents
             produced_files = []
             if output_dir and Path(output_dir).exists():
-                produced_files = [str(p.absolute()) for p in Path(output_dir).rglob("*") if p.is_file()]
+                produced_files = [str(p.relative_to(Path(output_dir))) for p in Path(output_dir).rglob("*") if p.is_file()]
             result["__cached_files__"] = produced_files
 
             # Copier les outputs dans le cache
@@ -416,15 +431,16 @@ class ToolOutputCache:
                 cached_output_dir = str(self.cache_dir / f"outputs_{key}")
                 self._archive_outputs(output_dir, cached_output_dir)
 
-            conn = sqlite3.connect(self._meta_db)
-            conn.execute(
-                """INSERT OR REPLACE INTO tool_cache
-                   (key, tool_name, result_json, output_dir, created)
-                   VALUES (?,?,?,?,?)""",
-                (key, tool_name, json.dumps(result, default=str), cached_output_dir, time.time()),
-            )
-            conn.commit()
-            conn.close()
+            with self._lock:
+                conn = sqlite3.connect(self._meta_db, check_same_thread=False)
+                conn.execute(
+                    """INSERT OR REPLACE INTO tool_cache
+                       (key, tool_name, result_json, output_dir, created)
+                       VALUES (?,?,?,?,?)""",
+                    (key, tool_name, json.dumps(result, default=str), cached_output_dir, time.time()),
+                )
+                conn.commit()
+                conn.close()
             logger.info(f"[ToolCache] SET {tool_name} key={key[:8]}")
         except Exception as e:
             logger.warning(f"[ToolCache] set failed: {e}")
@@ -482,16 +498,17 @@ class ToolOutputCache:
 
     def _delete(self, key: str):
         try:
-            conn = sqlite3.connect(self._meta_db)
-            conn.execute("DELETE FROM tool_cache WHERE key=?", (key,))
-            conn.commit()
-            conn.close()
+            with self._lock:
+                conn = sqlite3.connect(self._meta_db, check_same_thread=False)
+                conn.execute("DELETE FROM tool_cache WHERE key=?", (key,))
+                conn.commit()
+                conn.close()
         except Exception:
             pass
 
     def stats(self) -> dict:
         try:
-            conn = sqlite3.connect(self._meta_db)
+            conn = sqlite3.connect(self._meta_db, check_same_thread=False)
             rows = conn.execute(
                 "SELECT tool_name, COUNT(*), SUM(hits) FROM tool_cache GROUP BY tool_name"
             ).fetchall()
@@ -502,7 +519,7 @@ class ToolOutputCache:
 
     def purge_expired(self):
         try:
-            conn = sqlite3.connect(self._meta_db)
+            conn = sqlite3.connect(self._meta_db, check_same_thread=False)
             all_rows = conn.execute(
                 "SELECT key, tool_name, created FROM tool_cache"
             ).fetchall()
@@ -513,8 +530,9 @@ class ToolOutputCache:
                 if now - created > ttl:
                     to_delete.append(key)
             if to_delete:
-                conn.executemany("DELETE FROM tool_cache WHERE key=?", [(k,) for k in to_delete])
-                conn.commit()
+                with self._lock:
+                    conn.executemany("DELETE FROM tool_cache WHERE key=?", [(k,) for k in to_delete])
+                    conn.commit()
                 logger.info(f"[ToolCache] Purged {len(to_delete)} expired tool outputs")
             conn.close()
         except Exception as e:
@@ -545,11 +563,13 @@ class APIResponseCache:
         self.db_path = db_path
         self.default_ttl = default_ttl
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS api_cache (
                 key      TEXT PRIMARY KEY,
                 url      TEXT,
@@ -576,7 +596,7 @@ class APIResponseCache:
             return None
         key = self.make_key(url, params)
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             row = conn.execute(
                 "SELECT value, created FROM api_cache WHERE key=?", (key,)
             ).fetchone()
@@ -588,10 +608,11 @@ class APIResponseCache:
             if time.time() - created > ttl:
                 self._delete(key)
                 return None
-            conn2 = sqlite3.connect(self.db_path)
-            conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
-            conn2.commit()
-            conn2.close()
+            with self._lock:
+                conn2 = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
+                conn2.commit()
+                conn2.close()
             return pickle.loads(value_bytes)
         except Exception as e:
             logger.warning(f"[APICache] get failed: {e}")
@@ -602,13 +623,14 @@ class APIResponseCache:
             return
         key = self.make_key(url, params)
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
-                (key, url, pickle.dumps(value), time.time()),
-            )
-            conn.commit()
-            conn.close()
+            with self._lock:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn.execute(
+                    "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
+                    (key, url, pickle.dumps(value), time.time()),
+                )
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.warning(f"[APICache] set failed: {e}")
 
@@ -631,7 +653,7 @@ class APIResponseCache:
 
                 if not _CACHE_DISABLED:
                     try:
-                        conn = sqlite3.connect(self.db_path)
+                        conn = sqlite3.connect(self.db_path, check_same_thread=False)
                         row = conn.execute(
                             "SELECT value, created FROM api_cache WHERE key=?", (key,)
                         ).fetchone()
@@ -640,10 +662,11 @@ class APIResponseCache:
                             value_bytes, created = row
                             effective_ttl = ttl_seconds or self.default_ttl
                             if time.time() - created <= effective_ttl:
-                                conn2 = sqlite3.connect(self.db_path)
-                                conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
-                                conn2.commit()
-                                conn2.close()
+                                with self._lock:
+                                    conn2 = sqlite3.connect(self.db_path, check_same_thread=False)
+                                    conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
+                                    conn2.commit()
+                                    conn2.close()
                                 logger.debug(f"[APICache] HIT {fn.__name__}")
                                 return pickle.loads(value_bytes)
                     except Exception:
@@ -652,13 +675,14 @@ class APIResponseCache:
                 result = fn(*args, **kwargs)
 
                 try:
-                    conn = sqlite3.connect(self.db_path)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
-                        (key, fn.__name__, pickle.dumps(result), time.time()),
-                    )
-                    conn.commit()
-                    conn.close()
+                    with self._lock:
+                        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                        conn.execute(
+                            "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
+                            (key, fn.__name__, pickle.dumps(result), time.time()),
+                        )
+                        conn.commit()
+                        conn.close()
                 except Exception:
                     pass
 
@@ -668,22 +692,24 @@ class APIResponseCache:
 
     def _delete(self, key: str):
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("DELETE FROM api_cache WHERE key=?", (key,))
-            conn.commit()
-            conn.close()
+            with self._lock:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn.execute("DELETE FROM api_cache WHERE key=?", (key,))
+                conn.commit()
+                conn.close()
         except Exception:
             pass
 
     def purge_expired(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            deleted = conn.execute(
-                "DELETE FROM api_cache WHERE created < ?",
-                (time.time() - self.default_ttl,)
-            ).rowcount
-            conn.commit()
-            conn.close()
+            with self._lock:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                deleted = conn.execute(
+                    "DELETE FROM api_cache WHERE created < ?",
+                    (time.time() - self.default_ttl,)
+                ).rowcount
+                conn.commit()
+                conn.close()
             if deleted:
                 logger.info(f"[APICache] Purged {deleted} expired entries")
         except Exception as e:

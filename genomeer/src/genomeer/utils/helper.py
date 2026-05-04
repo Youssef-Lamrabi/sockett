@@ -154,14 +154,39 @@ def _run_in_env(
         env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
 
     import time
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+
+    def set_limits():
+        try:
+            import resource
+            # 1.1 Limites mémoire (16 GB default)
+            max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "16"))
+            max_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
+            resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+            
+            # 1.2 Limites CPU (basé sur timeout)
+            max_cpu = int(timeout)
+            if max_cpu > 0:
+                resource.setrlimit(resource.RLIMIT_CPU, (max_cpu, max_cpu))
+                
+            # 1.3 Limiter le nombre de processus fils
+            resource.setrlimit(resource.RLIMIT_NPROC, (512, 512))
+        except (ImportError, ValueError, OSError):
+            pass
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            preexec_fn=set_limits if os.name != 'nt' else None,
+        )
+    except MemoryError as e:
+        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "16")
+        logger.error(f"[_run_in_env] MemoryError: L'outil {' '.join(cmd)} a dépassé les limites ou échoué au fork. (RAM Configurée: {max_ram_gb} GB)")
+        raise e
 
     try:
         if cancel_event is not None:
@@ -194,6 +219,8 @@ def _run_in_env(
         outs, errs = proc.communicate()
         exc.stdout = outs
         exc.stderr = errs
+        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "16")
+        logger.error(f"[_run_in_env] TimeoutExpired: L'outil {' '.join(cmd)} a dépassé les limites de temps. (CPU: {timeout}s, RAM Configurée: {max_ram_gb} GB)")
         raise
 
     retcode = proc.poll()

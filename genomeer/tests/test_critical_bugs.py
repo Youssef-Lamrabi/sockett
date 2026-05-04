@@ -72,12 +72,19 @@ class TestNoUndefinedStatus:
         except ImportError:
             pytest.skip("BioAgent not importable in this environment")
 
-        source = inspect.getsource(BioAgent._planner)
+        source = inspect.getsource(BioAgent)
         tree = ast.parse(source)
+
+        planner_node = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_planner":
+                planner_node = node
+                break
+        assert planner_node is not None, "Could not find _planner function in BioAgent"
 
         # Trouver toutes les assignations de 'status'
         assigned_vars = set()
-        for node in ast.walk(tree):
+        for node in ast.walk(planner_node):
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name):
@@ -88,7 +95,7 @@ class TestNoUndefinedStatus:
 
         # Trouver toutes les utilisations de 'status'
         used_names = set()
-        for node in ast.walk(tree):
+        for node in ast.walk(planner_node):
             if isinstance(node, ast.Name) and node.id == "status":
                 used_names.add("status")
 
@@ -107,18 +114,25 @@ class TestNoUndefinedStatus:
         except ImportError:
             pytest.skip("BioAgent not importable in this environment")
 
-        source = inspect.getsource(BioAgent._generator)
+        source = inspect.getsource(BioAgent)
         tree = ast.parse(source)
 
-        assigned = set()
+        generator_node = None
         for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_generator":
+                generator_node = node
+                break
+        assert generator_node is not None, "Could not find _generator function in BioAgent"
+
+        assigned = set()
+        for node in ast.walk(generator_node):
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name):
                         assigned.add(t.id)
 
         used = set()
-        for node in ast.walk(tree):
+        for node in ast.walk(generator_node):
             if isinstance(node, ast.Name) and node.id == "status":
                 used.add("status")
 
@@ -464,3 +478,62 @@ class TestBioRAGJoin:
         # Le thread doit être fini avant d'utiliser le RAG
         assert not thread.is_alive(), "Thread should be joined before using RAG"
         assert "rag_built" in results, "RAG should be built before finalizer proceeds"
+
+# ===========================================================================
+# NOUVEAU — Tâche 2.4 : Test SQLite Thread Safety
+# ===========================================================================
+
+class TestSQLiteThreadSafety:
+    """Tâche 2.4: Vérifier que le cache est accessible de manière concurrente (batch mode)."""
+
+    def test_cache_concurrent_writes(self, tmp_path):
+        import threading
+        from genomeer.agent.v2.utils.cache import ToolOutputCache
+        cache = ToolOutputCache(str(tmp_path))
+        
+        errors = []
+        def worker(thread_id):
+            try:
+                for i in range(20):
+                    key = cache.make_key(f"tool_{thread_id}", [], {"i": i})
+                    cache.set(key, f"tool_{thread_id}", {"res": i})
+                    val = cache.get(key)
+                    if not val or val.get("res") != i:
+                        errors.append(f"Thread {thread_id} failed to get valid data")
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        assert not errors, f"Exceptions occurred during concurrent access: {errors}"
+
+# ===========================================================================
+# NOUVEAU — Tâche 3.4 : Test Tool Cache Cross-Session
+# ===========================================================================
+
+class TestToolCacheCrossSession:
+    """Tâche 3.4: Le cache d'outils doit être récupérable d'une session à l'autre avec un run_dir différent."""
+
+    def test_cross_session_hit(self, tmp_path):
+        from genomeer.agent.v2.utils.cache import ToolOutputCache
+        cache_dir = tmp_path / "global_cache"
+        cache = ToolOutputCache(str(cache_dir))
+        
+        # Session 1: Run and cache
+        run1_dir = tmp_path / "run_1"
+        run1_dir.mkdir()
+        (run1_dir / "output.txt").write_text("hello result")
+        
+        key = cache.make_key("mock_tool", [], {"param": "1"})
+        cache.set(key, "mock_tool", {"step": "test"}, output_dir=str(run1_dir))
+        
+        # Session 2: Retrieve cache into a new run_dir
+        run2_dir = tmp_path / "run_2"
+        run2_dir.mkdir()
+        result = cache.get(key, output_dir=str(run2_dir))
+        
+        assert result is not None, "Expected cache hit in session 2"
+        assert (run2_dir / "output.txt").exists(), "Cached output file was not restored to new session run_dir"
+        assert (run2_dir / "output.txt").read_text() == "hello result"

@@ -273,7 +273,7 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         "warn_threshold": 1,
         "fail_threshold": 0,
         "fail_on_zero":   True,
-        "parse_regex":    r"n_viral_sequences["':,\s]+([0-9]+)",
+        "parse_regex":    r"n_viral_sequences[\"':,\s]+([0-9]+)",
         "fix_hint": (
             "VirSorter2 found 0 viral sequences. Check if the input assembly has contigs > 1500bp "
             "or if the sample is exclusively bacterial/host."
@@ -285,7 +285,7 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         "metric_label":   "Mean Viral Completeness (%)",
         "warn_threshold": 50.0,
         "fail_threshold": 10.0,
-        "parse_regex":    r"mean_completeness["':,\s]+([0-9.]+)",
+        "parse_regex":    r"mean_completeness[\"':,\s]+([0-9.]+)",
         "fix_hint": (
             "CheckV completeness is very low. The viral contigs are highly fragmented. "
             "Consider using a different assembler (e.g. metaSPAdes with --rnaviral)."
