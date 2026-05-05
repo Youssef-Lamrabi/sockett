@@ -126,9 +126,7 @@ class LLMResponseCache:
     """
 
     # Nœuds dont les réponses NE doivent PAS être cachées
-    # (trop dépendants du contexte runtime)
-    # T5.2: Add "generator" to avoid hallucinated paths from previous runs
-    _SKIP_NODES = {"planner", "orchestrator", "finalizer", "generator"}
+    from genomeer.config import NOCACHE_LLM_NODES as _SKIP_NODES
 
     def __init__(self, db_path: str, ttl: int = _LLM_TTL):
         self.db_path = db_path
@@ -162,7 +160,11 @@ class LLMResponseCache:
         conn.commit()
 
     def make_key(self, model: str, system_prompt: str, user_message: str) -> str:
-        return _hash(model, system_prompt[:2000], user_message[:2000])
+        # FIX B7: hash the FULL content — truncating to 2000 chars caused hash collisions
+        # when two prompts differed only after char 2000.
+        import hashlib as _hl
+        combined = "\x00".join([model, system_prompt, user_message])
+        return _hl.sha256(combined.encode("utf-8", errors="replace")).hexdigest()[:32]
 
     def get(self, key: str, node: str = "") -> Optional[str]:
         # T5.1: Added node parameter to prevent cross-node cache leakage
@@ -764,13 +766,14 @@ class GenoCache:
         self.api  = APIResponseCache(str(self.cache_dir / "api_cache.db"))
 
 
-# Singleton global
+# Singleton global et son lock (Fix A1: thread-safe singleton)
 _CACHE_INSTANCE: Optional[GenoCache] = None
-
+_CACHE_LOCK = threading.Lock()
 
 def get_cache(cache_dir: Optional[str] = None) -> GenoCache:
     """Retourne le singleton GenoCache. Thread-safe."""
     global _CACHE_INSTANCE
-    if _CACHE_INSTANCE is None:
-        _CACHE_INSTANCE = GenoCache(cache_dir or _DEFAULT_CACHE_DIR)
-    return _CACHE_INSTANCE
+    with _CACHE_LOCK:
+        if _CACHE_INSTANCE is None:
+            _CACHE_INSTANCE = GenoCache(cache_dir or _DEFAULT_CACHE_DIR)
+        return _CACHE_INSTANCE

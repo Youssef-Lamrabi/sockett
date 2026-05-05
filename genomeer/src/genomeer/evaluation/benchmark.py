@@ -117,18 +117,29 @@ class EvalReport:
         return sum(1 for r in self.results if r.status == EvalStatus.WARN)
 
     @property
-    def overall_score(self) -> float:
+    def skip_count(self) -> int:
+        return sum(1 for r in self.results if r.status == EvalStatus.SKIP)
+
+    @property
+    def coverage_rate(self) -> float:
         if not self.results:
             return 0.0
-        return sum(r.score for r in self.results) / len(self.results)
+        return (len(self.results) - self.skip_count) / len(self.results)
+
+    @property
+    def overall_score(self) -> float:
+        valid_results = [r for r in self.results if r.status != EvalStatus.SKIP]
+        if not valid_results:
+            return 0.0
+        return sum(r.score for r in valid_results) / len(valid_results)
 
     def summary(self) -> str:
         lines = [
             f"\n{'='*60}",
             f"GENOMEER EVALUATION REPORT — {self.suite_name}",
             f"{'='*60}",
-            f"Tests: {len(self.results)} | PASS: {self.pass_count} | WARN: {self.warn_count} | FAIL: {self.fail_count}",
-            f"Overall score: {self.overall_score:.1%}",
+            f"Tests: {len(self.results)} | PASS: {self.pass_count} | WARN: {self.warn_count} | FAIL: {self.fail_count} | SKIP: {self.skip_count}",
+            f"Overall score: {self.overall_score:.1%} (Coverage: {self.coverage_rate:.1%})",
             f"Duration: {self.total_duration:.1f}s",
             f"{'='*60}",
         ]
@@ -142,9 +153,11 @@ class EvalReport:
         return {
             "suite": self.suite_name,
             "overall_score": self.overall_score,
+            "coverage_rate": self.coverage_rate,
             "pass": self.pass_count,
             "warn": self.warn_count,
             "fail": self.fail_count,
+            "skip": self.skip_count,
             "duration_sec": self.total_duration,
             "results": [
                 {

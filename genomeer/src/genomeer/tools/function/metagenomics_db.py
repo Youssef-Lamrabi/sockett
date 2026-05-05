@@ -38,14 +38,31 @@ except Exception:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get(url: str, params: Optional[Dict] = None, timeout: int = 60) -> str:
-    """HTTP GET via requests (available in bio-agent-env1). Returns response text."""
+def _get_with_retry(url: str, params: Optional[Dict] = None, timeout: int = 60) -> str:
+    """HTTP GET via urllib with exponential backoff for 5xx/timeouts. No retry on 4xx."""
     import urllib.request
     import urllib.parse
+    import urllib.error
+    import time
+    
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read().decode("utf-8", errors="replace")
+        
+    delays = [2, 4, 8]
+    for attempt in range(len(delays) + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                raise e
+            if attempt == len(delays):
+                raise e
+            time.sleep(delays[attempt])
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == len(delays):
+                raise e
+            time.sleep(delays[attempt])
 
 
 def _ensure_dir(path: str | Path) -> Path:
@@ -88,7 +105,7 @@ def query_ncbi_taxonomy(
     # Search step
     search_url = base + "esearch.fcgi"
     search_params = {"db": db, "term": query, "retmax": retmax, "retmode": "json"}
-    search_resp = json.loads(_get(search_url, search_params))
+    search_resp = json.loads(_get_with_retry(search_url, search_params))
     ids = search_resp.get("esearchresult", {}).get("idlist", [])
 
     if not ids:
@@ -97,7 +114,7 @@ def query_ncbi_taxonomy(
     # Fetch step
     fetch_url = base + "efetch.fcgi"
     fetch_params = {"db": db, "id": ",".join(ids[:retmax]), "retmode": "xml"}
-    xml_text = _get(fetch_url, fetch_params)
+    xml_text = _get_with_retry(fetch_url, fetch_params)
 
     # Parse names from XML (lightweight, no lxml required)
     import re
@@ -150,7 +167,7 @@ def query_silva_sequences(
         params["taxa"] = taxon_filter
 
     try:
-        resp_text = _get(base_url, params, timeout=30)
+        resp_text = _get_with_retry(base_url, params, timeout=30)
         data = json.loads(resp_text)
         results = data.get("results", [])
     except Exception as e:
@@ -235,7 +252,7 @@ def query_gtdb_taxonomy(
     params = {"search": query, "limit": max_results}
 
     try:
-        resp = _get(base_url, params, timeout=30)
+        resp = _get_with_retry(base_url, params, timeout=30)
         data = json.loads(resp)
         rows = data.get("rows", []) if isinstance(data, dict) else data
         return {
@@ -272,7 +289,7 @@ def query_card_resistance(
     params = {"q": query, "source": "external"}
 
     try:
-        resp = _get(base_url, params, timeout=30)
+        resp = _get_with_retry(base_url, params, timeout=30)
         # CARD returns HTML; extract JSON if present or return metadata
         if "application/json" in resp[:50]:
             data = json.loads(resp)
@@ -348,7 +365,7 @@ def query_mgnify_studies(
         params["lineage"] = biome
 
     try:
-        resp = _get(base_url, params, timeout=30)
+        resp = _get_with_retry(base_url, params, timeout=30)
         data = json.loads(resp)
         results = data.get("data", [])
         return {
@@ -388,7 +405,7 @@ def query_mgnify_samples(
     params = {"page_size": max_results}
 
     try:
-        resp = _get(base_url, params, timeout=30)
+        resp = _get_with_retry(base_url, params, timeout=30)
         data = json.loads(resp)
         results = data.get("data", [])
         return {
@@ -494,7 +511,7 @@ def query_uniprot_proteins(
     }
 
     try:
-        resp = _get(base_url, params, timeout=30)
+        resp = _get_with_retry(base_url, params, timeout=30)
         data = json.loads(resp)
         results = data.get("results", [])
         return {
@@ -527,7 +544,7 @@ def query_kegg_pathway(
     """
     base_url = f"https://rest.kegg.jp/get/{pathway_id}"
     try:
-        resp = _get(base_url, timeout=30)
+        resp = _get_with_retry(base_url, timeout=30)
         lines = resp.splitlines()
         info: Dict[str, Any] = {"pathway_id": pathway_id, "source": "KEGG REST API"}
         section = None
@@ -563,7 +580,7 @@ def query_kegg_orthology(
     """
     base_url = f"https://rest.kegg.jp/get/{ko_id}"
     try:
-        resp = _get(base_url, timeout=30)
+        resp = _get_with_retry(base_url, timeout=30)
         lines = resp.splitlines()
         info: Dict[str, Any] = {"ko_id": ko_id, "source": "KEGG REST API"}
         for line in lines:

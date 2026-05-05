@@ -39,6 +39,9 @@ _SERIALIZABLE_FIELDS = {
     "retry_counts", "batch_strategy", "run_started_at",
     "next_step", "diagnostic_mode", "session_id",
     "run_id",
+    # FIX A6: env_name and env_ready must be restored on checkpoint resume,
+    # otherwise the agent restarts with the wrong default env (bio-agent-env1).
+    "env_name", "env_ready",
 }
 
 

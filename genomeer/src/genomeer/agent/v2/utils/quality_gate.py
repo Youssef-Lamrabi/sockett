@@ -96,6 +96,22 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         ),
     },
 
+    # FIX BUG4: run_bracken was iterated in _observer but had no gate → silent ok
+    "run_bracken": {
+        "metric_key":     "n_species_estimated",
+        "metric_label":   "Species estimated by Bracken",
+        "warn_threshold": 1,
+        "fail_threshold": 0,
+        "fail_on_zero":   True,
+        "parse_regex":    r"(\d+)\s+species",
+        "fix_hint": (
+            "Bracken estimated 0 species. Check: "
+            "(1) Kraken2 was run successfully before Bracken. "
+            "(2) The Bracken database matches the Kraken2 database version. "
+            "(3) The read length parameter (-r) matches the actual read length."
+        ),
+    },
+
     "run_metaphlan4": {
         "metric_key":     None,
         "metric_label":   "MetaPhlAn4 hits",

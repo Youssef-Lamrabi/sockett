@@ -75,15 +75,28 @@ class RunMetrics:
     total_errors: int = 0
     peak_mem_mb: float = 0.0
     _step_starts: Dict[str, float] = field(default_factory=dict)
+    _lock_obj: Any = field(default=None, init=False, repr=False)
+
+    def _get_lock(self):
+        import threading
+        if self._lock_obj is None:
+            self._lock_obj = threading.RLock()
+        return self._lock_obj
 
     def record_step_start(self, step_idx: int, step_title: str) -> None:
-        key = f"{step_idx}:{step_title}"
-        self._step_starts[key] = time.time()
-        self.steps.append(StepMetric(
-            step_idx=step_idx,
-            step_title=step_title,
-            started_at=self._step_starts[key],
-        ))
+        import time
+        with self._get_lock():
+            key = f"{step_idx}:{step_title}"
+            self._step_starts[key] = time.time()
+            existing = next((s for s in self.steps if s.step_idx == step_idx), None)
+            if not existing:
+                self.steps.append(StepMetric(
+                    step_idx=step_idx,
+                    step_title=step_title,
+                    started_at=self._step_starts[key],
+                ))
+            else:
+                existing.started_at = self._step_starts[key]
 
     def record_step_end(
         self,
@@ -97,39 +110,41 @@ class RunMetrics:
         quality_level: Optional[str] = None,
         env_used: Optional[str] = None,
     ) -> None:
+        import time
         now = time.time()
-        key = f"{step_idx}:{step_title}"
-        started = self._step_starts.get(key, now)
-
-        # Trouver le step existant ou créer
-        sm = next((s for s in self.steps if s.step_idx == step_idx), None)
-        if sm is None:
-            sm = StepMetric(step_idx=step_idx, step_title=step_title, started_at=started)
-            self.steps.append(sm)
-
-        sm.status = status
-        sm.tool_name = tool_name
-        sm.ended_at = now
-        sm.duration_sec = round(now - started, 2)
-        sm.retry_count = retry_count
-        sm.cache_hit = cache_hit
-        sm.error_summary = error_summary
-        sm.quality_level = quality_level
-        sm.env_used = env_used
-
-        if status in ("blocked", "error"):
-            self.total_errors += 1
-        if cache_hit:
-            self.tool_cache_hits += 1
-
-        # Snapshot mémoire
-        if _PSUTIL_OK:
-            try:
-                mem = psutil.virtual_memory()
-                used_mb = (mem.total - mem.available) / 1024 / 1024
-                self.peak_mem_mb = max(self.peak_mem_mb, used_mb)
-            except Exception:
-                pass
+        with self._get_lock():
+            key = f"{step_idx}:{step_title}"
+            started = self._step_starts.get(key, now)
+    
+            # Trouver le step existant ou créer
+            sm = next((s for s in self.steps if s.step_idx == step_idx), None)
+            if sm is None:
+                sm = StepMetric(step_idx=step_idx, step_title=step_title, started_at=started)
+                self.steps.append(sm)
+    
+            sm.status = status
+            sm.tool_name = tool_name
+            sm.ended_at = now
+            sm.duration_sec = round(now - started, 2)
+            sm.retry_count = retry_count
+            sm.cache_hit = cache_hit
+            sm.error_summary = error_summary
+            sm.quality_level = quality_level
+            sm.env_used = env_used
+    
+            if status in ("blocked", "error"):
+                self.total_errors += 1
+            if cache_hit:
+                self.tool_cache_hits += 1
+    
+            # Snapshot mémoire
+            if _PSUTIL_OK:
+                try:
+                    mem = psutil.virtual_memory()
+                    used_mb = (mem.total - mem.available) / 1024 / 1024
+                    self.peak_mem_mb = max(self.peak_mem_mb, used_mb)
+                except Exception:
+                    pass
 
     def record_llm_call(self, cache_hit: bool = False) -> None:
         self.llm_calls += 1

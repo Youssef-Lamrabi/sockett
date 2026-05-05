@@ -28,13 +28,7 @@ patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalem
 _robust_parser = RobustLLMParser(strict_validation=True)
 
 
-# Nœuds pour lesquels le cache LLM est désactivé
-_NOCACHE_LLM_NODES = frozenset({
-    "planner",      # Plan dépend du contexte courant et des fichiers présents
-    "observer",     # Observation dépend du résultat réel de l'exécution
-    "finalizer",    # Rapport final dépend de TOUS les résultats du run
-    "orchestrator", # Routing dépend de l'état courant du plan
-})
+from genomeer.config import NOCACHE_LLM_NODES as _NOCACHE_LLM_NODES
 
 # ── AXE 2.3: SqliteSaver for cross-session persistence ──
 try:
@@ -90,7 +84,8 @@ except Exception:
 dotenv_path = find_dotenv()
 if dotenv_path:
     load_dotenv(dotenv_path, override=False)
-    print(f"Loaded environment variables from {dotenv_path}")
+    import logging
+    logging.getLogger(__name__).info(f"Loaded environment variables from {dotenv_path}")
 
 from genomeer.agent.v2.utils.tempdir import run_workdir
 
@@ -138,7 +133,10 @@ class AgentState(TypedDict):
     current_sample_idx: int | None
     current_sample_id: str | None
     per_sample_results: Dict[str, Any] | None     # {sample_id: {step_results}}
-    
+    # ── Run metadata ───────────────────────────────────────────────────────
+    run_started_at: float | None          # epoch time of run start (T6.3 global timeout guard)
+    session_id: str | None                # LangGraph thread_id / CheckpointManager key
+
     
     # ---------------------------------------------------------------------------
 # METAGENOMICS ENV AUTO-DETECTION
@@ -171,33 +169,6 @@ _HEAVY_STEPS = {
     "prokka":   3600,
 }
 
-def _estimate_timeout(step_title: str, input_files: list, default: int) -> int:
-    """Dynamically estimates timeout based on step type and input file sizes (P2-B)."""
-    import os
-    
-    # P2-B.3: GENOMEER_TIMEOUT_SCALE_FACTOR
-    scale_factor = float(os.environ.get("GENOMEER_TIMEOUT_SCALE_FACTOR", "1.0"))
-    max_timeout = 48 * 3600
-    
-    # Base timeout detection
-    base_timeout = default
-    step_lower = step_title.lower()
-    for kw, t in _HEAVY_STEPS.items():
-        if kw in step_lower:
-            base_timeout = t
-            break
-            
-    # Calculate input size in GB
-    total_size_gb = 0.0
-    for f in input_files:
-        if os.path.exists(f):
-            total_size_gb += os.path.getsize(f) / (1024**3)
-            
-    # Scale based on size (base assumes ~5GB of data)
-    size_multiplier = max(1.0, total_size_gb / 5.0)
-    
-    timeout = int(base_timeout * size_multiplier * scale_factor)
-    return min(timeout, max_timeout)
 
 # ---------------------------------------------------------------------------
 # Phase 3: Adaptive retry escalation
@@ -247,13 +218,7 @@ RETRY_ESCALATION: Dict[str, Dict[int, str]] = {
     },
 }
  
-def _adaptive_timeout(step_title: str, default: int = 600) -> int:
-    """Return an appropriate timeout in seconds based on the step title."""
-    t = step_title.lower()
-    for keyword, timeout in _HEAVY_STEPS.items():
-        if keyword in t:
-            return max(timeout, default)
-    return default
+
  
  # FIX G5: resolve_env_for_code is already imported from genomeer.runtime.env_resolver (line 46)
  # The local re-definition below was silently masking that import — REMOVED.
@@ -365,6 +330,7 @@ class BioAgent:
         self._install_iters = {}
         self.log_registry = REGISTRY
         self._install_threads = {}
+        self._install_threads_lock = threading.Lock()  # FIX B2: protect dict from race in batch mode
         
         # Interaction mode
         self.interaction_mode = interaction_mode
@@ -373,8 +339,10 @@ class BioAgent:
         self.timeout_seconds = timeout_seconds
         self.configure()
         
-        # [DEV-ONLY] logs
-        self._set_debug_log("./agent_debug.log")
+        # FIX B3: use system temp dir instead of CWD to avoid permission errors and workspace pollution
+        import tempfile as _tf
+        _debug_log_path = os.path.join(_tf.gettempdir(), "genomeer_agent_debug.log")
+        self._set_debug_log(_debug_log_path)
         
         # CONSTANTS
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics
@@ -433,8 +401,26 @@ class BioAgent:
         os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
         with open(self.debug_log_path, "w", encoding="utf-8") as f:
             f.write("\n===== NEW SESSION =====\n")
-        self._log_buffer = []
-        self._log_buffer_lock = threading.Lock()
+        
+        # A5: use thread-safe queue instead of blocking list+lock
+        import queue
+        self._log_queue = queue.Queue()
+        
+        def _log_worker():
+            while True:
+                item = self._log_queue.get()
+                if item is None: break
+                lines = [item]
+                while not self._log_queue.empty():
+                    try: lines.append(self._log_queue.get_nowait())
+                    except queue.Empty: break
+                if lines:
+                    with open(self.debug_log_path, "a", encoding="utf-8") as f:
+                        f.writelines(lines)
+        
+        if not hasattr(self, "_log_thread") or not self._log_thread.is_alive():
+            self._log_thread = threading.Thread(target=_log_worker, daemon=True, name="log_worker")
+            self._log_thread.start()
 
     def _slim_manifest(self, manifest: dict, node: str) -> dict:
         if node in ("observer", "generator", "diagnostics"):
@@ -459,7 +445,13 @@ class BioAgent:
         return manifest
 
     def _trim_messages(self, messages: list, keep_first: int = 1, keep_last: int = 30) -> list:
-        """P3-A: Trim messages to prevent context explosion on long runs."""
+        """
+        P3-A: Trim messages to prevent context explosion on long runs.
+        Returns a list of RemoveMessage objects.
+        Note (Fix B8): In LangGraph, returning `{"messages": trim_msgs + new_msgs}` 
+        where `trim_msgs` contains RemoveMessage objects will delete those IDs from state 
+        and then append new_msgs. If empty, it just appends new_msgs without deletion.
+        """
         import os
         keep_last = int(os.environ.get("GENOMEER_MAX_MESSAGES", str(keep_last)))
         
@@ -507,28 +499,14 @@ class BioAgent:
             line += "\n" + (">"*60)
         line += f"\n[{node or '-'}] {title}\n{body}\n" + ("-"*60) + "\n"
         if type == 'file':
-            with getattr(self, "_log_buffer_lock", threading.Lock()):
-                if not hasattr(self, "_log_buffer"):
-                    self._log_buffer = []
-                self._log_buffer.append(line)
-                if len(self._log_buffer) >= 20:
-                    self._flush_log()
+            if hasattr(self, "_log_queue"):
+                self._log_queue.put(line)
         elif type == 'stdout':
             print(line)
 
     def _flush_log(self):
-        if not getattr(self, "_log_buffer", None):
-            return
-        lock = getattr(self, "_log_buffer_lock", None)
-        if lock is None:
-            return
-        with lock:
-            if not self._log_buffer:
-                return
-            path = getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log"))
-            with open(path, "a", encoding="utf-8") as f:
-                f.writelines(self._log_buffer)
-            self._log_buffer.clear()
+        # Deprecated: _log_worker now flushes continuously
+        pass
 
     def _fmt_msgs(self, msgs):
         """Pretty format a LangChain message list for logging."""
@@ -1360,6 +1338,7 @@ class BioAgent:
             # P4-D.2: Semaphore for concurrency control
             concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
             semaphore = threading.Semaphore(concurrency)
+            results_lock = threading.Lock()  # FIX A3: Lock to prevent data races on per_sample
             idx = state["current_idx"]
             plan = state["plan"]
             
@@ -1471,14 +1450,16 @@ class BioAgent:
                 for future in as_completed(futures):
                     try:
                         sample_id, res = future.result()
-                        per_sample[sample_id] = res
+                        with results_lock:
+                            per_sample[sample_id] = res
                         self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
                         
-                        _save_batch_progress(
-                            per_sample,
-                            state.get("run_temp_dir", "/tmp"),
-                            session_id
-                        )
+                        with results_lock:
+                            _save_batch_progress(
+                                per_sample,
+                                state.get("run_temp_dir", "/tmp"),
+                                session_id
+                            )
                     except Exception as e:
                         self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}", node=node)
                         
@@ -1673,7 +1654,13 @@ class BioAgent:
         
             # ADAPTIVE TIMEOUT: long-running metagenomics steps get more time
             step_title_lower = step["title"].lower()
-            adaptive_timeout = _adaptive_timeout(step_title_lower, manifest.get("timeout_seconds", 600))
+            from genomeer.utils.metrics import compute_adaptive_timeout, get_available_ram_gb
+            adaptive_timeout = compute_adaptive_timeout(
+                base_seconds=manifest.get("timeout_seconds", 600),
+                input_files=[],
+                tool_name=step_title_lower,
+                available_ram_gb=get_available_ram_gb()
+            )
             new_manifest = dict(manifest)
             new_manifest["timeout_seconds"] = adaptive_timeout
         
@@ -1850,7 +1837,13 @@ class BioAgent:
             step = self._get_current_step(state)
             step_title = step["title"] if step else "unknown step"
             
-            timeout = _estimate_timeout(step_title, _input_files, _default_timeout)
+            from genomeer.utils.metrics import compute_adaptive_timeout, get_available_ram_gb
+            timeout = compute_adaptive_timeout(
+                base_seconds=_default_timeout,
+                input_files=_input_files,
+                tool_name=step_title,
+                available_ram_gb=get_available_ram_gb()
+            )
             
             last_result = ""
 
@@ -2099,8 +2092,9 @@ class BioAgent:
                 "run_host_decontamination",
                 "compute_coverage_samtools", "run_metabat2", "run_checkm2",
                 "run_bracken", "run_gtdbtk", "run_das_tool",
+                "run_medaka", "run_virsorter2", "run_checkv",  # FIX: add missing long-read/viromics tools
             ]:
-                if tool_name not in pending_code:
+                if tool_name.lower() not in pending_code:
                     continue
                 # Try to extract result dict (nested JSON-aware)
                 result_dict = None
@@ -2386,7 +2380,9 @@ class BioAgent:
                 HumanMessage(content=prompt),
                 HumanMessage(content=ctx) 
             ]
-            msgs = self._trim_messages(msgs, keep_first=1, keep_last=10)
+            # M3 FIX: do NOT call _trim_messages before _llm_invoke here.
+            # _trim_messages() returns RemoveMessage objects (LangGraph state update directives),
+            # NOT plain messages for llm.invoke(). The msgs list (3 items) is already compact.
             self._log("ENTER NODE", body=f"retry_count={retry_count}\nstep={step['title']}", node=node)
             resp = self._llm_invoke(node, "diagnostics_plan", msgs)
 
@@ -2460,9 +2456,10 @@ class BioAgent:
                     "output_files": [str(Path(temp_dir) / p) for p in expose_paths[:20]],
                 }
                 _eval_report = PipelineOutputEval().evaluate(_eval_metrics)
-                manifest["eval_score"]  = round(_eval_report.overall_score, 3)
-                manifest["eval_fails"]  = _eval_report.fail_count
-                manifest["eval_warns"]  = _eval_report.warn_count
+                manifest["eval_score"]         = round(_eval_report.overall_score, 3)
+                manifest["eval_fails"]         = _eval_report.fail_count
+                manifest["eval_warns"]         = _eval_report.warn_count
+                manifest["eval_coverage_rate"] = round(_eval_report.coverage_rate, 3)  # FIX: export coverage_rate
                 self._log(
                     "PIPELINE EVAL",
                     body=_eval_report.summary(),
@@ -2552,6 +2549,13 @@ class BioAgent:
                             success_metrics=manifest.get("quality_signals") or {},
                         )
                         self._log("TEMPLATE SAVED", body=f"Saved pipeline. Total templates: {_TEMPLATE_LIB.count()}", node=node)
+                        
+                        # FIX C3: Cleanup checkpoint after successful pipeline completion
+                        try:
+                            from genomeer.utils.checkpoint import CheckpointManager
+                            CheckpointManager(state.get("run_temp_dir", ""), state.get("session_id", "unknown")).delete()
+                        except Exception:
+                            pass
                 except Exception as _te:
                     self._log("TEMPLATE SAVE (warn)", body=str(_te), node=node)
 
@@ -3018,12 +3022,14 @@ class BioAgent:
         import base64, requests
         from IPython.display import Image, display
 
-        if mode  == "manual":
-            mmd = self.app.get_graph().draw_mermaid()
+        # FIX A7: always compute mmd first — was undefined outside the "manual" branch
+        mmd = self.app.get_graph().draw_mermaid()
+
+        if mode == "manual":
             print(mmd)
             print("Open : https://mermaid.live/edit and pass this code to render the graph.")
             return mmd
-        
+
         encoded = base64.urlsafe_b64encode(mmd.encode("utf-8")).decode("ascii")
         url = f"https://mermaid.ink/svg/{encoded}"
 
@@ -3195,14 +3201,50 @@ class BioAgent:
             "diagnostic_code": None,
             "diagnostic_observation": None,
             "run_id": tmp.split(_os.sep)[-1],
+            "session_id": session_id,          # FIX: session_id was missing from initial state
             "run_started_at": time.time(),    # T6.3: global elapsed time guard
             "batch_mode": None,
             "batch_strategy": "independent",
             "sample_manifest": None,
             "current_sample_idx": None,
-            "current_sample_id": None,
+            "current_sample_id": None,         # FIX: removed duplicate key
             "per_sample_results": None,
         }
+
+    def _prepare_run_inputs(self, prompt: str, attachments: list[str] | None, session_id: str | None, thread_id: str, tmp: str):
+        if self.use_tool_retriever:
+            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+            self.update_system_prompt_with_selected_resources(selected_resources_names)
+
+        staged = self._stage_attachments(tmp, attachments or [])
+        
+        # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
+        from genomeer.utils.helper import _persistent_namespace
+        _persistent_namespace.clear()
+        
+        from genomeer.utils.checkpoint import CheckpointManager
+        from genomeer.utils.metrics import RunMetrics
+        
+        cp = CheckpointManager(tmp, thread_id)
+        if cp.exists():
+            inputs = cp.load()
+            if isinstance(inputs, dict):
+                inputs["run_started_at"] = time.time()  # FIX C1: Reset timer on resume
+            self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
+            self._metrics = RunMetrics(thread_id, tmp)
+        else:
+            if not self._has_session_state(thread_id):
+                inputs = self._build_initial_state(prompt, staged, session_id, tmp)
+                self._metrics = RunMetrics(thread_id, tmp)
+            else:
+                msg_block = [HumanMessage(content=prompt)]
+                if staged:
+                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                inputs = {"messages": msg_block}
+            
+        config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
+        return inputs, config
+
 
     def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
         """Execute the agent with the given prompt.
@@ -3219,40 +3261,8 @@ class BioAgent:
         def _is_human(msg) -> bool:
             return getattr(msg, "type", "").lower() == "human"
 
-        if self.use_tool_retriever:
-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
-            self.update_system_prompt_with_selected_resources(selected_resources_names)
-
         with run_workdir("run", session_id) as tmp:
-            staged = self._stage_attachments(tmp, attachments or [])
-            
-            # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
-            from genomeer.utils.helper import _persistent_namespace
-            _persistent_namespace.clear()
-            
-            from genomeer.utils.checkpoint import CheckpointManager
-            from genomeer.utils.metrics import RunMetrics
-            
-            cp = CheckpointManager(tmp, thread_id)
-            if cp.exists():
-                inputs = cp.load()
-                self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
-                self._metrics = RunMetrics(thread_id, tmp)
-            else:
-                if not self._has_session_state(thread_id):
-                    # FIRST TURN OF THIS SESSION -> full bootstrap state
-                    inputs = self._build_initial_state(prompt, staged, session_id, tmp)
-                    self._metrics = RunMetrics(thread_id, tmp)
-                else:
-                    # FOLLOW-UP TURN -> only append the new message and record any new attachments
-                    msg_block = [HumanMessage(content=prompt)]
-                    if staged:
-                        msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                    inputs = {
-                        "messages": msg_block
-                    }
-                
-            config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
+            inputs, config = self._prepare_run_inputs(prompt, attachments, session_id, thread_id, tmp)
             self.log = []
             last_msg_text = None
 
@@ -3302,40 +3312,8 @@ class BioAgent:
         def _is_human(msg) -> bool:
             return getattr(msg, "type", "").lower() == "human"
 
-        if self.use_tool_retriever:
-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
-            self.update_system_prompt_with_selected_resources(selected_resources_names)
-
         with run_workdir("run", session_id) as tmp:
-            staged = self._stage_attachments(tmp, attachments or [])
-            
-            # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
-            from genomeer.utils.helper import _persistent_namespace
-            _persistent_namespace.clear()
-            
-            from genomeer.utils.checkpoint import CheckpointManager
-            from genomeer.utils.metrics import RunMetrics
-            
-            cp = CheckpointManager(tmp, thread_id)
-            if cp.exists():
-                inputs = cp.load()
-                self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
-                self._metrics = RunMetrics(thread_id, tmp)
-            else:
-                if not self._has_session_state(thread_id):
-                    # FIRST TURN OF THIS SESSION -> full bootstrap state
-                    inputs = self._build_initial_state(prompt, staged, session_id, tmp)
-                    self._metrics = RunMetrics(thread_id, tmp)
-                else:
-                    # FOLLOW-UP TURN -> only append the new message and record any new attachments
-                    msg_block = [HumanMessage(content=prompt)]
-                    if staged:
-                        msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                    inputs = {
-                        "messages": msg_block
-                    }
-
-            config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
+            inputs, config = self._prepare_run_inputs(prompt, attachments, session_id, thread_id, tmp)
             last_msg_text = None
             self.log = []
 

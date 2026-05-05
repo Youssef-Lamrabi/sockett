@@ -235,8 +235,7 @@ class ToolRetriever:
         Original implementation preserved for compatibility.
         """
         from langchain_core.messages import HumanMessage
-        from langchain_openai import ChatOpenAI
-
+        
         prompt = f"""
             You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.
 

@@ -480,42 +480,58 @@ class BioRAGStore:
         if "card" in sources:
             card_path = base_dir / "card_top500.json"
             if card_path.exists():
-                import time
-                mtime = card_path.stat().st_mtime
-                days_old = (time.time() - mtime) / 86400
-                if days_old > 180:
-                    logger.warning(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old:.0f} days old. Context may be outdated.")
                 with open(card_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    version = data.get("source_version", "CARD")
-                    for entry in data.get("entries", []):
-                        gene = entry.get("gene", "Unknown")
-                        doc_id = f"card_{gene.lower().replace(' ', '_')}"
-                        text = f"AMR gene: {gene} | Drug class: {entry.get('drug_class','')} | Mechanism: {entry.get('mechanism','')}. {entry.get('description','')}"
-                        docs.append(BioDocument(
-                            doc_id=doc_id, text=text, source="card", category="amr",
-                            metadata={"gene": gene, "drug_class": entry.get("drug_class"), "source_version": version}
-                        ))
+                    
+                bundle_date_str = data.get("__bundle_date__")
+                if bundle_date_str:
+                    from datetime import datetime
+                    bundle_date = datetime.fromisoformat(bundle_date_str)
+                    days_old = (datetime.now() - bundle_date).days
+                    if days_old > 180:
+                        import warnings
+                        warnings.warn(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old} days old. Context may be outdated.", UserWarning)
+                
+                version = data.get("source_version", "CARD")
+                for entry in data.get("entries", []):
+                    gene = entry.get("gene", "Unknown")
+                    doc_id = f"card_{gene.lower().replace(' ', '_')}"
+                    text = f"AMR gene: {gene} | Drug class: {entry.get('drug_class','')} | Mechanism: {entry.get('mechanism','')}. {entry.get('description','')}"
+                    docs.append(BioDocument(
+                        doc_id=doc_id, text=text, source="card", category="amr",
+                        metadata={"gene": gene, "drug_class": entry.get("drug_class"), "source_version": version}
+                    ))
+            else:
+                import warnings
+                warnings.warn(f"[BioRAG] WARNING: Static bundle {card_path.name} not found. Running with missing biological context. Please run scripts/refresh_bundles.py.", UserWarning)
                         
         if "kegg_pathways" in sources:
             kegg_path = base_dir / "kegg_core_pathways.json"
             if kegg_path.exists():
-                import time
-                mtime = kegg_path.stat().st_mtime
-                days_old = (time.time() - mtime) / 86400
-                if days_old > 180:
-                    logger.warning(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old:.0f} days old. Context may be outdated.")
                 with open(kegg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    version = data.get("source_version", "KEGG")
-                    for entry in data.get("entries", []):
-                        pid = entry.get("pathway_id", "Unknown")
-                        doc_id = f"kegg_{pid}"
-                        text = f"KEGG Pathway {pid}: {entry.get('name','')}. {entry.get('description','')}"
-                        docs.append(BioDocument(
-                            doc_id=doc_id, text=text, source="kegg", category="pathway",
-                            metadata={"pathway_id": pid, "name": entry.get("name"), "source_version": version}
-                        ))
+
+                bundle_date_str = data.get("__bundle_date__")
+                if bundle_date_str:
+                    from datetime import datetime
+                    bundle_date = datetime.fromisoformat(bundle_date_str)
+                    days_old = (datetime.now() - bundle_date).days
+                    if days_old > 180:
+                        import warnings
+                        warnings.warn(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old} days old. Context may be outdated.", UserWarning)
+                
+                version = data.get("source_version", "KEGG")
+                for entry in data.get("entries", []):
+                    pid = entry.get("pathway_id", "Unknown")
+                    doc_id = f"kegg_{pid}"
+                    text = f"KEGG Pathway {pid}: {entry.get('name','')}. {entry.get('description','')}"
+                    docs.append(BioDocument(
+                        doc_id=doc_id, text=text, source="kegg", category="pathway",
+                        metadata={"pathway_id": pid, "name": entry.get("name"), "source_version": version}
+                    ))
+            else:
+                import warnings
+                warnings.warn(f"[BioRAG] WARNING: Static bundle {kegg_path.name} not found. Running with missing biological context. Please run scripts/refresh_bundles.py.", UserWarning)
                         
         return docs
 

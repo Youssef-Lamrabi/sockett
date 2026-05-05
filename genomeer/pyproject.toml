@@ -39,10 +39,6 @@ dependencies = [
     "networkx",
     "requests",
     "pyyaml",
-    "jupyter",
-    "notebook",
-    "ipykernel",
-    "pytest",
     "transformers",
     "sentencepiece",
     "mcp",
@@ -86,7 +82,7 @@ line-length = 120
 
 [project.optional-dependencies]
 r = ["rpy2"]
-dev = ["pytest", "pytest-cov", "ruff", "mypy"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy", "jupyter", "notebook", "ipykernel"]
 # server dependencies moved to main dependencies
 
 [tool.ruff.lint]

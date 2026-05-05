@@ -68,6 +68,10 @@ def preload_tool_versions(env_name: str, tools: list[str]):
     if not env_name or not tools:
         return
         
+    import platform
+    if platform.system() == "Windows":
+        return
+        
     with _version_cache_lock:
         tools_to_check = [t for t in set(tools) if f"{env_name}::{t}" not in _version_cache]
     if not tools_to_check:
@@ -151,20 +155,20 @@ def _run_in_env(
         env.update(extra_env)
     # If RUN_TEMP_DIR still not set, use a safe fallback
     if "RUN_TEMP_DIR" not in env:
-        env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
+        env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", os.path.join(tempfile.gettempdir(), "bioagent"))
 
     import time
 
     def set_limits():
         try:
             import resource
-            # 1.1 Limites mémoire (16 GB default)
-            max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "16"))
+            # 1.1 Limites mémoire (64 GB default)
+            max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "64"))
             max_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
             resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
             
-            # 1.2 Limites CPU (basé sur timeout)
-            max_cpu = int(timeout)
+            # 1.2 Limites CPU (6h default)
+            max_cpu = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", str(6 * 3600)))
             if max_cpu > 0:
                 resource.setrlimit(resource.RLIMIT_CPU, (max_cpu, max_cpu))
                 
@@ -173,6 +177,7 @@ def _run_in_env(
         except (ImportError, ValueError, OSError):
             pass
 
+    import sys
     try:
         proc = subprocess.Popen(
             cmd,
@@ -181,10 +186,10 @@ def _run_in_env(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
-            preexec_fn=set_limits if os.name != 'nt' else None,
+            preexec_fn=set_limits if sys.platform != 'win32' else None,
         )
     except MemoryError as e:
-        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "16")
+        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "64")
         logger.error(f"[_run_in_env] MemoryError: L'outil {' '.join(cmd)} a dépassé les limites ou échoué au fork. (RAM Configurée: {max_ram_gb} GB)")
         raise e
 
@@ -219,12 +224,17 @@ def _run_in_env(
         outs, errs = proc.communicate()
         exc.stdout = outs
         exc.stderr = errs
-        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "16")
+        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "64")
         logger.error(f"[_run_in_env] TimeoutExpired: L'outil {' '.join(cmd)} a dépassé les limites de temps. (CPU: {timeout}s, RAM Configurée: {max_ram_gb} GB)")
         raise
 
     retcode = proc.poll()
-    if check and retcode:
+    if retcode == -9:
+        logger.error(f"[_run_in_env] Le processus a été tué par SIGKILL (OOM-Killer ou timeout CPU) : {' '.join(cmd)}")
+        stderr = (stderr or "") + "\n\n[SYSTEM] Le processus a été tué (SIGKILL / -9). Limite RAM (64GB) ou CPU dépassée."
+        if check:
+            raise subprocess.CalledProcessError(retcode, cmd, output=stdout, stderr=stderr)
+    elif check and retcode:
         raise subprocess.CalledProcessError(retcode, cmd, output=stdout, stderr=stderr)
     return subprocess.CompletedProcess(proc.args, retcode, stdout, stderr)
     
@@ -269,8 +279,9 @@ def run_r_code(
             path = f.name
 
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
+                return f"Environment '{env_name}' is not available. {_env_msg}"
             proc = _run_in_env(
                 env_name, ["Rscript", path],
                 timeout=settings.timeout_seconds,
@@ -296,6 +307,7 @@ def run_r_code(
             stderr=subprocess.PIPE,
             text=True,
         )
+        res_stdout, res_stderr = "", ""
         try:
             if cancel_event is not None:
                 start_time = time.time()
@@ -323,7 +335,7 @@ def run_r_code(
         if res_returncode == 0:
             return res_stdout or ""
         return _format_proc_error(
-            "Error running Bash script",
+            "Error running R script",   # FIX: was incorrectly 'Error running Bash script'
             [path],
             res_returncode,
             res_stdout or "",
@@ -385,8 +397,9 @@ def run_bash_script(
 
     try:
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
+                return f"Environment '{env_name}' is not available. {_env_msg}"
 
             proc = _run_in_env(
                 env_name, ["bash", path],
@@ -477,8 +490,9 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
         argv = shlex.split(command)
         
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
+                return f"Environment '{env_name}' is not available. {_env_msg}"
             proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
             return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
 
@@ -533,8 +547,9 @@ def run_python_code(
     try:
         # --- Case 1: run in a micromamba environment ---
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
+                return f"Environment '{env_name}' is not available. {_env_msg}"
 
             os.makedirs(settings.run_dir, exist_ok=True)
             with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
@@ -725,8 +740,8 @@ def function_to_api_schema(function_string, llm):
             return ast.literal_eval(api)  # -> prefer "default": None
             # return json.loads(api) # -> prefer "default": null
         except Exception as e:
-            print("API string:", api)
-            print("Error parsing the API string:", e)
+            logger.debug("API string: %s", locals().get("api", "<undefined>"))
+            logger.debug("Error parsing the API string: %s", e)
             continue
     return "Error: Could not parse the API schema"
     

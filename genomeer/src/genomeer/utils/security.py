@@ -102,9 +102,9 @@ _BLOCKED_PYTHON: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\beval\s*\(", re.IGNORECASE),
      "eval() is forbidden (arbitrary code execution)"),
 
-    # exec() sur variable (exec(var) OK pour exec("print()") mais risky)
-    (re.compile(r"\bexec\s*\(\s*(?![\"\'])", re.IGNORECASE),
-     "exec() on non-literal (dynamic code execution)"),
+    # exec() — exécution de code dynamique (inclut exec("string"))
+    (re.compile(r"\bexec\s*\(", re.IGNORECASE),
+     "exec() is forbidden (arbitrary code execution)"),
 
     # import dynamique de os pour contournement
     (re.compile(r"__import__\s*\(\s*['\"]os['\"]", re.IGNORECASE),
@@ -113,6 +113,14 @@ _BLOCKED_PYTHON: List[Tuple[re.Pattern, str]] = [
     # Écriture dans /etc
     (re.compile(r"open\s*\(\s*['\"]?\s*/etc/", re.IGNORECASE),
      "file write to /etc (system config)"),
+
+    # os.remove / os.unlink dans une list comprehension (suppression de masse)
+    (re.compile(r"\[\s*os\.(remove|unlink).*\bfor\b", re.IGNORECASE | re.DOTALL),
+     "mass file deletion via os.remove/unlink in list comprehension"),
+
+    # os.remove / os.unlink sur chemin absolu racine
+    (re.compile(r"\bos\.(remove|unlink)\s*\(\s*['\"]?\s*/(?![tT]mp|[vV]ar/[tT]mp|[hH]ome/\w+/\.genomeer)", re.IGNORECASE),
+     "os.remove/unlink on root or sensitive path"),
 ]
 
 
@@ -164,8 +172,27 @@ def check_python_code(code: str) -> Tuple[bool, str]:
     for pattern, label in _BLOCKED_PYTHON:
         if pattern.search(code):
             reason = f"[SECURITY BLOCK] Dangerous Python pattern detected: {label}"
-            logger.error(f"{reason}\\nCode (first 300 chars): {code[:300]!r}")
+            logger.error(f"{reason}\nCode (first 300 chars): {code[:300]!r}")
             return False, reason
+
+    # FIX B6 & M4: AST-based deep analysis for dynamic execution
+    import ast
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                func_name = None
+                if isinstance(func, ast.Name):
+                    func_name = func.id
+                elif isinstance(func, ast.Attribute):
+                    func_name = func.attr
+                
+                if func_name in ("eval", "exec", "compile", "__import__"):
+                    reason = f"[SECURITY BLOCK] Forbidden AST call detected: {func_name}()"
+                    return False, reason
+    except SyntaxError:
+        pass  # Let the actual execution catch syntax errors
 
     return True, "ok"
 

@@ -117,6 +117,7 @@ class TestPipelineEvalScenarios:
         evaluator = PipelineOutputEval()
         report = evaluator.evaluate({"assembly_n50": 15_000, "classified_pct": 80.0})
         assert 0.0 <= report.overall_score <= 1.0
+        assert 0.0 <= report.coverage_rate <= 1.0
 
     def test_report_saves_to_json(self, tmp_path):
         from genomeer.evaluation.benchmark import PipelineOutputEval
@@ -129,6 +130,7 @@ class TestPipelineEvalScenarios:
             data = json.load(f)
         assert "suite" in data
         assert "overall_score" in data
+        assert "coverage_rate" in data
         assert "results" in data
 
     def test_medaka_qv_metric_long_read_pass(self):
