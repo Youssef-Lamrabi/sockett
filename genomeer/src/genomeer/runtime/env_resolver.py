@@ -245,6 +245,7 @@ META_ENV_SIGNALS = {
     # CLI binaries
     "fastp", "fastqc", "multiqc", "nanostat", "nanoplot", "trim-galore",
     "metaspades.py", "megahit", "flye",
+    "racon", "medaka_consensus", "unicycler",         # long-read polishing / hybrid
     "minimap2", "bowtie2", "bwa", "bwa-mem2", "samtools", "bedtools",
     "kraken2", "bracken", "metaphlan", "gtdbtk", "krona",
     "metabat2", "das_tool", "checkm2", "virsorter2", "checkv", "deepvirfinder",
@@ -260,6 +261,7 @@ META_ENV_SIGNALS = {
     "run_bracken", "run_gtdbtk", "run_krona", "run_nanostat",
     "run_multiqc", "compute_coverage_samtools",
     "run_virsorter2", "run_checkv", "run_deepvirfinder",
+    "run_medaka", "run_racon",                        # long-read polishing wrappers
     "from genomeer.tools.function.metagenomics",
     "from genomeer.tools.function.viromics",
 }

@@ -1,0 +1,18 @@
+
+============================================================
+GENOMEER EVALUATION REPORT — PipelineOutputEval [shotgun]
+============================================================
+Tests: 9 | PASS: 6 | WARN: 0 | FAIL: 0
+Overall score: 83.3%
+Duration: 0.0s
+============================================================
+  ✔ [EvalStatus.PASS] assembly_n50: 16569.0bp ≥ 10000bp — good (score=1.00)
+  ✔ [EvalStatus.PASS] classified_pct: 78.3% ≥ 60.0% — good (score=1.00)
+  ✔ [EvalStatus.PASS] mean_completeness: 91.5% ≥ 90.0% — good (score=1.00)
+  ✔ [EvalStatus.PASS] mean_contamination: 3.2% ≤ 5.0% — excellent (score=1.00)
+  ✔ [EvalStatus.PASS] q30_rate: 88.5% ≥ 80.0% — good (score=1.00)
+  – [EvalStatus.SKIP] n_hq_mags: Metric not present in pipeline results (score=0.50)
+  – [EvalStatus.SKIP] diversity_shannon: Metric not present in pipeline results (score=0.50)
+  ✔ [EvalStatus.PASS] amr_genes: No AMR genes detected (or not tested) (score=1.00)
+  – [EvalStatus.SKIP] output_files: No output file list provided (score=0.50)
+============================================================

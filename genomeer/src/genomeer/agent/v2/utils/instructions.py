@@ -22,7 +22,8 @@ You work inside a node-graph system with access to a coding environment, special
 Always specify the correct environment for code execution:
 
   bio-agent-env1  → Python/R scripts, data processing, visualization, NCBI downloads, general bioinformatics
-  meta-env1       → ALL metagenomics CLI tools: fastp, Kraken2, MetaSPAdes, MEGAHIT, Flye, minimap2,
+  meta-env1       → ALL metagenomics CLI tools: fastp, Kraken2, MetaSPAdes, MEGAHIT, Flye,
+                    Racon, Medaka (medaka_consensus), Unicycler, minimap2,
                     MetaPhlAn4, GTDB-Tk, MetaBAT2, DAS_Tool, CheckM2, Prokka, Prodigal,
                     DIAMOND, HMMER, HUMAnN3, AMRFinderPlus, RGI
 
@@ -67,6 +68,21 @@ TOOL SELECTION RULES:
     - Short reads, large dataset or low RAM: MEGAHIT (faster, lower memory)
     - Long reads (Nanopore): Flye with --meta flag
     - Hybrid (short + long): metaSPAdes with --nanopore or --pacbio flag
+
+  LONG-READ PIPELINE (ONT / Nanopore):
+    Recommended order: Flye → Racon (1-2 rounds) → Medaka → CheckM2
+    Step 1 — Assembly:   run_flye() with read_type='nano-raw' or 'nano-hq'
+    Step 2 — Polish #1:  run_minimap2(preset='map-ont') → overlaps.paf  then  run_racon(reads, paf, assembly)
+    Step 3 — Polish #2:  (optional) repeat minimap2 + racon on racon_polished.fasta
+    Step 4 — Polish #3:  run_medaka(reads, racon_polished.fasta, model='r941_min_high_g360')
+    Step 5 — QC:         run_checkm2() on medaka consensus
+
+  LONG-READ DETECTION RULE:
+    Automatically route to long-read pipeline if ANY of these is true:
+    - The user mentions 'nanopore', 'ONT', 'Oxford Nanopore', 'long reads', 'PacBio'
+    - NanoStat reports: mean quality < Q15 (typical for ONT)
+    - NanoStat reports: mean read length > 5000 bp (short-read reads are typically 100-300 bp)
+    - The FASTQ file contains reads with typical ONT length distribution (check with NanoStat first)
   
   Taxonomy:
     - Fast screening of reads: Kraken2 (k-mer, very fast, needs large DB)
@@ -238,6 +254,17 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     - [ ] Run DeepVirFinder for additional viral identification (phase: 2)
     - [ ] Run Prokka for annotation of viral MAGs (phase: 2)
 
+  Long-read (ONT/Nanopore) metagenomics:
+    - [ ] Run NanoStat for read QC and quality assessment (phase: 1)
+    - [ ] Run Flye for long-read assembly (--meta mode) (phase: 1)
+    - [ ] Map reads to assembly with minimap2 (preset: map-ont) → produce overlaps.paf (phase: 1)
+    - [ ] Run Racon (round 1) for fast consensus polishing (phase: 1)
+    - [ ] Map reads to Racon output (minimap2 map-ont) → new overlaps.paf (phase: 1)
+    - [ ] Run Racon (round 2) for second polishing pass (phase: 1)
+    - [ ] Run Medaka for neural-network consensus polishing (phase: 2)
+    - [ ] Run MetaBAT2 for binning (phase: 2)
+    - [ ] Run CheckM2 to assess bin quality (phase: 2)
+
 End your checklist with exactly one routing tag on its own line:
 <next:QA> or <next:ORCHESTRATOR>
 """
@@ -337,6 +364,7 @@ HARD RULES (do not violate):
 ENVIRONMENT SELECTION:
   - bio-agent-env1: Python/R scripts, ncbi-genome-download, general analysis
   - meta-env1: fastp, FastQC, MultiQC, NanoStat, metaSPAdes, MEGAHIT, Flye,
+               Racon (racon), Medaka (medaka_consensus), Unicycler,
                minimap2, Bowtie2, samtools, Kraken2, Bracken, MetaPhlAn4,
                GTDB-Tk, MetaBAT2, DAS_Tool, CheckM2, Prokka, Prodigal,
                DIAMOND, HMMER, HUMAnN3, AMRFinderPlus, RGI

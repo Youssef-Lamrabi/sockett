@@ -151,6 +151,27 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         ),
     },
 
+    # ── Long-Read Polishing ───────────────────────────────────────────────────
+
+    "run_medaka": {
+        # Medaka logs QV (Quality Value) of the polished consensus.
+        # QV = -10 * log10(error_rate): QV20 = 99% acc, QV30 = 99.9% acc.
+        # Medaka typically outputs: "[M::] INFO: mean qv: 28.35" in its stderr.
+        "metric_key":     "mean_qv",
+        "metric_label":   "Medaka consensus QV (Quality Value)",
+        "warn_threshold": 20,   # QV10–20: polishing worked but quality suboptimal
+        "fail_threshold": 10,   # QV < 10: polishing failed or reads too noisy
+        "warn_below":     20,
+        "fail_below":     10,
+        "parse_regex":    r"(?:mean\s*qv|consensus\s*qv)[:\s]+([0-9]+(?:\.[0-9]+)?)",
+        "fix_hint": (
+            "Medaka consensus QV is very low. Check: "
+            "(1) Were Racon rounds run before Medaka (1-2 rounds recommended)? "
+            "(2) Is the model correct for the flowcell/kit (e.g. r941_min_high_g360)? "
+            "(3) Are input reads high-quality ONT reads (mean Q >= Q8)?"
+        ),
+    },
+
     # ── Coverage ─────────────────────────────────────────────────────────────
 
     "compute_coverage_samtools": {

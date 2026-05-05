@@ -298,7 +298,17 @@ def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = No
 
 
 def ensure_env(name: str, auto_install: bool  = True, log_cb: Optional[Callable[[str], None]] = None) -> tuple[Path, bool, str]:
-    """Ensure env exists from the registry. Returns (prefix, created, message)."""
+    """Ensure env exists from the registry. Returns (prefix, created, message).
+
+    If the environment variable ``GENOMEER_SKIP_ENV_INSTALL`` is set to ``1``,
+    this function returns immediately without calling micromamba.  This allows
+    Windows CI / E2E tests to exercise the LangGraph pipeline logic without
+    any real bioinformatics tooling.
+    """
+    # ── CI / Windows E2E bypass ───────────────────────────────────────────────
+    if os.environ.get("GENOMEER_SKIP_ENV_INSTALL", "0") == "1":
+        return ENVS_DIR / name, False, f"[SKIP] Environment '{name}' install skipped (GENOMEER_SKIP_ENV_INSTALL=1)."
+    # ─────────────────────────────────────────────────────────────────────────
     reg = load_registry()
     rec = next((e for e in reg.get("envs", []) if e.get("name") == name), None)
     if not rec:

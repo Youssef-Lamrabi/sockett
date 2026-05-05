@@ -53,7 +53,7 @@ envs:
       - edgeR
 
   - name: meta-env1
-    description: "Metagenomics specialized environment. Contains ALL metagenomics CLI tools: fastp, FastQC, MultiQC, NanoStat, metaSPAdes, MEGAHIT, Flye, minimap2, Bowtie2, samtools, Kraken2, Bracken, MetaPhlAn4, GTDB-Tk, Krona, MetaBAT2, DAS_Tool, CheckM2, Prokka, Prodigal, DIAMOND, HMMER, HUMAnN3, AMRFinderPlus, RGI. Use for any metagenomics pipeline step."
+    description: "Metagenomics specialized environment. Contains ALL metagenomics CLI tools: fastp, FastQC, MultiQC, NanoStat, metaSPAdes, MEGAHIT, Flye, Racon, Medaka, Unicycler, minimap2, Bowtie2, samtools, Kraken2, Bracken, MetaPhlAn4, GTDB-Tk, Krona, MetaBAT2, DAS_Tool, CheckM2, Prokka, Prodigal, DIAMOND, HMMER, HUMAnN3, AMRFinderPlus, RGI. Use for any metagenomics pipeline step including long-read (ONT) pipelines: Flye → Racon → Medaka → CheckM2."
     spec: "metagenomics-env.yaml"
     python: "3.11"
     provides_bins:
@@ -69,6 +69,9 @@ envs:
       - spades.py
       - megahit
       - flye
+      - racon
+      - medaka_consensus
+      - unicycler
       # Mapping
       - minimap2
       - bowtie2

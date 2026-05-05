@@ -1177,7 +1177,7 @@ class BioAgent:
                     "messages": [AIMessage(content="<observe>No plan generated. Asking user for clarification.</observe>")],
                 }
 
-            # --- TÂCHE 7: Planning adaptatif mid-pipeline ---
+            # --- TÂCHE 7: Planning adaptatif mid-pipeline (MEGAHIT fallback) ---
             if idx < len(plan) and plan[idx].get("status") == "done":
                 step_title = plan[idx].get("title", "").lower()
                 step_code = plan[idx].get("code", "").lower()
@@ -1196,6 +1196,65 @@ class BioAgent:
                             state.setdefault("messages", []).append(
                                 AIMessage(content=f"<observe>[ADAPTIVE PLAN] metaSPAdes assembly N50={n50} is too low (<1000). Injecting MEGAHIT alternative step.</observe>")
                             )
+
+            # --- TÂCHE A.7: Planning adaptatif long-read (Flye -> Racon -> Medaka) ---
+            # After a completed Flye step on ONT reads, inject Racon + Medaka polishing steps
+            # before the pipeline continues to CheckM2/binning.
+            if idx < len(plan) and plan[idx].get("status") == "done":
+                step_title_lr = plan[idx].get("title", "").lower()
+                step_code_lr  = plan[idx].get("code", "").lower()
+                step_notes_lr = plan[idx].get("notes", "").lower()
+
+                _is_flye_step = "flye" in step_title_lr or "flye" in step_code_lr
+                # Detect ONT input: step references nano/ont/long-read, or read_type contains nano
+                _is_ont_reads = any(
+                    kw in (step_title_lr + step_code_lr + step_notes_lr)
+                    for kw in ("nano", "ont", "nanopore", "long-read", "long_read", "nano-raw", "nano-hq")
+                )
+
+                if _is_flye_step and _is_ont_reads:
+                    _already_has_racon  = any("racon"  in s.get("title", "").lower() for s in plan)
+                    _already_has_medaka = any("medaka" in s.get("title", "").lower() for s in plan)
+
+                    if not (_already_has_racon or _already_has_medaka):
+                        self._log(
+                            "ADAPTIVE PLAN (long-read)",
+                            body="Flye+ONT assembly detected. Injecting Racon (x2) + Medaka polishing steps.",
+                            node=node,
+                        )
+                        # Inject in reverse order so final order is: Racon1 -> Racon2 -> Medaka
+                        # Each plan.insert(idx+1) shifts previous insertions forward
+                        plan.insert(idx + 1, {
+                            "title": "Run Medaka (ONT Consensus Polishing)",
+                            "description": (
+                                "Polish the Racon-corrected assembly with Medaka neural-network "
+                                "consensus. Uses medaka_consensus -i reads.fastq -d racon2.fasta "
+                                "-o medaka_out -t 8 -m r941_min_high_g360."
+                            ),
+                            "status": "todo",
+                        })
+                        plan.insert(idx + 1, {
+                            "title": "Run Racon Round 2 (ONT Polish)",
+                            "description": (
+                                "Second Racon polishing round: re-map reads to racon_round1.fasta "
+                                "with minimap2 -x map-ont, then run racon reads.fastq overlaps.paf "
+                                "racon_round1.fasta > racon_round2.fasta."
+                            ),
+                            "status": "todo",
+                        })
+                        plan.insert(idx + 1, {
+                            "title": "Run Racon Round 1 (ONT Polish)",
+                            "description": (
+                                "First Racon polishing round: map ONT reads to Flye assembly with "
+                                "minimap2 -x map-ont assembly.fasta reads.fastq > overlaps.paf, "
+                                "then run racon reads.fastq overlaps.paf assembly.fasta > racon_round1.fasta."
+                            ),
+                            "status": "todo",
+                        })
+                        state.setdefault("messages", []).append(AIMessage(content=(
+                            "<observe>[ADAPTIVE PLAN — LONG-READ] Flye assembly on ONT reads detected. "
+                            "Injecting Racon (×2) -> Medaka polishing pipeline before CheckM2.</observe>"
+                        )))
             # --------------------------------------------------
 
             while idx < len(plan) and plan[idx]["status"] != "todo":
@@ -1610,7 +1669,7 @@ class BioAgent:
                 env_hint=env_hint,
                 current_env=env_name,
             )
-            self._log("ENV RESOLVED", body=f"current={env_name} → resolved={resolved_env}", node=node)
+            self._log("ENV RESOLVED", body=f"current={env_name} -> resolved={resolved_env}", node=node)
         
             # ADAPTIVE TIMEOUT: long-running metagenomics steps get more time
             step_title_lower = step["title"].lower()
@@ -1657,6 +1716,18 @@ class BioAgent:
         def _ensure_env(self, state: AgentState) -> AgentState:
             sid = state.get("current_sample_id")
             node = f"ensure_env|{sid}" if sid else "ensure_env"
+
+            # ── CI / Windows E2E bypass ───────────────────────────────────────
+            if os.environ.get("GENOMEER_SKIP_ENV_INSTALL", "0") == "1":
+                env_name = state.get("env_name") or "mocked_env"
+                self._log("ENSURE_ENV SKIP", body=f"GENOMEER_SKIP_ENV_INSTALL=1 -> skipping install for '{env_name}'", node=node)
+                return {
+                    "env_ready": True,
+                    "next_step": "executor",
+                    "messages": [AIMessage(content=f"<observe>[SKIP] Environment '{env_name}' install bypassed (GENOMEER_SKIP_ENV_INSTALL=1).</observe>")],
+                }
+            # ─────────────────────────────────────────────────────────────────
+
             # state["env_ready"] = True
             # state["next_step"] = "executor"
             # return state
@@ -1755,7 +1826,18 @@ class BioAgent:
             _extra_env = {"RUN_TEMP_DIR": _run_temp_dir}
 
             env = state["env_name"]
+
+            # ── CI / Windows E2E bypass ───────────────────────────────────────
+            # Force in-process execution: no micromamba, no subprocess.
+            # The step_namespace below already injects 'manifest' so mock PY
+            # steps work correctly without any external env.
+            if os.environ.get("GENOMEER_SKIP_ENV_INSTALL", "0") == "1":
+                env = None
+                self._log("EXECUTOR SKIP", body="GENOMEER_SKIP_ENV_INSTALL=1 -> running code in-process (env=None)", node=node)
+            # ─────────────────────────────────────────────────────────────────
+
             _default_timeout = state["manifest"].get("timeout_seconds", 600)
+
             
             # P2-B.2 & Point Faible 1: Extract input files including paths without quotes
             import re as _re
@@ -1790,7 +1872,6 @@ class BioAgent:
                 code = diagnostic_code
                 
             try:
-                import threading
                 _cancel_event = threading.Event()
                 state["cancel_event"] = _cancel_event
 
@@ -1870,9 +1951,11 @@ class BioAgent:
                     self._inject_custom_functions_to_repl()  # for _persistent_namespace only
                     code = re.sub(r"^\s*#!PY\s*\r?\n", "", code, count=1)
                     # T4: Build an isolated step namespace — prevents variable leakage between steps
+                    _manifest_copy = dict(state.get("manifest") or {})
                     _step_namespace = {
                         "__builtins__": __builtins__,
                         "run_dir": _run_temp_dir,          # always available to generated code
+                        "manifest": _manifest_copy,        # allow mock steps to mutate quality_signals
                     }
                     # Copy custom functions from _persistent_namespace if present (T4 preserves custom tools)
                     from genomeer.utils.helper import _persistent_namespace as _pns
@@ -1891,6 +1974,10 @@ class BioAgent:
                         timeout=timeout,
                         cancel_event=_cancel_event,
                     )
+                    # If code mutated the manifest copy in-process, propagate changes back to state
+                    if _step_namespace.get("manifest") is not _manifest_copy or _step_namespace.get("manifest") != _manifest_copy:
+                        state = {**state, "manifest": _step_namespace.get("manifest", _manifest_copy)}
+
 
                 # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────────
                 if _tool_cache_key and not _cached_result and out:
@@ -2602,7 +2689,7 @@ class BioAgent:
                 _conn = sqlite3.connect(_sqlite_path, check_same_thread=False)
                 self._sqlite_path = _sqlite_path
                 self.checkpointer = SqliteSaver(_conn)
-                self._log("CHECKPOINTER", body=f"SqliteSaver → {_sqlite_path}", node="init")
+                self._log("CHECKPOINTER", body=f"SqliteSaver -> {_sqlite_path}", node="init")
             except Exception as _e:
                 self.checkpointer = MemorySaver()
                 self._log("CHECKPOINTER", body=f"SqliteSaver failed ({_e}), fallback to MemorySaver", node="init")

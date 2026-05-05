@@ -1,6 +1,6 @@
 # metagenomics-env.yaml
 # meta-env1 — Metagenomics Specialized Environment
-# Aligned with index.yaml provides_bins spec (all 35 tools)
+# Aligned with index.yaml provides_bins spec (all 38 tools — incl. medaka, racon, unicycler)
 name: meta-env1
 channels:
   - bioconda
@@ -21,6 +21,8 @@ dependencies:
   - spades                 # Includes metaspades.py
   - megahit                # Fast memory-efficient assembler
   - flye                   # Long-read assembler (FIXED: was missing)
+  - racon                  # Long-read consensus polisher (1-2 rounds before Medaka)
+  - unicycler              # Hybrid assembler: combines short + long reads (Illumina + ONT)
 
   # ─── Mapping ───────────────────────────────────────────────────────────────
   - minimap2               # Multi-purpose aligner (short/long reads)
@@ -74,6 +76,11 @@ dependencies:
   - pip:
       - humann              # HUMAnN3 functional profiling
       - multiqc             # ensure latest version
+      # NOTE: medaka officially supports Python 3.8-3.10.
+      # medaka 1.11.3 ships Python-3.11-compatible wheels (via ont-medaka PyPI).
+      # If installation fails in meta-env1 (Python 3.11), create a separate
+      # long-read-env with Python=3.10 and install: conda install -c nanoporetech medaka
+      - medaka==1.11.3      # ONT consensus polisher (post-Racon polish step)
 
   # ─── Phase 5: R statistical packages ───────────────────────────────────────
   - r-base                 # R language runtime

@@ -3,7 +3,7 @@ Genomeer — Metagenomics Tool Descriptions
 ==========================================
 API schema list for genomeer.tools.function.metagenomics
 Follows the exact same structure as description/basic.py and description/ncbi.py.
-28 tools covering the full metagenomics pipeline.
+30 tools covering the full metagenomics pipeline including long-read (ONT) polishing.
 """
 
 description = [
@@ -182,6 +182,50 @@ description = [
             {"name": "extra_args", "type": "str", "default": "", "description": "Extra Flye CLI flags."},
         ],
         "returns": "dict(assembly_fasta, assembly_info, log, output_dir)",
+    },
+    {
+        "name": "run_racon",
+        "description": (
+            "Polish a long-read assembly using Racon (rapid consensus from overlaps). "
+            "Takes raw ONT reads, a minimap2 PAF overlap file, and a draft assembly FASTA. "
+            "Run 1-2 rounds of Racon BEFORE Medaka polishing for best results. "
+            "Generate the PAF with: minimap2 -x map-ont assembly.fasta reads.fastq > overlaps.paf. "
+            "Part of the recommended ONT long-read pipeline: Flye → Racon (x1-2) → Medaka → CheckM2."
+        ),
+        "required_parameters": [
+            {"name": "reads_fastq", "type": "str", "description": "Path to raw ONT reads FASTQ."},
+            {"name": "overlaps_paf", "type": "str", "description": "Path to minimap2 PAF overlap file (map-ont preset)."},
+            {"name": "assembly_fasta", "type": "str", "description": "Path to draft assembly FASTA (from Flye or previous Racon round)."},
+            {"name": "output_dir", "type": "str", "description": "Output directory."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
+            {"name": "extra_args", "type": "str", "default": "", "description": "Extra Racon CLI flags."},
+        ],
+        "returns": "dict(polished_fasta, output_dir)",
+    },
+    {
+        "name": "run_medaka",
+        "description": (
+            "Polish an ONT assembly using Medaka neural-network consensus. "
+            "Medaka is the most accurate polishing tool for Oxford Nanopore assemblies. "
+            "Run AFTER 1-2 rounds of Racon for best results. "
+            "The model must match the flowcell and basecaller version used for sequencing. "
+            "Common models: 'r941_min_high_g360' (MinION, Guppy high accuracy), "
+            "'r1041_e82_400bps_sup_g615' (R10.4.1, Dorado, latest Kit14). "
+            "Part of the recommended ONT pipeline: Flye → Racon (x1-2) → Medaka → CheckM2."
+        ),
+        "required_parameters": [
+            {"name": "reads_fastq", "type": "str", "description": "Path to raw ONT reads FASTQ (same reads used for assembly)."},
+            {"name": "assembly_fasta", "type": "str", "description": "Path to Racon-polished assembly FASTA (or Flye assembly if skipping Racon)."},
+            {"name": "output_dir", "type": "str", "description": "Output directory."},
+        ],
+        "optional_parameters": [
+            {"name": "model", "type": "str", "default": "r941_min_high_g360", "description": "Medaka model (must match flowcell + basecaller)."},
+            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
+            {"name": "batch_size", "type": "int", "default": 100, "description": "Batch size for inference (100 for CPU, 200+ for GPU)."},
+        ],
+        "returns": "dict(polished_fasta, log, output_dir, mean_qv)",
     },
 
     # =========================================================================

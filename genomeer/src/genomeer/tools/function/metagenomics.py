@@ -8,9 +8,9 @@ Every function follows the same contract as genomeer/src/genomeer/tools/function
   - Writes all output files into `output_dir`
   - Raises RuntimeError with formatted message on failure
 
-Coverage (28 tools):
+Coverage (30 tools):
   QC          : run_fastp, run_multiqc, run_nanostat, run_fastqc
-  Assembly    : run_metaspades, run_megahit, run_flye
+  Assembly    : run_metaspades, run_megahit, run_flye, run_medaka, run_racon
   Mapping     : run_minimap2, run_bowtie2, run_bwa_mem, compute_coverage_samtools, sort_index_bam
   Taxonomy    : run_kraken2, run_bracken, run_metaphlan4, run_gtdbtk, run_krona
   Binning     : run_metabat2, run_das_tool, run_checkm2
@@ -411,6 +411,168 @@ def run_flye(
         "assembly_fasta": assembly if Path(assembly).exists() else None,
         "assembly_info": str(out / "assembly_info.txt"),
         "log": str(out / "flye.log"),
+        "output_dir": str(out),
+    }
+
+
+def run_medaka(
+    reads_fastq: str,
+    assembly_fasta: str,
+    output_dir: str,
+    model: str = "r941_min_high_g360",
+    threads: int = 8,
+    batch_size: int = 100,
+) -> Dict[str, Any]:
+    """
+    Polish an ONT assembly using Medaka.
+
+    Medaka is the recommended post-assembly polishing tool for Oxford Nanopore
+    reads. It uses a neural network trained on specific flowcell/basecaller
+    models to correct systematic errors left by assemblers like Flye.
+
+    Recommended pipeline: Flye → Racon (1-2 rounds) → Medaka → CheckM2.
+
+    Parameters
+    ----------
+    reads_fastq    : Path to raw ONT reads FASTQ (the same reads used for assembly).
+    assembly_fasta : Path to the draft assembly FASTA produced by Flye (or Racon-polished).
+    output_dir     : Output directory where medaka_out/ will be created.
+    model          : Medaka model matching flowcell + basecaller version.
+                     Examples: 'r941_min_high_g360', 'r941_prom_high_g360',
+                               'r1041_e82_400bps_sup_g615' (latest Kit14/Dorado).
+    threads        : CPU threads (-t).
+    batch_size     : Batch size for GPU inference (-b). Use 100 for CPU.
+
+    Returns
+    -------
+    dict(polished_fasta, log, output_dir, mean_qv)
+        polished_fasta : Path to consensus.fasta produced by Medaka.
+        log            : Path to medaka log file.
+        output_dir     : The medaka output directory.
+        mean_qv        : Mean Quality Value parsed from medaka output (float or None).
+    """
+    import re as _re
+    out = _ensure_dir(output_dir)
+    medaka_out = str(out / "medaka_out")
+
+    cmd = [
+        "medaka_consensus",
+        "-i", reads_fastq,
+        "-d", assembly_fasta,
+        "-o", medaka_out,
+        "-t", str(threads),
+        "-m", model,
+        "-b", str(batch_size),
+    ]
+
+    proc = _run(cmd, timeout=21600)
+    _assert_ok(proc, "medaka_consensus")
+
+    polished = str(Path(medaka_out) / "consensus.fasta")
+    log_path = str(out / "medaka.log")
+
+    # Write combined stdout+stderr to a log file
+    try:
+        with open(log_path, "w") as lf:
+            lf.write(proc.stdout or "")
+            lf.write(proc.stderr or "")
+    except Exception:
+        pass
+
+    # Parse mean QV from medaka output
+    # Medaka prints: "[M::pyabpoa] INFO mean qv: 28.35" or similar
+    mean_qv: Optional[float] = None
+    combined_output = (proc.stdout or "") + (proc.stderr or "")
+    m = _re.search(
+        r"(?:mean\s*qv|consensus\s*qv)[:\s]+([0-9]+(?:\.[0-9]+)?)",
+        combined_output,
+        _re.IGNORECASE,
+    )
+    if m:
+        try:
+            mean_qv = float(m.group(1))
+        except ValueError:
+            pass
+
+    return {
+        "polished_fasta": polished if Path(polished).exists() else None,
+        "log": log_path,
+        "output_dir": medaka_out,
+        "mean_qv": mean_qv,
+    }
+
+
+def run_racon(
+    reads_fastq: str,
+    overlaps_paf: str,
+    assembly_fasta: str,
+    output_dir: str,
+    threads: int = 8,
+    extra_args: str = "",
+) -> Dict[str, Any]:
+    """
+    Polish an assembly using Racon (fast consensus from long-read overlaps).
+
+    Racon is a fast, error-correction tool that uses raw read overlaps (PAF
+    format, produced by minimap2) to improve assembly accuracy before the
+    more accurate (but slower) Medaka polishing step.
+
+    Recommended pipeline: Flye → Racon (1-2 rounds) → Medaka → CheckM2.
+    For each Racon round, re-run minimap2 on the latest polished FASTA.
+
+    Parameters
+    ----------
+    reads_fastq    : Path to raw ONT reads FASTQ.
+    overlaps_paf   : Path to minimap2 PAF overlap file.
+                     Generate with: minimap2 -x map-ont assembly.fasta reads.fastq > overlaps.paf
+    assembly_fasta : Path to the draft assembly FASTA (Flye output or previous Racon round).
+    output_dir     : Output directory. The polished FASTA is written here.
+    threads        : CPU threads.
+    extra_args     : Extra Racon CLI flags as a string.
+
+    Returns
+    -------
+    dict(polished_fasta, output_dir)
+        polished_fasta : Path to racon_polished.fasta.
+        output_dir     : The output directory.
+    """
+    out = _ensure_dir(output_dir)
+    polished_fasta = str(out / "racon_polished.fasta")
+
+    cmd = ["racon", "-t", str(threads)]
+    if extra_args:
+        cmd += extra_args.split()
+    cmd += [reads_fastq, overlaps_paf, assembly_fasta]
+
+    # Racon writes polished FASTA to stdout
+    import subprocess as _sp
+    mm = _micromamba_bin()
+    prefix = _env_prefix(_META_ENV)
+    full_cmd = [mm, "run", "-p", str(prefix)] + cmd
+    print("CMD:", " ".join(full_cmd))
+
+    import os as _os
+    env = dict(_os.environ)
+    env.pop("CONDA_PREFIX", None)
+
+    with open(polished_fasta, "w") as out_fh:
+        proc = _sp.run(
+            full_cmd,
+            stdout=out_fh,
+            stderr=_sp.PIPE,
+            text=True,
+            timeout=14400,
+            env=env,
+        )
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"racon failed (exit {proc.returncode})\n"
+            f"--- STDERR ---\n{proc.stderr[-4000:]}"
+        )
+
+    return {
+        "polished_fasta": polished_fasta if Path(polished_fasta).exists() else None,
         "output_dir": str(out),
     }
 
