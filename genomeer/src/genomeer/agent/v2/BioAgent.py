@@ -2061,6 +2061,16 @@ class BioAgent:
                 step_title    = _step_obj.get("title", "")
                 out_dir = state.get("run_temp_dir", "")
                 if _PARSERS_OK and out and len(out) > 2000:
+                    # TÂCHE 9: Sauvegarde de l'output complet sur le disque avant troncature/parsing
+                    if out and out_dir:
+                        try:
+                            _step_filename = f"step_{_current_idx:02d}_output.txt"
+                            _step_output_path = Path(out_dir) / _step_filename
+                            _step_output_path.write_text(out, encoding="utf-8")
+                            self._log("FULL OUTPUT SAVED", body=f"Saved to {_step_filename}", node=node)
+                        except Exception as _wse:
+                            self._log("FULL OUTPUT SAVE (warn)", body=str(_wse), node=node)
+
                     parsed = _smart_parse_output(
                         step_title,
                         out,
@@ -2070,6 +2080,14 @@ class BioAgent:
                     if parsed and len(parsed) < len(out):
                         out = parsed
                 elif out and len(out) > 12000:
+                    # TÂCHE 9: Sauvegarde avant troncature simple
+                    if out_dir:
+                        try:
+                            _step_filename = f"step_{_current_idx:02d}_output.txt"
+                            Path(out_dir).joinpath(_step_filename).write_text(out, encoding="utf-8")
+                            self._log("FULL OUTPUT SAVED", body=f"Saved to {_step_filename} (pre-truncation)", node=node)
+                        except Exception: pass
+
                     out = out[:12000] + "\n...<truncated>"
                     
                 last_result = out or ""

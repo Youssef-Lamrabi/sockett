@@ -85,6 +85,15 @@ _BLOCKED_BASH: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'(>>?|\| tee -a?)\s+/(etc|boot|sys|proc|root|usr/local/bin)/', re.IGNORECASE),
      "redirection to sensitive system directory"),
 
+    # TÂCHE 2.4 — Blocage des substitutions de commandes ($() ou ``)
+    # Ferme le vecteur rm -rf $(echo /) ou rm -rf `echo /`
+    (re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\s+[^;|\n]*(\$\(|\`)", re.IGNORECASE),
+     "command substitution inside rm -rf"),
+    
+    # Blocage générique des substitutions contenant des commandes destructrices
+    (re.compile(r"(\$\(|\`)[^)\`]*\b(rm|chmod|chown|mkfs|dd|iptables|mv|cp)\b", re.IGNORECASE),
+     "dangerous command inside command substitution"),
+
     # iptables flush (désactive le firewall)
     (re.compile(r"\biptables\s+-F\b", re.IGNORECASE),
      "iptables flush (firewall disable)"),

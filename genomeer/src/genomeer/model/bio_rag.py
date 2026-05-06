@@ -399,37 +399,36 @@ class _PubMedFetcher:
                     continue
                 seen_pmids.update(new_pmids)
 
-                # 2. Récupérer les abstracts
+                # 2. Récupérer les articles (XML)
                 time.sleep(0.35)  # Rate limit NCBI
                 fetch_params = {
                     "db": "pubmed", "id": ",".join(new_pmids),
-                    "rettype": "abstract", "retmode": "text",
+                    "retmode": "xml",
                 }
                 fetch_resp = requests.get(cls.ENTREZ_FETCH, params=fetch_params, timeout=timeout)
                 if fetch_resp.status_code != 200:
                     continue
 
-                # 3. Découper par article
-                raw_text = fetch_resp.text
-                articles = re.split(r"\n\d+\.", raw_text)
-                for i, article in enumerate(articles[:max_results]):
-                    article = article.strip()
-                    if len(article) < 100:
-                        continue
-
-                    # Extraire titre et abstract
-                    lines = [l.strip() for l in article.splitlines() if l.strip()]
-                    title = lines[0] if lines else "Unknown title"
-                    abstract = " ".join(lines[1:])[:800] if len(lines) > 1 else ""
-
+                # 3. Parsing XML robuste (TÂCHE 10)
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(fetch_resp.text)
+                
+                for article in root.findall(".//PubmedArticle"):
+                    pmid_node = article.find(".//PMID")
+                    pmid = pmid_node.text if pmid_node is not None else "0"
+                    
+                    title_node = article.find(".//ArticleTitle")
+                    title = "".join(title_node.itertext()) if title_node is not None else "Unknown Title"
+                    
+                    abstract_nodes = article.findall(".//AbstractText")
+                    abstract = " ".join(["".join(node.itertext()) for node in abstract_nodes if node is not None])
+                    abstract = abstract.strip()[:1200]
+                    
                     if not abstract:
                         continue
 
-                    pmid = new_pmids[i] if i < len(new_pmids) else f"unknown_{i}"
-                    doc_id = f"pubmed_{pmid}"
-
                     docs.append(BioDocument(
-                        doc_id=doc_id,
+                        doc_id=f"pubmed_{pmid}",
                         text=f"[PubMed {pmid}] {title}. {abstract}",
                         source="pubmed",
                         category="literature",
@@ -560,7 +559,20 @@ class BioRAGStore:
         force_rebuild : ignorer le cache et refaire l'index
         """
         sources = sources or ["card", "kegg_pathways", "quality_thresholds"]
-        cache_key = hashlib.md5(json.dumps(sorted(sources)).encode()).hexdigest()[:8]
+        
+        # TÂCHE 8: Inclusion des dates de modification des bundles dans la cache_key
+        # Cela force un rebuild si refresh_bundles.py a été exécuté.
+        base_data_dir = Path(os.path.dirname(os.path.abspath(__file__))).parent.parent.parent / "data"
+        mtimes = []
+        for s in sources:
+            fname = "card_top500.json" if s == "card" else "kegg_core_pathways.json" if s == "kegg_pathways" else None
+            if fname:
+                fpath = base_data_dir / fname
+                if fpath.exists():
+                    mtimes.append(f"{s}:{fpath.stat().st_mtime}")
+        
+        cache_key_content = json.dumps({"sources": sorted(sources), "mtimes": sorted(mtimes)})
+        cache_key = hashlib.md5(cache_key_content.encode()).hexdigest()[:8]
         index_path  = self.persist_dir / f"bio_index_{cache_key}.faiss"
         docs_path   = self.persist_dir / f"bio_docs_{cache_key}.pkl"
 
