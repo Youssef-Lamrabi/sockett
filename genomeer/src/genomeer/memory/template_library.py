@@ -208,10 +208,17 @@ class TemplateLibrary:
 
     def _save(self) -> None:
         try:
-            with open(self.store_path, "w") as f:
+            tmp_path = self.store_path.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
                 json.dump(self._templates, f, indent=2)
+            os.replace(tmp_path, self.store_path)
         except Exception:
-            pass
+            try:
+                tmp_path = self.store_path.with_suffix(".tmp")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     def _get_embedder(self):
         if self._embedder is None:

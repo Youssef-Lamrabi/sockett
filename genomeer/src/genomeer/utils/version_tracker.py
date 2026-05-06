@@ -32,9 +32,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("genomeer.version_tracker")
 
+import threading
+
 # Cache global des versions (évite de re-lancer --version à chaque step)
 _VERSION_CACHE: Dict[str, str] = {}
+_VERSION_CACHE_LOCK = threading.RLock()
 _DB_CHECKSUM_CACHE: Dict[str, str] = {}
+_DB_CHECKSUM_CACHE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -82,11 +86,12 @@ class VersionTracker:
         self._recorded_tools.add(key)
 
         # Cache global
-        if key in _VERSION_CACHE:
-            version = _VERSION_CACHE[key]
-        else:
-            version = self._get_tool_version(tool_name, env_name)
-            _VERSION_CACHE[key] = version
+        with _VERSION_CACHE_LOCK:
+            if key in _VERSION_CACHE:
+                version = _VERSION_CACHE[key]
+            else:
+                version = self._get_tool_version(tool_name, env_name)
+                _VERSION_CACHE[key] = version
 
         self.tools.append(ToolVersion(
             tool_name=tool_name,
@@ -138,12 +143,13 @@ class VersionTracker:
             import threading
             def _async_md5(rec: DBRecord, path: Path):
                 cache_key = str(path)
-                if cache_key in _DB_CHECKSUM_CACHE:
-                    rec.checksum = _DB_CHECKSUM_CACHE[cache_key]
-                else:
-                    c = self._md5_file(path)
-                    _DB_CHECKSUM_CACHE[cache_key] = c
-                    rec.checksum = c
+                with _DB_CHECKSUM_CACHE_LOCK:
+                    if cache_key in _DB_CHECKSUM_CACHE:
+                        rec.checksum = _DB_CHECKSUM_CACHE[cache_key]
+                    else:
+                        c = self._md5_file(path)
+                        _DB_CHECKSUM_CACHE[cache_key] = c
+                        rec.checksum = c
 
             t = threading.Thread(target=_async_md5, args=(record, db_path_obj), daemon=True)
             t.start()
@@ -151,6 +157,43 @@ class VersionTracker:
             self._threads.append(t)
 
         logger.info(f"[VERSION] DB={db_name} tracking started")
+
+    def compute_db_checksums_async(self, output_dir: str) -> None:
+        """
+        Calcule les checksums de toutes les DBs suivies en arrière-plan
+        et les écrit dans db_checksums.json sans bloquer le thread principal.
+        """
+        import threading
+        
+        def _run_checksums():
+            results = {}
+            for db in self.databases:
+                path = Path(db.db_path)
+                if not path.exists():
+                    continue
+                    
+                logger.debug(f"[VERSION] Computing async checksum for {db.db_name}...")
+                if path.is_file():
+                    # MD5 for file
+                    results[db.db_name] = self._md5_file(path)
+                else:
+                    # Quick fingerprint for directories
+                    try:
+                        st = path.stat()
+                        results[db.db_name] = f"dir_mtime_{st.st_mtime}_size_{st.st_size}"
+                    except Exception:
+                        results[db.db_name] = "dir_access_error"
+            
+            out_path = Path(output_dir) / "db_checksums.json"
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(results, f, indent=2)
+                logger.info(f"[VERSION] Async DB checksums saved → {out_path}")
+            except Exception as e:
+                logger.warning(f"[VERSION] Failed to save async checksums: {e}")
+
+        t = threading.Thread(target=_run_checksums, daemon=True)
+        t.start()
 
     def _md5_file(self, path: Path) -> str:
         import hashlib
@@ -209,7 +252,7 @@ class VersionTracker:
             m = re.search(pattern, pending_code)
             if m:
                 path = m.group(1).strip("'\"")
-                self.record_db(db_name, path, compute_checksum=True)
+                self.record_db(db_name, path, compute_checksum=False)
 
     def wait_for_completion(self, timeout: float = 30.0):
         """Attend la fin des threads de checksum."""

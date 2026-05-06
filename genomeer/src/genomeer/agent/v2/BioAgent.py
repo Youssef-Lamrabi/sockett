@@ -1307,6 +1307,11 @@ class BioAgent:
                 
             # P4-D.2: Semaphore for concurrency control
             concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
+            
+            # T9: Proportional RAM per worker
+            max_ram_total = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
+            per_worker_ram = max(4.0, max_ram_total / concurrency)
+            
             semaphore = threading.Semaphore(concurrency)
             results_lock = threading.Lock()  # FIX A3: Lock to prevent data races on per_sample
             idx = state["current_idx"]
@@ -1332,6 +1337,7 @@ class BioAgent:
                     local_state["retry_counts"] = {}
                     local_state["current_sample_id"] = sample_id
                     local_state["current_sample_idx"] = sample_idx
+                    local_state["_per_worker_ram_gb"] = per_worker_ram # T9
                     
                     # P4-D.3: Isolated run_temp_dir
                     local_state["run_temp_dir"] = os.path.join(state["run_temp_dir"], sample_id)
@@ -1781,6 +1787,13 @@ class BioAgent:
 
             # T2.3: Build extra_env dict — injected into every subprocess call
             _extra_env = {"RUN_TEMP_DIR": _run_temp_dir}
+            
+            # T9: Support per-worker RAM quota in batch mode
+            _ram_quota = state.get("_per_worker_ram_gb")
+            if _ram_quota:
+                _extra_env["GENOMEER_MAX_RAM_GB"] = str(_ram_quota)
+                # Also update current process env so that helper.py reads it
+                os.environ["GENOMEER_MAX_RAM_GB"] = str(_ram_quota)
 
             env = state["env_name"]
 
@@ -1884,6 +1897,7 @@ class BioAgent:
                                 "env_name": env,
                                 "extra_env": _extra_env,      # T2.3
                                 "run_temp_dir": _run_temp_dir, # T2.1
+                                "cancel_event": _cancel_event, # T7
                             },
                             timeout=timeout,
                             cancel_event=_cancel_event,
@@ -1898,6 +1912,7 @@ class BioAgent:
                                     "env_name": env,
                                     "extra_env": _extra_env,      # T2.3
                                     "run_temp_dir": _run_temp_dir, # T2.1
+                                    "cancel_event": _cancel_event, # T7
                                 },
                                 timeout=timeout,
                                 cancel_event=_cancel_event,
@@ -1913,6 +1928,7 @@ class BioAgent:
                                 "env_name": env,
                                 "extra_env": _extra_env,      # T2.3
                                 "run_temp_dir": _run_temp_dir, # T2.1
+                                "cancel_event": _cancel_event, # T7
                             },
                             timeout=timeout,
                             cancel_event=_cancel_event,
@@ -2159,8 +2175,8 @@ class BioAgent:
                     "manifest": new_manifest,
                     "retry_counts": rc,
                     "diagnostic_mode": False,
-                    "diagnostic_code": False,
-                    "diagnostic_observation": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
                 }
             # ── End Quality Gate ─────────────────────────────────────────────────
 
@@ -2355,8 +2371,8 @@ class BioAgent:
                 "manifest": new_manifest,
                 "retry_counts": rc,
                 "diagnostic_mode": False,
-                "diagnostic_code": False,
-                "diagnostic_observation": False,
+                "diagnostic_code": None,
+                "diagnostic_observation": None,
             }
 
             # ------ feedback replay mode check ------
@@ -2459,6 +2475,7 @@ class BioAgent:
             if hasattr(self, "_metrics") and self._metrics:
                 self._metrics.save(temp_dir)
             if hasattr(self, "_version_tracker") and self._version_tracker:
+                self._version_tracker.compute_db_checksums_async(temp_dir) # T12
                 self._version_tracker.wait_for_completion(timeout=10.0)
                 self._version_tracker.save(temp_dir)
                 manifest["tool_versions"] = self._version_tracker.as_dict()

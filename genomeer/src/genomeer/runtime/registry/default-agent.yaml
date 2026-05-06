@@ -6,8 +6,6 @@ channels:
 dependencies:
   - python=3.11
   - ncbi-genome-download
-  - samtools
-  - bowtie2
   - pip
   - pip:
       # Install genomeer from the package (use -e . for local dev or 'genomeer' for PyPI)

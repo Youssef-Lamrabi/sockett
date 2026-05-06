@@ -397,16 +397,18 @@ def check_quality(
             except (ValueError, IndexError):
                 pass
 
-    # ── Normalize value (T1) ──────────────────────────────────────────────
+    # --- Normalize value (T1) ---
+    # Handle special case for warn/fail below explicit fields
+    warn_below = gate.get("warn_below", warn_thresh)
+    fail_below = gate.get("fail_below", fail_thresh)
+
     # If the value is > 1.0 and we are dealing with a rate/percentage (threshold <= 1.0),
     # it's likely a percentage (e.g. 85.3) instead of a decimal (0.853).
     if value is not None and value > 1.0:
         # Check if thresholds suggest a decimal scale (0-1)
         is_decimal_scale = (
             (warn_below is not None and warn_below <= 1.0) or
-            (fail_below is not None and fail_below <= 1.0) or
-            (warn_thresh is not None and warn_thresh <= 1.0) or
-            (fail_thresh is not None and fail_thresh <= 1.0)
+            (fail_below is not None and fail_below <= 1.0)
         )
         if is_decimal_scale:
             value /= 100.0
@@ -418,9 +420,6 @@ def check_quality(
         return ("warn", msg)
 
     # ── Threshold comparisons ─────────────────────────────────────────────
-    # Handle special case for warn/fail below explicit fields
-    warn_below = gate.get("warn_below", warn_thresh)
-    fail_below = gate.get("fail_below", fail_thresh)
 
     if fail_below is not None and value < fail_below:
         return (

@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import contextlib
 import os
+import logging
 import re
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("genomeer.retriever")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional FAISS + embeddings imports (graceful fallback if not installed)
@@ -183,7 +186,7 @@ class ToolRetriever:
         self,
         query: str,
         k: int = 12,
-        min_score: float = 0.30,  # FIX G13: raised from 0.15 — all-MiniLM-L6-v2 scores are generous
+        min_score: float = 0.45,  # T13: raised from 0.30 for better precision
     ) -> Dict[str, List]:
         """
         Find the top-k most relevant resources for `query` using FAISS cosine search.
@@ -209,17 +212,28 @@ class ToolRetriever:
             seen: Dict[str, set] = {"tools": set(), "data_lake": set(), "libraries": set()}
 
             for score, idx in zip(scores, indices):
-                if idx < 0:
-                    continue
-                if float(score) < min_score:
+                if idx < 0 or float(score) < min_score:
                     continue
                 cat, name, orig_idx = self._items[idx]
-                if orig_idx in seen[cat]:
-                    continue
-                seen[cat].add(orig_idx)
-                raw = self._raw_resources[cat]
-                if orig_idx < len(raw):
-                    selected[cat].append(raw[orig_idx])
+                if orig_idx not in seen[cat]:
+                    seen[cat].add(orig_idx)
+                    raw = self._raw_resources[cat]
+                    if orig_idx < len(raw):
+                        selected[cat].append(raw[orig_idx])
+
+            # T13: Fallback if no results above min_score
+            if not any(selected.values()):
+                logger.debug(f"[Retriever] No results above min_score={min_score}, using top-k fallback")
+                # Return the best k_search results regardless of score
+                for i in range(min(k, len(self._items))):
+                    score, idx = scores[i], indices[i]
+                    if idx < 0: continue
+                    cat, name, orig_idx = self._items[idx]
+                    if orig_idx not in seen[cat]:
+                        seen[cat].add(orig_idx)
+                        raw = self._raw_resources[cat]
+                        if orig_idx < len(raw):
+                            selected[cat].append(raw[orig_idx])
 
             return selected
 

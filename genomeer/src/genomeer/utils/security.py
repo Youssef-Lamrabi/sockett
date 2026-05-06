@@ -50,7 +50,7 @@ _BLOCKED_BASH: List[Tuple[re.Pattern, str]] = [
      "raw disk write via dd"),
 
     # shutdown / reboot / poweroff / halt
-    (re.compile(r"\b(shutdown|reboot|poweroff|halt)\b", re.IGNORECASE),
+    (re.compile(r"(?m)^\s*(shutdown|reboot|poweroff|halt)\b", re.IGNORECASE),
      "system shutdown/reboot command"),
 
     # Fork bomb

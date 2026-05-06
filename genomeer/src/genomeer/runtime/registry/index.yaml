@@ -9,8 +9,6 @@ envs:
       - jupyter
       - jupyter-notebook
       - ncbi-genome-download
-      - samtools
-      - bowtie2
       - Rscript
     provides_py:
       - numpy==2.1

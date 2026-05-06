@@ -185,8 +185,8 @@ def _run_in_env(
     # If RUN_TEMP_DIR still not set, use a safe fallback
     if "RUN_TEMP_DIR" not in env:
         env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", os.path.join(tempfile.gettempdir(), "bioagent"))
-    max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
-    max_cpu_seconds = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
+    max_ram_gb = float(env.get("GENOMEER_MAX_RAM_GB", "32"))
+    max_cpu_seconds = int(env.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
     
     preexec = None
     if platform.system() != "Windows":
@@ -317,11 +317,16 @@ def run_r_code(
             )
 
         import time
+        env = dict(os.environ)
+        if extra_env:
+            env.update(extra_env)
+        
         proc = subprocess.Popen(
             ["Rscript", path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         res_stdout, res_stderr = "", ""
         try:
@@ -437,8 +442,12 @@ def run_bash_script(
 
         # fallback: host bash
         import time
-        max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
-        max_cpu_seconds = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
+        env = dict(os.environ)
+        if extra_env:
+            env.update(extra_env)
+            
+        max_ram_gb = float(env.get("GENOMEER_MAX_RAM_GB", "32"))
+        max_cpu_seconds = int(env.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
         
         preexec = None
         if platform.system() != "Windows":
@@ -454,6 +463,7 @@ def run_bash_script(
                 stderr=subprocess.PIPE,
                 text=True,
                 preexec_fn=preexec,
+                env=env,
             )
         except Exception as e:
             logger.error(f"[run_bash_script] Failed to start host subprocess: {e}")

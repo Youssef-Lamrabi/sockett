@@ -50,7 +50,7 @@ import os
 import pickle
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -574,12 +574,13 @@ class BioRAGStore:
         cache_key_content = json.dumps({"sources": sorted(sources), "mtimes": sorted(mtimes)})
         cache_key = hashlib.md5(cache_key_content.encode()).hexdigest()[:8]
         index_path  = self.persist_dir / f"bio_index_{cache_key}.faiss"
-        docs_path   = self.persist_dir / f"bio_docs_{cache_key}.pkl"
+        docs_path   = self.persist_dir / f"bio_docs_{cache_key}.json"
+        old_docs_path = self.persist_dir / f"bio_docs_{cache_key}.pkl"
 
         # Charger depuis le cache si disponible
-        if not force_rebuild and index_path.exists() and docs_path.exists():
+        if not force_rebuild and index_path.exists() and (docs_path.exists() or old_docs_path.exists()):
             try:
-                self._load_from_cache(index_path, docs_path)
+                self._load_from_cache(index_path, docs_path, old_docs_path)
                 logger.info(f"[BioRAG] Loaded from cache: {len(self._documents)} documents")
                 return self
             except Exception as e:
@@ -685,15 +686,34 @@ class BioRAGStore:
 
     def _save_to_cache(self, index_path: Path, docs_path: Path):
         import faiss
+        import json
         faiss.write_index(self._index, str(index_path))
-        with open(docs_path, "wb") as f:
-            pickle.dump(self._documents, f)
+        data = [asdict(d) for d in self._documents]
+        with open(docs_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
-    def _load_from_cache(self, index_path: Path, docs_path: Path):
+    def _load_from_cache(self, index_path: Path, docs_path: Path, old_docs_path: Optional[Path] = None):
         import faiss
+        import json
+        import pickle
         self._index = faiss.read_index(str(index_path))
-        with open(docs_path, "rb") as f:
-            self._documents = pickle.load(f)
+        
+        # Migration logic
+        if not docs_path.exists() and old_docs_path and old_docs_path.exists():
+            logger.warning(f"[BioRAG] Migrating pickle cache to JSON format: {old_docs_path.name}")
+            with open(old_docs_path, "rb") as f:
+                self._documents = pickle.load(f)
+            # Resave as JSON
+            self._save_to_cache(index_path, docs_path)
+            try:
+                old_docs_path.unlink()
+            except Exception:
+                pass
+        else:
+            with open(docs_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._documents = [BioDocument(**d) for d in data]
+            
         self._init_embedder()
         self._ready = True
 

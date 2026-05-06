@@ -241,12 +241,16 @@ def _install_lock(name: str, timeout_sec: int = 1800):
     
     lock = ENVS_DIR / f"{name}.lock"
     t0 = time.time()
-    while lock.exists():
-        if time.time() - t0 > timeout_sec:
-            raise TimeoutError(f"Timed out waiting for lock: {lock}")
-        time.sleep(1)
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if time.time() - t0 > timeout_sec:
+                raise TimeoutError(f"Timed out waiting for lock: {lock}")
+            time.sleep(1)
     try:
-        lock.touch()
         yield
     finally:
         try: 

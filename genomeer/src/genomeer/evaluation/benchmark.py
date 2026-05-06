@@ -256,11 +256,19 @@ BEHAVIOR_TEST_CASES = [
         "forbidden_patterns": [r"rm\s+-rf\s+/(?!tmp)", r"\bdd\s+if=/dev"],
     },
     {
-        "name": "ncbi_download",
-        "prompt": "Download the genome GCF_000001405.40 from NCBI",
-        "expected_tools": ["ncbi-genome-download", "download_from_ncbi", "fasterq-dump"],
+        "name": "ncbi_genome_download",
+        "prompt": "Download the RefSeq genome GCF_000001735.4 from NCBI",
+        "expected_tools": ["ncbi-genome-download", "download_from_ncbi"],
         "expected_env": "bio-agent-env1",
         "expected_lang": ["PY", "BASH"],
+        "not_expected": [],
+    },
+    {
+        "name": "sra_download",
+        "prompt": "Download SRA reads SRR5926764 from NCBI SRA",
+        "expected_tools": ["fasterq-dump", "prefetch"],
+        "expected_env": "meta-env1",
+        "expected_lang": ["BASH", "PY"],
         "not_expected": [],
     },
 ]
@@ -706,6 +714,7 @@ class EndToEndBenchmark:
         pipeline_prompt: Optional[str] = None,
         timeout_hours: int = 2,
     ) -> EvalReport:
+        raise NotImplementedError("EndToEndBenchmark.run() requires a full bioinformatics environment with real CLI tools. Use PipelineOutputEval for automated testing.")
         """
         Lance le benchmark sur le dataset spécifié.
 
@@ -1000,8 +1009,8 @@ def main():
         report = evaluator.evaluate(metrics)
 
     elif args.suite == "e2e":
-        print("E2E benchmark requires a running BioAgent. Use programmatically.", file=sys.stderr)
-        sys.exit(1)
+        print("EndToEndBenchmark is not yet implemented for CLI usage. Use it programmatically with a real BioAgent instance. See documentation.", file=sys.stderr)
+        sys.exit(2)
 
     print(report.summary())
     report.save_json(args.output)

@@ -357,3 +357,21 @@ def test_run_metrics_json_produced(monkeypatch, ecoli_fasta, tmp_path):
             "finalizer may not be reached in 2-step mock plans. "
             "Run with a real agent for full B.4 validation."
         )
+
+# ---------------------------------------------------------------------------
+# B.3  EndToEndBenchmark — NotImplementedError check (T17)
+# ---------------------------------------------------------------------------
+
+class TestEndToEndBenchmarkImplementation:
+    """
+    B.3: EndToEndBenchmark.run() must raise NotImplementedError.
+    This documents the current state of the E2E implementation.
+    """
+
+    def test_run_raises_not_implemented(self):
+        import pytest
+        from genomeer.evaluation.benchmark import EndToEndBenchmark
+        bench = EndToEndBenchmark(agent=None)
+        with pytest.raises(NotImplementedError) as exc:
+            bench.run(dataset="cami_mouse_gut_toy")
+        assert "EndToEndBenchmark.run() requires a full bioinformatics environment" in str(exc.value)
