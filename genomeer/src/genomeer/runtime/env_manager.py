@@ -22,15 +22,9 @@ _MICROMAMBA_URLS = {
 }
 
 # Phase 3 Security: Known SHA256 hashes for latest micromamba builds
-# In a real production system, the URL would be pinned to a specific version (e.g. 1.5.8-0)
-# to ensure these hashes remain valid.
-_MICROMAMBA_KNOWN_HASHES = {
-    "linux-64": "f9b8849b3806f082e6669f3796d111797f1f0e4250269f8c679a7a6b896b797b", # Example for 1.5.8
-    "linux-aarch64": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2",
-    "win-64":   "e40a0c648835848e001851e2270911797f1f0e4250269f8c679a7a6b896b797c", # Example for 1.5.8
-    "osx-64":   "d23a1c648835848e001851e2270911797f1f0e4250269f8c679a7a6b896b797d",
-    "osx-arm64": "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2",
-}
+# Backlog: Populate these from https://github.com/mamba-org/micromamba-releases
+# when pinning a specific version in the future.
+_MICROMAMBA_KNOWN_HASHES = {}
 
 def _micromamba_target_path() -> Path:
     exe = "micromamba.exe" if platform.system() == "Windows" else "micromamba"
