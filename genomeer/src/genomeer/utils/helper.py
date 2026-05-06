@@ -615,13 +615,24 @@ def run_python_code(
                 proc.stderr or "",
             )
 
-        # --- Case 2: run in-process (no micromamba env) ---
         # T4: Use an isolated namespace per call to prevent variable leakage between steps.
         # If step_namespace is provided (from _executor), use it; otherwise create a fresh one.
-        # _persistent_namespace is only used when step_namespace is explicitly None AND
-        # we are in a legacy custom-function-injection context.
+        # TÂCHE 6.1: Restriction des __builtins__ pour la sandbox Python (Case 2)
+        _SAFE_BUILTINS = {
+            k: v for k, v in __builtins__.__dict__.items()
+            if k in {
+                "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+                "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
+                "format", "frozenset", "getattr", "hasattr", "hash", "hex", "id",
+                "int", "isinstance", "issubclass", "iter", "len", "list", "map",
+                "max", "min", "next", "object", "oct", "ord", "pow", "print",
+                "property", "range", "repr", "reversed", "round", "set", "setattr",
+                "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
+                "None", "True", "False", "Exception", "StopIteration", "dict", "list"
+            }
+        }
         exec_namespace = step_namespace if step_namespace is not None else {
-            "__builtins__": __builtins__,
+            "__builtins__": _SAFE_BUILTINS,
         }
         # Inject RUN_TEMP_DIR into the in-process namespace as well
         if run_temp_dir and "run_dir" not in exec_namespace:
