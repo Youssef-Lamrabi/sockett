@@ -28,7 +28,7 @@ patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalem
 _robust_parser = RobustLLMParser(strict_validation=True)
 
 
-from genomeer.config import NOCACHE_LLM_NODES as _NOCACHE_LLM_NODES
+_NOCACHE_LLM_NODES = {"planner"}
 
 # ── AXE 2.3: SqliteSaver for cross-session persistence ──
 try:
@@ -355,7 +355,6 @@ class BioAgent:
             self._start_artifacts_server_in_bg(host=artifacts_host, port=artifacts_port, prefix=artifacts_prefix)
 
         # BIO RAG
-        import threading
         from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever
         self.bio_rag_store = BioRAGStore(persist_dir=str(Path(self.path) / ".genomeer_rag_cache"))
         
@@ -1967,9 +1966,8 @@ class BioAgent:
                         timeout=timeout,
                         cancel_event=_cancel_event,
                     )
-                    # If code mutated the manifest copy in-process, propagate changes back to state
-                    if _step_namespace.get("manifest") is not _manifest_copy or _step_namespace.get("manifest") != _manifest_copy:
-                        state = {**state, "manifest": _step_namespace.get("manifest", _manifest_copy)}
+                    # Propagate changes from the step namespace back to the state
+                    state = {**state, "manifest": _step_namespace.get("manifest", _manifest_copy)}
 
 
                 # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────────
@@ -2035,6 +2033,7 @@ class BioAgent:
                 "next_step": "observer", #end
                 result_key: last_result,
                 "messages": [AIMessage(content=f"<observe>Code Execution output: '{_stored_result}'</observe>")],
+                "manifest": state.get("manifest"),
             }
             return updates
         
@@ -3289,7 +3288,7 @@ class BioAgent:
                 # *******************************************
 
             self._flush_log()
-            return self.log, last_msg_text
+            return self.log, s
     
     def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.

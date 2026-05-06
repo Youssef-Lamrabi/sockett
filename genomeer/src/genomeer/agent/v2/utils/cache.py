@@ -126,7 +126,7 @@ class LLMResponseCache:
     """
 
     # Nœuds dont les réponses NE doivent PAS être cachées
-    from genomeer.config import NOCACHE_LLM_NODES as _SKIP_NODES
+    _SKIP_NODES = {"planner"}
 
     def __init__(self, db_path: str, ttl: int = _LLM_TTL):
         self.db_path = db_path
@@ -172,9 +172,10 @@ class LLMResponseCache:
             return None
         try:
             conn = self._conn_get()
-            row = conn.execute(
-                "SELECT value, created, node FROM llm_cache WHERE key=?", (key,)
-            ).fetchone()
+            with self._lock:
+                row = conn.execute(
+                    "SELECT value, created, node FROM llm_cache WHERE key=?", (key,)
+                ).fetchone()
             if row is None:
                 return None
             value, created, cached_node = row

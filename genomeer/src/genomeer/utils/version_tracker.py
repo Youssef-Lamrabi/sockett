@@ -125,14 +125,13 @@ class VersionTracker:
         checksum = None
 
         try:
-            # Taille du répertoire ou fichier
             if db_path_obj.is_dir():
-                total = sum(f.stat().st_size for f in db_path_obj.rglob("*") if f.is_file())
-                size_gb = total / (1024 ** 3)
-                # Date de modification du fichier le plus récent
-                mtimes = [f.stat().st_mtime for f in db_path_obj.rglob("*") if f.is_file()]
-                if mtimes:
-                    last_modified = time.strftime("%Y-%m-%d", time.gmtime(max(mtimes)))
+                # Optimisation: On évite rglob("*") qui bloque sur les énormes bases (ex: Kraken2)
+                # On se base uniquement sur les stats du dossier parent
+                size_gb = 0.0 # Skipping deep size calculation for performance
+                last_modified = time.strftime(
+                    "%Y-%m-%d", time.gmtime(db_path_obj.stat().st_mtime)
+                )
             else:
                 size_gb = db_path_obj.stat().st_size / (1024 ** 3)
                 last_modified = time.strftime(
@@ -158,6 +157,14 @@ class VersionTracker:
             last_modified=last_modified,
         ))
         logger.info(f"[VERSION] DB={db_name} path={db_path} size={size_gb:.2f}GB mod={last_modified}")
+
+    def _md5_file(self, path: Path) -> str:
+        import hashlib
+        hasher = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     def auto_record_from_step(
         self,

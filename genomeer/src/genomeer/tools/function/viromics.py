@@ -410,6 +410,8 @@ def parse_amr_tsv(tsv_path: str, tool: str = "rgi") -> Dict[str, Any]:
                         break
 
     except Exception as e:
+        import logging
+        logging.getLogger("genomeer.viromics").warning(f"Failed to parse AMR TSV {tsv_path}: {e}")
         return {
             "genes": [], "drug_classes": {}, "mechanisms": {},
             "n_hits": 0, "critical_genes": [],

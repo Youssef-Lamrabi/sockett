@@ -275,15 +275,24 @@ class TemplateLibrary:
             return 0.5
             
         try:
-            c_pct = float(metrics.get("classified_pct", 0)) / 100.0 * 0.3
-            n50 = float(metrics.get("n50_bp", 0))
+            def _get_val(substring):
+                for k, v in metrics.items():
+                    if substring in k:
+                        if isinstance(v, str):
+                            v = v.replace('%', '').strip()
+                        return float(v)
+                return 0.0
+
+            c_pct = _get_val("classified_pct") / 100.0 * 0.3
+            n50 = _get_val("n50")
             n_score = min(n50 / 50000.0, 1.0) * 0.3
-            comp = float(metrics.get("mean_completeness", 0)) / 100.0 * 0.2
+            comp = _get_val("completeness") / 100.0 * 0.2
             
-            contam_raw = float(metrics.get("mean_contamination", 0))
+            contam_raw = _get_val("contamination")
             contam_score = max(0.0, 1.0 - (contam_raw / 10.0)) * 0.2
             
-            return c_pct + n_score + comp + contam_score
+            score = c_pct + n_score + comp + contam_score
+            return score if score > 0 else 0.5
         except Exception:
             return 0.5
 

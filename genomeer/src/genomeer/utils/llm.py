@@ -119,6 +119,8 @@ def get_llm(
 
     # Create appropriate model based on source
     if source == "OpenAI":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY environment variable is required for OpenAI models.")
         return _mk_openai_like("OpenAI", model, temperature, stop_sequences)
     
     elif source == "AzureOpenAI":
@@ -128,11 +130,16 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-openai package is required for Azure OpenAI models. Install with: pip install langchain-openai"
             )
+        if not os.getenv("AZURE_OPENAI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("AZURE_OPENAI_API_KEY (or OPENAI_API_KEY) is required for AzureOpenAI models.")
+        if not os.getenv("AZURE_OPENAI_ENDPOINT"):
+            raise ValueError("AZURE_OPENAI_ENDPOINT is required for AzureOpenAI models.")
+            
         API_VERSION = "2024-12-01-preview"
         model = model.replace("azure-", "")
         return AzureChatOpenAI(
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            azure_endpoint=os.getenv("OPENAI_ENDPOINT"),
+            openai_api_key=os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             azure_deployment=model,
             openai_api_version=API_VERSION,
             temperature=temperature,
@@ -145,6 +152,8 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-anthropic package is required for Anthropic models. Install with: pip install langchain-anthropic"
             )
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            raise ValueError("ANTHROPIC_API_KEY environment variable is required for Anthropic models.")
         return ChatAnthropic(
             model=model,
             temperature=temperature,
@@ -153,6 +162,8 @@ def get_llm(
         )
 
     elif source == "Gemini":
+        if not os.getenv("GEMINI_API_KEY"):
+            raise ValueError("GEMINI_API_KEY environment variable is required for Gemini models.")
         return _mk_openai_like(
             "Gemini",
             model, temperature, stop_sequences,
@@ -161,6 +172,8 @@ def get_llm(
         )
 
     elif source == "Groq":
+        if not os.getenv("GROQ_API_KEY"):
+            raise ValueError("GROQ_API_KEY environment variable is required for Groq models.")
         return _mk_openai_like(
             "Groq",
             model, temperature, stop_sequences,
@@ -220,5 +233,5 @@ def get_llm(
 
     else:
         raise ValueError(
-            f"Invalid source: {source}. Valid options are 'OpenAI', 'AzureOpenAI', 'Anthropic', 'Gemini', 'Groq', 'Bedrock', or 'Ollama'"
+            f"Invalid source: {source}. Valid options are 'OpenAI', 'AzureOpenAI', 'Anthropic', 'Gemini', 'Groq', 'Bedrock', 'Ollama', or 'Custom'"
         )

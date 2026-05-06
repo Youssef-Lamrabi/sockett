@@ -72,7 +72,11 @@ def annotate_celltype_scRNA(
 
     # TODO: this can be optimized
     czi_celltype_path = data_lake_path + "/czi_census_datasets_v4.parquet"
-    df = pd.read_parquet(czi_celltype_path)
+    try:
+        df = pd.read_parquet(czi_celltype_path)
+    except FileNotFoundError:
+        return f"Error: The reference dataset {czi_celltype_path} is missing from the Data Lake. Please ensure it is downloaded."
+    
     czi_celltype_set = {cell_type.strip() for cell_types in df["cell_type"] for cell_type in str(cell_types).split(";")}
     czi_celltype = ", ".join(sorted(czi_celltype_set))
 
@@ -181,30 +185,14 @@ def annotate_celltype_with_panhumanpy(
     """
     import json
     import shutil
-    import subprocess
     import tempfile
-
-    def conda_env_exists(env_name):
-        try:
-            result = subprocess.run(["conda", "env", "list"], capture_output=True, text=True, check=True)
-            return any(env_name in line.split() for line in result.stdout.splitlines())
-        except Exception:
-            return False
-
-    def create_panhumanpy_env(env_name):
-        # Create env and install panhumanpy
-        subprocess.run(["conda", "create", "-y", "-n", env_name, "python=3.10"], check=True)
-        # Install panhumanpy in the new env
-        subprocess.run(
-            ["conda", "run", "-n", env_name, "pip", "install", "git+https://github.com/satijalab/panhumanpy.git"],
-            check=True,
-        )
+    from genomeer.utils.helper import _run_in_env
+    from genomeer.runtime.env_manager import ensure_env
 
     PANHUMANPY_ENV = "panhumanpy_env"
 
-    # 1. Check/create panhumanpy_env
-    if not conda_env_exists(PANHUMANPY_ENV):
-        create_panhumanpy_env(PANHUMANPY_ENV)
+    # 1. Ensure the environment is built via standard micromamba workflow
+    ensure_env(PANHUMANPY_ENV)
 
     # 2. Write a temp script to run in the panhumanpy_env
     temp_dir = tempfile.mkdtemp()
@@ -316,11 +304,10 @@ except Exception as e:
 
     # 3. Run the script in the panhumanpy_env
     try:
-        run_cmd = ["conda", "run", "-n", PANHUMANPY_ENV, "python", script_path]
-        subprocess.run(run_cmd, check=True)
-    except subprocess.CalledProcessError as e:
+        proc = _run_in_env(PANHUMANPY_ENV, ["python", script_path], timeout=7200, check=True)
+    except Exception as e:
         shutil.rmtree(temp_dir)
-        return f"Error running panhumanpy in conda env: {e}"
+        return f"Error running panhumanpy in micromamba env: {e}"
 
     # 4. Read the result
     try:
@@ -470,7 +457,12 @@ def map_to_ima_interpret_scRNA(adata_filename, data_dir, custom_args=None):
 
     steps.append("adata.obs['X_uce'] found. Proceeding with cell type mapping.")
 
-    IMA_adata = sc.read_h5ad(f"{data_dir}/uce_10000_per_dataset_33l_8ep_coarse_ct.h5ad")
+    ima_path = f"{data_dir}/uce_10000_per_dataset_33l_8ep_coarse_ct.h5ad"
+    try:
+        IMA_adata = sc.read_h5ad(ima_path)
+    except FileNotFoundError:
+        return f"Error: The IMA reference dataset is missing ({ima_path})."
+        
     steps.append("Loaded Integrated Megascale Atlas (IMA) reference dataset")
 
     if adata.obsm["X_uce"].shape[1] != IMA_adata.X.shape[1]:

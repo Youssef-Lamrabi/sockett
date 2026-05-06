@@ -92,6 +92,7 @@ envs:
       - metabat2
       - jgi_summarize_bam_contig_depths
       - DAS_Tool
+      - das_tool
       - checkm2
       # Annotation
       - prokka
@@ -141,4 +142,17 @@ envs:
     provides_py:
       - cnvkit
       - rich
+    provides_r: []
+
+  - name: panhumanpy_env
+    description: "Environment for single cell hierarchical cell type annotation using panhumanpy and Azimuth Neural Network."
+    spec: "panhumanpy-env.yaml"
+    python: "3.10"
+    provides_bins:
+      - python
+    provides_py:
+      - scanpy
+      - pandas
+      - numpy
+      - panhumanpy
     provides_r: []

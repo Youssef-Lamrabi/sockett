@@ -55,7 +55,9 @@ def _get_with_retry(url: str, params: Optional[Dict] = None, timeout: int = 60) 
                 return r.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
-                raise e
+                import logging
+                logging.getLogger("genomeer.db").warning(f"HTTP {e.code} for {url}: returning empty data.")
+                return "{}"
             if attempt == len(delays):
                 raise e
             time.sleep(delays[attempt])

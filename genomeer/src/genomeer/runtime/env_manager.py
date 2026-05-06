@@ -21,6 +21,17 @@ _MICROMAMBA_URLS = {
     "Windows": "https://micro.mamba.pm/api/micromamba/win-64/latest",
 }
 
+# Phase 3 Security: Known SHA256 hashes for latest micromamba builds
+# In a real production system, the URL would be pinned to a specific version (e.g. 1.5.8-0)
+# to ensure these hashes remain valid. If the hash doesn't match, we log a warning or fail.
+_MICROMAMBA_KNOWN_HASHES = {
+    "linux-64": "",      # Add pinned hashes here
+    "linux-aarch64": "",
+    "osx-64": "",
+    "osx-arm64": "",
+    "win-64": "",
+}
+
 def _micromamba_target_path() -> Path:
     exe = "micromamba.exe" if platform.system() == "Windows" else "micromamba"
     return BIN_DIR / exe
@@ -131,6 +142,19 @@ def ensure_micromamba() -> Path:
         # Use an extension so tar's -a (auto-compress) can detect format if we need it
         archive = td / "micromamba.tar.zst"
         _download(url, archive)
+
+        # Supply Chain Security Check (Phase 3)
+        triplet = url.split('/')[-2]
+        expected_hash = _MICROMAMBA_KNOWN_HASHES.get(triplet)
+        if expected_hash:
+            import hashlib
+            hasher = hashlib.sha256()
+            with open(archive, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
+            actual_hash = hasher.hexdigest()
+            if actual_hash != expected_hash:
+                raise RuntimeError(f"Micromamba checksum mismatch! Expected {expected_hash}, got {actual_hash}")
 
         extracted_bin: Path | None = None
 
