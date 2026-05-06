@@ -352,8 +352,12 @@ class RobustLLMParser:
                     break
 
         if status == StepStatus.UNKNOWN:
-            # Par défaut optimiste — l'orchestrateur décidera
-            status = StepStatus.DONE
+            # TÂCHE 3: Fallback sécurisé vers BLOCKED au lieu de DONE
+            status = StepStatus.BLOCKED
+            reason = "[OBSERVER FALLBACK] No recognizable status tag found in LLM output. Defaulting to BLOCKED for safety."
+            parse_failed = True
+        else:
+            parse_failed = False
 
         return ParsedObserverOutput(
             status=status,
@@ -361,7 +365,7 @@ class RobustLLMParser:
             next_node=next_node,
             quality_signals=quality_signals,
             raw_text=text,
-            parse_failed=False,
+            parse_failed=parse_failed,
         )
 
     # ── Stratégies privées ────────────────────────────────────────────────────

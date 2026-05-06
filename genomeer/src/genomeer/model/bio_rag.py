@@ -470,6 +470,13 @@ class BioRAGStore:
         self._index = None          # FAISS index
         self._embedder = None
         self._ready = False
+        
+        # TÂCHE 7.2: Infos de péremption des bundles
+        self.rag_warnings = {
+            "rag_bundles_stale": False,
+            "rag_bundles_age_days": 0,
+            "missing_bundles": []
+        }
 
     def _load_static_bundles(self, sources: List[str]) -> List[BioDocument]:
         import json
@@ -489,8 +496,10 @@ class BioRAGStore:
                     bundle_date = datetime.fromisoformat(bundle_date_str)
                     days_old = (datetime.now() - bundle_date).days
                     if days_old > 180:
-                        import warnings
-                        warnings.warn(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old} days old. Context may be outdated.", UserWarning)
+                        # TÂCHE 7.1: Élévation au niveau ERROR pour visibilité
+                        logger.error(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old} days old. Context may be outdated.")
+                        self.rag_warnings["rag_bundles_stale"] = True
+                        self.rag_warnings["rag_bundles_age_days"] = max(self.rag_warnings["rag_bundles_age_days"], days_old)
                 
                 version = data.get("source_version", "CARD")
                 for entry in data.get("entries", []):
@@ -502,8 +511,8 @@ class BioRAGStore:
                         metadata={"gene": gene, "drug_class": entry.get("drug_class"), "source_version": version}
                     ))
             else:
-                import warnings
-                warnings.warn(f"[BioRAG] WARNING: Static bundle {card_path.name} not found. Running with missing biological context. Please run scripts/refresh_bundles.py.", UserWarning)
+                logger.error(f"[BioRAG] CRITICAL: Static bundle {card_path.name} not found. Biological context will be missing.")
+                self.rag_warnings["missing_bundles"].append("card")
                         
         if "kegg_pathways" in sources:
             kegg_path = base_dir / "kegg_core_pathways.json"
@@ -517,8 +526,10 @@ class BioRAGStore:
                     bundle_date = datetime.fromisoformat(bundle_date_str)
                     days_old = (datetime.now() - bundle_date).days
                     if days_old > 180:
-                        import warnings
-                        warnings.warn(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old} days old. Context may be outdated.", UserWarning)
+                        # TÂCHE 7.1: Élévation au niveau ERROR
+                        logger.error(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old} days old. Context may be outdated.")
+                        self.rag_warnings["rag_bundles_stale"] = True
+                        self.rag_warnings["rag_bundles_age_days"] = max(self.rag_warnings["rag_bundles_age_days"], days_old)
                 
                 version = data.get("source_version", "KEGG")
                 for entry in data.get("entries", []):
@@ -530,8 +541,8 @@ class BioRAGStore:
                         metadata={"pathway_id": pid, "name": entry.get("name"), "source_version": version}
                     ))
             else:
-                import warnings
-                warnings.warn(f"[BioRAG] WARNING: Static bundle {kegg_path.name} not found. Running with missing biological context. Please run scripts/refresh_bundles.py.", UserWarning)
+                logger.error(f"[BioRAG] CRITICAL: Static bundle {kegg_path.path} not found. Biological context will be missing.")
+                self.rag_warnings["missing_bundles"].append("kegg")
                         
         return docs
 

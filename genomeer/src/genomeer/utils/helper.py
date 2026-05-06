@@ -1,7 +1,7 @@
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
 import logging
-import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys
+import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys, platform, time
 from typing import Any, Callable, Iterable, Mapping, Optional
 from pydantic import BaseModel, Field, ValidationError
 from langchain_core.messages.base import get_msg_title_repr
@@ -108,6 +108,35 @@ def preload_tool_versions(env_name: str, tools: list[str]):
         pass
 
 # ------------------------------------------------------------------------------------------
+# Resource Limiter Utility
+# ------------------------------------------------------------------------------------------
+def _make_resource_limiter(max_ram_gb: float, max_cpu_seconds: int) -> Optional[Callable[[], None]]:
+    """Returns a function to be used as preexec_fn in Popen to limit resources."""
+    if platform.system() == "Windows":
+        return None
+
+    def limit_resources():
+        try:
+            import resource
+            # RAM limit
+            limit_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
+            # RLIMIT_AS: The maximum size of the process's virtual memory (address space) in bytes.
+            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+            
+            # CPU limit
+            # RLIMIT_CPU: The maximum amount of CPU time (in seconds) that the process can use.
+            resource.setrlimit(resource.RLIMIT_CPU, (max_cpu_seconds, max_cpu_seconds))
+            
+            # Subprocesses limit (extra safety)
+            resource.setrlimit(resource.RLIMIT_NPROC, (512, 512))
+        except (ImportError, ValueError, OSError) as e:
+            # Note: preexec_fn runs in the child, logging might not be safe/visible.
+            # We rely on the parent logging any startup failures if possible.
+            pass
+            
+    return limit_resources
+
+# ------------------------------------------------------------------------------------------
 # internal utility to run in env
 # ------------------------------------------------------------------------------------------
 def _run_in_env(
@@ -156,28 +185,15 @@ def _run_in_env(
     # If RUN_TEMP_DIR still not set, use a safe fallback
     if "RUN_TEMP_DIR" not in env:
         env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", os.path.join(tempfile.gettempdir(), "bioagent"))
+    max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
+    max_cpu_seconds = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
+    
+    preexec = None
+    if platform.system() != "Windows":
+        preexec = _make_resource_limiter(max_ram_gb, max_cpu_seconds)
+    else:
+        logger.warning("[_run_in_env] Resource limits (RAM/CPU) are not supported on Windows.")
 
-    import time
-
-    def set_limits():
-        try:
-            import resource
-            # 1.1 Limites mémoire (64 GB default)
-            max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "64"))
-            max_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
-            resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
-            
-            # 1.2 Limites CPU (6h default)
-            max_cpu = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", str(6 * 3600)))
-            if max_cpu > 0:
-                resource.setrlimit(resource.RLIMIT_CPU, (max_cpu, max_cpu))
-                
-            # 1.3 Limiter le nombre de processus fils
-            resource.setrlimit(resource.RLIMIT_NPROC, (512, 512))
-        except (ImportError, ValueError, OSError):
-            pass
-
-    import sys
     try:
         proc = subprocess.Popen(
             cmd,
@@ -186,11 +202,10 @@ def _run_in_env(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
-            preexec_fn=set_limits if sys.platform != 'win32' else None,
+            preexec_fn=preexec,
         )
-    except MemoryError as e:
-        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "64")
-        logger.error(f"[_run_in_env] MemoryError: L'outil {' '.join(cmd)} a dépassé les limites ou échoué au fork. (RAM Configurée: {max_ram_gb} GB)")
+    except Exception as e:
+        logger.error(f"[_run_in_env] Failed to start subprocess: {e} (RAM Config: {max_ram_gb} GB, CPU: {max_cpu_seconds}s)")
         raise e
 
     try:
@@ -224,14 +239,15 @@ def _run_in_env(
         outs, errs = proc.communicate()
         exc.stdout = outs
         exc.stderr = errs
-        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "64")
+        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "32")
         logger.error(f"[_run_in_env] TimeoutExpired: L'outil {' '.join(cmd)} a dépassé les limites de temps. (CPU: {timeout}s, RAM Configurée: {max_ram_gb} GB)")
         raise
 
     retcode = proc.poll()
     if retcode == -9:
         logger.error(f"[_run_in_env] Le processus a été tué par SIGKILL (OOM-Killer ou timeout CPU) : {' '.join(cmd)}")
-        stderr = (stderr or "") + "\n\n[SYSTEM] Le processus a été tué (SIGKILL / -9). Limite RAM (64GB) ou CPU dépassée."
+        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "32")
+        stderr = (stderr or "") + f"\n\n[SYSTEM] Le processus a été tué (SIGKILL / -9). Limite RAM ({max_ram_gb}GB) ou CPU dépassée."
         if check:
             raise subprocess.CalledProcessError(retcode, cmd, output=stdout, stderr=stderr)
     elif check and retcode:
@@ -421,13 +437,27 @@ def run_bash_script(
 
         # fallback: host bash
         import time
-        proc = subprocess.Popen(
-            [path],
-            shell=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
+        max_cpu_seconds = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
+        
+        preexec = None
+        if platform.system() != "Windows":
+            preexec = _make_resource_limiter(max_ram_gb, max_cpu_seconds)
+        else:
+            logger.warning("[run_bash_script] Resource limits (RAM/CPU) are not supported on Windows.")
+
+        try:
+            proc = subprocess.Popen(
+                [path],
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                preexec_fn=preexec,
+            )
+        except Exception as e:
+            logger.error(f"[run_bash_script] Failed to start host subprocess: {e}")
+            return f"Error: Failed to start host subprocess: {e}"
         try:
             if cancel_event is not None:
                 start_time = time.time()

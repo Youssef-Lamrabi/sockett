@@ -443,6 +443,31 @@ class BioAgent:
             }
         return manifest
 
+    def _extract_tools_from_code(self, code: str) -> List[str]:
+        """TÂCHE 11: Extrait les wrappers métagénomiques réellement appelés dans le code."""
+        if not code:
+            return []
+        
+        # Liste des wrappers Genomeer connus (run_*)
+        KNOWN_WRAPPERS = {
+            "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
+            "run_metaspades", "run_megahit", "run_flye", "run_host_decontamination",
+            "compute_coverage_samtools", "run_metabat2", "run_checkm2",
+            "run_bracken", "run_gtdbtk", "run_das_tool", "run_medaka",
+            "run_virsorter2", "run_checkv", "run_prokka", "run_bakta",
+            "run_prodigal", "run_diamond", "run_hmmer", "run_antismash",
+            "run_deepbgc", "run_vibrant", "run_pharokka", "run_rgi",
+            "run_amrfinder", "run_abricate", "run_mob_suite", "run_plasmidfinder",
+            "run_seqtk", "run_samtools", "run_minimap2", "run_bowtie2"
+        }
+        
+        found = []
+        import re
+        for tool in KNOWN_WRAPPERS:
+            if re.search(rf"\b{tool}\b", code):
+                found.append(tool)
+        return sorted(found)
+
     def _trim_messages(self, messages: list, keep_first: int = 1, keep_last: int = 30) -> list:
         """
         P3-A: Trim messages to prevent context explosion on long runs.
@@ -1154,25 +1179,52 @@ class BioAgent:
                     "messages": [AIMessage(content="<observe>No plan generated. Asking user for clarification.</observe>")],
                 }
 
-            # --- TÂCHE 7: Planning adaptatif mid-pipeline (MEGAHIT fallback) ---
+            # --- TÂCHE 6: Orchestrator adaptatif générique ---
             if idx < len(plan) and plan[idx].get("status") == "done":
-                step_title = plan[idx].get("title", "").lower()
-                step_code = plan[idx].get("code", "").lower()
-                if "metaspades" in step_title or "metaspades" in step_code:
-                    qs = state.get("manifest", {}).get("quality_signals", {})
-                    n50 = qs.get("assembly_n50")
-                    if n50 is not None and n50 < 1000:
-                        already_injected = any("megahit" in s.get("title", "").lower() for s in plan)
-                        if not already_injected:
-                            self._log("ADAPTIVE PLAN", body=f"metaSPAdes N50={n50} < 1000. Injecting MEGAHIT.", node=node)
-                            plan.insert(idx + 1, {
-                                "title": "Run MEGAHIT (Fallback Assembly)",
-                                "description": "metaSPAdes produced highly fragmented assembly (N50 < 1000). Falling back to MEGAHIT.",
-                                "status": "todo"
-                            })
-                            state.setdefault("messages", []).append(
-                                AIMessage(content=f"<observe>[ADAPTIVE PLAN] metaSPAdes assembly N50={n50} is too low (<1000). Injecting MEGAHIT alternative step.</observe>")
-                            )
+                try:
+                    from genomeer.agent.v2.adaptive_rules import ADAPTIVE_RULES
+                    qs = state.get("manifest", {}).get("quality_signals") or {}
+                    current_step_title = plan[idx].get("title", "").lower()
+                    current_step_code = plan[idx].get("code", "").lower()
+
+                    for rule in ADAPTIVE_RULES:
+                        signal_val = qs.get(rule["signal"])
+                        if signal_val is None:
+                            continue
+                        
+                        # Vérifier la condition (si la règle est spécifique à un outil)
+                        if rule.get("condition") and rule["condition"] not in (current_step_title + " " + current_step_code):
+                            continue
+                        
+                        # Évaluer l'opérateur
+                        triggered = False
+                        op = rule["operator"]
+                        threshold = rule["threshold"]
+                        
+                        if op == "lt": triggered = float(signal_val) < threshold
+                        elif op == "gt": triggered = float(signal_val) > threshold
+                        elif op == "eq": triggered = float(signal_val) == threshold
+                        elif op == "lte": triggered = float(signal_val) <= threshold
+                        elif op == "gte": triggered = float(signal_val) >= threshold
+                        
+                        if triggered:
+                            if rule["action"] == "inject_step":
+                                new_step = rule["inject"]
+                                already_injected = any(new_step["title"].lower() in s.get("title", "").lower() for s in plan)
+                                if not already_injected:
+                                    self._log("ADAPTIVE RULE TRIGGERED", body=f"Rule: {rule['name']}\nSignal: {rule['signal']}={signal_val}\nInjecting: {new_step['title']}", node=node)
+                                    plan.insert(idx + 1, new_step)
+                                    state.setdefault("messages", []).append(
+                                        AIMessage(content=f"<observe>[ADAPTIVE PLAN] Rule '{rule['name']}' triggered ({rule['signal']}={signal_val}). Injecting step: {new_step['title']}.</observe>")
+                                    )
+                            elif rule["action"] == "abort_pipeline":
+                                self._log("ADAPTIVE RULE ABORT", body=f"Rule: {rule['name']} triggered. Aborting.", node=node)
+                                return {
+                                    "next_step": "finalizer",
+                                    "messages": [AIMessage(content=f"<observe>[ADAPTIVE ABORT] {rule['name']} triggered. Pipeline stopped for safety.</observe>")],
+                                }
+                except Exception as _adapt_exc:
+                    self._log("ADAPTIVE ORCHESTRATOR (warn)", body=str(_adapt_exc), node=node)
 
             # --- TÂCHE A.7: Planning adaptatif long-read (Flye -> Racon -> Medaka) ---
             # After a completed Flye step on ONT reads, inject Racon + Medaka polishing steps
@@ -1867,9 +1919,18 @@ class BioAgent:
                 _cancel_event = threading.Event()
                 state["cancel_event"] = _cancel_event
 
-                # ── TOOL OUTPUT CACHE (Fix 1) ──────────────────────────────────────────
+                # ── TOOL OUTPUT CACHE (Fix 5.1) ────────────────────────────────────────
                 _tool_cache_key = None
                 _cached_result = None
+                
+                # S'assurer que le dossier temporaire est valide pour la restauration
+                _run_temp_dir = state.get("run_temp_dir", "")
+                if not _run_temp_dir or not os.path.exists(_run_temp_dir):
+                    self._log("TOOL CACHE WARN", body="run_temp_dir missing - cache restoration disabled", node=node)
+                    _cache_output_dir = None
+                else:
+                    _cache_output_dir = _run_temp_dir
+
                 if hasattr(self, "_cache") and self._cache and self._cache.tool:
                     try:
                         import hashlib
@@ -1877,20 +1938,19 @@ class BioAgent:
                         _env_hash = str(env)
                         _files_snapshot = sorted([
                             f"{f['name']}:{f.get('size_bytes', 0)}"
-                            for f in self._list_ctx_files(state.get("run_temp_dir", ""))
+                            for f in self._list_ctx_files(_run_temp_dir)
                         ])
                         _tool_cache_key = self._cache.tool.make_key(
                             step_title,
                             {"code_hash": _code_hash, "env": _env_hash, "files": _files_snapshot},
                             {},
                         )
-                        _cached_result = self._cache.tool.get(_tool_cache_key, output_dir=_run_temp_dir)
+                        _cached_result = self._cache.tool.get(_tool_cache_key, output_dir=_cache_output_dir)
                         if _cached_result:
                             self._log("TOOL CACHE HIT", body=f"step={step_title}", node=node)
                             out = _cached_result.get("output", "") if isinstance(_cached_result, dict) else str(_cached_result)
                     except Exception as _ce:
                         self._log("TOOL CACHE (warn)", body=str(_ce), node=node)
-                        _tool_cache_key = None
                 # ── END TOOL CACHE LOOKUP ──────────────────────────────────────────────
                 if hasattr(self, "_metrics") and self._metrics:
                     self._metrics.record_step_start(state.get("current_idx", 0), step_title)
@@ -1967,7 +2027,17 @@ class BioAgent:
                         cancel_event=_cancel_event,
                     )
                     # Propagate changes from the step namespace back to the state
-                    state = {**state, "manifest": _step_namespace.get("manifest", _manifest_copy)}
+                    new_manifest = _step_namespace.get("manifest", _manifest_copy)
+                    
+                    # TÂCHE 11: Tracking des wrappers réels
+                    detected_tools = self._extract_tools_from_code(code)
+                    if detected_tools:
+                        step_tools = dict(new_manifest.get("step_tools_used", {}))
+                        step_tools[str(state.get("current_idx", 0))] = detected_tools
+                        new_manifest["step_tools_used"] = step_tools
+                        self._log("TOOL TRACKING", body=f"Detected: {', '.join(detected_tools)}", node=node)
+
+                    state = {**state, "manifest": new_manifest}
 
 
                 # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────────
@@ -2182,6 +2252,11 @@ class BioAgent:
 
             # ── Extraire et persister les quality_signals dans le manifest ──────────
             _obs_parsed = _robust_parser.parse_observer_output(resp.content, step_title=step["title"])
+            
+            # TÂCHE 3: Log si le parsing a échoué (fallback BLOCKED)
+            if _obs_parsed.parse_failed:
+                self._log("OBSERVER PARSE FAILED -> FORCED BLOCKED", body=f"Raw text start: {resp.content[:500]}...", node=node)
+
             if _obs_parsed.quality_signals:
                 new_manifest["quality_signals"] = {
                     **dict(state["manifest"].get("quality_signals") or {}),
@@ -2488,6 +2563,20 @@ class BioAgent:
                 self._log("PUBLISH ERROR", body=str(e), node=node)
                 artifacts = {"artifacts": [], "error": str(e)}
 
+            # --- TÂCHE 7.2 & 7.3: Alerte active sur les bundles CARD/KEGG périmés ---
+            if hasattr(self, "bio_rag_store") and hasattr(self.bio_rag_store, "rag_warnings"):
+                rag_warns = self.bio_rag_store.rag_warnings
+                if rag_warns.get("rag_bundles_stale"):
+                    age = rag_warns.get("rag_bundles_age_days", 0)
+                    stale_notice = (
+                        f"\n\n> [!CAUTION]\n"
+                        f"> ⚠️ **AVERTISSEMENT : Les bases de données AMR/KEGG utilisées pour ce rapport ont {age} jours.**\n"
+                        f"> Les résultats de résistance aux antibiotiques peuvent être incomplets.\n"
+                        f"> Exécutez `scripts/refresh_bundles.py` pour mettre à jour.\n"
+                    )
+                    observations.append(stale_notice)
+                    manifest["rag_warnings"] = rag_warns
+
             # ── RAG CONTEXT pour interprétation biologique sourcée ──────────────
             rag_context = ""
             if hasattr(self, "bio_retriever"):
@@ -2537,10 +2626,20 @@ class BioAgent:
                     if all_done:
                         import re
                         tools_used = []
-                        for s in plan_steps:
-                            for m in re.findall(r"\brun_[a-zA-Z0-9_]+\b", s.get("code", "")):
-                                if m not in tools_used:
-                                    tools_used.append(m)
+                        # TÂCHE 11: Agrégation des outils réels trackés dans le manifest
+                        step_tools_dict = manifest.get("step_tools_used", {})
+                        if step_tools_dict:
+                            for tools in step_tools_dict.values():
+                                for t in tools:
+                                    if t not in tools_used:
+                                        tools_used.append(t)
+                        
+                        # Fallback (ancien comportement) si aucun outil tracké
+                        if not tools_used:
+                            for s in plan_steps:
+                                for m in re.findall(r"\brun_[a-zA-Z0-9_]+\b", s.get("code", "")):
+                                    if m not in tools_used:
+                                        tools_used.append(m)
                         _TEMPLATE_LIB.save(
                             task_summary=(state.get("last_prompt") or "")[:200],
                             steps=plan_steps,

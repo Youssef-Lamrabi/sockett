@@ -73,6 +73,18 @@ _BLOCKED_BASH: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"(>>?\s*/etc/(passwd|shadow|sudoers|crontab))", re.IGNORECASE),
      "write to critical system file"),
 
+    # TÂCHE 2.2 — Blocage des expansions de variables dangereuses
+    (re.compile(r'[A-Za-z_][A-Za-z0-9_]*\s*=\s*/[^;|\n]*[;\n].*rm\s+-[a-zA-Z]*r[a-zA-Z]*f\s+\$', re.DOTALL),
+     "dangerous variable assignment followed by rm -rf"),
+    
+    # eval $(...) ou eval `...`
+    (re.compile(r'\beval\s+["\']?(\$\(|\`)', re.IGNORECASE),
+     "dynamic code execution via eval and expansion"),
+
+    # TÂCHE 2.3 — Blocage des redirections vers des fichiers système
+    (re.compile(r'(>>?|\| tee -a?)\s+/(etc|boot|sys|proc|root|usr/local/bin)/', re.IGNORECASE),
+     "redirection to sensitive system directory"),
+
     # iptables flush (désactive le firewall)
     (re.compile(r"\biptables\s+-F\b", re.IGNORECASE),
      "iptables flush (firewall disable)"),
@@ -125,6 +137,26 @@ _BLOCKED_PYTHON: List[Tuple[re.Pattern, str]] = [
 
 
 # ---------------------------------------------------------------------------
+# Internal Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_script(script: str) -> str:
+    """
+    Normalise un script bash pour faciliter la détection de patterns.
+    1. Remplace les séquences de whitespace par un espace simple.
+    2. Retire les backslashes de continuation de ligne.
+    3. Convertit en minuscule (pour la comparaison).
+    """
+    if not script:
+        return ""
+    # Retire les backslashes de continuation de ligne (\ followed by newline)
+    script = script.replace("\\\n", " ")
+    # Remplace les whitespaces (espaces, tabs, etc.) par un espace simple
+    script = re.sub(r'[ \t\r\n]+', ' ', script)
+    return script.lower().strip()
+
+
+# ---------------------------------------------------------------------------
 # API publique
 # ---------------------------------------------------------------------------
 
@@ -145,10 +177,14 @@ def check_bash_script(script: str) -> Tuple[bool, str]:
     if not script or not script.strip():
         return True, "ok"
 
+    # TÂCHE 2.1 — Normalisation préalable
+    normalized = _normalize_script(script)
+
     for pattern, label in _BLOCKED_BASH:
-        if pattern.search(script):
+        # On applique les regex sur la version normalisée pour éviter les contournements par whitespace
+        if pattern.search(normalized):
             reason = f"[SECURITY BLOCK] Dangerous bash pattern detected: {label}"
-            logger.error(f"{reason}\\nScript (first 300 chars): {script[:300]!r}")
+            logger.error(f"{reason}\nScript (first 300 chars): {script[:300]!r}")
             return False, reason
 
     return True, "ok"
