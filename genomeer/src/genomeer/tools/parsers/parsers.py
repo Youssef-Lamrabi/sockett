@@ -72,7 +72,9 @@ def parse_tool_output(tool_name_or_step: str, stdout: str, result_dict: Optional
             if summary:
                 return _cap(summary, 2000)
         except Exception as e:
-            pass  # Fall through to truncation on error
+            # BUG-48 FIX: Don't swallow exceptions silently. Log them for debugging.
+            from genomeer.utils.helper import logger as hlogger
+            hlogger.warning(f"[parse_tool_output] Parser for {tool_name_or_step} failed: {e}")
 
     # Default: intelligent truncation — keep first 1000 and last 500 chars
     if not stdout:

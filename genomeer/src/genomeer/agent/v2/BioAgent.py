@@ -547,11 +547,10 @@ class BioAgent:
             parts.append(f"--- {role.upper()} ---\n{content}")
         return "\n".join(parts)
 
-    
     # SYSTEM SETUP
     def _llm_invoke(self, node: str, purpose: str, msgs, verbose=True):
         """
-        Central LLM call with cache layer.
+        Central LLM call with cache layer and exponential backoff.
         Cache skipped for: planner, orchestrator, finalizer (non-deterministic nodes).
         """
         # ── Cache lookup ────────────────────────────────────────────────────
@@ -560,8 +559,16 @@ class BioAgent:
         sys_msg  = next((getattr(m, "content", "") for m in msgs if getattr(m, "type", "") == "system"), "")
         user_msg = next((getattr(m, "content", "") for m in reversed(msgs) if getattr(m, "type", "") == "human"), "")
         model_name = str(getattr(self.llm, "model_name", self.llm.__class__.__name__))
-        cache_key = self._cache.llm.make_key(model_name, sys_msg, user_msg)
- 
+        
+        # BUG-20: Normalize prompt to exclude session-specific paths/IDs from cache key
+        import re
+        norm_user_msg = re.sub(r'run-[a-f0-9-]{36}', 'run-ID', user_msg)
+        norm_user_msg = re.sub(r'[a-f0-9]{32}', 'SESSION-ID', norm_user_msg)
+        if state_dir := os.environ.get("RUN_TEMP_DIR"):
+            norm_user_msg = norm_user_msg.replace(state_dir, "/tmp/bioagent")
+
+        cache_key = self._cache.llm.make_key(model_name, sys_msg, norm_user_msg)
+
         if _cache_eligible:
             cached = self._cache.llm.get(cache_key, node=node)
             if cached:
@@ -573,21 +580,33 @@ class BioAgent:
         else:
             self._log(f"LLM CACHE SKIP ({purpose})", body=f"node={node} is non-deterministic", node=node)
         # ── End cache lookup ────────────────────────────────────────────────
- 
+
         if verbose:
             prompt_txt = self._fmt_msgs(msgs)
             self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
- 
-        resp = self.llm.invoke(msgs)
+
+        # BUG-39: Exponential Backoff for LLM calls (429, 503, timeouts)
+        resp = None
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                resp = self.llm.invoke(msgs)
+                break
+            except Exception as e:
+                if i == max_retries - 1: raise
+                wait = (2 ** i) + (0.1 * i)
+                self._log("LLM RETRY", body=f"Retry {i+1}/{max_retries} after {wait}s due to: {e}", node=node)
+                time.sleep(wait)
+
         content = getattr(resp, "content", str(resp))
- 
+
         if verbose:
             self._log(f"LLM RESPONSE ({purpose})", content, node=node)
- 
+
         # ── Cache save (skips planner/orchestrator/finalizer automatiquement) ──
         if _cache_eligible:
             self._cache.llm.set(cache_key, content, model=model_name, node=node)
- 
+
         if hasattr(self, "_metrics") and self._metrics:
             self._metrics.record_llm_call(cache_hit=False)
 
@@ -1886,13 +1905,15 @@ class BioAgent:
                 if hasattr(self, "_cache") and self._cache and self._cache.tool:
                     try:
                         import hashlib
-                        _code_hash = hashlib.sha256((state.get("pending_code") or "").encode()).hexdigest()[:16]
+                        _code_hash = hashlib.sha256((code or "").encode()).hexdigest()[:16]
                         _env_hash = str(env)
                         
-                        # BUG-37: Include tool versions in cache key for reproducibility
-                        _tool_versions = {}
+                        # BUG-37: Detect tools/DBs BEFORE cache check to include versions in key
                         if hasattr(self, "_version_tracker"):
+                            self._version_tracker.auto_record_from_step(step_title, code, env_name=env or "meta-env1")
                             _tool_versions = self._version_tracker.as_dict()
+                        else:
+                            _tool_versions = {}
                         
                         _files_snapshot = sorted([
                             f"{f['name']}:{f.get('size_bytes', 0)}"
@@ -2879,12 +2900,8 @@ class BioAgent:
             for name, func in self._custom_functions.items():
                 _pns[name] = func
 
-            # Also make them available in builtins for broader access
-            import builtins
-
-            if not hasattr(builtins, "_bioagent_custom_functions"):
-                builtins._bioagent_custom_functions = {}
-            builtins._bioagent_custom_functions.update(self._custom_functions)
+            # NOUVEAU-02 FIX: Removed builtins injection to ensure session isolation.
+            # Custom tools are already available via the persistent namespace in run_python_repl.
             
     def _prepare_resources_for_retrieval(self, prompt):
         """Prepare resources for retrieval and return selected resource names.
@@ -3326,6 +3343,17 @@ class BioAgent:
             inputs = cp.load()
             if isinstance(inputs, dict):
                 inputs["run_started_at"] = time.time()  # FIX C1: Reset timer on resume
+                
+                # BUG-05: Restore integer keys for retry counts and diagnostic rounds
+                # JSON serialization converts int keys to strings, which breaks state[idx] lookups
+                if "retry_counts" in inputs and isinstance(inputs["retry_counts"], dict):
+                    inputs["retry_counts"] = {int(k): v for k, v in inputs["retry_counts"].items() if str(k).isdigit()}
+                
+                if "manifest" in inputs and isinstance(inputs["manifest"], dict):
+                    diag = inputs["manifest"].get("diagnostics_rounds")
+                    if isinstance(diag, dict):
+                        inputs["manifest"]["diagnostics_rounds"] = {int(k): v for k, v in diag.items() if str(k).isdigit()}
+
                 # Reconstruct LangChain message objects
                 if "messages" in inputs and isinstance(inputs["messages"], list):
                     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage

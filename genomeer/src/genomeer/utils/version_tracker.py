@@ -134,10 +134,12 @@ class VersionTracker:
         except Exception:
             size_gb, last_modified = 0.0, "unknown"
 
+        # BUG-37: Provide a fast fingerprint for cache keys immediately
+        fingerprint = f"mtime:{last_modified}|size:{size_gb}gb"
         record = DBRecord(
             db_name=db_name,
             db_path=str(db_path),
-            checksum="calculating...",
+            checksum=fingerprint,
             size_gb=round(size_gb, 3),
             last_modified=last_modified,
         )

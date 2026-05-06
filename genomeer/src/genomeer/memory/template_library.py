@@ -330,17 +330,22 @@ class TemplateLibrary:
 
     @staticmethod
     def _extract_tools_from_steps(steps: List[Dict]) -> List[str]:
-        TOOL_KEYWORDS = [
-            "fastp", "fastqc", "multiqc", "trimgalore",
-            "metaspades", "megahit", "flye",
-            "minimap2", "bowtie2", "bwa", "samtools",
-            "kraken2", "bracken", "metaphlan", "gtdbtk",
-            "metabat", "das_tool", "checkm", "checkm2",
-            "prokka", "prodigal", "diamond", "hmmer",
-            "humann", "amrfinder", "rgi", "lefse", "permanova", "ancombc",
-        ]
+        """BUG-33: Extract tools from actual metadata if available, otherwise fallback to titles."""
         found = []
         for s in steps:
+            # 1. Prioritize 'tool' field from telemetry (if available in the step dict)
+            t_exec = s.get("tool")
+            if t_exec and t_exec not in found:
+                found.append(t_exec)
+                continue
+                
+            # 2. Fallback to title keywords if telemetry is missing
+            TOOL_KEYWORDS = [
+                "run_fastp", "run_kraken2", "run_metaspades", "run_megahit", 
+                "run_metabat2", "run_checkm2", "run_prokka", "run_diamond",
+                "run_hmmer", "run_humann", "run_amrfinder", "run_rgi",
+                "run_minimap2", "run_flye", "run_gtdbtk"
+            ]
             title = s.get("title", "").lower()
             for t in TOOL_KEYWORDS:
                 if t in title and t not in found:

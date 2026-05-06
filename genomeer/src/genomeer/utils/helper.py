@@ -217,29 +217,16 @@ def _run_in_env(
 
     try:
         if cancel_event is not None:
-            # Poll loop checking cancel_event
-            start_time = time.time()
-            stdout_buf, stderr_buf = [], []
-            while True:
-                if cancel_event.is_set():
-                    proc.kill()
-                    proc.wait(timeout=1.0)
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-                if time.time() - start_time > timeout:
-                    proc.kill()
-                    proc.wait(timeout=1.0)
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-                try:
-                    outs, errs = proc.communicate(input=input_text, timeout=0.5)
-                    stdout_buf.append(outs or "")
-                    stderr_buf.append(errs or "")
-                    break
-                except subprocess.TimeoutExpired:
-                    # T8.2 FIX: Don't set input_text = None here yet, 
-                    # as communicate might not have sent everything.
-                    pass
-            stdout = "".join(stdout_buf)
-            stderr = "".join(stderr_buf)
+            # NOUVEAU-01 FIX: Use a thread to run communicate so we can check cancel_event
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(proc.communicate, input=input_text, timeout=timeout)
+                while not future.done():
+                    if cancel_event.is_set():
+                        proc.kill()
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    time.sleep(0.1)
+                stdout, stderr = future.result()
         else:
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as exc:

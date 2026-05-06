@@ -79,7 +79,12 @@ class RunMetrics:
 
     def __post_init__(self):
         import threading
-        self._lock_obj = threading.RLock()
+        # BUG-16: Use a private attribute to avoid asdict() serialization issues
+        object.__setattr__(self, "_metrics_lock", threading.RLock())
+
+    @property
+    def _lock_obj(self):
+        return getattr(self, "_metrics_lock")
 
     def record_step_start(self, step_idx: int, step_title: str) -> None:
         import time
@@ -110,7 +115,7 @@ class RunMetrics:
     ) -> None:
         import time
         now = time.time()
-        with self._lock_obj:
+        with self._metrics_lock:
             key = f"{step_idx}:{step_title}"
             started = self._step_starts.get(key, now)
     

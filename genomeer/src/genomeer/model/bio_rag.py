@@ -59,6 +59,18 @@ import requests
 
 logger = logging.getLogger("genomeer.bio_rag")
 
+# BUG-25: Global cache for embedding models to prevent repeated reloading
+_MODEL_CACHE: Dict[str, Any] = {}
+_MODEL_LOCK = threading.Lock()
+
+def _get_model(model_name: str) -> Any:
+    with _MODEL_LOCK:
+        if model_name not in _MODEL_CACHE:
+            logger.info(f"[BioRAG] Loading embedding model: {model_name}")
+            from sentence_transformers import SentenceTransformer
+            _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+    return _MODEL_CACHE[model_name]
+
 # ---------------------------------------------------------------------------
 # Document — unité de base du store
 # ---------------------------------------------------------------------------
@@ -470,7 +482,8 @@ class BioRAGStore:
         self._index = None          # FAISS index
         self._embedder = None
         self._ready = False
-        self._lock = threading.Lock()
+        # BUG-23: Use RLock to allow nested calls and protect index access
+        self._lock = threading.RLock()
         
         # TÂCHE 7.2: Infos de péremption des bundles
         self.rag_warnings = {
@@ -645,8 +658,8 @@ class BioRAGStore:
 
     def _init_embedder(self):
         try:
-            from sentence_transformers import SentenceTransformer
-            self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            # BUG-25: Use the shared model cache
+            self._embedder = _get_model("all-MiniLM-L6-v2")
             self._embed_backend = "sentence_transformers"
             return
         except ImportError:
@@ -764,9 +777,14 @@ class BioRAGRetriever:
 
         try:
             import numpy as np
-            q_vec = self.store._embed([query])
-            k_search = min(top_k * 3, len(self.store._documents))
-            scores, indices = self.store._index.search(q_vec, k_search)
+            # BUG-23: Thread-safe search access
+            with self.store._lock:
+                if not self.store.ready:
+                    return []
+                q_vec = self.store._embed([query])
+                k_search = min(top_k * 3, len(self.store._documents))
+                scores, indices = self.store._index.search(q_vec, k_search)
+            
             scores, indices = scores[0], indices[0]
 
             results = []
