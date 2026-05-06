@@ -58,7 +58,7 @@ import requests
 RUNS_ROOT = Path(os.getenv("RUNS_ROOT", "/tmp/bioagent"))
 ARTIFACT_ROOT = Path(os.getenv("ARTIFACT_ROOT", "/tmp/bioagent-app/artifacts"))
 PUBLIC_ARTIFACTS_URL = os.getenv("PUBLIC_ARTIFACTS_URL", "http://localhost:8080/api/v1/artifacts")
-OPEN_MODE = os.getenv("OPEN_MODE", "true").lower() == "true"
+OPEN_MODE = os.getenv("OPEN_MODE", "false").lower() == "true"
 
 ARTIFACTS_TIMEOUT_SEC = int(os.getenv("ARTIFACTS_TIMEOUT_SEC", "30"))
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
@@ -97,12 +97,22 @@ def _safe_rel_key(rel_key: str) -> str:
 
 
 def ensure_run_dir(run_id: str) -> Path:
+    import uuid as _uuid
+    try:
+        _uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid run_id: must be a valid UUID")
     p = RUNS_ROOT / f"run-{run_id}"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def ensure_artifact_dir(run_id: str) -> Path:
+    import uuid as _uuid
+    try:
+        _uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid run_id: must be a valid UUID")
     p = ARTIFACT_ROOT / run_id
     p.mkdir(parents=True, exist_ok=True)
     return p

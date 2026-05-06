@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -81,8 +82,8 @@ class CheckpointManager:
 
             self.run_temp_dir.mkdir(parents=True, exist_ok=True)
 
-            # Écriture atomique (write + rename) pour éviter la corruption
-            tmp_path = self.checkpoint_path.with_suffix(".tmp")
+            # BUG-14: Écriture atomique (write + rename) avec suffixe unique par thread
+            tmp_path = self.checkpoint_path.with_suffix(f".tmp.{uuid.uuid4().hex}")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(serializable, f, indent=2, default=str)
             os.replace(tmp_path, self.checkpoint_path)
@@ -107,6 +108,16 @@ class CheckpointManager:
         try:
             with open(self.checkpoint_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            
+            # BUG-15: Relocalisation des chemins si run_temp_dir a changé
+            old_dir = data.get("run_temp_dir")
+            new_dir = str(self.run_temp_dir)
+            if old_dir and old_dir != new_dir:
+                logger.info(f"[CHECKPOINT] Relocating paths from {old_dir} to {new_dir}")
+                # Recursively update paths in data
+                data = self._relocate_paths(data, old_dir, new_dir)
+                data["run_temp_dir"] = new_dir
+
             logger.info(
                 f"[CHECKPOINT] Loaded — step={data.get('_completed_step_idx')}, "
                 f"saved={time.ctime(data.get('_saved_at', 0))}"
@@ -209,3 +220,16 @@ class CheckpointManager:
             elif isinstance(val, (str, int, float, bool, list, dict, type(None))):
                 serializable[field] = val
         return serializable
+
+    @classmethod
+    def _relocate_paths(cls, obj: Any, old_base: str, new_base: str) -> Any:
+        """BUG-15: Replace old_base with new_base in strings recursively."""
+        if isinstance(obj, str):
+            if obj.startswith(old_base):
+                return obj.replace(old_base, new_base, 1)
+            return obj
+        elif isinstance(obj, list):
+            return [cls._relocate_paths(i, old_base, new_base) for i in obj]
+        elif isinstance(obj, dict):
+            return {k: cls._relocate_paths(v, old_base, new_base) for k, v in obj.items()}
+        return obj

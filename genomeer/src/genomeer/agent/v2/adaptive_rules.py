@@ -26,6 +26,24 @@ ADAPTIVE_RULES = [
         }
     },
     {
+        "name": "Abort on critically low N50",
+        "signal": "assembly_n50",
+        "operator": "lt",
+        "threshold": 200,
+        "condition": None,
+        "action": "abort_pipeline",
+        "inject": None
+    },
+    {
+        "name": "Abort on critically low classification",
+        "signal": "classified_pct",
+        "operator": "lt",
+        "threshold": 1.0,
+        "condition": "kraken2",
+        "action": "abort_pipeline",
+        "inject": None
+    },
+    {
         "name": "Re-binning on low completeness",
         "signal": "completeness",
         "operator": "lt",

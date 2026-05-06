@@ -5,7 +5,7 @@ from dataclasses import dataclass, asdict
 class GenomeerConfig:
     path: str = "./data"
     run_dir: str = ".genomeer_runs"
-    timeout_seconds: int = 600
+    timeout_seconds: int = 3600  # BUG-51: increased to 1h for metagenomics assembly
     llm: str = "ollama/llama3.1"
     temperature: float = 0.7
     use_tool_retriever: bool = True
@@ -27,6 +27,8 @@ class GenomeerConfig:
         self.base_url = os.getenv("CUSTOM_MODEL_BASE_URL", self.base_url)
         self.api_key  = os.getenv("CUSTOM_MODEL_API_KEY", self.api_key)
         self.source   = os.getenv("GENOMEER_MODEL_SOURCE", self.source)
+        if self.source:
+            self.source = self.source.strip("'\"") # BUG-38: handle quotes in .env
 
     def to_dict(self) -> dict:
         """Convert config to dictionary for easy access."""

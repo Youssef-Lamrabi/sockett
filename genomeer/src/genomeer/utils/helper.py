@@ -243,12 +243,17 @@ def _run_in_env(
         else:
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        proc.kill()
-        outs, errs = proc.communicate()
-        exc.stdout = outs
-        exc.stderr = errs
-        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "32")
-        logger.error(f"[_run_in_env] TimeoutExpired: L'outil {' '.join(cmd)} a dépassé les limites de temps. (CPU: {timeout}s, RAM Configurée: {max_ram_gb} GB)")
+        # BUG-09: Robust cleanup on timeout
+        try:
+            proc.kill()
+            outs, errs = proc.communicate(timeout=2.0)
+            exc.stdout = outs
+            exc.stderr = errs
+        except Exception:
+            # If kill/communicate fails, ensure we still raise the timeout
+            pass
+        max_ram_gb_str = env.get("GENOMEER_MAX_RAM_GB", "32")
+        logger.error(f"[_run_in_env] TimeoutExpired: L'outil {' '.join(cmd)} a dépassé les limites de temps. (CPU: {timeout}s, RAM Configurée: {max_ram_gb_str} GB)")
         raise
 
     retcode = proc.poll()
@@ -545,8 +550,11 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
             return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
 
         # fallback: host
+        # BUG-08: systematic returncode check
         res = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
-        return res.stdout if res.returncode == 0 else f"Error running command '{command}':\n{res.stderr}"
+        if res.returncode != 0:
+            return f"Error running command '{command}' (Exit {res.returncode}):\n{res.stderr}"
+        return res.stdout if res.stdout else "Command completed successfully (no output)."
     except Exception as e:
         return f"Error running command '{command}': {e}"
 

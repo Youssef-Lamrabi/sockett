@@ -35,6 +35,13 @@ class InstallLogStream:
             # line-buffered text mode so readers see updates immediately
             self._fp = open(self._file_path, "a", encoding="utf-8", buffering=1)
 
+    def __del__(self):
+        """BUG-49: Ensure file handle is closed if object is garbage collected."""
+        try:
+            self.close()
+        except Exception:
+            pass
+
     @property
     def file_path(self) -> Optional[Path]:
         return self._file_path
@@ -59,12 +66,12 @@ class InstallLogStream:
             return self._seq
 
     def replace(self, text: str) -> int:
-        """Update the ephemeral line (also emit a tagged line to the file)."""
+        """Update the ephemeral line (in-memory only)."""
         with self._cv:
             self._eph_text = text
             self._eph_seq += 1
-            # Persist a tagged ephemeral snapshot. External readers can handle specially.
-            self._write_file_line(f"[EPH] {text}")
+            # BUG-50: Do NOT write ephemeral snapshots to file to avoid noise for 'tail' readers.
+            # self._write_file_line(f"[EPH] {text}") 
             self._cv.notify_all()
             return self._eph_seq
 

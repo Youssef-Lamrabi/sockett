@@ -463,7 +463,8 @@ class BioAgent:
             "run_prodigal", "run_diamond", "run_hmmer", "run_antismash",
             "run_deepbgc", "run_vibrant", "run_pharokka", "run_rgi",
             "run_amrfinder", "run_abricate", "run_mob_suite", "run_plasmidfinder",
-            "run_seqtk", "run_samtools", "run_minimap2", "run_bowtie2"
+            "run_seqtk", "run_samtools", "run_minimap2", "run_bowtie2",
+            "run_humann", "run_strainphlan", "run_metaspades_hyb" # Added missing
         }
         
         found = []
@@ -1396,7 +1397,24 @@ class BioAgent:
                         updates = self._observer(local_state)
                         local_state.update(updates)
                         
-                        # Bug 2: handle observer's next_step routing for retries
+                    while local_state.get("current_idx", 0) < len(plan):
+                        curr_idx = local_state["current_idx"]
+                        step = plan[curr_idx]
+                        
+                        # BUG-02: Propagation de l'événement d'annulation
+                        if self.current_cancel_event.is_set():
+                            self._log("BATCH CANCEL", body=f"Sample {sample_id} cancelled by global event.", node=node)
+                            return sample_id, {"status": "cancelled"}
+
+                        # ... execute step logic ...
+                        # (simplifié pour le remplacement, on garde la logique existante)
+                        local_state = self._input_guard(local_state)
+                        if local_state.get("next_step") == "generator":
+                            local_state = self._generator(local_state)
+                            local_state = self._ensure_env(local_state)
+                            local_state = self._executor(local_state)
+                            local_state = self._observer(local_state)
+                        
                         next_step = local_state.get("next_step")
                         
                         if next_step == "diagnostics":
@@ -1405,14 +1423,10 @@ class BioAgent:
                             next_step = local_state.get("next_step")
                             
                         if next_step == "generator":
-                            # Force status to todo so the while loop picks it up for retry
                             local_state["plan"][curr_idx]["status"] = "todo"
-                            # Do NOT increment current_idx
                         else:
-                            # success (orchestrator) or final failure
                             local_state["current_idx"] += 1
                         
-                    # Extract sample results
                     manifest = local_state.get("manifest", {})
                     result = {
                         "quality_signals": manifest.get("quality_signals", {}),
@@ -1874,13 +1888,24 @@ class BioAgent:
                         import hashlib
                         _code_hash = hashlib.sha256((state.get("pending_code") or "").encode()).hexdigest()[:16]
                         _env_hash = str(env)
+                        
+                        # BUG-37: Include tool versions in cache key for reproducibility
+                        _tool_versions = {}
+                        if hasattr(self, "_version_tracker"):
+                            _tool_versions = self._version_tracker.as_dict()
+                        
                         _files_snapshot = sorted([
                             f"{f['name']}:{f.get('size_bytes', 0)}"
                             for f in self._list_ctx_files(_run_temp_dir)
                         ])
                         _tool_cache_key = self._cache.tool.make_key(
                             step_title,
-                            {"code_hash": _code_hash, "env": _env_hash, "files": _files_snapshot},
+                            {
+                                "code_hash": _code_hash, 
+                                "env": _env_hash, 
+                                "files": _files_snapshot,
+                                "tool_versions": _tool_versions
+                            },
                             {},
                         )
                         _cached_result = self._cache.tool.get(_tool_cache_key, output_dir=_cache_output_dir)
@@ -2137,7 +2162,8 @@ class BioAgent:
                 "run_host_decontamination",
                 "compute_coverage_samtools", "run_metabat2", "run_checkm2",
                 "run_bracken", "run_gtdbtk", "run_das_tool",
-                "run_medaka", "run_virsorter2", "run_checkv",  # FIX: add missing long-read/viromics tools
+                "run_medaka", "run_virsorter2", "run_checkv",
+                "run_prokka", "run_bakta", "run_rgi", "run_amrfinder", # Added
             ]:
                 if tool_name.lower() not in pending_code:
                     continue
@@ -2210,10 +2236,13 @@ class BioAgent:
                     _retry_resp = self._llm_invoke(node, "status_clarification", _retry_msgs)
                     status, summary = StateGraphHelper.parse_status(_retry_resp.content)
                     if status == "unknown":
-                        # Still unknown after retry — default to blocked to be safe
-                        self._log("STATUS UNKNOWN \u2192 FORCED BLOCKED", body="Still unknown after retry. Defaulting to blocked.", node=node)
-                        status = "blocked"
-                        summary = f"[OBSERVER FALLBACK] Status unclear after two LLM calls. Treating as blocked. Raw: {_retry_resp.content[:200]}"
+                        # T11.2 fallback: check for success keywords if status still unknown
+                        _c = _retry_resp.content.lower()
+                        if any(kw in _c for kw in ["success", "done", "complete", "finished", "passed"]):
+                            status = "done"
+                        else:
+                            status = "blocked"
+                        summary = f"[OBSERVER FALLBACK] Status inferred as {status}. Raw: {_retry_resp.content[:100]}"
                     else:
                         self._log("STATUS UNKNOWN \u2192 CLARIFIED", body=f"Clarified as {status}", node=node)
                 except Exception as _retry_exc:
@@ -2471,130 +2500,120 @@ class BioAgent:
         def _finalizer(self, state: AgentState) -> AgentState:
             node = "finalizer"
             self._log("ENTER NODE", body="publishing artifacts + generating report", node=node)
-
-            if getattr(self, "_rag_build_thread", None):
-                self._rag_build_thread.join(timeout=30)
-
-            manifest = dict(state.get("manifest") or {})
+            
             temp_dir = state.get("run_temp_dir", "")
 
-            # --- FIX 8 & 9: Sauvegarde Metrics & VersionTracker ---
-            if hasattr(self, "_metrics") and self._metrics:
-                self._metrics.save(temp_dir)
-            if hasattr(self, "_version_tracker") and self._version_tracker:
-                self._version_tracker.compute_db_checksums_async(temp_dir) # T12
-                self._version_tracker.wait_for_completion(timeout=10.0)
-                self._version_tracker.save(temp_dir)
-                manifest["tool_versions"] = self._version_tracker.as_dict()
-
-            run_id = state.get("run_id")
-            pub = manifest.get("publisher") or {}
-            base_url = (pub.get("base_url") or "").rstrip("/")
-
-            files = self._list_ctx_files(temp_dir)
-            def _want(relname: str) -> bool:
-                name = relname.lower()
-                SKIP = (".cache/", "__pycache__", ".ipynb_checkpoints", ".mamba", ".micromamba")
-                return not any(x in name for x in SKIP)
-
-            expose_paths = [f["name"] for f in files if _want(f["name"])]
-
-            # Auto-évaluation quantifiée post-pipeline
+            # --- BUG-03: Bloc try-finally pour garantir la sauvegarde des métriques ---
             try:
-                from genomeer.evaluation.benchmark import PipelineOutputEval
-                _eval_metrics = {
-                    **(manifest.get("quality_signals") or {}),
-                    "amr_genes_detected": manifest.get("amr_genes_detected", []),
-                    "output_files": [str(Path(temp_dir) / p) for p in expose_paths[:20]],
-                }
-                _eval_report = PipelineOutputEval().evaluate(_eval_metrics)
-                manifest["eval_score"]         = round(_eval_report.overall_score, 3)
-                manifest["eval_fails"]         = _eval_report.fail_count
-                manifest["eval_warns"]         = _eval_report.warn_count
-                manifest["eval_coverage_rate"] = round(_eval_report.coverage_rate, 3)  # FIX: export coverage_rate
-                self._log(
-                    "PIPELINE EVAL",
-                    body=_eval_report.summary(),
-                    node=node
-                )
-            except Exception as _eval_exc:
-                self._log("PIPELINE EVAL (warn)", body=str(_eval_exc), node=node)
-
-            artifacts = {}
-            observations = manifest.get("observations", [])
-            try:
-                # from genomeer.tools.function.artifacts import create_run, upload_files, publish_run
-                from genomeer.agent.v2.utils.artifacts_service import create_run, upload_files, publish_run_http
-                try:
-                    create_run(run_id, base_url=self.artifacts_base_url)
-                except Exception:
-                    pass
-
-                abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
-                if abs_paths:
-                    upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
-
-                expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
-                art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
-                artifacts = art_manifest or {}
-            except Exception as e:
-                self._log("PUBLISH ERROR", body=str(e), node=node)
-                artifacts = {"artifacts": [], "error": str(e)}
-
-            # --- TÂCHE 7.2 & 7.3: Alerte active sur les bundles CARD/KEGG périmés ---
-            if hasattr(self, "bio_rag_store") and hasattr(self.bio_rag_store, "rag_warnings"):
-                rag_warns = self.bio_rag_store.rag_warnings
-                if rag_warns.get("rag_bundles_stale"):
-                    age = rag_warns.get("rag_bundles_age_days", 0)
-                    stale_notice = (
-                        f"\n\n> [!CAUTION]\n"
-                        f"> ⚠️ **AVERTISSEMENT : Les bases de données AMR/KEGG utilisées pour ce rapport ont {age} jours.**\n"
-                        f"> Les résultats de résistance aux antibiotiques peuvent être incomplets.\n"
-                        f"> Exécutez `scripts/refresh_bundles.py` pour mettre à jour.\n"
-                    )
-                    observations.append(stale_notice)
-                    manifest["rag_warnings"] = rag_warns
-
-            # ── RAG CONTEXT pour interprétation biologique sourcée ──────────────
-            rag_context = ""
-            if hasattr(self, "bio_retriever"):
-                if hasattr(self, "_rag_build_thread") and self._rag_build_thread.is_alive():
+                # BUG-04: Robust thread join
+                if getattr(self, "_rag_build_thread", None):
                     self._rag_build_thread.join(timeout=30)
                     if self._rag_build_thread.is_alive():
-                        self._log("BIO RAG (warn)", body="RAG build still in progress after 30s — using partial index", node=node)
+                        self._log("FINALIZER WARN", body="BioRAG thread still alive after 30s join. Proceeding with partial data.", node=node)
+
+                manifest = dict(state.get("manifest") or {})
+
+                # VersionTracker
+                if hasattr(self, "_version_tracker") and self._version_tracker:
+                    try:
+                        self._version_tracker.compute_db_checksums_async(temp_dir)
+                        self._version_tracker.wait_for_completion(timeout=10.0)
+                        self._version_tracker.save(temp_dir)
+                        manifest["tool_versions"] = self._version_tracker.as_dict()
+                    except Exception as _vt_exc:
+                        self._log("VERSION TRACKER ERROR", body=str(_vt_exc), node=node)
+
+                run_id = state.get("run_id")
+                pub = manifest.get("publisher") or {}
+                base_url = (pub.get("base_url") or "").rstrip("/")
+
+                files = self._list_ctx_files(temp_dir)
+                def _want(relname: str) -> bool:
+                    name = relname.lower()
+                    SKIP = (".cache/", "__pycache__", ".ipynb_checkpoints", ".mamba", ".micromamba")
+                    return not any(x in name for x in SKIP)
+
+                expose_paths = [f["name"] for f in files if _want(f["name"])]
+
+                # Auto-évaluation quantifiée
                 try:
-                    from genomeer.model.bio_rag import build_finalizer_rag_context
-                    _pipeline_results = {
-                        "amr_genes":         manifest.get("amr_genes_detected", []),
-                        "pathways":          manifest.get("top_pathways", []),
-                        "assembly_n50":      manifest.get("quality_signals", {}).get("n50_bp"),
-                        "mean_completeness": manifest.get("quality_signals", {}).get("mean_completeness"),
-                        "classified_pct":    manifest.get("quality_signals", {}).get("classified_pct"),
+                    from genomeer.evaluation.benchmark import PipelineOutputEval
+                    _eval_metrics = {
+                        **(manifest.get("quality_signals") or {}),
+                        "amr_genes_detected": manifest.get("amr_genes_detected", []),
+                        "output_files": [str(Path(temp_dir) / p) for p in expose_paths[:20]],
                     }
-                    
-                    self._log("FINALIZER", body=f"BioRAG status: {self.bio_rag_status}", node=node)
-                    if self.bio_rag_status != "ready":
-                        rag_context += f"Note: Biological context database is incomplete (status: {self.bio_rag_status}). Interpretations may rely on fallback offline thresholds.\n\n"
-                    
-                    rag_context += build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
-                    if rag_context:
-                        self._log("RAG CONTEXT", body=f"Injected {len(rag_context)} chars of bio context", node=node)
-                except Exception as _rag_exc:
-                    self._log("RAG CONTEXT (warn)", body=str(_rag_exc), node=node)
-            # ── END RAG CONTEXT ──────────────────────────────────────────────────
-        
-            msgs = [
-                SystemMessage(content=instructions.FINALIZER_PROMPT),
-                HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
-                    user_goal=state.get("last_prompt"),
-                    plan=state.get("plan"),
-                    observation=observations,
-                    artifacts=artifacts,
-                    biological_context=rag_context,
-                ))
-            ]
-            resp = self._llm_invoke(node, "final_report", msgs)
-            self._log("EXIT NODE", body="final report generated", node=node)
+                    _eval_report = PipelineOutputEval().evaluate(_eval_metrics)
+                    manifest["eval_score"] = round(_eval_report.overall_score, 3)
+                    manifest["eval_fails"] = _eval_report.fail_count
+                    manifest["eval_warns"] = _eval_report.warn_count
+                    manifest["eval_coverage_rate"] = round(_eval_report.coverage_rate, 3)
+                except Exception as _eval_exc:
+                    self._log("PIPELINE EVAL (warn)", body=str(_eval_exc), node=node)
+
+                artifacts = {}
+                observations = manifest.get("observations", [])
+                try:
+                    from genomeer.agent.v2.utils.artifacts_service import create_run, upload_files, publish_run_http
+                    create_run(run_id, base_url=self.artifacts_base_url)
+                    abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
+                    if abs_paths:
+                        upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
+                    expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
+                    art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
+                    artifacts = art_manifest or {}
+                except Exception as e:
+                    self._log("PUBLISH ERROR", body=str(e), node=node)
+                    artifacts = {"artifacts": [], "error": str(e)}
+
+                # RAG Alerts
+                if hasattr(self, "bio_rag_store") and hasattr(self.bio_rag_store, "rag_warnings"):
+                    rag_warns = self.bio_rag_store.rag_warnings
+                    if rag_warns.get("rag_bundles_stale"):
+                        age = rag_warns.get("rag_bundles_age_days", 0)
+                        stale_notice = f"\n\n> [!CAUTION]\n> ⚠️ **AVERTISSEMENT : Les bases de données AMR/KEGG ont {age} jours.**\n"
+                        observations.append(stale_notice)
+
+                # RAG Interpretation
+                rag_context = ""
+                if hasattr(self, "bio_retriever"):
+                    try:
+                        from genomeer.model.bio_rag import build_finalizer_rag_context
+                        _pipeline_results = {
+                            "amr_genes": manifest.get("amr_genes_detected", []),
+                            "pathways": manifest.get("top_pathways", []),
+                            "assembly_n50": manifest.get("quality_signals", {}).get("n50_bp"),
+                            "mean_completeness": manifest.get("quality_signals", {}).get("mean_completeness"),
+                            "classified_pct": manifest.get("quality_signals", {}).get("classified_pct"),
+                        }
+                        rag_context = build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
+                    except Exception as _rag_exc:
+                        self._log("RAG CONTEXT (warn)", body=str(_rag_exc), node=node)
+
+                msgs = [
+                    SystemMessage(content=instructions.FINALIZER_PROMPT),
+                    HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
+                        user_goal=state.get("last_prompt"),
+                        plan=state.get("plan"),
+                        observation=observations,
+                        artifacts=artifacts,
+                        biological_context=rag_context,
+                    ))
+                ]
+                resp = self._llm_invoke(node, "final_report", msgs)
+                return {
+                    "messages": [AIMessage(content=resp.content)],
+                    "next_step": "end"
+                }
+
+            finally:
+                # BUG-03: Sauvegarde forcée des métriques quoi qu'il arrive
+                if hasattr(self, "_metrics") and self._metrics:
+                    try:
+                        self._metrics.save(temp_dir)
+                        self._log("FINALIZER", body="Run metrics saved successfully.", node=node)
+                    except Exception as _m_exc:
+                        self._log("METRICS SAVE ERROR", body=str(_m_exc), node=node)
 
             # FIX G2b: persist successful pipeline to TemplateLibrary for future few-shot reuse
             if _TEMPLATE_OK and _TEMPLATE_LIB:

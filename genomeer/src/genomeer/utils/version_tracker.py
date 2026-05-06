@@ -71,6 +71,9 @@ class VersionTracker:
         self.databases: List[DBRecord] = []
         self._recorded_tools: set = set()
         self._recorded_dbs: set = set()
+        self._lock = threading.Lock()
+        self._threads: List[threading.Thread] = []
+        self._threads_lock = threading.Lock()
 
     def record_tool(self, tool_name: str, env_name: str) -> Optional[str]:
         """
@@ -93,11 +96,12 @@ class VersionTracker:
                 version = self._get_tool_version(tool_name, env_name)
                 _VERSION_CACHE[key] = version
 
-        self.tools.append(ToolVersion(
-            tool_name=tool_name,
-            env_name=env_name,
-            version_string=version,
-        ))
+        with self._lock:
+            self.tools.append(ToolVersion(
+                tool_name=tool_name,
+                env_name=env_name,
+                version_string=version,
+            ))
         logger.debug(f"[VERSION] {tool_name} ({env_name}): {version}")
         return version
 
@@ -137,26 +141,24 @@ class VersionTracker:
             size_gb=round(size_gb, 3),
             last_modified=last_modified,
         )
-        self.databases.append(record)
+        with self._lock:
+            self.databases.append(record)
 
         if compute_checksum and db_path_obj.is_file():
-            import threading
             def _async_md5(rec: DBRecord, path: Path):
                 cache_key = str(path)
                 with _DB_CHECKSUM_CACHE_LOCK:
                     if cache_key in _DB_CHECKSUM_CACHE:
-                        rec.checksum = _DB_CHECKSUM_CACHE[cache_key]
+                        c = _DB_CHECKSUM_CACHE[cache_key]
                     else:
                         c = self._md5_file(path)
                         _DB_CHECKSUM_CACHE[cache_key] = c
-                        rec.checksum = c
+                
+                with self._lock:
+                    rec.checksum = c
 
             t = threading.Thread(target=_async_md5, args=(record, db_path_obj), daemon=True)
             t.start()
-            if not hasattr(self, "_threads"): 
-                self._threads = []
-            if not hasattr(self, "_threads_lock"):
-                self._threads_lock = threading.Lock()
             
             with self._threads_lock:
                 self._threads.append(t)
