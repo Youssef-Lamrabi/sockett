@@ -58,6 +58,7 @@ from genomeer.utils.stream.shared import REGISTRY
 from genomeer.agent.v2.utils import instructions
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
 from genomeer.agent.v2.utils.quality_gate import check_quality, format_quality_message  # GAP4 fix
+from genomeer.utils.version_tracker import VersionTracker
 from genomeer.runtime.env_resolver import resolve_env_for_code
 from genomeer.model.feedback import FeedbackParser
 # ── AXE 3.3: Intelligent output parsers ──
@@ -388,6 +389,9 @@ class BioAgent:
         # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
         self._cache = get_cache()
         self._log("CACHE", body=f"Cache dir: {self._cache.cache_dir}", node="init")
+
+        # ── VERSION TRACKING ────────────────────────────────────────────────────
+        self._version_tracker = VersionTracker()
 
     @property
     def bio_rag_status(self) -> str:
@@ -1179,111 +1183,26 @@ class BioAgent:
                     "messages": [AIMessage(content="<observe>No plan generated. Asking user for clarification.</observe>")],
                 }
 
-            # --- TÂCHE 6: Orchestrator adaptatif générique ---
+            # --- Orchestration adaptative centralisée (T4) ---
             if idx < len(plan) and plan[idx].get("status") == "done":
                 try:
-                    from genomeer.agent.v2.adaptive_rules import ADAPTIVE_RULES
-                    qs = state.get("manifest", {}).get("quality_signals") or {}
-                    current_step_title = plan[idx].get("title", "").lower()
-                    current_step_code = plan[idx].get("code", "").lower()
-
-                    for rule in ADAPTIVE_RULES:
-                        signal_val = qs.get(rule["signal"])
-                        if signal_val is None:
-                            continue
-                        
-                        # Vérifier la condition (si la règle est spécifique à un outil)
-                        if rule.get("condition") and rule["condition"] not in (current_step_title + " " + current_step_code):
-                            continue
-                        
-                        # Évaluer l'opérateur
-                        triggered = False
-                        op = rule["operator"]
-                        threshold = rule["threshold"]
-                        
-                        if op == "lt": triggered = float(signal_val) < threshold
-                        elif op == "gt": triggered = float(signal_val) > threshold
-                        elif op == "eq": triggered = float(signal_val) == threshold
-                        elif op == "lte": triggered = float(signal_val) <= threshold
-                        elif op == "gte": triggered = float(signal_val) >= threshold
-                        
-                        if triggered:
-                            if rule["action"] == "inject_step":
-                                new_step = rule["inject"]
-                                already_injected = any(new_step["title"].lower() in s.get("title", "").lower() for s in plan)
-                                if not already_injected:
-                                    self._log("ADAPTIVE RULE TRIGGERED", body=f"Rule: {rule['name']}\nSignal: {rule['signal']}={signal_val}\nInjecting: {new_step['title']}", node=node)
-                                    plan.insert(idx + 1, new_step)
-                                    state.setdefault("messages", []).append(
-                                        AIMessage(content=f"<observe>[ADAPTIVE PLAN] Rule '{rule['name']}' triggered ({rule['signal']}={signal_val}). Injecting step: {new_step['title']}.</observe>")
-                                    )
-                            elif rule["action"] == "abort_pipeline":
-                                self._log("ADAPTIVE RULE ABORT", body=f"Rule: {rule['name']} triggered. Aborting.", node=node)
-                                return {
-                                    "next_step": "finalizer",
-                                    "messages": [AIMessage(content=f"<observe>[ADAPTIVE ABORT] {rule['name']} triggered. Pipeline stopped for safety.</observe>")],
-                                }
+                    from genomeer.agent.v2.adaptive_rules import OrchestrationManager
+                    adaptation = OrchestrationManager.evaluate_rules(plan, idx, state.get("manifest", {}))
+                    if adaptation:
+                        if "plan" in adaptation:
+                            plan = adaptation["plan"]
+                        if "adaptation_messages" in adaptation:
+                            for msg in adaptation["adaptation_messages"]:
+                                self._log("ADAPTIVE TRIGGER", body=msg, node=node)
+                                state.setdefault("messages", []).append(AIMessage(content=f"<observe>{msg}</observe>"))
+                        if adaptation.get("next_step") == "finalizer":
+                            return {
+                                "next_step": "finalizer",
+                                "messages": [AIMessage(content=adaptation.get("abort_reason", "[ADAPTIVE ABORT]"))],
+                            }
                 except Exception as _adapt_exc:
                     self._log("ADAPTIVE ORCHESTRATOR (warn)", body=str(_adapt_exc), node=node)
-
-            # --- TÂCHE A.7: Planning adaptatif long-read (Flye -> Racon -> Medaka) ---
-            # After a completed Flye step on ONT reads, inject Racon + Medaka polishing steps
-            # before the pipeline continues to CheckM2/binning.
-            if idx < len(plan) and plan[idx].get("status") == "done":
-                step_title_lr = plan[idx].get("title", "").lower()
-                step_code_lr  = plan[idx].get("code", "").lower()
-                step_notes_lr = plan[idx].get("notes", "").lower()
-
-                _is_flye_step = "flye" in step_title_lr or "flye" in step_code_lr
-                # Detect ONT input: step references nano/ont/long-read, or read_type contains nano
-                _is_ont_reads = any(
-                    kw in (step_title_lr + step_code_lr + step_notes_lr)
-                    for kw in ("nano", "ont", "nanopore", "long-read", "long_read", "nano-raw", "nano-hq")
-                )
-
-                if _is_flye_step and _is_ont_reads:
-                    _already_has_racon  = any("racon"  in s.get("title", "").lower() for s in plan)
-                    _already_has_medaka = any("medaka" in s.get("title", "").lower() for s in plan)
-
-                    if not (_already_has_racon or _already_has_medaka):
-                        self._log(
-                            "ADAPTIVE PLAN (long-read)",
-                            body="Flye+ONT assembly detected. Injecting Racon (x2) + Medaka polishing steps.",
-                            node=node,
-                        )
-                        # Inject in reverse order so final order is: Racon1 -> Racon2 -> Medaka
-                        # Each plan.insert(idx+1) shifts previous insertions forward
-                        plan.insert(idx + 1, {
-                            "title": "Run Medaka (ONT Consensus Polishing)",
-                            "description": (
-                                "Polish the Racon-corrected assembly with Medaka neural-network "
-                                "consensus. Uses medaka_consensus -i reads.fastq -d racon2.fasta "
-                                "-o medaka_out -t 8 -m r941_min_high_g360."
-                            ),
-                            "status": "todo",
-                        })
-                        plan.insert(idx + 1, {
-                            "title": "Run Racon Round 2 (ONT Polish)",
-                            "description": (
-                                "Second Racon polishing round: re-map reads to racon_round1.fasta "
-                                "with minimap2 -x map-ont, then run racon reads.fastq overlaps.paf "
-                                "racon_round1.fasta > racon_round2.fasta."
-                            ),
-                            "status": "todo",
-                        })
-                        plan.insert(idx + 1, {
-                            "title": "Run Racon Round 1 (ONT Polish)",
-                            "description": (
-                                "First Racon polishing round: map ONT reads to Flye assembly with "
-                                "minimap2 -x map-ont assembly.fasta reads.fastq > overlaps.paf, "
-                                "then run racon reads.fastq overlaps.paf assembly.fasta > racon_round1.fasta."
-                            ),
-                            "status": "todo",
-                        })
-                        state.setdefault("messages", []).append(AIMessage(content=(
-                            "<observe>[ADAPTIVE PLAN — LONG-READ] Flye assembly on ONT reads detected. "
-                            "Injecting Racon (×2) -> Medaka polishing pipeline before CheckM2.</observe>"
-                        )))
+            # --------------------------------------------------
             # --------------------------------------------------
 
             while idx < len(plan) and plan[idx]["status"] != "todo":
@@ -2540,6 +2459,7 @@ class BioAgent:
             if hasattr(self, "_metrics") and self._metrics:
                 self._metrics.save(temp_dir)
             if hasattr(self, "_version_tracker") and self._version_tracker:
+                self._version_tracker.wait_for_completion(timeout=10.0)
                 self._version_tracker.save(temp_dir)
                 manifest["tool_versions"] = self._version_tracker.as_dict()
 

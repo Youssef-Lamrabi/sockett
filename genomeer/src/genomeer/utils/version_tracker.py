@@ -104,12 +104,7 @@ class VersionTracker:
     ) -> None:
         """
         Enregistre une base de données utilisée.
-
-        Parameters
-        ----------
-        db_name          : Nom logique (ex: "kraken2_standard", "card_db")
-        db_path          : Chemin vers la base
-        compute_checksum : Si True, calcule le MD5 du fichier principal (lent!)
+        Le calcul du checksum est effectué en arrière-plan (non-bloquant).
         """
         if db_name in self._recorded_dbs:
             return
@@ -120,43 +115,42 @@ class VersionTracker:
             logger.warning(f"[VERSION] DB not found: {db_path}")
             return
 
-        size_gb = 0.0
-        last_modified = None
-        checksum = None
-
         try:
             if db_path_obj.is_dir():
-                # Optimisation: On évite rglob("*") qui bloque sur les énormes bases (ex: Kraken2)
-                # On se base uniquement sur les stats du dossier parent
-                size_gb = 0.0 # Skipping deep size calculation for performance
-                last_modified = time.strftime(
-                    "%Y-%m-%d", time.gmtime(db_path_obj.stat().st_mtime)
-                )
+                size_gb = 0.0 
+                last_modified = time.strftime("%Y-%m-%d", time.gmtime(db_path_obj.stat().st_mtime))
             else:
                 size_gb = db_path_obj.stat().st_size / (1024 ** 3)
-                last_modified = time.strftime(
-                    "%Y-%m-%d", time.gmtime(db_path_obj.stat().st_mtime)
-                )
-        except Exception as e:
-            logger.warning(f"[VERSION] DB stat failed for {db_path}: {e}")
+                last_modified = time.strftime("%Y-%m-%d", time.gmtime(db_path_obj.stat().st_mtime))
+        except Exception:
+            size_gb, last_modified = 0.0, "unknown"
 
-        # Checksum optionnel (MD5 du fichier principal seulement)
-        if compute_checksum and db_path_obj.is_file():
-            cache_key = str(db_path_obj)
-            if cache_key in _DB_CHECKSUM_CACHE:
-                checksum = _DB_CHECKSUM_CACHE[cache_key]
-            else:
-                checksum = self._md5_file(db_path_obj)
-                _DB_CHECKSUM_CACHE[cache_key] = checksum
-
-        self.databases.append(DBRecord(
+        record = DBRecord(
             db_name=db_name,
             db_path=str(db_path),
-            checksum=checksum,
+            checksum="calculating...",
             size_gb=round(size_gb, 3),
             last_modified=last_modified,
-        ))
-        logger.info(f"[VERSION] DB={db_name} path={db_path} size={size_gb:.2f}GB mod={last_modified}")
+        )
+        self.databases.append(record)
+
+        if compute_checksum and db_path_obj.is_file():
+            import threading
+            def _async_md5(rec: DBRecord, path: Path):
+                cache_key = str(path)
+                if cache_key in _DB_CHECKSUM_CACHE:
+                    rec.checksum = _DB_CHECKSUM_CACHE[cache_key]
+                else:
+                    c = self._md5_file(path)
+                    _DB_CHECKSUM_CACHE[cache_key] = c
+                    rec.checksum = c
+
+            t = threading.Thread(target=_async_md5, args=(record, db_path_obj), daemon=True)
+            t.start()
+            if not hasattr(self, "_threads"): self._threads = []
+            self._threads.append(t)
+
+        logger.info(f"[VERSION] DB={db_name} tracking started")
 
     def _md5_file(self, path: Path) -> str:
         import hashlib
@@ -173,8 +167,7 @@ class VersionTracker:
         env_name: str = "meta-env1",
     ) -> None:
         """
-        Détecte automatiquement les outils utilisés dans un step
-        et enregistreurs versions.
+        Détecte automatiquement les outils ET les bases de données utilisés dans un step.
         """
         TOOL_SIGNALS = {
             "fastp": "fastp",
@@ -196,10 +189,33 @@ class VersionTracker:
             "gtdbtk": "gtdbtk",
             "metaphlan": "metaphlan",
         }
-        code_lower = pending_code.lower()
+        code_lower = (pending_code or "").lower()
+        
+        # 1. Outils
         for signal, binary in TOOL_SIGNALS.items():
             if signal in code_lower:
                 self.record_tool(binary, env_name)
+
+        # 2. Bases de données (détection par regex)
+        import re
+        db_patterns = {
+            "kraken2_db": r"kraken2.*--db\s+([^\s]+)",
+            "bracken_db": r"bracken.*-d\s+([^\s]+)",
+            "gtdbtk_db": r"GTDBTK_DATA_PATH=([^\s]+)",
+            "amrfinder_db": r"amrfinder.*--database\s+([^\s]+)",
+            "card_json": r"rgi.*--card_json\s+([^\s]+)",
+        }
+        for db_name, pattern in db_patterns.items():
+            m = re.search(pattern, pending_code)
+            if m:
+                path = m.group(1).strip("'\"")
+                self.record_db(db_name, path, compute_checksum=True)
+
+    def wait_for_completion(self, timeout: float = 30.0):
+        """Attend la fin des threads de checksum."""
+        for t in getattr(self, "_threads", []):
+            if t.is_alive():
+                t.join(timeout=timeout)
 
     def as_dict(self) -> Dict[str, Any]:
         """Retourne un dict JSON-sérialisable pour le manifest."""

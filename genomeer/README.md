@@ -18,6 +18,13 @@ For heavier bioinformatics tools, consider increasing the memory quota:
 - **Kraken2**: `GENOMEER_MAX_RAM_GB=32` (Required for standard/large Kraken databases loaded into RAM)
 - **fastp**: `GENOMEER_MAX_RAM_GB=4` (Lightweight, fits comfortably within the default)
 
+### Orchestration & Runtime
+- `GENOMEER_MAX_RUN_SECONDS` : Global timeout for the entire pipeline run. Default is `14400` (4 hours).
+- `RUN_TEMP_DIR` : Base working directory for pipeline artifacts. Defaults to `/tmp/bioagent` or system temp.
+- `GENOMEER_BATCH_CONCURRENCY` : Number of samples to process in parallel in Batch Mode. Default is `4`.
+- `GENOMEER_SKIP_ENV_INSTALL` : If set to `1`, bypasses micromamba environment installations. Useful for CI/CD or Windows environments where tools are mocked.
+- `GENOMEER_RAG_OFFLINE` : If set to `1`, forces BioRAG to use local bundles only without external lookups.
+
 ## Mise à jour des bases de données
 
 Pour garantir des résultats biologiques pertinents (notamment pour la détection de la résistance aux antibiotiques via CARD et l'assignation taxonomique via GTDB/Kraken2), il est impératif de garder les bases de données à jour.

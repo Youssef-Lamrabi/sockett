@@ -151,32 +151,15 @@ _RX_OK_STANDALONE  = re.compile(r"<OK\s*/\s*>|<ok/>|\bOK\b", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
-# Résolveur d'environnement (extrait de BioAgent._META_ENV_SIGNALS)
+# Résolveur d'environnement (Source unique : env_resolver.py)
 # ---------------------------------------------------------------------------
 
-_META_ENV_SIGNALS = {
-    "fastp", "fastqc", "multiqc", "nanostat", "nanoplot",
-    "metaspades.py", "spades.py", "megahit", "flye",
-    "minimap2", "bowtie2", "bwa", "samtools", "bedtools",
-    "kraken2", "bracken", "metaphlan", "gtdbtk",
-    "metabat2", "das_tool", "checkm2", "virsorter2", "checkv", "deepvirfinder",
-    "prokka", "prodigal", "diamond", "hmmsearch", "humann",
-    "amrfinder", "rgi", "virsorter", "dvf.py",
-    # wrappers Python
-    "run_fastp", "run_kraken2", "run_metaspades", "run_megahit", "run_flye",
-    "run_minimap2", "run_bowtie2", "run_metaphlan4", "run_gtdbtk",
-    "run_metabat2", "run_das_tool", "run_checkm2", "run_prokka",
-    "run_prodigal", "run_diamond", "run_hmmer", "run_humann3",
-    "run_amrfinderplus", "run_rgi_card", "run_bracken",
-    "run_virsorter2", "run_checkv", "run_deepvirfinder",
-    "from genomeer.tools.function.metagenomics",
-    "from genomeer.tools.function.viromics",
-}
+from genomeer.runtime.env_resolver import META_ENV_SIGNALS as _META_ENV_SIGNALS
 
 
 def _resolve_env_from_code(code: str) -> str:
     """Déduit l'environnement micromamba depuis le contenu du code."""
-    code_lower = code.lower()
+    code_lower = (code or "").lower()
     for signal in _META_ENV_SIGNALS:
         if signal.lower() in code_lower:
             return "meta-env1"
