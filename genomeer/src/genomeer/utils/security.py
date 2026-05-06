@@ -160,8 +160,8 @@ def _normalize_script(script: str) -> str:
         return ""
     # Retire les backslashes de continuation de ligne (\ followed by newline)
     script = script.replace("\\\n", " ")
-    # Remplace les whitespaces (espaces, tabs, etc.) par un espace simple
-    script = re.sub(r'[ \t\r\n]+', ' ', script)
+    # Normalisation des espaces horizontaux uniquement (on préserve les \n pour les patterns multi-lignes)
+    script = re.sub(r'[ \t\r]+', ' ', script)
     return script.lower().strip()
 
 

@@ -2002,10 +2002,26 @@ class BioAgent:
                     # Inject custom functions into the Python execution environment
                     self._inject_custom_functions_to_repl()  # for _persistent_namespace only
                     code = re.sub(r"^\s*#!PY\s*\r?\n", "", code, count=1)
-                    # T4: Build an isolated step namespace — prevents variable leakage between steps
+                    # TÂCHE 6.1/Flaw 6: Restriction stricte des __builtins__ pour la sandbox Python
+                    # On ne garde que les fonctions sûres (print, len, range, etc.)
+                    # et on bloque open, __import__, eval, exec, breakpoint.
+                    _SAFE_BUILTINS = {
+                        k: v for k, v in __builtins__.__dict__.items()
+                        if k in {
+                            "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+                            "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
+                            "format", "frozenset", "getattr", "hasattr", "hash", "hex", "id",
+                            "int", "isinstance", "issubclass", "iter", "len", "list", "map",
+                            "max", "min", "next", "object", "oct", "ord", "pow", "print",
+                            "property", "range", "repr", "reversed", "round", "set", "setattr",
+                            "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
+                            "None", "True", "False", "Exception", "StopIteration", "dict", "list"
+                        }
+                    }
+                    
                     _manifest_copy = dict(state.get("manifest") or {})
                     _step_namespace = {
-                        "__builtins__": __builtins__,
+                        "__builtins__": _SAFE_BUILTINS,
                         "run_dir": _run_temp_dir,          # always available to generated code
                         "manifest": _manifest_copy,        # allow mock steps to mutate quality_signals
                     }

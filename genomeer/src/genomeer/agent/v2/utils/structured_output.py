@@ -214,9 +214,12 @@ class LLMOutputValidator:
         """
         warnings: List[str] = []
         code = parsed.code
+        
+        # TÂCHE 5.1/Flaw 5: Normalisation whitespace avant validation (horizontal uniquement)
+        normalized_code = re.sub(r'[ \t\r]+', ' ', code).lower()
 
         # 1. Commandes destructives → échec critique
-        if cls._DESTRUCTIVE.search(code):
+        if cls._DESTRUCTIVE.search(normalized_code):
             return False, ["[SECURITY] Code contains potentially destructive commands (rm -rf, dd, etc.)"]
 
         # 2. Env mismatch — outil meta-env1 dans bio-agent-env1

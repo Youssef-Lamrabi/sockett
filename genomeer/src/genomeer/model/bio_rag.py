@@ -540,7 +540,7 @@ class BioRAGStore:
                         metadata={"pathway_id": pid, "name": entry.get("name"), "source_version": version}
                     ))
             else:
-                logger.error(f"[BioRAG] CRITICAL: Static bundle {kegg_path.path} not found. Biological context will be missing.")
+                logger.error(f"[BioRAG] CRITICAL: Static bundle {kegg_path.name} not found. Biological context will be missing.")
                 self.rag_warnings["missing_bundles"].append("kegg")
                         
         return docs

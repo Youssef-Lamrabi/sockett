@@ -118,19 +118,25 @@ def query_ncbi_taxonomy(
     fetch_params = {"db": db, "id": ",".join(ids[:retmax]), "retmode": "xml"}
     xml_text = _get_with_retry(fetch_url, fetch_params)
 
-    # Parse names from XML (lightweight, no lxml required)
-    import re
-    names = re.findall(r"<ScientificName>(.*?)</ScientificName>", xml_text)
-    ranks = re.findall(r"<Rank>(.*?)</Rank>", xml_text)
-    tax_ids = re.findall(r"<TaxId>(\d+)</TaxId>", xml_text)
-
-    results = []
-    for i, tid in enumerate(tax_ids[:retmax]):
-        results.append({
-            "tax_id": tid,
-            "scientific_name": names[i] if i < len(names) else "unknown",
-            "rank": ranks[i] if i < len(ranks) else "unknown",
-        })
+    # Parse names from XML (TÂCHE 10/Flaw 3: Robust ElementTree parsing)
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+        results = []
+        for taxon in root.findall(".//Taxon"):
+            tid_node = taxon.find("TaxId")
+            name_node = taxon.find("ScientificName")
+            rank_node = taxon.find("Rank")
+            
+            results.append({
+                "tax_id": tid_node.text if tid_node is not None else "0",
+                "scientific_name": name_node.text if name_node is not None else "unknown",
+                "rank": rank_node.text if rank_node is not None else "unknown",
+            })
+    except Exception as e:
+        import logging
+        logging.getLogger("genomeer.db").error(f"NCBI Taxonomy XML parsing failed: {e}")
+        return {"query": query, "db": db, "results": [], "error": "XML parse error"}
 
     result = {"query": query, "db": db, "n_found": len(results), "results": results}
     
