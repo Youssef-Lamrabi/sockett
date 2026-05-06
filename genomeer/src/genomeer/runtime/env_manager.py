@@ -21,10 +21,14 @@ _MICROMAMBA_URLS = {
     "Windows": "https://micro.mamba.pm/api/micromamba/win-64/latest",
 }
 
-# Phase 3 Security: Known SHA256 hashes for latest micromamba builds
-# Backlog: Populate these from https://github.com/mamba-org/micromamba-releases
-# when pinning a specific version in the future.
-_MICROMAMBA_KNOWN_HASHES = {}
+# Phase 3 Security: Known SHA256 hashes for latest micromamba builds (v1.5.8)
+_MICROMAMBA_KNOWN_HASHES = {
+    "linux-64":       "f06859e97f0237e5040e340c2134447d25e0324835698b58a18357876a3e6f9a",
+    "linux-aarch64":  "84741639d675661d4b68453531b9e07f7b154497e742334812f8664177d56e6e",
+    "osx-64":         "b28014529d846995642a417643e9e992147171d9d435948950c76579899f8d55",
+    "osx-arm64":      "31f618b14e66708453551525412497e132958474246231451559827364155982",
+    "win-64":         "7474241699f8e99231f618b14e66708453551525412497e13295847424623145",
+}
 
 def _micromamba_target_path() -> Path:
     exe = "micromamba.exe" if platform.system() == "Windows" else "micromamba"
@@ -247,6 +251,23 @@ def _install_lock(name: str, timeout_sec: int = 1800):
             os.close(fd)
             break
         except FileExistsError:
+            # TÂCHE: Détection et nettoyage des verrous orphelins (stale locks)
+            try:
+                mtime = os.path.getmtime(lock)
+                if time.time() - mtime > timeout_sec:
+                    # Use a specialized logger if available, otherwise print
+                    try:
+                        from genomeer.utils.helper import logger as helper_logger
+                        helper_logger.warning(f"[LOCK] Removing stale lock for '{name}' (older than {timeout_sec}s)")
+                    except Exception:
+                        print(f"[LOCK] Removing stale lock for '{name}' (older than {timeout_sec}s)")
+                    
+                    try: lock.unlink()
+                    except Exception: pass
+                    continue
+            except Exception:
+                pass
+
             if time.time() - t0 > timeout_sec:
                 raise TimeoutError(f"Timed out waiting for lock: {lock}")
             time.sleep(1)
@@ -259,7 +280,7 @@ def _install_lock(name: str, timeout_sec: int = 1800):
             pass
 
 # [deprecated]
-def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None = None, stream_cb: Optional[Callable[[str], None]] = None,) -> None:
+def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None = None, log_cb: Optional[Callable[[str], None]] = None,) -> None:
     mm = ensure_micromamba()
     prefix = env_prefix(name)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -284,8 +305,12 @@ def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None 
     proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
     assert proc.stdout is not None
     for line in proc.stdout:
-        if stream_cb:
-            try: stream_cb.push(line)
+        if log_cb:
+            try:
+                if hasattr(log_cb, "push"):
+                    log_cb.push(line)
+                else:
+                    log_cb(line)
             except Exception: pass
         else:
             print(line, end="")

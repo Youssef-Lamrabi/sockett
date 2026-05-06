@@ -153,8 +153,13 @@ class VersionTracker:
 
             t = threading.Thread(target=_async_md5, args=(record, db_path_obj), daemon=True)
             t.start()
-            if not hasattr(self, "_threads"): self._threads = []
-            self._threads.append(t)
+            if not hasattr(self, "_threads"): 
+                self._threads = []
+            if not hasattr(self, "_threads_lock"):
+                self._threads_lock = threading.Lock()
+            
+            with self._threads_lock:
+                self._threads.append(t)
 
         logger.info(f"[VERSION] DB={db_name} tracking started")
 
@@ -196,12 +201,8 @@ class VersionTracker:
         t.start()
 
     def _md5_file(self, path: Path) -> str:
-        import hashlib
-        hasher = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
+        # TÂCHE: Utiliser le helper statique partagé pour éviter la duplication
+        return self._md5_file_static(path)
 
     def auto_record_from_step(
         self,
@@ -256,7 +257,14 @@ class VersionTracker:
 
     def wait_for_completion(self, timeout: float = 30.0):
         """Attend la fin des threads de checksum."""
-        for t in getattr(self, "_threads", []):
+        threads = []
+        if hasattr(self, "_threads_lock"):
+            with self._threads_lock:
+                threads = list(self._threads)
+        else:
+            threads = getattr(self, "_threads", [])
+
+        for t in threads:
             if t.is_alive():
                 t.join(timeout=timeout)
 
@@ -288,10 +296,12 @@ class VersionTracker:
     def _get_tool_version(tool_name: str, env_name: str) -> str:
         """Exécute <tool> --version dans l'environnement micromamba."""
         try:
-            from genomeer.runtime.env_manager import ENVS_DIR
-            mm_bin = "micromamba"
+            from genomeer.runtime.env_manager import ensure_micromamba, env_prefix
+            mm_bin = str(ensure_micromamba())
+            prefix = str(env_prefix(env_name))
+            
             result = subprocess.run(
-                [mm_bin, "run", "-n", env_name, tool_name, "--version"],
+                [mm_bin, "run", "-p", prefix, tool_name, "--version"],
                 capture_output=True, text=True, timeout=15,
             )
             output = (result.stdout + result.stderr).strip()
@@ -302,8 +312,9 @@ class VersionTracker:
             return "unknown"
 
     @staticmethod
-    def _md5_file(path: Path, chunk_size: int = 8192) -> str:
+    def _md5_file_static(path: Path, chunk_size: int = 8192) -> str:
         """Calcule le MD5 d'un fichier par chunks."""
+        import hashlib
         h = hashlib.md5()
         try:
             with open(path, "rb") as f:

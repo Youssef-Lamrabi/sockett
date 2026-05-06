@@ -42,6 +42,7 @@ DÉPENDANCES:
 """
 
 from __future__ import annotations
+import threading
 
 import hashlib
 import json
@@ -469,6 +470,7 @@ class BioRAGStore:
         self._index = None          # FAISS index
         self._embedder = None
         self._ready = False
+        self._lock = threading.Lock()
         
         # TÂCHE 7.2: Infos de péremption des bundles
         self.rag_warnings = {
@@ -630,7 +632,8 @@ class BioRAGStore:
 
         # Persister
         try:
-            self._save_to_cache(index_path, docs_path)
+            with self._lock:
+                self._save_to_cache(index_path, docs_path)
         except Exception as e:
             logger.warning(f"[BioRAG] Cache save failed: {e}")
 
@@ -687,10 +690,17 @@ class BioRAGStore:
     def _save_to_cache(self, index_path: Path, docs_path: Path):
         import faiss
         import json
-        faiss.write_index(self._index, str(index_path))
+        # Index FAISS
+        tmp_index = index_path.with_suffix(".tmp_faiss")
+        faiss.write_index(self._index, str(tmp_index))
+        os.replace(tmp_index, index_path)
+
+        # Docs JSON
         data = [asdict(d) for d in self._documents]
-        with open(docs_path, "w", encoding="utf-8") as f:
+        tmp_docs = docs_path.with_suffix(".tmp_json")
+        with open(tmp_docs, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp_docs, docs_path)
 
     def _load_from_cache(self, index_path: Path, docs_path: Path, old_docs_path: Optional[Path] = None):
         import faiss

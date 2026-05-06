@@ -380,10 +380,10 @@ class AgentBehaviorEval:
             else:
                 # Détecter via les signaux d'env
                 if expected_env == "meta-env1":
-                    meta_signals = ["meta-env1", "micromamba run -n meta", "metaspades", "kraken2", "fastp"]
+                    meta_signals = ["meta-env1", "micromamba run -n meta", "metaspades", "kraken2", "fastp", "megahit", "flye", "metabat2", "checkm2"]
                     found = any(s in code_lower for s in meta_signals)
                 else:
-                    bio_signals = ["bio-agent-env1", "import pandas", "import matplotlib", "import numpy"]
+                    bio_signals = ["bio-agent-env1", "import pandas", "import matplotlib", "import numpy", "import requests", "import Bio"]
                     found = any(s in code_lower for s in bio_signals)
                 scores.append(0.7 if found else 0.3)
                 if not found:
@@ -781,25 +781,72 @@ class EndToEndBenchmark:
         t.start()
         t.join(timeout=timeout_hours * 3600)
 
-        if t.is_alive():
+        # 1. Préparer les données (téléchargement si nécessaire)
+        # T7.1: Check for download flags
+        if os.environ.get("GENOMEER_SKIP_ENV_INSTALL") == "1":
             report.add(EvalResult(
-                name="pipeline_timeout",
-                status=EvalStatus.FAIL,
-                score=0.0,
-                message=f"Pipeline timed out after {timeout_hours}h",
+                name="dataset_download",
+                status=EvalStatus.SKIP,
+                score=1.0,
+                message="Skipped download (GENOMEER_SKIP_ENV_INSTALL=1)",
             ))
+            # Fallback to dummy path or local path if dataset name is already a path
+            data_path = dataset if os.path.exists(dataset) else None
+        else:
+            data_path = self._check_or_download(accession, report)
+        
+        if not data_path and os.environ.get("GENOMEER_SKIP_ENV_INSTALL") != "1":
             report.finalize()
             return report
 
-        if results_container["error"]:
+        # 2. Lancer le BioAgent sur le prompt
+        full_prompt = pipeline_prompt or (
+            f"Run a complete metagenomics pipeline on the reads at {data_path}. "
+            f"Include: QC (fastp), assembly (MEGAHIT for speed), "
+            f"taxonomy classification (Kraken2 + Bracken), "
+            f"binning (MetaBAT2 + CheckM2). "
+            f"Save all results to {self.output_dir / dataset}."
+        )
+        
+        self.agent._log("BENCHMARK", body=f"Starting E2E run for {dataset}", node="benchmark")
+        
+        try:
+            # Mode prod pour éviter la pollution des logs HumanMessage
+            # Utilise thread_id unique pour cette évaluation
+            thread_id = f"eval_{dataset}_{int(time.time())}"
+            # On utilise go() qui est synchrone et attend la fin
+            log, final_state = self.agent.go(
+                full_prompt, 
+                mode="prod", 
+                session_id=thread_id
+            )
+        except Exception as e:
             report.add(EvalResult(
                 name="pipeline_execution",
                 status=EvalStatus.FAIL,
                 score=0.0,
-                message=f"Pipeline failed: {results_container['error']}",
+                message=f"Agent crash: {type(e).__name__}: {e}",
+                details={"traceback": traceback.format_exc()},
             ))
             report.finalize()
             return report
+
+        # 3. Vérifier le succès du plan
+        if final_state.get("next_step") != "end":
+            # Le pipeline n'est pas arrivé au bout
+            report.add(EvalResult(
+                name="pipeline_completion",
+                status=EvalStatus.FAIL,
+                score=0.2,
+                message=f"Agent stopped at node: {final_state.get('next_step')}",
+            ))
+        else:
+            report.add(EvalResult(
+                name="pipeline_completion",
+                status=EvalStatus.PASS,
+                score=1.0,
+                message="Agent reached 'end' node successfully",
+            ))
 
         report.add(EvalResult(
             name="pipeline_execution",

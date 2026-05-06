@@ -38,9 +38,8 @@ _SERIALIZABLE_FIELDS = {
     "last_prompt", "last_result", "run_temp_dir",
     "retry_counts", "batch_strategy", "run_started_at",
     "next_step", "diagnostic_mode", "session_id",
-    "run_id",
+    "run_id", "messages",
     # FIX A6: env_name and env_ready must be restored on checkpoint resume,
-    # otherwise the agent restarts with the wrong default env (bio-agent-env1).
     "env_name", "env_ready",
 }
 
@@ -86,7 +85,7 @@ class CheckpointManager:
             tmp_path = self.checkpoint_path.with_suffix(".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(serializable, f, indent=2, default=str)
-            tmp_path.rename(self.checkpoint_path)
+            os.replace(tmp_path, self.checkpoint_path)
 
             logger.info(
                 f"[CHECKPOINT] Saved after step {current_idx} → {self.checkpoint_path}"
@@ -199,6 +198,14 @@ class CheckpointManager:
                     }
                     for step in val
                 ]
+            elif field == "messages" and isinstance(val, list):
+                # LangChain messages: convert to dict using .dict() if available, else str
+                serializable[field] = []
+                for m in val:
+                    if hasattr(m, "dict"):
+                        serializable[field].append(m.dict())
+                    else:
+                        serializable[field].append(str(m))
             elif isinstance(val, (str, int, float, bool, list, dict, type(None))):
                 serializable[field] = val
         return serializable

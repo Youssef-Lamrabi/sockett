@@ -241,18 +241,8 @@ if __name__ == "__main__":
 # Determines correct micromamba env for a generated code block.
 # Priority: env_hint > meta-env1 tool scan > R lang > keep current_env
 # ---------------------------------------------------------------------------
-META_ENV_SIGNALS = {
-    # CLI binaries
-    "fastp", "fastqc", "multiqc", "nanostat", "nanoplot", "trim-galore",
-    "metaspades.py", "megahit", "flye",
-    "racon", "medaka_consensus", "unicycler",         # long-read polishing / hybrid
-    "minimap2", "bowtie2", "bwa", "bwa-mem2", "samtools", "bedtools",
-    "kraken2", "bracken", "metaphlan", "gtdbtk", "krona",
-    "metabat2", "das_tool", "checkm2", "virsorter2", "checkv", "deepvirfinder",
-    "prokka", "prodigal", "diamond", "hmmsearch", "hmmscan",
-    "humann", "amrfinder", "rgi", "virsorter", "dvf.py",
-    "prefetch", "fasterq-dump", "seqtk", "pigz",
-    # Python wrapper names
+# Meta-env signals (used for code-to-env routing)
+_WRAPPERS_SIGNALS = {
     "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
     "run_metaspades", "run_megahit", "run_flye", "run_minimap2",
     "run_bowtie2", "run_bwa_mem", "run_metabat2", "run_das_tool",
@@ -261,10 +251,26 @@ META_ENV_SIGNALS = {
     "run_bracken", "run_gtdbtk", "run_krona", "run_nanostat",
     "run_multiqc", "compute_coverage_samtools",
     "run_virsorter2", "run_checkv", "run_deepvirfinder",
-    "run_medaka", "run_racon",                        # long-read polishing wrappers
+    "run_medaka", "run_racon",
     "from genomeer.tools.function.metagenomics",
     "from genomeer.tools.function.viromics",
 }
+
+def get_meta_env_signals() -> set[str]:
+    """Dynamically merges hardcoded wrappers with registry binaries for meta-env1."""
+    signals = set(_WRAPPERS_SIGNALS)
+    try:
+        envs = _load_registry(REGISTRY_PATH)
+        for e in envs:
+            if e.name == "meta-env1":
+                signals.update(e._bins_norm)
+                break
+    except Exception:
+        pass
+    return signals
+
+# For backward compatibility with imports
+META_ENV_SIGNALS = _WRAPPERS_SIGNALS
 
 
 def resolve_env_for_code(
@@ -286,11 +292,12 @@ def resolve_env_for_code(
     if env_hint:
         return env_hint
 
-    # 2. Scan code for metagenomics tool usage
+    # 2. Scan code for metagenomics tool usage (dynamic registry check)
     if code:
         code_lower = code.lower()
-        for tool in META_ENV_SIGNALS:
-            if tool in code_lower:
+        signals = get_meta_env_signals()
+        for tool in signals:
+            if re.search(rf"\b{re.escape(tool.lower())}\b", code_lower):
                 return "meta-env1"
 
     # 3. R code always runs in bio-agent-env1 (has Rscript + R packages)

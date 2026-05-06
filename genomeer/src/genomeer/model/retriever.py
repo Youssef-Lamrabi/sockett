@@ -54,16 +54,16 @@ def _lazy_init_embedder() -> None:
     if _EMBED_BACKEND is not None:
         return  # already initialised
 
-    # Option A: sentence-transformers (local)
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
-        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        # P3-B.3: Handle download failures/timeouts
+        _embed_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         _EMBED_BACKEND = "sentence_transformers"
         return
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[ToolRetriever] Failed to load local embedder ({e}). Falling back to OpenAI if available.")
         pass
 
-    # Option B: OpenAI embeddings via langchain-openai
     try:
         from langchain_openai import OpenAIEmbeddings  # type: ignore
         _embed_model = OpenAIEmbeddings(model="text-embedding-3-small")
@@ -117,6 +117,7 @@ class ToolRetriever:
         self._items: List[Tuple[str, str, int]] = []  # (category, name, orig_idx)
         self._raw_resources: Dict[str, List] = {}     # original resource lists
         self._faiss_available = _FAISS_OK and _NUMPY_OK
+        self._index_fingerprint: Optional[str] = None
 
     # ── Public: build index (call once at agent startup) ─────────────────────
 
@@ -125,18 +126,19 @@ class ToolRetriever:
         tools: List[Any],
         data_lake: Optional[List[Any]] = None,
         libraries: Optional[List[Any]] = None,
+        force: bool = False
     ) -> None:
         """
         Vectorise all resources and build a FAISS inner-product index.
-
-        Parameters
-        ----------
-        tools      : list of tool dicts with 'name' and 'description'
-        data_lake  : list of data lake items (strings or dicts)
-        libraries  : list of library items (strings or dicts)
+        P3-B.2: Added simple fingerprinting to avoid expensive rebuilds.
         """
         data_lake = data_lake or []
         libraries = libraries or []
+        
+        # Simple fingerprint: count + first item + last item hash
+        fingerprint = f"{len(tools)}_{len(data_lake)}_{len(libraries)}_{hash(str(tools[0]) if tools else 0)}_{hash(str(libraries[-1]) if libraries else 0)}"
+        if not force and self._index_fingerprint == fingerprint:
+            return
 
         self._raw_resources = {
             "tools": list(tools),
@@ -176,6 +178,7 @@ class ToolRetriever:
             index.add(embeddings)               # type: ignore[arg-type]
             self._index = index
             self._items = meta
+            self._index_fingerprint = fingerprint
         except Exception as e:
             warnings.warn(f"[ToolRetriever.build_index] Failed to build FAISS index: {e}", stacklevel=2)
             self._index = None
@@ -314,10 +317,22 @@ class ToolRetriever:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _item_to_text(self, item: Any) -> str:
+        if isinstance(item, str):
+            return item
         if isinstance(item, dict):
-            name = item.get("name", "")
-            desc = item.get("description", "")
-            return f"{name}: {desc}".strip()
+            name = item.get("name") or item.get("title") or ""
+            desc = item.get("description") or item.get("summary") or ""
+            return f"{name}: {desc}"
+        
+        # P3-B.4: Handle objects with attributes (BioAgent tools)
+        try:
+            name = getattr(item, "name", "") or getattr(item, "title", "")
+            desc = getattr(item, "description", "") or getattr(item, "summary", "")
+            if name or desc:
+                return f"{name}: {desc}"
+        except Exception:
+            pass
+            
         return str(item)
 
     def _format_resources_for_prompt(self, resources: list) -> str:

@@ -67,6 +67,22 @@ def _get_with_retry(url: str, params: Optional[Dict] = None, timeout: int = 60) 
             time.sleep(delays[attempt])
 
 
+def _download_file(url: str, dest: str, timeout: int = 3600) -> bool:
+    """Download a file via urllib with basic verification."""
+    import urllib.request
+    import shutil
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response, open(dest, "wb") as out_file:
+            shutil.copyfileobj(response, out_file)
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger("genomeer.db").error(f"Download failed for {url}: {e}")
+        if os.path.exists(dest):
+            os.remove(dest)
+        return False
+
+
 def _ensure_dir(path: str | Path) -> Path:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
@@ -229,10 +245,9 @@ def download_silva_database(
     for url, fname in [(fasta_url, fasta_file), (tax_url, tax_file)]:
         dest = str(out / fname)
         if not Path(dest).exists():
-            cmd = ["wget", "-q", "-O", dest, url]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            if proc.returncode != 0:
-                results["files"][fname] = f"FAILED: {proc.stderr[:200]}"
+            success = _download_file(url, dest)
+            if not success:
+                results["files"][fname] = f"FAILED: Download error"
             else:
                 results["files"][fname] = dest
         else:
@@ -330,12 +345,9 @@ def download_card_database(output_dir: str) -> Dict[str, Any]:
     card_url = "https://card.mcmaster.ca/latest/data"
     card_tar = str(out / "card_data.tar.bz2")
 
-    proc = subprocess.run(
-        ["wget", "-q", "-O", card_tar, card_url],
-        capture_output=True, text=True, timeout=600
-    )
-    if proc.returncode != 0:
-        return {"status": "failed", "error": proc.stderr[:500]}
+    success = _download_file(card_url, card_tar)
+    if not success:
+        return {"status": "failed", "error": "Download error"}
 
     subprocess.run(["tar", "-xjf", card_tar, "-C", str(out)], check=True)
     card_json = str(out / "card.json")

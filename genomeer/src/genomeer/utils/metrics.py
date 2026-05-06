@@ -77,15 +77,13 @@ class RunMetrics:
     _step_starts: Dict[str, float] = field(default_factory=dict)
     _lock_obj: Any = field(default=None, init=False, repr=False)
 
-    def _get_lock(self):
+    def __post_init__(self):
         import threading
-        if self._lock_obj is None:
-            self._lock_obj = threading.RLock()
-        return self._lock_obj
+        self._lock_obj = threading.RLock()
 
     def record_step_start(self, step_idx: int, step_title: str) -> None:
         import time
-        with self._get_lock():
+        with self._lock_obj:
             key = f"{step_idx}:{step_title}"
             self._step_starts[key] = time.time()
             existing = next((s for s in self.steps if s.step_idx == step_idx), None)
@@ -112,7 +110,7 @@ class RunMetrics:
     ) -> None:
         import time
         now = time.time()
-        with self._get_lock():
+        with self._lock_obj:
             key = f"{step_idx}:{step_title}"
             started = self._step_starts.get(key, now)
     

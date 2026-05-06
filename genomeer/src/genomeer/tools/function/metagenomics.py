@@ -48,7 +48,7 @@ def _env_prefix(env_name: str) -> Path:
     return ENVS_DIR / env_name
 
 
-def _run(argv: List[str], env_name: str = _META_ENV, timeout: int = 7200,
+def _run(argv: List[str], env_name: str = _META_ENV, timeout: int = 21600,
          extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
     """Run argv inside micromamba env and return CompletedProcess."""
     mm = _micromamba_bin()

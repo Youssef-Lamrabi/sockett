@@ -365,12 +365,13 @@ class ToolOutputCache:
         if _CACHE_DISABLED:
             return None
         try:
-            conn = _open_sqlite_conn(self._meta_db)
-            row = conn.execute(
-                "SELECT result_json, output_dir, created, tool_name FROM tool_cache WHERE key=?",
-                (key,)
-            ).fetchone()
-            conn.close()
+            with self._lock:
+                conn = _open_sqlite_conn(self._meta_db)
+                row = conn.execute(
+                    "SELECT result_json, output_dir, created, tool_name FROM tool_cache WHERE key=?",
+                    (key,)
+                ).fetchone()
+                conn.close()
 
             if row is None:
                 return None
@@ -623,11 +624,12 @@ class APIResponseCache:
             return None
         key = self.make_key(url, params)
         try:
-            conn = _open_sqlite_conn(self.db_path)
-            row = conn.execute(
-                "SELECT value, created FROM api_cache WHERE key=?", (key,)
-            ).fetchone()
-            conn.close()
+            with self._lock:
+                conn = _open_sqlite_conn(self.db_path)
+                row = conn.execute(
+                    "SELECT value, created FROM api_cache WHERE key=?", (key,)
+                ).fetchone()
+                conn.close()
             if row is None:
                 return None
             value_bytes, created = row
@@ -680,11 +682,12 @@ class APIResponseCache:
 
                 if not _CACHE_DISABLED:
                     try:
-                        conn = _open_sqlite_conn(self.db_path)
-                        row = conn.execute(
-                            "SELECT value, created FROM api_cache WHERE key=?", (key,)
-                        ).fetchone()
-                        conn.close()
+                        with self._lock:
+                            conn = _open_sqlite_conn(self.db_path)
+                            row = conn.execute(
+                                "SELECT value, created FROM api_cache WHERE key=?", (key,)
+                            ).fetchone()
+                            conn.close()
                         if row:
                             value_bytes, created = row
                             effective_ttl = ttl_seconds or self.default_ttl

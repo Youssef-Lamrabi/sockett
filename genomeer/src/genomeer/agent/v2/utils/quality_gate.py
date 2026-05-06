@@ -356,6 +356,7 @@ def check_quality(
     """
     gate = BIOLOGICAL_GATES.get(tool_name)
     if gate is None:
+        logger.debug(f"No biological gate defined for tool: {tool_name}")
         return ("ok", "")
 
     # --- FIX 7: Strict check for missing metrics ---
@@ -402,15 +403,11 @@ def check_quality(
     warn_below = gate.get("warn_below", warn_thresh)
     fail_below = gate.get("fail_below", fail_thresh)
 
-    # If the value is > 1.0 and we are dealing with a rate/percentage (threshold <= 1.0),
-    # it's likely a percentage (e.g. 85.3) instead of a decimal (0.853).
+    # Improved normalization: If value > 1.0 but thresholds are <= 1.0, it's a percentage (85.3 -> 0.853)
+    # If thresholds are > 1.0 (e.g. 20.0), it's a raw percentage scale (0-100) — leave it.
     if value is not None and value > 1.0:
-        # Check if thresholds suggest a decimal scale (0-1)
-        is_decimal_scale = (
-            (warn_below is not None and warn_below <= 1.0) or
-            (fail_below is not None and fail_below <= 1.0)
-        )
-        if is_decimal_scale:
+        thresholds = [t for t in (warn_below, fail_below) if t is not None]
+        if thresholds and all(t <= 1.0 for t in thresholds):
             value /= 100.0
 
     # ── If we couldn't extract a number, log a warning and return warn ────────

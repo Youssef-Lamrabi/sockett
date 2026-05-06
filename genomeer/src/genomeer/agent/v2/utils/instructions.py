@@ -392,7 +392,7 @@ AVAILABLE_FILES_BY_STEP (file_registry):
 
 IMPORTANT:
 - Any script that downloads data or saves output must use this folder: {run_temp_dir}
-- MANDATORY [T2.4]: All generated Python scripts must start with: `import os; run_dir = os.environ.get("RUN_TEMP_DIR", "/tmp/bioagent")` and all generated Bash scripts must start with: `RUN_TEMP_DIR="${{RUN_TEMP_DIR:-/tmp/bioagent}}"`
+- MANDATORY [T2.4]: All generated Python scripts must start with: `import os, tempfile; run_dir = os.environ.get("RUN_TEMP_DIR", os.path.join(tempfile.gettempdir(), "bioagent"))` and all generated Bash scripts must start with: `RUN_TEMP_DIR="${{RUN_TEMP_DIR:-${{TMPDIR:-${{TEMP:-/tmp}}}}/bioagent}}"`
 - Each code you generate should focus only on CURRENT_STEP goal. Not less. Not more.
 - If this step involves metagenomics CLI tools (fastp, kraken2, metaspades, etc.),
   the code runs in meta-env1. Use #!BASH for CLI pipelines.

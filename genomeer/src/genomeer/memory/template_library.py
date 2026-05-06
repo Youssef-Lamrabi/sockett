@@ -24,6 +24,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,7 @@ class TemplateLibrary:
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         self._templates: List[Dict[str, Any]] = self._load()
         self._embedder = None   # lazy-loaded
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     def save(
@@ -79,32 +81,35 @@ class TemplateLibrary:
         }
         template["quality_score"] = self._compute_quality_score(template)
         
-        self._templates.append(template)
-        # Keep top 100 templates based on combined quality and recency score
-        if len(self._templates) > 100:
-            now = datetime.now()
-            scored_templates = []
-            for t in self._templates:
-                q_score = t.get("quality_score", 0.5)
-                try:
-                    run_date = datetime.fromisoformat(t.get("run_date", now.isoformat()))
-                    days_ago = max(0, (now - run_date).days)
-                    r_score = 1.0 / (1.0 + days_ago)
-                except Exception:
-                    r_score = 0.0
+        with self._lock:
+            self._templates.append(template)
+            # Keep top 100 templates based on combined quality and recency score
+            if len(self._templates) > 100:
+                now = datetime.now()
+                scored_templates = []
+                for t in self._templates:
+                    q_score = t.get("quality_score", 0.5)
+                    try:
+                        run_date = datetime.fromisoformat(t.get("run_date", now.isoformat()))
+                        days_ago = max(0, (now - run_date).days)
+                        r_score = 1.0 / (1.0 + days_ago)
+                    except Exception:
+                        r_score = 0.0
+                    
+                    combined = (q_score * 0.7) + (r_score * 0.3)
+                    scored_templates.append((combined, t))
                 
-                combined = (q_score * 0.7) + (r_score * 0.3)
-                scored_templates.append((combined, t))
+                scored_templates.sort(key=lambda x: -x[0])
+                self._templates = [t for _, t in scored_templates[:100]]
             
-            scored_templates.sort(key=lambda x: -x[0])
-            self._templates = [t for _, t in scored_templates[:100]]
-            
-        self._save()
+            self._save()
 
     def get_similar(self, query: str, n: int = 3, embed_fn: Optional[Any] = None) -> List[Dict[str, Any]]:
         """Return the n most similar templates to the query."""
-        if not self._templates:
-            return []
+        with self._lock:
+            if not self._templates:
+                return []
+            templates_copy = list(self._templates)
 
         # Extract sequence type from query
         q_seq_type = "unknown"
@@ -118,17 +123,17 @@ class TemplateLibrary:
         # Try embedding-based retrieval
         try:
             if embed_fn is not None:
-                results = self._embedding_retrieval(query, len(self._templates), embed_fn=embed_fn)
+                results = self._embedding_retrieval(query, len(templates_copy), embed_fn=embed_fn, templates=templates_copy)
             else:
                 embedder = self._get_embedder()
                 if embedder is not None:
-                    results = self._embedding_retrieval(query, len(self._templates), embedder=embedder)
+                    results = self._embedding_retrieval(query, len(templates_copy), embedder=embedder, templates=templates_copy)
         except Exception:
             pass
 
         # Fallback: keyword overlap
         if not results:
-            results = self._keyword_retrieval(query, len(self._templates))
+            results = self._keyword_retrieval(query, len(templates_copy), templates=templates_copy)
             
         # Re-rank based on combined similarity, quality, and sequencer type mismatch penalty
         scored = []
@@ -171,22 +176,24 @@ class TemplateLibrary:
 
     def stats(self) -> dict:
         """P3-B.4: Provide stats including average quality score and >0.7 threshold counts."""
-        if not self._templates:
-            return {"count": 0}
+        with self._lock:
+            if not self._templates:
+                return {"count": 0}
+            templates_copy = list(self._templates)
             
-        scores = [t.get("quality_score", 0.5) for t in self._templates]
+        scores = [t.get("quality_score", 0.5) for t in templates_copy]
         avg_score = sum(scores) / len(scores)
-        best_template = max(self._templates, key=lambda t: t.get("quality_score", 0.5))
+        best_template = max(templates_copy, key=lambda t: t.get("quality_score", 0.5))
         
         seq_types = {}
-        for t in self._templates:
+        for t in templates_copy:
             st = t.get("sequencer_type", "unknown")
             seq_types[st] = seq_types.get(st, 0) + 1
             
         high_quality = sum(1 for s in scores if s > 0.7)
         
         return {
-            "count": len(self._templates),
+            "count": len(templates_copy),
             "average_quality_score": round(avg_score, 3),
             "best_template_id": best_template.get("id"),
             "best_template_score": round(best_template.get("quality_score", 0.5), 3),
@@ -229,26 +236,44 @@ class TemplateLibrary:
                 self._embedder = False   # not available
         return self._embedder if self._embedder else None
 
-    def _embedding_retrieval(self, query: str, n: int, embedder=None, embed_fn=None) -> List[Dict[str, Any]]:
+    def _embedding_retrieval(self, query: str, n: int, embedder=None, embed_fn=None, templates: Optional[List] = None) -> List[Dict[str, Any]]:
         import numpy as np
+        tpls = templates if templates is not None else self._templates
         
-        summaries = [t["task_summary"] for t in self._templates]
+        # P3-B.2: Use cached embeddings if available, otherwise compute and cache
+        texts_to_embed = []
+        for t in tpls:
+            if "embedding" not in t:
+                texts_to_embed.append(t["task_summary"])
         
-        if embed_fn is not None:
-            q_emb = embed_fn([query])[0]
-            t_embs = embed_fn(summaries)
-        else:
-            q_emb = embedder.encode(query, normalize_embeddings=True)
-            t_embs = embedder.encode(summaries, normalize_embeddings=True, batch_size=64)
+        if texts_to_embed:
+            if embed_fn is not None:
+                new_embs = embed_fn(texts_to_embed)
+            else:
+                new_embs = embedder.encode(texts_to_embed, normalize_embeddings=True, batch_size=64)
             
+            # Map back
+            it = iter(new_embs)
+            for t in tpls:
+                if "embedding" not in t:
+                    t["embedding"] = next(it).tolist()
+            
+            # Persist if we added new embeddings
+            self._save()
+
+        # Compute scores
+        q_emb = embed_fn([query])[0] if embed_fn else embedder.encode(query, normalize_embeddings=True)
+        t_embs = np.array([t["embedding"] for t in tpls])
+        
         scores = t_embs @ q_emb
         top_idx = np.argsort(scores)[::-1][:n]
-        return [self._templates[i] for i in top_idx]
+        return [tpls[i] for i in top_idx]
 
-    def _keyword_retrieval(self, query: str, n: int) -> List[Dict[str, Any]]:
+    def _keyword_retrieval(self, query: str, n: int, templates: Optional[List] = None) -> List[Dict[str, Any]]:
         query_words = set(query.lower().split())
         scored = []
-        for tpl in self._templates:
+        tpls = templates if templates is not None else self._templates
+        for tpl in tpls:
             text = (tpl["task_summary"] + " " + " ".join(tpl["tools_used"])).lower()
             overlap = sum(1 for w in query_words if w in text)
             scored.append((overlap, tpl))

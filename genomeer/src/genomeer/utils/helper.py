@@ -16,9 +16,16 @@ from genomeer.runtime.env_manager import (
 
 logger = logging.getLogger("genomeer.helper")
 
-# Persistent namespace used ONLY for custom function injection via _inject_custom_functions_to_repl().
-# Do NOT use this for per-step code execution — use isolated step namespaces instead (T4).
-_persistent_namespace = {}
+# Thread-local storage for custom function injection to ensure isolation between concurrent requests.
+_thread_local = threading.local()
+
+def _get_persistent_namespace():
+    if not hasattr(_thread_local, "namespace"):
+        _thread_local.namespace = {}
+    return _thread_local.namespace
+
+def clear_persistent_namespace():
+    _thread_local.namespace = {}
 class api_schema(BaseModel):
     """api schema specification."""
     api_schema: str | None = Field(description="The api schema as a dictionary")
@@ -226,9 +233,10 @@ def _run_in_env(
                     outs, errs = proc.communicate(input=input_text, timeout=0.5)
                     stdout_buf.append(outs or "")
                     stderr_buf.append(errs or "")
-                    input_text = None  # consumed
                     break
                 except subprocess.TimeoutExpired:
+                    # T8.2 FIX: Don't set input_text = None here yet, 
+                    # as communicate might not have sent everything.
                     pass
             stdout = "".join(stdout_buf)
             stderr = "".join(stderr_buf)
@@ -633,10 +641,10 @@ def run_python_code(
             if k in {
                 "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
                 "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
-                "format", "frozenset", "getattr", "hasattr", "hash", "hex", "id",
+                "format", "frozenset", "hash", "hex", "id",
                 "int", "isinstance", "issubclass", "iter", "len", "list", "map",
                 "max", "min", "next", "object", "oct", "ord", "pow", "print",
-                "property", "range", "repr", "reversed", "round", "set", "setattr",
+                "property", "range", "repr", "reversed", "round", "set",
                 "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
                 "None", "True", "False", "Exception", "StopIteration", "dict", "list"
             }
@@ -644,6 +652,14 @@ def run_python_code(
         exec_namespace = step_namespace if step_namespace is not None else {
             "__builtins__": _SAFE_BUILTINS,
         }
+        
+        # Merge thread-local persistent namespace if using step-based isolation
+        if step_namespace is not None:
+             pns = _get_persistent_namespace()
+             for k, v in pns.items():
+                 if k not in exec_namespace:
+                     exec_namespace[k] = v
+
         # Inject RUN_TEMP_DIR into the in-process namespace as well
         if run_temp_dir and "run_dir" not in exec_namespace:
             exec_namespace["run_dir"] = run_temp_dir
@@ -663,6 +679,13 @@ def run_python_code(
                     f"\n--- STDOUT (so far) ---\n{_tail(out)}"
                     f"\n--- STDERR (so far) ---\n{_tail(err)}"
                 ).strip()
+
+        # Update the persistent namespace with any new functions defined in this step
+        if step_namespace is not None:
+             pns = _get_persistent_namespace()
+             for k, v in exec_namespace.items():
+                 if k != "__builtins__" and callable(v):
+                     pns[k] = v
 
         out = stdout_buf.getvalue()
         err = stderr_buf.getvalue()

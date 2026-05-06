@@ -331,7 +331,8 @@ class BioAgent:
         self._install_iters = {}
         self.log_registry = REGISTRY
         self._install_threads = {}
-        self._install_threads_lock = threading.Lock()  # FIX B2: protect dict from race in batch mode
+        self._install_threads_lock = threading.Lock()
+        self._install_iters_lock = threading.Lock()    # LOCK for self._install_iters
         
         # Interaction mode
         self.interaction_mode = interaction_mode
@@ -1267,6 +1268,7 @@ class BioAgent:
 
             session_id = state.get("session_id") or state.get("run_id") or "unknown"
             progress_file = os.path.join(state.get("run_temp_dir", ""), f".batch_progress_{session_id}.json")
+            progress_lock = threading.Lock()
             
             if os.path.exists(progress_file):
                 with open(progress_file) as f:
@@ -1279,8 +1281,11 @@ class BioAgent:
 
             def _save_batch_progress(results: dict, run_temp_dir: str, sid: str) -> None:
                 try:
-                    with open(progress_file, "w") as f:
+                    # Atomic write (temp + replace)
+                    tmp_file = progress_file + ".tmp"
+                    with open(tmp_file, "w") as f:
                         json.dump(results, f, default=str)
+                    os.replace(tmp_file, progress_file)
                 except Exception:
                     pass
 
@@ -1330,7 +1335,8 @@ class BioAgent:
                     local_state["manifest"].pop("observations", None)
                     
                     local_state["plan"] = copy.deepcopy(plan)
-                    local_state["messages"] = []  # Point Faible 1: prevent data race on messages list
+                    # FIX: Preserve messages to maintain context in batch mode
+                    local_state["messages"] = list(state.get("messages", []))
                     import time as _time
                     local_state["run_started_at"] = _time.time()  # Point Faible 4: reset global timeout timer
                     local_state["current_idx"] = idx
@@ -1428,14 +1434,14 @@ class BioAgent:
                         sample_id, res = future.result()
                         with results_lock:
                             per_sample[sample_id] = res
+                            # FIX: Use a dedicated lock for file IO in addition to memory dict lock
+                            with progress_lock:
+                                _save_batch_progress(
+                                    per_sample,
+                                    state.get("run_temp_dir", "/tmp"),
+                                    session_id
+                                )
                         self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
-                        
-                        with results_lock:
-                            _save_batch_progress(
-                                per_sample,
-                                state.get("run_temp_dir", "/tmp"),
-                                session_id
-                            )
                     except Exception as e:
                         self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}", node=node)
                         
@@ -1961,7 +1967,8 @@ class BioAgent:
                         "manifest": _manifest_copy,        # allow mock steps to mutate quality_signals
                     }
                     # Copy custom functions from _persistent_namespace if present (T4 preserves custom tools)
-                    from genomeer.utils.helper import _persistent_namespace as _pns
+                    from genomeer.utils.helper import _get_persistent_namespace as _gpns
+                    _pns = _gpns()
                     for _k, _v in _pns.items():
                         if callable(_v):
                             _step_namespace[_k] = _v
@@ -2846,11 +2853,12 @@ class BioAgent:
         """
         if hasattr(self, "_custom_functions") and self._custom_functions:
             # Access the persistent namespace used by run_python_repl
-            from genomeer.utils.helper import _persistent_namespace
+            from genomeer.utils.helper import _get_persistent_namespace
+            _pns = _get_persistent_namespace()
 
             # Inject all custom functions into the execution namespace
             for name, func in self._custom_functions.items():
-                _persistent_namespace[name] = func
+                _pns[name] = func
 
             # Also make them available in builtins for broader access
             import builtins
@@ -3288,8 +3296,8 @@ class BioAgent:
         staged = self._stage_attachments(tmp, attachments or [])
         
         # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
-        from genomeer.utils.helper import _persistent_namespace
-        _persistent_namespace.clear()
+        from genomeer.utils.helper import clear_persistent_namespace
+        clear_persistent_namespace()
         
         from genomeer.utils.checkpoint import CheckpointManager
         from genomeer.utils.metrics import RunMetrics
@@ -3299,6 +3307,21 @@ class BioAgent:
             inputs = cp.load()
             if isinstance(inputs, dict):
                 inputs["run_started_at"] = time.time()  # FIX C1: Reset timer on resume
+                # Reconstruct LangChain message objects
+                if "messages" in inputs and isinstance(inputs["messages"], list):
+                    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+                    new_msgs = []
+                    for m in inputs["messages"]:
+                        if isinstance(m, dict):
+                            mtype = (m.get("type") or m.get("role", "human")).lower()
+                            if mtype == "human": new_msgs.append(HumanMessage(**m))
+                            elif mtype == "ai": new_msgs.append(AIMessage(**m))
+                            elif mtype == "system": new_msgs.append(SystemMessage(**m))
+                            elif mtype == "tool": new_msgs.append(ToolMessage(**m))
+                            else: new_msgs.append(HumanMessage(**m)) # fallback
+                        else:
+                            new_msgs.append(m)
+                    inputs["messages"] = new_msgs
             self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
             self._metrics = RunMetrics(thread_id, tmp)
         else:
