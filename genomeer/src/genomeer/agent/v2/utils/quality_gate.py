@@ -389,6 +389,16 @@ def check_quality(
         except (TypeError, ValueError):
             pass
 
+    # BUG-26: q30_rate should be a 0–1 fraction (fastp JSON convention).
+    # If the value is > 1.0 the wrapper returned a percentage (0–100) instead.
+    # Normalise and log a warning so the gate still fires correctly.
+    if value is not None and metric_key == "q30_rate" and value > 1.0:
+        logger.warning(
+            f"[QA] q30_rate value {value:.2f} looks like a percentage (expected 0–1 fraction). "
+            "Dividing by 100 to normalise. Check run_fastp() wrapper."
+        )
+        value = value / 100.0
+
     # 2. From stdout via regex
     if value is None and parse_regex and stdout_text:
         m = re.search(parse_regex, stdout_text, re.IGNORECASE)

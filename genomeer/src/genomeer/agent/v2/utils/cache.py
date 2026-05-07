@@ -147,14 +147,17 @@ class LLMResponseCache:
     def __init__(self, db_path: str, ttl: int = _LLM_TTL):
         self.db_path = db_path
         self.ttl = ttl
-        self._conn: Optional[sqlite3.Connection] = None
-        self._lock = threading.Lock()
+        # BUG-15: per-thread connections prevent "database is locked" in batch mode.
+        # Each thread (Generator node) gets its own SQLite connection; WAL mode allows
+        # concurrent readers and serialises writers without a shared Python-level lock.
+        self._local = threading.local()
+        self._lock = threading.Lock()   # kept for DDL operations only
         self._init_db()
 
     def _conn_get(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = _open_sqlite_conn(self.db_path)
-        return self._conn
+        if not getattr(self._local, "conn", None):
+            self._local.conn = _open_sqlite_conn(self.db_path)
+        return self._local.conn
 
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -185,28 +188,23 @@ class LLMResponseCache:
         if _CACHE_DISABLED:
             return None
         try:
+            # BUG-15: per-thread conn — no Python lock needed for reads/writes
             conn = self._conn_get()
-            with self._lock:
-                row = conn.execute(
-                    "SELECT value, created, node FROM llm_cache WHERE key=?", (key,)
-                ).fetchone()
+            row = conn.execute(
+                "SELECT value, created, node FROM llm_cache WHERE key=?", (key,)
+            ).fetchone()
             if row is None:
                 return None
             value, created, cached_node = row
-            # If node was provided, ensure it matches the cached node
             if node and cached_node and node != cached_node:
                 logger.debug(f"[LLMCache] Miss node mismatch (wanted {node}, got {cached_node}) for key={key[:8]}")
                 return None
-
             if time.time() - created > self.ttl:
-                with self._lock:
-                    conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
-                    conn.commit()
-                return None
-            # Update hit count
-            with self._lock:
-                conn.execute("UPDATE llm_cache SET hits=hits+1 WHERE key=?", (key,))
+                conn.execute("DELETE FROM llm_cache WHERE key=?", (key,))
                 conn.commit()
+                return None
+            conn.execute("UPDATE llm_cache SET hits=hits+1 WHERE key=?", (key,))
+            conn.commit()
             logger.debug(f"[LLMCache] HIT key={key[:8]}")
             return value
         except Exception as e:
@@ -217,15 +215,15 @@ class LLMResponseCache:
         if _CACHE_DISABLED:
             return
         if node in self._SKIP_NODES:
-            return   # Ne pas cacher ces nœuds
+            return
         try:
-            with self._lock:
-                conn = self._conn_get()
-                conn.execute(
-                    "INSERT OR REPLACE INTO llm_cache(key,value,model,node,created) VALUES(?,?,?,?,?)",
-                    (key, value, model, node, time.time()),
-                )
-                conn.commit()
+            # BUG-15: per-thread conn — no Python lock needed
+            conn = self._conn_get()
+            conn.execute(
+                "INSERT OR REPLACE INTO llm_cache(key,value,model,node,created) VALUES(?,?,?,?,?)",
+                (key, value, model, node, time.time()),
+            )
+            conn.commit()
         except Exception as e:
             logger.warning(f"[LLMCache] set failed: {e}")
 
@@ -397,7 +395,13 @@ class ToolOutputCache:
             if _verify_files:
                 expected_files = result.get("__cached_files__", [])
                 if cached_output_dir:
-                    missing_files = [f for f in expected_files if not (Path(cached_output_dir) / f).exists()]
+                    # BUG-17: also reject zero-byte files — a crash can leave empty files
+                    # that satisfy os.path.exists() but contain no real data.
+                    missing_files = [
+                        f for f in expected_files
+                        if not (Path(cached_output_dir) / f).exists()
+                        or (Path(cached_output_dir) / f).stat().st_size == 0
+                    ]
                 else:
                     missing_files = []
                 if missing_files:
@@ -557,25 +561,29 @@ class ToolOutputCache:
             return {}
 
     def purge_expired(self):
+        # BUG-18: use a single connection wrapped in try/finally so it is always
+        # closed even if an exception occurs mid-operation.
+        conn = None
         try:
             conn = _open_sqlite_conn(self._meta_db)
             all_rows = conn.execute(
                 "SELECT key, tool_name, created FROM tool_cache"
             ).fetchall()
             now = time.time()
-            to_delete = []
-            for key, tool_name, created in all_rows:
-                ttl = self.TOOL_TTL_OVERRIDES.get(tool_name, self.default_ttl)
-                if now - created > ttl:
-                    to_delete.append(key)
+            to_delete = [
+                key for key, tool_name, created in all_rows
+                if now - created > self.TOOL_TTL_OVERRIDES.get(tool_name, self.default_ttl)
+            ]
             if to_delete:
                 with self._lock:
                     conn.executemany("DELETE FROM tool_cache WHERE key=?", [(k,) for k in to_delete])
                     conn.commit()
                 logger.info(f"[ToolCache] Purged {len(to_delete)} expired tool outputs")
-            conn.close()
         except Exception as e:
             logger.warning(f"[ToolCache] purge failed: {e}")
+        finally:
+            if conn:
+                conn.close()
 
 
 # ---------------------------------------------------------------------------

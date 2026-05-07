@@ -36,14 +36,51 @@ def _micromamba_bin() -> str:
     return str(ensure_micromamba())
 
 
+def _env_prefix(env_name: str):
+    from genomeer.runtime.env_manager import ENVS_DIR
+    return ENVS_DIR / env_name
+
+
 def _run(argv: List[str], env_name: str = _META_ENV, timeout: int = 7200,
          extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
-    """Run argv inside micromamba env."""
+    """Run argv inside micromamba env using -p <prefix> (not -n) so that
+    MAMBA_ROOT_PREFIX is not required to be set in the subprocess environment.
+    Applies RAM/CPU resource limits on Linux/macOS (BUG-1, BUG-2)."""
+    import platform as _platform
     mm = _micromamba_bin()
-    cmd = [mm, "run", "-n", env_name] + argv
-    env = {**os.environ, **(extra_env or {})}
+    prefix = _env_prefix(env_name)
+    cmd = [mm, "run", "-p", str(prefix)] + argv
+
+    env = dict(os.environ)
+    env.pop("CONDA_PREFIX", None)
+    from genomeer.runtime.env_manager import ENVS_DIR
+    env["MAMBA_ROOT_PREFIX"] = str(ENVS_DIR.parent.parent)
+    if extra_env:
+        env.update(extra_env)
+
+    preexec_fn = None
+    if _platform.system() != "Windows":
+        try:
+            import resource as _res
+            max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
+            max_cpu_sec = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", str(timeout)))
+
+            def _limit():
+                try:
+                    ram_bytes = int(max_ram_gb * 1024 ** 3)
+                    _res.setrlimit(_res.RLIMIT_AS, (ram_bytes, ram_bytes))
+                    _res.setrlimit(_res.RLIMIT_CPU, (max_cpu_sec, max_cpu_sec))
+                    _res.setrlimit(_res.RLIMIT_NPROC, (512, 512))
+                except Exception:
+                    pass
+
+            preexec_fn = _limit
+        except ImportError:
+            pass
+
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, env=env, check=False,
+        cmd, capture_output=True, text=True, timeout=timeout,
+        env=env, check=False, preexec_fn=preexec_fn,
     )
 
 
@@ -366,8 +403,10 @@ def run_deepvirfinder(
             reader = csv.DictReader(f, delimiter="\t")
             for row in reader:
                 try:
-                    score = float(row.get("score", 0) or 0)
-                    pval = float(row.get("pvalue", 1) or 1)
+                    _raw_score = row.get("score", "0")
+                    _raw_pval  = row.get("pvalue", "1")
+                    score = float(_raw_score) if str(_raw_score).strip() else 0.0
+                    pval  = float(_raw_pval)  if str(_raw_pval).strip()  else 1.0
                     if score >= score_cutoff and pval <= pvalue_cutoff:
                         n_viral += 1
                     if score >= 0.9 and pval <= 0.01:

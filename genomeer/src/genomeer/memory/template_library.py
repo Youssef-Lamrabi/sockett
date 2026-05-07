@@ -330,26 +330,54 @@ class TemplateLibrary:
 
     @staticmethod
     def _extract_tools_from_steps(steps: List[Dict]) -> List[str]:
-        """BUG-33: Extract tools from actual metadata if available, otherwise fallback to titles."""
-        found = []
+        """Extract canonical wrapper function names from steps.
+
+        Priority:
+          1. Explicit 'tool' field set by the agent telemetry (most reliable).
+          2. BUG-47: Regex scan of the 'code' field for run_*() calls — gives
+             exact canonical names instead of title keywords which degrade over time.
+          3. Fallback: keyword match against the step title.
+        """
+        import re as _re
+        _WRAPPER_RE = _re.compile(r"\b(run_[a-z0-9_]+)\s*\(")
+        found: List[str] = []
+        seen: set = set()
+
+        def _add(name: str):
+            if name and name not in seen:
+                seen.add(name)
+                found.append(name)
+
         for s in steps:
-            # 1. Prioritize 'tool' field from telemetry (if available in the step dict)
+            # Tier 1: explicit telemetry field
             t_exec = s.get("tool")
-            if t_exec and t_exec not in found:
-                found.append(t_exec)
+            if t_exec:
+                _add(t_exec)
                 continue
-                
-            # 2. Fallback to title keywords if telemetry is missing
-            TOOL_KEYWORDS = [
-                "run_fastp", "run_kraken2", "run_metaspades", "run_megahit", 
-                "run_metabat2", "run_checkm2", "run_prokka", "run_diamond",
-                "run_hmmer", "run_humann", "run_amrfinder", "run_rgi",
-                "run_minimap2", "run_flye", "run_gtdbtk"
+
+            # Tier 2 (BUG-47): scan generated code for wrapper calls
+            code = s.get("code") or s.get("pending_code") or ""
+            if code:
+                for m in _WRAPPER_RE.findall(code):
+                    _add(m)
+                if found:
+                    continue  # found canonical names — skip title fallback
+
+            # Tier 3: keyword match against title (least reliable)
+            TITLE_KEYWORDS = [
+                "run_fastp", "run_fastqc", "run_kraken2", "run_bracken",
+                "run_metaspades", "run_megahit", "run_flye", "run_racon", "run_medaka",
+                "run_metabat2", "run_das_tool", "run_checkm2", "run_gtdbtk",
+                "run_prokka", "run_prodigal", "run_diamond", "run_hmmer",
+                "run_humann3", "run_amrfinderplus", "run_rgi_card",
+                "run_minimap2", "run_bowtie2", "run_metaphlan4",
+                "run_virsorter2", "run_checkv", "run_deepvirfinder",
             ]
             title = s.get("title", "").lower()
-            for t in TOOL_KEYWORDS:
-                if t in title and t not in found:
-                    found.append(t)
+            for kw in TITLE_KEYWORDS:
+                if kw in title:
+                    _add(kw)
+
         return found
 
 

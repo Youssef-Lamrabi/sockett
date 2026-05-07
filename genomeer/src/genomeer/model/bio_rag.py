@@ -346,10 +346,13 @@ class _PubMedFetcher:
                 break
             try:
                 # 1. Recherche des PMIDs
+                # BUG-22: maxdate was hardcoded to "2025"; use current year dynamically
+                from datetime import datetime as _dt
+                _cur_year = str(_dt.now().year)
                 search_params = {
                     "db": "pubmed", "term": query, "retmax": max_results,
                     "retmode": "json", "sort": "relevance",
-                    "datetype": "pdat", "mindate": "2020", "maxdate": "2025",
+                    "datetype": "pdat", "mindate": "2020", "maxdate": _cur_year,
                 }
                 resp = requests.get(cls.ENTREZ_SEARCH, params=search_params, timeout=timeout)
                 if resp.status_code != 200:
@@ -465,10 +468,17 @@ class BioRAGStore:
                     bundle_date = datetime.fromisoformat(bundle_date_str)
                     days_old = (datetime.now() - bundle_date).days
                     if days_old > 180:
-                        # TÂCHE 7.1: Downgraded from ERROR to WARNING (stale bundle, not a hard failure)
                         logger.warning(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old} days old. Context may be outdated.")
                         self.rag_warnings["rag_bundles_stale"] = True
                         self.rag_warnings["rag_bundles_age_days"] = max(self.rag_warnings["rag_bundles_age_days"], days_old)
+                else:
+                    # BUG-24: missing bundle_date is itself a warning — bundle may be very old
+                    logger.warning(
+                        f"[BioRAG] CARD bundle {card_path.name} has no '__bundle_date__' field. "
+                        "Bundle age cannot be verified — AMR context may be outdated. "
+                        "Run scripts/refresh_bundles.py to regenerate."
+                    )
+                    self.rag_warnings["rag_bundles_stale"] = True
                 
                 version = data.get("source_version", "CARD")
                 for entry in data.get("entries", []):
@@ -495,10 +505,17 @@ class BioRAGStore:
                     bundle_date = datetime.fromisoformat(bundle_date_str)
                     days_old = (datetime.now() - bundle_date).days
                     if days_old > 180:
-                        # TÂCHE 7.1: Downgraded from ERROR to WARNING (stale bundle, not a hard failure)
                         logger.warning(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old} days old. Context may be outdated.")
                         self.rag_warnings["rag_bundles_stale"] = True
                         self.rag_warnings["rag_bundles_age_days"] = max(self.rag_warnings["rag_bundles_age_days"], days_old)
+                else:
+                    # BUG-24: missing bundle_date means we cannot verify freshness
+                    logger.warning(
+                        f"[BioRAG] KEGG bundle {kegg_path.name} has no '__bundle_date__' field. "
+                        "Bundle age cannot be verified — pathway context may be outdated. "
+                        "Run scripts/refresh_bundles.py to regenerate."
+                    )
+                    self.rag_warnings["rag_bundles_stale"] = True
                 
                 version = data.get("source_version", "KEGG")
                 for entry in data.get("entries", []):
@@ -652,20 +669,30 @@ class BioRAGStore:
         raise RuntimeError("No embedder")
 
     def _build_faiss_index(self):
-        with self._lock:
-            try:
-                import faiss
-                import numpy as np
-            except ImportError:
-                logger.warning("[BioRAG] faiss-cpu not installed")
-                return
+        # BUG-23: compute embeddings OUTSIDE the lock — embedding can take several
+        # minutes on large corpora and would block any concurrent get_context() call
+        # (including the Finalizer) if the lock were held the whole time.
+        # Acquire the lock only for the final assignment of self._index.
+        try:
+            import faiss
+        except ImportError:
+            logger.warning("[BioRAG] faiss-cpu not installed — RAG index disabled")
+            return
 
-            texts = [doc.text for doc in self._documents]
-            embeddings = self._embed(texts)
-            D = embeddings.shape[1]
-            index = faiss.IndexFlatIP(D)
-            index.add(embeddings)
-            self._index = index
+        texts = [doc.text for doc in self._documents]
+        try:
+            embeddings = self._embed(texts)  # potentially slow — done WITHOUT lock
+        except Exception as e:
+            logger.warning(f"[BioRAG] Embedding failed: {e}")
+            return
+
+        import numpy as np  # noqa: F401 (used implicitly by faiss add)
+        D = embeddings.shape[1]
+        new_index = faiss.IndexFlatIP(D)
+        new_index.add(embeddings)
+
+        with self._lock:
+            self._index = new_index
 
     def _save_to_cache(self, index_path: Path, docs_path: Path):
         import faiss

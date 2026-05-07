@@ -393,7 +393,17 @@ def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = No
         for line in proc.stdout:
             yield line.rstrip("\n")
     finally:
-        rc = proc.wait()
+        # BUG-42: proc.wait() blocks indefinitely if the generator is abandoned
+        # early (timeout / cancel).  Use a short timeout and kill if needed.
+        try:
+            rc = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            import logging as _lg
+            _lg.getLogger("genomeer.env_manager").warning(
+                "[install_env_iter] micromamba still running after generator exit — killing process"
+            )
+            proc.kill()
+            rc = proc.wait()
         if rc != 0:
             raise RuntimeError("micromamba create failed")
 

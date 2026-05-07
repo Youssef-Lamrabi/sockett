@@ -346,12 +346,20 @@ def run_r_code(
         if extra_env:
             env.update(extra_env)
         
+        # BUG-19: apply resource limits to host-fallback R process (same as bash fallback)
+        _r_preexec = None
+        if platform.system() != "Windows":
+            _r_preexec = _make_resource_limiter(
+                float(env.get("GENOMEER_MAX_RAM_GB", "32")),
+                int(env.get("GENOMEER_MAX_CPU_SECONDS", "7200")),
+            )
         proc = subprocess.Popen(
             ["Rscript", path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            preexec_fn=_r_preexec,
         )
         res_stdout, res_stderr = "", ""
         try:
@@ -752,8 +760,13 @@ def run_with_timeout(
     
     args = [] if args is None else list(args)
     kwargs = {} if kwargs is None else dict(kwargs)
+    # BUG-20: use setdefault only when cancel_event is not None; if the caller
+    # explicitly passed cancel_event=None we must still inject our own event so
+    # the subprocess can be cancelled on timeout.
     if cancel_event is not None:
-        kwargs.setdefault("cancel_event", cancel_event)
+        kwargs["cancel_event"] = cancel_event
+    elif "cancel_event" not in kwargs:
+        kwargs["cancel_event"] = None
 
     with cf.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(func, *args, **kwargs)

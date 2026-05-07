@@ -139,6 +139,13 @@ _BLOCKED_PYTHON: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"__import__\s*\(\s*['\"]os['\"]", re.IGNORECASE),
      "__import__('os') dynamic import bypass"),
 
+    # BUG-8: importlib.import_module("subprocess") bypasses AST import checks
+    (re.compile(
+        r'importlib\s*\.\s*import_module\s*\(\s*["\']'
+        r'(subprocess|os|sys|shutil|ctypes|pty|socket|signal|resource|platform)["\']',
+        re.IGNORECASE,
+    ), "importlib.import_module with dangerous module (sandbox bypass)"),
+
     # Écriture dans /etc
     (re.compile(r"open\s*\(\s*['\"]?\s*/etc/", re.IGNORECASE),
      "file write to /etc (system config)"),
@@ -265,6 +272,29 @@ def check_python_code(code: str) -> Tuple[bool, str]:
                     mod = (node.module or "").split('.')[0]
                     if mod in _BLOCKED_MODULES:
                         return False, f"[SECURITY BLOCK] Forbidden module import: {node.module}"
+
+            # BUG-8: detect importlib.import_module("dangerous_module") via AST
+            _DANGEROUS_MODS = {
+                "subprocess", "os", "sys", "shutil", "ctypes",
+                "pty", "socket", "signal", "resource",
+            }
+            if isinstance(node, ast.Call):
+                func = node.func
+                # importlib.import_module(...)
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "import_module"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "importlib"
+                ):
+                    if node.args:
+                        first_arg = node.args[0]
+                        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                            if first_arg.value.split(".")[0] in _DANGEROUS_MODS:
+                                return False, (
+                                    f"[SECURITY BLOCK] importlib.import_module('{first_arg.value}') "
+                                    "is forbidden (sandbox bypass)"
+                                )
 
             # 1. Block direct calls to dangerous builtins
             if isinstance(node, ast.Call):

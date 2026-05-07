@@ -154,13 +154,22 @@ _RX_OK_STANDALONE  = re.compile(r"<OK\s*/\s*>|<ok/>|\bOK\b", re.IGNORECASE)
 # Résolveur d'environnement (Source unique : env_resolver.py)
 # ---------------------------------------------------------------------------
 
-from genomeer.runtime.env_resolver import META_ENV_SIGNALS as _META_ENV_SIGNALS
+# BUG-38 / Incohérence-B: importing META_ENV_SIGNALS at module load time captures
+# only the static _WRAPPERS_SIGNALS fallback, missing any binaries added to the
+# registry YAML after startup.  Call get_meta_env_signals() at resolution time
+# instead so the dynamic (full) signal set is always used.
+def _get_meta_signals() -> set:
+    try:
+        from genomeer.runtime.env_resolver import get_meta_env_signals
+        return get_meta_env_signals()
+    except Exception:
+        return set()
 
 
 def _resolve_env_from_code(code: str) -> str:
     """Déduit l'environnement micromamba depuis le contenu du code."""
     code_lower = (code or "").lower()
-    for signal in _META_ENV_SIGNALS:
+    for signal in _get_meta_signals():
         if signal.lower() in code_lower:
             return "meta-env1"
     return "bio-agent-env1"
@@ -207,7 +216,7 @@ class LLMOutputValidator:
 
         # 2. Env mismatch — outil meta-env1 dans bio-agent-env1
         declared_env = parsed.env or _resolve_env_from_code(code)
-        for signal in _META_ENV_SIGNALS:
+        for signal in _get_meta_signals():
             if signal in code and declared_env == "bio-agent-env1":
                 warnings.append(
                     f"[ENV-MISMATCH] Tool '{signal}' requires meta-env1 but declared env is bio-agent-env1. "
@@ -218,7 +227,7 @@ class LLMOutputValidator:
 
         # 3. BASH sans shebang ou micromamba prefix pour tools CLI
         if parsed.lang == CodeLang.BASH:
-            for signal in _META_ENV_SIGNALS:
+            for signal in _get_meta_signals():
                 if signal in code and "micromamba run" not in code and "conda run" not in code:
                     warnings.append(
                         f"[ENV-HINT] BASH code uses '{signal}' but no 'micromamba run -n meta-env1' prefix found. "

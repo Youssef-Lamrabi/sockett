@@ -51,16 +51,41 @@ def _env_prefix(env_name: str) -> Path:
 
 def _run(argv: List[str], env_name: str = _META_ENV, timeout: int = 21600,
          extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
-    """Run argv inside micromamba env and return CompletedProcess."""
+    """Run argv inside micromamba env and return CompletedProcess.
+    Applies RLIMIT_AS/CPU resource limits on Linux/macOS (BUG-5)."""
+    import platform as _platform
     mm = _micromamba_bin()
     prefix = _env_prefix(env_name)
     cmd = [mm, "run", "-p", str(prefix), *argv]
-    print("CMD:", " ".join(cmd))
     env = dict(os.environ)
     env.pop("CONDA_PREFIX", None)
     if extra_env:
         env.update(extra_env)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+
+    preexec_fn = None
+    if _platform.system() != "Windows":
+        try:
+            import resource as _res
+            _max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
+            _max_cpu    = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", str(timeout)))
+
+            def _limit():
+                try:
+                    _ram = int(_max_ram_gb * 1024 ** 3)
+                    _res.setrlimit(_res.RLIMIT_AS, (_ram, _ram))
+                    _res.setrlimit(_res.RLIMIT_CPU, (_max_cpu, _max_cpu))
+                    _res.setrlimit(_res.RLIMIT_NPROC, (512, 512))
+                except Exception:
+                    pass
+
+            preexec_fn = _limit
+        except ImportError:
+            pass
+
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout,
+        env=env, preexec_fn=preexec_fn,
+    )
 
 
 def _assert_ok(proc: subprocess.CompletedProcess, label: str) -> None:
@@ -348,11 +373,21 @@ def run_metaspades(
     proc = _run(cmd, timeout=21600)
     _assert_ok(proc, "metaSPAdes")
 
-    contigs = str(out / "contigs.fasta")
-    scaffolds = str(out / "scaffolds.fasta")
+    contigs   = out / "contigs.fasta"
+    scaffolds = out / "scaffolds.fasta"
+
+    # BUG-6: metaSPAdes can exit 0 with a missing/empty FASTA on partial failures.
+    primary = scaffolds if scaffolds.exists() and scaffolds.stat().st_size > 0 else contigs
+    if not primary.exists() or primary.stat().st_size == 0:
+        raise RuntimeError(
+            f"metaSPAdes returned exit 0 but primary assembly FASTA is absent or empty "
+            f"(checked {scaffolds}, {contigs}). "
+            f"Check spades.log: {out / 'spades.log'}"
+        )
+
     return {
-        "contigs_fasta": contigs if Path(contigs).exists() else None,
-        "scaffolds_fasta": scaffolds if Path(scaffolds).exists() else None,
+        "contigs_fasta":  str(contigs)   if contigs.exists()   and contigs.stat().st_size   > 0 else None,
+        "scaffolds_fasta": str(scaffolds) if scaffolds.exists() and scaffolds.stat().st_size > 0 else None,
         "assembly_graph": str(out / "assembly_graph.fastg"),
         "log": str(out / "spades.log"),
         "output_dir": str(out),
@@ -393,9 +428,17 @@ def run_megahit(
     proc = _run(cmd, timeout=21600)
     _assert_ok(proc, "MEGAHIT")
 
-    contigs = str(final_out / "final.contigs.fa")
+    contigs_path = final_out / "final.contigs.fa"
+
+    # BUG-6: MEGAHIT can exit 0 with an absent/empty FASTA when input depth is too low.
+    if not contigs_path.exists() or contigs_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"MEGAHIT returned exit 0 but final.contigs.fa is absent or empty in {final_out}. "
+            f"Check log: {final_out / 'log'}"
+        )
+
     return {
-        "contigs_fasta": contigs if Path(contigs).exists() else None,
+        "contigs_fasta": str(contigs_path),
         "output_dir": str(final_out),
         "log": str(final_out / "log"),
     }
@@ -773,7 +816,8 @@ def run_kraken2(
         if "classified" in line.lower():
             classification_summary_str = line.strip()
             import re as _re
-            m = _re.search(r"([0-9]+\.[0-9]+)%\s+of\s+sequences\s+classified", line, _re.IGNORECASE)
+            # BUG-7: decimal part optional so "100%" (no decimal) also matches
+            m = _re.search(r"([0-9]+(?:\.[0-9]+)?)%\s+of\s+sequences\s+classified", line, _re.IGNORECASE)
             if m:
                 try:
                     classified_pct = float(m.group(1))

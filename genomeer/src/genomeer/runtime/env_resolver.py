@@ -129,11 +129,22 @@ def _score_match(env: EnvSpec, tool_name: str, kind: Kind, req_version: str | No
 def _tiebreak(a: EnvSpec, b: EnvSpec, kind: Kind) -> int:
     """
     Deterministic tiebreak:
-      1) Prefer env with fewer total provides (more specific)
-      2) Prefer higher python version (if both have numeric python)
-      3) Lexicographic by env name
-    Return -1 if a<b (a wins), 1 if a>b (b wins), 0 if equal.
+      1) BUG-39: for binary tools, prefer meta-env1 over bio-agent-env1 — metagenomics
+         CLI tools belong in meta-env1 even when accidentally also listed in bio-agent-env1.
+      2) Prefer env with fewer total provides (more specific)
+      3) Prefer higher python version (if both have numeric python)
+      4) Lexicographic by env name
+    Return -1 if a wins, 1 if b wins, 0 if equal.
     """
+    # Rule 1: for bin kind, explicit meta-env1 preference
+    if kind == "bin":
+        _META = "meta-env1"
+        _BIO  = "bio-agent-env1"
+        if a.name == _META and b.name == _BIO:
+            return -1   # a (meta-env1) wins
+        if b.name == _META and a.name == _BIO:
+            return 1    # b (meta-env1) wins
+
     def size(e: EnvSpec) -> int:
         return len(e.provides_bins) + len(e.provides_py) + len(e.provides_r)
 
@@ -149,7 +160,6 @@ def _tiebreak(a: EnvSpec, b: EnvSpec, kind: Kind) -> int:
 
     va, vb = pyv(a), pyv(b)
     if va != vb:
-        # prefer higher
         return -1 if va > vb else 1
 
     return -1 if a.name < b.name else (1 if a.name > b.name else 0)

@@ -39,28 +39,49 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 def _get_with_retry(url: str, params: Optional[Dict] = None, timeout: int = 60) -> str:
-    """HTTP GET via urllib with exponential backoff for 5xx/timeouts. No retry on 4xx."""
+    """HTTP GET via urllib with exponential backoff.
+    BUG-50: 429 (Rate-Limit) and 5xx (Server Error) are now retried properly.
+    On 429 we honour the Retry-After header if present."""
     import urllib.request
     import urllib.parse
     import urllib.error
     import time
-    
+    import logging as _logging
+    _log = _logging.getLogger("genomeer.db")
+
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
-        
+
     delays = [2, 4, 8]
     for attempt in range(len(delays) + 1):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as r:
                 return r.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
-            if 400 <= e.code < 500:
-                import logging
-                logging.getLogger("genomeer.db").warning(f"HTTP {e.code} for {url}: returning empty data.")
-                return "{}"
-            if attempt == len(delays):
-                raise e
-            time.sleep(delays[attempt])
+            if e.code == 429:
+                # BUG-50: honour Retry-After if present, else use exponential back-off
+                retry_after = None
+                try:
+                    retry_after = int(e.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    pass
+                wait = retry_after if retry_after and retry_after > 0 else (delays[attempt] if attempt < len(delays) else None)
+                if wait is None:
+                    _log.warning(f"HTTP 429 (rate limit) on {url} — max retries exceeded")
+                    raise e
+                _log.warning(f"HTTP 429 (rate limit) on {url} — waiting {wait}s before retry {attempt+1}")
+                time.sleep(wait)
+                continue
+            if 500 <= e.code < 600:
+                # BUG-50: retry on 5xx server errors
+                if attempt == len(delays):
+                    raise e
+                _log.warning(f"HTTP {e.code} on {url} — retrying in {delays[attempt]}s")
+                time.sleep(delays[attempt])
+                continue
+            # 4xx (except 429) — no retry, return empty
+            _log.warning(f"HTTP {e.code} for {url}: returning empty data.")
+            return "{}"
         except (urllib.error.URLError, TimeoutError) as e:
             if attempt == len(delays):
                 raise e

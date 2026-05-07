@@ -6,6 +6,7 @@ Gère l'injection de nouveaux steps et les abandons basés sur les signaux de qu
 """
 
 import logging
+import re
 from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger("genomeer.orchestration")
@@ -112,9 +113,15 @@ class OrchestrationManager:
             if signal_val is None:
                 continue
             
-            # Condition spécifique à l'outil
-            if rule.get("condition") and rule["condition"] not in (step_title + " " + step_code):
-                continue
+            # BUG-51: plain substring matching was too broad — "meta" matched any step
+            # containing "metagenomics".  Use word-boundary regex instead so that
+            # condition="kraken2" only matches when the word "kraken2" appears as a
+            # distinct token in the step text.
+            condition = rule.get("condition")
+            if condition:
+                step_text = step_title + " " + step_code + " " + step_notes
+                if not re.search(rf"\b{re.escape(condition)}\b", step_text, re.IGNORECASE):
+                    continue
             
             triggered = False
             op = rule["operator"]

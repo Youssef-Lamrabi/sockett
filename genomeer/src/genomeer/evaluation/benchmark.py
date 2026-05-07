@@ -449,59 +449,39 @@ class AgentBehaviorEval:
 # 2. PipelineOutputEval — évaluation des résultats biologiques
 # ---------------------------------------------------------------------------
 
-# Seuils de référence (MIMAG / CAMI standards)
-BIOLOGICAL_THRESHOLDS = {
-    "assembly_n50": {
-        "pass":  10_000,    # > 10 kb = bon assemblage
-        "warn":  1_000,     # 1–10 kb = acceptable
-        "fail":  500,       # < 500 bp = mauvais
-        "unit": "bp",
-        "description": "Assembly N50 (CAMI standard: >10kb for reliable binning)",
-    },
-    "classified_pct": {
-        "pass":  60.0,      # > 60% = bon taux de classification
-        "warn":  20.0,      # 20–60% = acceptable
-        "fail":  3.0,       # < 3% = échec de classification
-        "unit": "%",
-        "description": "% reads classified (Kraken2/MetaPhlAn4)",
-    },
-    "mean_completeness": {
-        "pass":  90.0,      # >= 90% = HQ MAG (MIMAG)
-        "warn":  50.0,      # 50–90% = MQ MAG
-        "fail":  20.0,      # < 20% = bins inutilisables
-        "unit": "%",
-        "description": "Mean MAG completeness (MIMAG HQ: >=90%)",
-    },
-    "mean_contamination": {
-        "pass_below":  5.0,     # <= 5% = HQ MAG
-        "warn_below":  10.0,    # 5–10% = MQ MAG
-        "fail_above":  10.0,    # > 10% = bins rejetés
-        "inverted": True,       # Plus bas = mieux
-        "unit": "%",
-        "description": "Mean MAG contamination (MIMAG HQ: <=5%)",
-    },
-    "q30_rate": {
-        "pass":  80.0,
-        "warn":  60.0,
-        "fail":  40.0,
-        "unit": "%",
-        "description": "Q30 base quality rate after fastp trimming",
-    },
-    "n_hq_mags": {
-        "pass":  1,         # Au moins 1 MAG HQ = succès minimal
-        "warn":  0,
-        "fail":  -1,        # Impossible d'échouer si 0 bins attendus
-        "unit": "MAGs",
-        "description": "Number of high-quality MAGs (completeness>=90%, contamination<=5%)",
-    },
-    "diversity_shannon": {
-        "pass":  1.5,       # > 1.5 = diversité minimale détectée
-        "warn":  0.5,
-        "fail":  0.0,       # Shannon = 0 = monoculture ou échec
-        "unit": "index",
-        "description": "Shannon diversity index (H')",
-    },
-}
+# BUG-43 / Incohérence-A: import the single source of truth instead of a local copy.
+# Previously benchmark.py had its own BIOLOGICAL_THRESHOLDS dict with values that
+# diverged from thresholds.py (e.g. N50 fail=500 here vs fail=200 in thresholds.py).
+# Now we derive BIOLOGICAL_THRESHOLDS from MIMAG_THRESHOLDS so all modules agree.
+
+def _build_biological_thresholds() -> Dict[str, Any]:
+    """Convert MIMAG_THRESHOLDS (thresholds.py key naming) to the format
+    expected by _check_metric() (pass/warn/fail / inverted keys)."""
+    try:
+        from genomeer.utils.thresholds import MIMAG_THRESHOLDS as _MT
+    except ImportError:
+        return {}
+
+    out: Dict[str, Any] = {}
+    for metric, t in _MT.items():
+        entry: Dict[str, Any] = {
+            "unit":        t.get("unit", ""),
+            "description": t.get("interpretation", metric),
+        }
+        if t.get("inverted"):
+            entry["inverted"]   = True
+            entry["pass_below"] = t.get("pass_below", t.get("pass_threshold", 5.0))
+            entry["warn_below"] = t.get("warn_below", t.get("warn_threshold", 10.0))
+            entry["fail_above"] = t.get("fail_above", t.get("fail_threshold", 10.0))
+        else:
+            entry["pass"] = t.get("pass_threshold", t.get("warn_threshold", 0) * 2)
+            entry["warn"] = t.get("warn_threshold", 0)
+            entry["fail"] = t.get("fail_threshold", 0)
+        out[metric] = entry
+    return out
+
+
+BIOLOGICAL_THRESHOLDS = _build_biological_thresholds()
 
 
 class PipelineOutputEval:

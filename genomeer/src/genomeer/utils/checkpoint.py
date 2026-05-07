@@ -186,6 +186,8 @@ class CheckpointManager:
         """
         results = []
         for cp_file in Path(run_dir).glob(".genomeer_checkpoint_*.json"):
+            # BUG-13: catch and log per-file errors so a corrupted checkpoint
+            # does not silently swallow valid neighbours.
             try:
                 with open(cp_file) as f:
                     data = json.load(f)
@@ -200,8 +202,14 @@ class CheckpointManager:
                     "plan_total": len(plan),
                     "plan_done": len([s for s in plan if s.get("status") == "done"]),
                 })
-            except Exception:
-                pass
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    f"[CHECKPOINT] Corrupted checkpoint file skipped: {cp_file} — {exc}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[CHECKPOINT] Could not read checkpoint {cp_file}: {exc}"
+                )
         return sorted(results, key=lambda x: x.get("saved_at") or 0, reverse=True)
 
     # ------------------------------------------------------------------

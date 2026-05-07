@@ -17,9 +17,11 @@ SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
 
 _MODEL_MAX_OUTPUT: dict[str, int] = {
-    "claude-opus-4-7": 8192,
+    # BUG-32: "claude-opus-4-7" was a typo; correct name is "claude-opus-4-6"
+    "claude-opus-4-6": 8192,
     "claude-sonnet-4-6": 8192,
     "claude-haiku-4-5": 4096,
+    "claude-haiku-4-5-20251001": 4096,
     "claude-3-opus-20240229": 4096,
     "claude-3-sonnet-20240229": 4096,
     "claude-3-haiku-20240307": 4096,
@@ -217,10 +219,11 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-ollama package is required for Ollama models. Install with: pip install langchain-ollama"
             )
-        return ChatOllama(
-            model=model,
-            temperature=temperature,
-        )
+        # BUG-33: pass stop sequences so structured output delimiters are respected
+        ollama_kwargs: dict = dict(model=model, temperature=temperature)
+        if stop_sequences:
+            ollama_kwargs["stop"] = stop_sequences
+        return ChatOllama(**ollama_kwargs)
 
     elif source == "Bedrock":
         try:
