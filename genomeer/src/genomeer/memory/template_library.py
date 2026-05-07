@@ -146,7 +146,7 @@ class TemplateLibrary:
             
             t_seq_type = tpl.get("sequencer_type", "unknown")
             if q_seq_type != "unknown" and t_seq_type != "unknown" and q_seq_type != t_seq_type:
-                base_score -= 1000 # heavily penalize mismatch
+                base_score *= 0.3  # Strongly discourage mismatch but don't make score -999
             scored.append((base_score, tpl))
         
         scored.sort(key=lambda x: -x[0])

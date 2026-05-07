@@ -235,7 +235,7 @@ description = [
     },
     {
         "name": "annotate_functions_hmm",
-        "description": "Toy functional annotation (all proteins labeled unknown_function).",
+        "description": "[STUB — DO NOT USE IN PRODUCTION PIPELINES] Toy functional annotation stub: labels ALL proteins as 'unknown_function' regardless of input. For real HMM annotation use run_hmmer() (HMMER against Pfam/TIGRFAM) or run_prokka() instead.",
         "required_parameters": [
             {"name": "proteins_faa", "type": "str"},
             {"name": "db_path", "type": "str"}
@@ -285,7 +285,7 @@ description = [
     },
     {
         "name": "assemble_greedy_baseline",
-        "description": "Very simple greedy baseline assembler (toy concat).",
+        "description": "[STUB — DO NOT USE IN PRODUCTION PIPELINES] Toy assembler that simply concatenates reads into fake 'contigs' without any De Bruijn graph construction. Produces biologically meaningless output. For real assembly use run_metaspades() (Illumina) or run_megahit() (large datasets) or run_flye() (Nanopore).",
         "required_parameters": [
             {"name": "reads", "type": "list"},
             {"name": "output_fasta", "type": "str"}

@@ -54,6 +54,7 @@ USAGE:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -513,18 +514,29 @@ class PipelineOutputEval:
         self,
         metrics: Dict[str, Any],
         pipeline_type: str = "shotgun",
+        has_ground_truth: bool = False,
     ) -> EvalReport:
         """
+        BUG-31: Evaluates pipeline outputs against MIMAG/CAMI biological quality thresholds,
+        NOT against a ground-truth reference dataset.  The resulting score reflects
+        biological quality (completeness, classification rate, N50) relative to published
+        community standards — it is NOT an accuracy metric against known truth.
+        Use EndToEndBenchmark with a CAMI dataset for true accuracy benchmarking.
+
         Parameters
         ----------
-        metrics : dict des métriques du pipeline (keys = noms standardisés)
+        metrics       : dict des métriques du pipeline (keys = noms standardisés)
         pipeline_type : "shotgun" | "amplicon" | "mag_only"
+        has_ground_truth : Must be True for EndToEndBenchmark calls; keeps API honest.
 
         Returns
         -------
         EvalReport
         """
-        report = EvalReport(suite_name=f"PipelineOutputEval [{pipeline_type}]")
+        suite_label = f"PipelineOutputEval [{pipeline_type}] — quality vs MIMAG/CAMI standards"
+        if has_ground_truth:
+            suite_label += " (ground-truth comparison)"
+        report = EvalReport(suite_name=suite_label)
 
         for metric_name, thresholds in BIOLOGICAL_THRESHOLDS.items():
             if metric_name not in metrics:
@@ -565,6 +577,15 @@ class PipelineOutputEval:
                 message=f"Non-numeric value: {value}",
             )
 
+        import math as _math
+        if not _math.isfinite(value):
+            return EvalResult(
+                name=name,
+                status=EvalStatus.SKIP,
+                message=f"Non-finite metric value ({value}); skipping",
+                score=0.0,
+            )
+
         if inverted:
             # Métrique "plus bas = mieux" (contamination)
             pass_below = thresholds.get("pass_below", 5.0)
@@ -574,7 +595,8 @@ class PipelineOutputEval:
                 msg = f"{value:.1f}{unit} ≤ {pass_below}{unit} — excellent"
             elif value <= warn_below:
                 ratio = (warn_below - value) / (warn_below - pass_below)
-                status, score = EvalStatus.WARN, 0.3 + 0.4 * ratio
+                score = max(0.0, min(1.0, 0.3 + 0.4 * ratio))
+                status = EvalStatus.WARN
                 msg = f"{value:.1f}{unit} — acceptable but above ideal threshold ({pass_below}{unit})"
             else:
                 status, score = EvalStatus.FAIL, 0.0
@@ -588,8 +610,10 @@ class PipelineOutputEval:
                 status, score = EvalStatus.PASS, 1.0
                 msg = f"{value:.1f}{unit} ≥ {pass_thresh}{unit} — good"
             elif value >= warn_thresh:
-                ratio = (value - warn_thresh) / (pass_thresh - warn_thresh + 1e-9)
-                status, score = EvalStatus.WARN, 0.3 + 0.4 * ratio
+                _denom = pass_thresh - warn_thresh
+                ratio = (value - warn_thresh) / _denom if _denom != 0 else 1.0
+                score = max(0.0, min(1.0, 0.3 + 0.4 * ratio))
+                status = EvalStatus.WARN
                 msg = f"{value:.1f}{unit} — below optimal threshold ({pass_thresh}{unit})"
             else:
                 status, score = EvalStatus.FAIL, 0.0
@@ -647,7 +671,7 @@ class PipelineOutputEval:
             )
 
         existing = [f for f in output_files if Path(f).exists()]
-        ratio = len(existing) / len(output_files)
+        ratio = len(existing) / len(output_files) if output_files else 0.0
 
         if ratio == 1.0:
             status, score = EvalStatus.PASS, 1.0
@@ -879,10 +903,11 @@ class EndToEndBenchmark:
             try:
                 actual_float = float(actual)
                 passed = actual_float >= float(min_val)
+                _raw_score = 1.0 if passed else (max(0.0, actual_float / float(min_val)) if float(min_val) != 0.0 else 0.0)
                 report.add(EvalResult(
                     name=f"reference_{metric_key}",
                     status=EvalStatus.PASS if passed else EvalStatus.FAIL,
-                    score=1.0 if passed else max(0.0, actual_float / float(min_val)),
+                    score=max(0.0, min(1.0, _raw_score)),
                     message=(
                         f"{actual_float:.1f} >= {min_val} (reference)" if passed
                         else f"{actual_float:.1f} < {min_val} (reference) — below expected"

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -139,6 +140,18 @@ def run_host_decontamination(
     Returns dict with clean_r1, clean_r2, host_reads_pct, n_reads_after.
     """
     import re
+    validate_fastq_input(input_r1)
+    if input_r2:
+        validate_fastq_input(input_r2)
+    # Validate host_index path
+    _host_path = Path(host_index).resolve()
+    _bt2_check = Path(str(_host_path) + ".1.bt2")
+    _bt2l_check = Path(str(_host_path) + ".1.bt2l")
+    if not (_bt2_check.exists() or _bt2l_check.exists()):
+        raise FileNotFoundError(
+            f"[run_host_decontamination] Bowtie2 index not found: {host_index!r} "
+            f"(expected {_bt2_check} or {_bt2l_check})"
+        )
     out = _ensure_dir(output_dir)
     clean_r1 = str(out / "host_removed_R1.fastq.gz")
     clean_r2 = str(out / "host_removed_R2.fastq.gz")
@@ -186,6 +199,9 @@ def run_fastp(
     Supports both single-end and paired-end FASTQ (optionally gzipped).
     Returns a dict with paths to trimmed reads, JSON stats, and HTML report.
     """
+    validate_fastq_input(input_r1)
+    if input_r2:
+        validate_fastq_input(input_r2)
     out = _ensure_dir(output_dir)
     stem = Path(input_r1).stem.replace(".fastq", "").replace(".fq", "")
 
@@ -207,7 +223,7 @@ def run_fastp(
     if html_path:
         cmd += ["-h", html_path]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd)
     _assert_ok(proc, "fastp")
@@ -270,7 +286,7 @@ def run_multiqc(
     out = _ensure_dir(output_dir)
     cmd = ["multiqc", input_dir, "--outdir", str(out), "--filename", report_name, "--force"]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
     proc = _run(cmd)
     _assert_ok(proc, "multiqc")
     html = str(out / f"{report_name}.html")
@@ -313,6 +329,10 @@ def run_metaspades(
     Supports paired-end (reads_r1 + reads_r2) or single-end (reads_single).
     Returns dict with contigs_fasta, scaffolds_fasta, assembly_graph, and log.
     """
+    if reads_r1:
+        validate_fastq_input(reads_r1)
+    if reads_r2:
+        validate_fastq_input(reads_r2)
     out = _ensure_dir(output_dir)
     # FIX G11: --meta flag is required for metagenome mode in metaSPAdes
     cmd = ["metaspades.py", "--meta", "-o", str(out), "-t", str(threads), "-m", str(memory_gb)]
@@ -323,7 +343,7 @@ def run_metaspades(
     if reads_single:
         cmd += ["-s", reads_single]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd, timeout=21600)
     _assert_ok(proc, "metaSPAdes")
@@ -368,7 +388,7 @@ def run_megahit(
     if reads_single:
         cmd += ["-r", reads_single]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd, timeout=21600)
     _assert_ok(proc, "MEGAHIT")
@@ -401,7 +421,7 @@ def run_flye(
     if genome_size:
         cmd += ["--genome-size", genome_size]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd, timeout=21600)
     _assert_ok(proc, "Flye")
@@ -541,7 +561,7 @@ def run_racon(
 
     cmd = ["racon", "-t", str(threads)]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
     cmd += [reads_fastq, overlaps_paf, assembly_fasta]
 
     # Racon writes polished FASTA to stdout
@@ -724,6 +744,9 @@ def run_kraken2(
     Requires a pre-built Kraken2 database (db_path). Use MiniKraken2 for testing.
     Returns dict with report, output, and classified/unclassified counts.
     """
+    validate_fastq_input(reads_r1)
+    if reads_r2:
+        validate_fastq_input(reads_r2)
     out = _ensure_dir(output_dir)
     report = str(out / "kraken2_report.txt")
     output_file = str(out / "kraken2_output.txt")
@@ -738,7 +761,7 @@ def run_kraken2(
     if report_minimizer_data:
         cmd += ["--report-minimizer-data"]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd)
     _assert_ok(proc, "Kraken2")
@@ -961,7 +984,7 @@ def run_das_tool(
            "-o", prefix, "--threads", str(threads),
            "--score_threshold", str(score_threshold), "--write_bins"]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd, timeout=14400)
     _assert_ok(proc, "DAS_Tool")
@@ -1047,7 +1070,7 @@ def run_prokka(
     if metagenome:
         cmd += ["--metagenome"]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
     cmd += [contigs_fasta]
 
     proc = _run(cmd, timeout=14400)
@@ -1121,7 +1144,7 @@ def run_diamond(
            "-k", str(max_target_seqs), "-e", str(evalue),
            "--outfmt"] + output_format.split()
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd, timeout=14400)
     _assert_ok(proc, "DIAMOND")
@@ -1200,7 +1223,7 @@ def run_humann3(
     if bypass_nucleotide_search:
         cmd += ["--bypass-nucleotide-search"]
     if extra_args:
-        cmd += extra_args.split()
+        cmd += shlex.split(extra_args)
 
     proc = _run(cmd, timeout=21600)
     _assert_ok(proc, "HUMAnN3")

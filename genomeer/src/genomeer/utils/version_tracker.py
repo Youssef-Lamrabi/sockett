@@ -83,10 +83,10 @@ class VersionTracker:
         Returns la version string ou None en cas d'échec.
         """
         key = f"{env_name}::{tool_name}"
-        if key in self._recorded_tools:
-            return None  # déjà enregistré
-
-        self._recorded_tools.add(key)
+        with self._lock:
+            if key in self._recorded_tools:
+                return None  # déjà enregistré
+            self._recorded_tools.add(key)
 
         # Cache global
         with _VERSION_CACHE_LOCK:
@@ -115,9 +115,10 @@ class VersionTracker:
         Enregistre une base de données utilisée.
         Le calcul du checksum est effectué en arrière-plan (non-bloquant).
         """
-        if db_name in self._recorded_dbs:
-            return
-        self._recorded_dbs.add(db_name)
+        with self._lock:
+            if db_name in self._recorded_dbs:
+                return
+            self._recorded_dbs.add(db_name)
 
         db_path_obj = Path(db_path)
         if not db_path_obj.exists():

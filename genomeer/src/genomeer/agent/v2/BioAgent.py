@@ -491,7 +491,7 @@ class BioAgent:
         first_msgs = messages[:keep_first]
         remaining_msgs = messages[keep_first:]
         
-        cutoff_idx = len(remaining_msgs) - keep_last
+        cutoff_idx = max(0, len(remaining_msgs) - keep_last)
         older_msgs = remaining_msgs[:cutoff_idx]
         
         # Priority 3: Do not delete AIMessages with <observe> tags containing biological metrics
@@ -562,12 +562,22 @@ class BioAgent:
         
         # BUG-20: Normalize prompt to exclude session-specific paths/IDs from cache key
         import re
-        norm_user_msg = re.sub(r'run-[a-f0-9-]{36}', 'run-ID', user_msg)
-        norm_user_msg = re.sub(r'[a-f0-9]{32}', 'SESSION-ID', norm_user_msg)
-        if state_dir := os.environ.get("RUN_TEMP_DIR"):
-            norm_user_msg = norm_user_msg.replace(state_dir, "/tmp/bioagent")
+        def _norm(txt: str) -> str:
+            if not txt: return ""
+            # UUIDs and session IDs
+            txt = re.sub(r'[a-f0-9-]{36}', 'UUID', txt)
+            txt = re.sub(r'[a-f0-9]{32}', 'SESSION-ID', txt)
+            # Temporary paths
+            if state_dir := os.environ.get("RUN_TEMP_DIR"):
+                txt = txt.replace(state_dir, "/tmp/bioagent")
+            # Runtime env home
+            if env_home := os.environ.get("BIOAGENT_RUNTIME_ENV_HOME"):
+                txt = txt.replace(env_home, "/envs")
+            return txt
 
-        cache_key = self._cache.llm.make_key(model_name, sys_msg, norm_user_msg)
+        norm_sys_msg  = _norm(sys_msg)
+        norm_user_msg = _norm(user_msg)
+        cache_key = self._cache.llm.make_key(model_name, norm_sys_msg, norm_user_msg)
 
         if _cache_eligible:
             cached = self._cache.llm.get(cache_key, node=node)
@@ -615,6 +625,10 @@ class BioAgent:
     def _route_blocked_step(self, state, rc, diag_rounds, summary, step, new_manifest, node="observer"):
         """Unified routing for blocked steps. Handles retry counts, escalation hints, and the diag_rounds cap (T1.2/P1-C)."""
         rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+        _MAX_PER_STEP = int(os.environ.get("GENOMEER_MAX_RETRIES_PER_STEP", "10"))
+        if rc[state["current_idx"]] >= _MAX_PER_STEP:
+            logger.warning(f"[BioAgent] Step {state['current_idx']} hit per-step retry cap ({_MAX_PER_STEP}); routing to diagnostics")
+            return {"next_step": "diagnostics", "messages": []}
         current_retry = rc[state["current_idx"]]
         new_manifest["retry_count"] = current_retry
         new_manifest["repair_step_idx"] = state["current_idx"]
@@ -1289,15 +1303,16 @@ class BioAgent:
             session_id = state.get("session_id") or state.get("run_id") or "unknown"
             progress_file = os.path.join(state.get("run_temp_dir", ""), f".batch_progress_{session_id}.json")
             progress_lock = threading.Lock()
-            
-            if os.path.exists(progress_file):
-                with open(progress_file) as f:
-                    per_sample = json.load(f)
-                # Ne relancer que les samples non encore complétés
-                remaining_samples = [s for s in samples if s.get("id") not in per_sample]
-            else:
-                per_sample = dict(state.get("per_sample_results") or {})
-                remaining_samples = samples
+
+            with progress_lock:
+                if os.path.exists(progress_file):
+                    with open(progress_file) as f:
+                        per_sample = json.load(f)
+                    # Ne relancer que les samples non encore complétés
+                    remaining_samples = [s for s in samples if s.get("id") not in per_sample]
+                else:
+                    per_sample = dict(state.get("per_sample_results") or {})
+                    remaining_samples = samples
 
             def _save_batch_progress(results: dict, run_temp_dir: str, sid: str) -> None:
                 try:
@@ -1375,6 +1390,9 @@ class BioAgent:
                     
                     # Manual node chaining loop for this sub-plan
                     while local_state["current_idx"] < len(local_state["plan"]):
+                        if self.current_cancel_event and self.current_cancel_event.is_set():
+                            logger.info(f"[batch] Sample cancelled mid-execution; stopping.")
+                            break
                         if iteration_count > max_iterations:
                             self._log("BATCH FATAL", body=f"Sample {sample_id} exceeded max iterations ({max_iterations}). Breaking out.", node=node)
                             break
@@ -1416,10 +1434,10 @@ class BioAgent:
                         updates = self._observer(local_state)
                         local_state.update(updates)
                         
-                    while local_state.get("current_idx", 0) < len(plan):
+                    while local_state.get("current_idx", 0) < len(local_state["plan"]):
                         curr_idx = local_state["current_idx"]
-                        step = plan[curr_idx]
-                        
+                        step = local_state["plan"][curr_idx]
+
                         # BUG-02: Propagation de l'événement d'annulation
                         if self.current_cancel_event.is_set():
                             self._log("BATCH CANCEL", body=f"Sample {sample_id} cancelled by global event.", node=node)
@@ -1433,14 +1451,14 @@ class BioAgent:
                             local_state = self._ensure_env(local_state)
                             local_state = self._executor(local_state)
                             local_state = self._observer(local_state)
-                        
+
                         next_step = local_state.get("next_step")
-                        
+
                         if next_step == "diagnostics":
                             updates = self._diagnostics(local_state)
                             local_state.update(updates)
                             next_step = local_state.get("next_step")
-                            
+
                         if next_step == "generator":
                             local_state["plan"][curr_idx]["status"] = "todo"
                         else:
@@ -1476,7 +1494,10 @@ class BioAgent:
                                 )
                         self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
                     except Exception as e:
-                        self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}", node=node)
+                        self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}. Triggering global cancel.", node=node)
+                        # BUG-02: Propagate cancellation if a worker crashes
+                        if hasattr(self, "current_cancel_event"):
+                            self.current_cancel_event.set()
                         
             self._log("EXIT NODE", body="All parallel samples completed. Routing to finalizer.", node=node)
             try:
@@ -1791,10 +1812,14 @@ class BioAgent:
                     "messages": [AIMessage(content=f"<observe>Environment '{env_name}' ready at {prefix}</observe>")]
                 }
             except Exception as e:
-                try: entry["stream"].push(f"ERROR: {e}\n")
-                except Exception: pass
-                try: entry["stream"].close()
-                except Exception: pass
+                try:
+                    entry["stream"].push(f"ERROR: {e}\n")
+                except Exception as _se:
+                    logger.warning(f"[ensure_env_node] Stream push failed: {_se}")
+                try:
+                    entry["stream"].close()
+                except Exception as _ce:
+                    logger.warning(f"[ensure_env_node] Stream close failed: {_ce}")
                 self._install_threads.pop(env_name, None)
                 return {
                     "next_step": "end",
@@ -1997,12 +2022,12 @@ class BioAgent:
                         if k in {
                             "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
                             "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
-                            "format", "frozenset", "getattr", "hasattr", "hash", "hex", "id",
+                            "format", "frozenset", "hash", "hex", "id",
                             "int", "isinstance", "issubclass", "iter", "len", "list", "map",
                             "max", "min", "next", "object", "oct", "ord", "pow", "print",
-                            "property", "range", "repr", "reversed", "round", "set", "setattr",
+                            "property", "range", "repr", "reversed", "round", "set",
                             "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
-                            "None", "True", "False", "Exception", "StopIteration", "dict", "list"
+                            "None", "True", "False", "Exception", "StopIteration"
                         }
                     }
                     
@@ -2031,7 +2056,8 @@ class BioAgent:
                         cancel_event=_cancel_event,
                     )
                     # Propagate changes from the step namespace back to the state
-                    new_manifest = _step_namespace.get("manifest", _manifest_copy)
+                    import copy as _copy
+                    new_manifest = _copy.deepcopy(_step_namespace.get("manifest") or _manifest_copy or {})
                     
                     # TÂCHE 11: Tracking des wrappers réels
                     detected_tools = self._extract_tools_from_code(code)
@@ -2306,8 +2332,7 @@ class BioAgent:
 
             if not _found_amr:
                 _amr_pattern = re.compile(
-                    r'\b(bla[A-Z]{2,6}|van[A-Z]|mec[A-Z]|mcr-\d|erm[A-Z]|tet[A-Z]|qnr[A-Z]|sul\d|aac|aph|cfr)\b',
-                    re.IGNORECASE
+                    r'\b(bla[A-Z]{2,6}|van[A-Z]|mec[A-Z]|mcr-\d|erm[A-Z]|tet[A-Z]|qnr[A-Z]|sul\d|aac\([0-9\'\"]+\)|aph\([0-9\'\"]+\)|cfr)\b'
                 )
                 _last_result_text = (state.get("last_result") or "")
                 _found_amr = list(set(_amr_pattern.findall(_last_result_text)))
@@ -2616,7 +2641,7 @@ class BioAgent:
                     HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
                         user_goal=state.get("last_prompt"),
                         plan=state.get("plan"),
-                        observation=observations,
+                        observation="\n".join(observations) if isinstance(observations, list) else observations,
                         artifacts=artifacts,
                         biological_context=rag_context,
                     ))

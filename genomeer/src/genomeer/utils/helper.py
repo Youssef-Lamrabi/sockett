@@ -186,9 +186,19 @@ def _run_in_env(
     # T2.1: Always inject RUN_TEMP_DIR into the subprocess environment so that
     # LLM-generated code using os.environ.get("RUN_TEMP_DIR") never gets None.
     if run_temp_dir:
-        env["RUN_TEMP_DIR"] = run_temp_dir
+        _abs_tmp = os.path.realpath(run_temp_dir)
+        _allowed_base = os.path.realpath(os.environ.get("BIOAGENT_TMP_DIR", tempfile.gettempdir()))
+        if not _abs_tmp.startswith(_allowed_base):
+            logger.warning(f"[_run_in_env] run_temp_dir '{run_temp_dir}' is outside allowed base '{_allowed_base}'; using fallback")
+            _abs_tmp = _allowed_base
+        env["RUN_TEMP_DIR"] = _abs_tmp
     if extra_env:
-        env.update(extra_env)
+        import re as _re
+        for _k, _v in extra_env.items():
+            if not _re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', str(_k)):
+                logger.warning(f"[_run_in_env] Skipping extra_env key with invalid characters: {_k!r}")
+                continue
+            env[str(_k)] = str(_v)
     # If RUN_TEMP_DIR still not set, use a safe fallback
     if "RUN_TEMP_DIR" not in env:
         env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", os.path.join(tempfile.gettempdir(), "bioagent"))
@@ -217,16 +227,26 @@ def _run_in_env(
 
     try:
         if cancel_event is not None:
-            # NOUVEAU-01 FIX: Use a thread to run communicate so we can check cancel_event
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(proc.communicate, input=input_text, timeout=timeout)
-                while not future.done():
-                    if cancel_event.is_set():
-                        proc.kill()
-                        raise subprocess.TimeoutExpired(cmd, timeout)
-                    time.sleep(0.1)
-                stdout, stderr = future.result()
+                # NOUVEAU-04: Do not pass timeout to proc.communicate() inside the thread.
+                # Manage timeout via future.result() to handle exceptions properly.
+                future = executor.submit(proc.communicate, input=input_text)
+                try:
+                    while not future.done():
+                        if cancel_event.is_set():
+                            proc.kill()
+                            raise subprocess.TimeoutExpired(cmd, timeout)
+                        time.sleep(0.1)
+                    stdout, stderr = future.result(timeout=timeout)
+                except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
+                    proc.kill()
+                    # Final attempt to drain pipes after kill
+                    try:
+                        stdout, stderr = proc.communicate(timeout=2.0)
+                    except Exception:
+                        stdout, stderr = "", ""
+                    raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
         else:
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -290,9 +310,14 @@ def run_r_code(
         return "Error: Empty script"
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=".R", mode="w", dir=settings.run_dir, delete=False) as f:
+        import stat as _stat
+        _fd, path = tempfile.mkstemp(suffix=".R", dir=settings.run_dir)
+        try:
+            os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
+        except OSError:
+            pass
+        with os.fdopen(_fd, "w", encoding="utf-8") as f:
             f.write(code)
-            path = f.name
 
         if env_name:
             _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
@@ -331,21 +356,19 @@ def run_r_code(
         res_stdout, res_stderr = "", ""
         try:
             if cancel_event is not None:
-                start_time = time.time()
-                stdout_buf, stderr_buf = [], []
-                while True:
-                    if cancel_event.is_set() or time.time() - start_time > settings.timeout_seconds:
-                        proc.kill()
-                        proc.wait(1.0)
-                        break
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(proc.communicate)
+                    while not future.done():
+                        if cancel_event.is_set():
+                            proc.kill()
+                            break
+                        time.sleep(0.1)
                     try:
-                        outs, errs = proc.communicate(timeout=0.5)
-                        stdout_buf.append(outs or "")
-                        stderr_buf.append(errs or "")
-                        break
-                    except subprocess.TimeoutExpired:
-                        pass
-                res_stdout, res_stderr = "".join(stdout_buf), "".join(stderr_buf)
+                        res_stdout, res_stderr = future.result(timeout=settings.timeout_seconds)
+                    except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
+                        proc.kill()
+                        res_stdout, res_stderr = proc.communicate(timeout=2.0)
             else:
                 res_stdout, res_stderr = proc.communicate(timeout=settings.timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -407,14 +430,18 @@ def run_bash_script(
     if not _is_safe:
         return f"Error: {_reason}\nRewrite the script without the dangerous command."
 
-    with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
+    import stat as _stat
+    _fd, path = tempfile.mkstemp(suffix=".sh", dir=settings.run_dir)
+    try:
+        os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR | _stat.S_IXUSR)
+    except OSError:
+        pass
+    with os.fdopen(_fd, "w", encoding="utf-8") as f:
         if not script.startswith("#!/"):
             f.write("#!/bin/bash\n")
         if "set -e" not in script:
             f.write("set -euo pipefail\n")
         f.write(script)
-        path = f.name
-    os.chmod(path, 0o755)
 
     try:
         if env_name:
@@ -470,21 +497,19 @@ def run_bash_script(
             return f"Error: Failed to start host subprocess: {e}"
         try:
             if cancel_event is not None:
-                start_time = time.time()
-                stdout_buf, stderr_buf = [], []
-                while True:
-                    if cancel_event.is_set() or time.time() - start_time > settings.timeout_seconds:
-                        proc.kill()
-                        proc.wait(1.0)
-                        break
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(proc.communicate)
+                    while not future.done():
+                        if cancel_event.is_set():
+                            proc.kill()
+                            break
+                        time.sleep(0.1)
                     try:
-                        outs, errs = proc.communicate(timeout=0.5)
-                        stdout_buf.append(outs or "")
-                        stderr_buf.append(errs or "")
-                        break
-                    except subprocess.TimeoutExpired:
-                        pass
-                res_stdout, res_stderr = "".join(stdout_buf), "".join(stderr_buf)
+                        res_stdout, res_stderr = future.result(timeout=settings.timeout_seconds)
+                    except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
+                        proc.kill()
+                        res_stdout, res_stderr = proc.communicate(timeout=2.0)
             else:
                 res_stdout, res_stderr = proc.communicate(timeout=settings.timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -517,6 +542,13 @@ def run_bash_script(
 # DEPRECATED: Do not use for new code. Kept for backward compatibility. Secured.
 # ------------------------------------------------------------------------------------------
 def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+    import warnings
+    warnings.warn(
+        "run_cli_command() is deprecated and will be removed in a future version. "
+        "Use run_bash_script() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from genomeer.utils.security import check_bash_script
     _is_safe, _reason = check_bash_script(command)
     if not _is_safe:
@@ -595,9 +627,14 @@ def run_python_code(
                 return f"Environment '{env_name}' is not available. {_env_msg}"
 
             os.makedirs(settings.run_dir, exist_ok=True)
-            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
+            import stat as _stat
+            _fd, path = tempfile.mkstemp(suffix=".py", dir=settings.run_dir)
+            try:
+                os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
+            except OSError:
+                pass
+            with os.fdopen(_fd, "w", encoding="utf-8") as f:
                 f.write(code)
-                path = f.name
 
             try:
                 proc = _run_in_env(
@@ -631,6 +668,7 @@ def run_python_code(
         # T4: Use an isolated namespace per call to prevent variable leakage between steps.
         # If step_namespace is provided (from _executor), use it; otherwise create a fresh one.
         # TÂCHE 6.1: Restriction des __builtins__ pour la sandbox Python (Case 2)
+        # NOUVEAU-03: Unified sandbox whitelist (excludes getattr, setattr, hasattr, open, __import__)
         _SAFE_BUILTINS = {
             k: v for k, v in __builtins__.__dict__.items()
             if k in {
@@ -641,19 +679,12 @@ def run_python_code(
                 "max", "min", "next", "object", "oct", "ord", "pow", "print",
                 "property", "range", "repr", "reversed", "round", "set",
                 "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
-                "None", "True", "False", "Exception", "StopIteration", "dict", "list"
+                "None", "True", "False", "Exception", "StopIteration"
             }
         }
-        exec_namespace = step_namespace if step_namespace is not None else {
-            "__builtins__": _SAFE_BUILTINS,
-        }
-        
-        # Merge thread-local persistent namespace if using step-based isolation
-        if step_namespace is not None:
-             pns = _get_persistent_namespace()
-             for k, v in pns.items():
-                 if k not in exec_namespace:
-                     exec_namespace[k] = v
+        # Always start with a fresh namespace to prevent variable leakage between steps (M-NEW-03)
+        exec_ns = step_namespace if step_namespace is not None else {}
+        exec_namespace = exec_ns
 
         # Inject RUN_TEMP_DIR into the in-process namespace as well
         if run_temp_dir and "run_dir" not in exec_namespace:

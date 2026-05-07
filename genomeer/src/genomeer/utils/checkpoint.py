@@ -55,6 +55,9 @@ class CheckpointManager:
     VERSION = "1.0"
 
     def __init__(self, run_temp_dir: str, session_id: str):
+        import re as _re
+        if not _re.match(r'^[a-zA-Z0-9_-]+$', session_id):
+            raise ValueError(f"[CheckpointManager] Invalid session_id (must be alphanumeric/underscore/hyphen): {session_id!r}")
         self.run_temp_dir = Path(run_temp_dir)
         self.session_id = session_id
         self.checkpoint_path = self.run_temp_dir / f".genomeer_checkpoint_{session_id}.json"
@@ -82,11 +85,24 @@ class CheckpointManager:
 
             self.run_temp_dir.mkdir(parents=True, exist_ok=True)
 
-            # BUG-14: Écriture atomique (write + rename) avec suffixe unique par thread
-            tmp_path = self.checkpoint_path.with_suffix(f".tmp.{uuid.uuid4().hex}")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(serializable, f, indent=2, default=str)
-            os.replace(tmp_path, self.checkpoint_path)
+            # Use mkstemp for a guaranteed-unique temp path; clean up on failure (C-06)
+            import tempfile as _tmpfile
+            fd, tmp_path_str = _tmpfile.mkstemp(
+                dir=str(self.run_temp_dir),
+                prefix=f".ckpt_{self.session_id}_",
+                suffix=".json",
+            )
+            tmp_path = Path(tmp_path_str)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(serializable, f, indent=2, default=str)
+                os.replace(tmp_path_str, self.checkpoint_path)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
 
             logger.info(
                 f"[CHECKPOINT] Saved after step {current_idx} → {self.checkpoint_path}"
@@ -210,23 +226,39 @@ class CheckpointManager:
                     for step in val
                 ]
             elif field == "messages" and isinstance(val, list):
-                # LangChain messages: convert to dict using .dict() if available, else str
+                # LangChain messages: convert to safe JSON-only dict (C-12: no arbitrary .dict())
                 serializable[field] = []
                 for m in val:
-                    if hasattr(m, "dict"):
-                        serializable[field].append(m.dict())
+                    if isinstance(m, dict):
+                        # Already a plain dict — validate it has only safe keys
+                        safe_msg = {
+                            k: v for k, v in m.items()
+                            if k in ("role", "content", "type", "id", "name")
+                            and isinstance(v, (str, int, float, bool, type(None)))
+                        }
+                        serializable[field].append(safe_msg)
+                    elif hasattr(m, "type") and hasattr(m, "content"):
+                        # LangChain BaseMessage — extract only primitive fields
+                        serializable[field].append({
+                            "type": str(getattr(m, "type", "unknown")),
+                            "content": str(getattr(m, "content", "")),
+                        })
                     else:
-                        serializable[field].append(str(m))
+                        serializable[field].append({"type": "unknown", "content": str(m)})
             elif isinstance(val, (str, int, float, bool, list, dict, type(None))):
                 serializable[field] = val
         return serializable
 
     @classmethod
     def _relocate_paths(cls, obj: Any, old_base: str, new_base: str) -> Any:
-        """BUG-15: Replace old_base with new_base in strings recursively."""
+        """Replace old_base with new_base in strings recursively (precise prefix match)."""
         if isinstance(obj, str):
-            if obj.startswith(old_base):
-                return obj.replace(old_base, new_base, 1)
+            # Only replace if old_base is a true path prefix (followed by separator or exact match)
+            if obj == old_base:
+                return new_base
+            sep = os.sep
+            if obj.startswith(old_base + sep) or obj.startswith(old_base + '/'):
+                return new_base + obj[len(old_base):]
             return obj
         elif isinstance(obj, list):
             return [cls._relocate_paths(i, old_base, new_base) for i in obj]

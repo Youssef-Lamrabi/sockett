@@ -39,6 +39,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import shutil
 import zipfile
 from dataclasses import dataclass
@@ -163,22 +164,34 @@ def publish_artifacts(run_id: str, temp_dir: str, expose_paths: Iterable[str], p
             # skip missing paths silently
             continue
 
-    # Optional bundle
+    # Optional bundle — with size cap to prevent disk exhaustion (C-NEW-03)
     if artifacts:
-        bundle_key = "bundle/all_artifacts.zip"
-        bundle_path = out_dir / bundle_key
-        bundle_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as z:
-            for a in artifacts:
-                z.write(out_dir / a["key"], arcname=a["key"])
-        artifacts.append({
-            "key": bundle_key,
-            "display_name": "all_artifacts.zip",
-            "mime_type": "application/zip",
-            "size_bytes": bundle_path.stat().st_size,
-            "sha256": _sha256_of(bundle_path),
-            "download_url": f"{public_base.rstrip('/')}/download/{run_id}/{bundle_key}",
-        })
+        _MAX_BUNDLE_GB = float(os.environ.get("GENOMEER_MAX_BUNDLE_GB", "5"))
+        _bundle_total = sum(
+            (out_dir / a["key"]).stat().st_size
+            for a in artifacts
+            if (out_dir / a["key"]).exists()
+        )
+        if _bundle_total > _MAX_BUNDLE_GB * 1024 ** 3:
+            import logging as _lg
+            _lg.getLogger("genomeer.artifacts").warning(
+                f"[artifacts] Bundle too large ({_bundle_total / 1e9:.1f} GB > {_MAX_BUNDLE_GB} GB); skipping ZIP"
+            )
+        else:
+            bundle_key = "bundle/all_artifacts.zip"
+            bundle_path = out_dir / bundle_key
+            bundle_path.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as z:
+                for a in artifacts:
+                    z.write(out_dir / a["key"], arcname=a["key"])
+            artifacts.append({
+                "key": bundle_key,
+                "display_name": "all_artifacts.zip",
+                "mime_type": "application/zip",
+                "size_bytes": bundle_path.stat().st_size,
+                "sha256": _sha256_of(bundle_path),
+                "download_url": f"{public_base.rstrip('/')}/download/{run_id}/{bundle_key}",
+            })
 
     manifest = {
         "run_id": run_id,
@@ -208,6 +221,11 @@ def create_artifacts_router(prefix: str = "") -> APIRouter:
 
     @router.post("/runs/create/{run_id}")
     def create_run(run_id: str, user=Depends(maybe_auth)):
+        import uuid as _uuid_mod
+        try:
+            _uuid_mod.UUID(run_id)
+        except ValueError:
+            raise HTTPException(400, "run_id must be a valid UUID v4")
         run_dir = ensure_run_dir(run_id)
         (run_dir / "uploads").mkdir(parents=True, exist_ok=True)
         return {"run_id": run_id}
@@ -219,15 +237,40 @@ def create_artifacts_router(prefix: str = "") -> APIRouter:
         subdir: str = Form(default="uploads"),
         user=Depends(maybe_auth),
     ):
+        import uuid as _uuid_mod
+        try:
+            _uuid_mod.UUID(run_id)
+        except ValueError:
+            raise HTTPException(400, "run_id must be a valid UUID v4")
         run_dir = ensure_run_dir(run_id)
         target = _guard_under(run_dir, run_dir / subdir)
         target.mkdir(parents=True, exist_ok=True)
 
+        _ALLOWED_UPLOAD_EXT = {
+            '.fasta', '.fastq', '.fq', '.fa', '.gz', '.bz2', '.zst',
+            '.txt', '.log', '.json', '.tsv', '.csv', '.html', '.md',
+            '.bed', '.vcf', '.gff', '.gff3', '.gtf', '.sam', '.bam',
+            '.bai', '.cram', '.crai', '.nwk', '.xml', '.yaml', '.yml',
+        }
+        _MAX_FILE_BYTES = int(os.environ.get("GENOMEER_MAX_UPLOAD_GB", "10")) * 1024 ** 3
         saved = []
         for f in files:
-            dest = target / f.filename
+            ext = Path(f.filename).suffix.lower()
+            if ext not in _ALLOWED_UPLOAD_EXT:
+                raise HTTPException(400, f"File type '{ext}' is not permitted")
+            safe_name = re.sub(r'[^a-zA-Z0-9._\-]', '_', Path(f.filename).name)
+            dest = target / safe_name
+            written = 0
             with dest.open("wb") as out:
-                out.write(f.file.read())
+                while True:
+                    chunk = f.file.read(1024 * 1024)  # 1 MB chunks
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > _MAX_FILE_BYTES:
+                        dest.unlink(missing_ok=True)
+                        raise HTTPException(413, f"File '{f.filename}' exceeds upload size limit ({_MAX_FILE_BYTES // (1024**3)} GB)")
+                    out.write(chunk)
             saved.append({
                 "name": f.filename,
                 "size_bytes": dest.stat().st_size,
@@ -237,7 +280,18 @@ def create_artifacts_router(prefix: str = "") -> APIRouter:
         return {"run_id": run_id, "saved": saved}
 
     @router.get("/runs/{run_id}/files")
-    def list_run_files(run_id: str, under: str = "", user=Depends(maybe_auth)):
+    def list_run_files(
+        run_id: str,
+        under: str = "",
+        limit: int = Query(default=1000, le=10000, ge=1),
+        offset: int = Query(default=0, ge=0),
+        user=Depends(maybe_auth),
+    ):
+        import uuid as _uuid_mod
+        try:
+            _uuid_mod.UUID(run_id)
+        except ValueError:
+            raise HTTPException(400, "run_id must be a valid UUID v4")
         run_dir = ensure_run_dir(run_id)
         base = _guard_under(run_dir, run_dir / under)
         out = []
@@ -249,7 +303,8 @@ def create_artifacts_router(prefix: str = "") -> APIRouter:
                         "size_bytes": p.stat().st_size,
                         "mime_type": mimetypes.guess_type(p.name)[0] or "application/octet-stream",
                     })
-        return {"run_id": run_id, "files": out}
+        total = len(out)
+        return {"run_id": run_id, "files": out[offset:offset + limit], "total": total, "offset": offset, "limit": limit}
 
     @router.post("/runs/{run_id}/publish")
     def publish_run(
@@ -257,15 +312,24 @@ def create_artifacts_router(prefix: str = "") -> APIRouter:
         req: PublishRequest,
         user=Depends(maybe_auth),
     ):
+        import uuid as _uuid_mod
+        try:
+            _uuid_mod.UUID(run_id)
+        except ValueError:
+            raise HTTPException(400, "run_id must be a valid UUID v4")
         run_dir = ensure_run_dir(run_id)
         manifest = publish_artifacts(run_id, str(run_dir), req.expose_paths, PUBLIC_ARTIFACTS_URL)
         return JSONResponse(content=manifest)
 
     @router.get("/download/{run_id}/{path:path}")
     def download(run_id: str, path: str):
-        base = ensure_artifact_dir(run_id)
+        base = ensure_artifact_dir(run_id).resolve()
         file_path = (base / path).resolve()
-        if not (file_path.exists() and file_path.is_file() and (base in file_path.parents)):
+        try:
+            file_path.relative_to(base)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Access denied")
+        if not (file_path.exists() and file_path.is_file()):
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(path=str(file_path), filename=file_path.name)
 

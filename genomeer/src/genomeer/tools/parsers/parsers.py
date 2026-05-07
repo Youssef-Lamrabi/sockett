@@ -29,6 +29,41 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+def _sanitize_header(raw_header: str) -> str:
+    """Sanitize a FASTA sequence ID or contig/bin name before logging."""
+    return re.sub(r'[^\w\s._-]', '_', raw_header)[:100]
+
+
+def _safe_output_path(output_dir: str, filename: str) -> str:
+    """Build a path within output_dir, rejecting path traversal."""
+    base = Path(output_dir).resolve()
+    target = (base / filename).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise ValueError(f"[parsers] Path traversal rejected: {filename!r} outside {output_dir!r}")
+    return str(target)
+
+
+def _validate_result_path(_path: Optional[str], output_dir: Optional[str]) -> Optional[str]:
+    """Validate that a path from result.get(...) lies within output_dir before use.
+    Returns the path if safe, or None if rejected (with a warning logged).
+    If output_dir is None, the path is returned as-is (no containment check possible).
+    """
+    if not _path:
+        return _path
+    if output_dir:
+        try:
+            Path(_path).resolve().relative_to(Path(output_dir).resolve())
+        except ValueError:
+            import logging as _lg
+            _lg.getLogger("genomeer.parsers").warning(
+                f"[parsers] Path traversal rejected: {_path!r}"
+            )
+            return None
+    return _path
+
+
 # ---------------------------------------------------------------------------
 # Registry: keyword in step title → parser function
 # ---------------------------------------------------------------------------
@@ -74,7 +109,7 @@ def parse_tool_output(tool_name_or_step: str, stdout: str, result_dict: Optional
         except Exception as e:
             # BUG-48 FIX: Don't swallow exceptions silently. Log them for debugging.
             from genomeer.utils.helper import logger as hlogger
-            hlogger.warning(f"[parse_tool_output] Parser for {tool_name_or_step} failed: {e}")
+            hlogger.warning(f"[parse_tool_output] Parser for {tool_name_or_step} failed: {e}", exc_info=True)
 
     # Default: intelligent truncation — keep first 1000 and last 500 chars
     if not stdout:
@@ -97,14 +132,23 @@ def _cap(text: str, limit: int) -> str:
 @_register("fastp", "trimming", "adapter", "qc")
 def _parse_fastp(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract key QC metrics from fastp stdout or JSON report."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     # Try reading the JSON report first (most accurate)
-    json_path = result.get("json_report") or (
-        str(Path(output_dir) / "fastp.json") if output_dir else None
+    json_path = _validate_result_path(result.get("json_report"), output_dir) or (
+        _safe_output_path(output_dir, "fastp.json") if output_dir else None
     )
     if json_path and Path(json_path).exists():
         try:
-            with open(json_path) as f:
-                d = json.load(f)
+            try:
+                with open(json_path) as f:
+                    d = json.load(f)
+            except json.JSONDecodeError as _jde:
+                import logging as _lg
+                _lg.getLogger("genomeer.parsers").warning(
+                    f"[fastp parser] Corrupted JSON at {json_path}: {_jde}. Falling back to stdout."
+                )
+                d = {}
             s = d.get("summary", {})
             bf  = s.get("before_filtering", {})
             af  = s.get("after_filtering", {})
@@ -141,8 +185,14 @@ def _parse_fastp(stdout: str, result: dict, output_dir: Optional[str]) -> str:
 @_register("metaspades", "megahit", "flye", "assembly", "assembl")
 def _parse_assembly(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract N50, #contigs, max contig from assembly stdout or scaffolds.fasta."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     # Try to compute from FASTA file
-    fasta = result.get("contigs") or result.get("scaffolds") or result.get("assembly_fasta")
+    fasta = (
+        _validate_result_path(result.get("contigs"), output_dir)
+        or _validate_result_path(result.get("scaffolds"), output_dir)
+        or _validate_result_path(result.get("assembly_fasta"), output_dir)
+    )
     if not fasta and output_dir:
         for candidate in ["scaffolds.fasta", "contigs.fasta", "final.contigs.fa", "assembly.fasta"]:
             p = Path(output_dir) / candidate
@@ -202,9 +252,15 @@ def _parse_assembly(stdout: str, result: dict, output_dir: Optional[str]) -> str
 @_register("kraken2", "bracken", "taxonom", "classif")
 def _parse_taxonomy(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract classification rate and top taxa from Kraken2/Bracken report."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     # Look for report file
     # FIX: run_kraken2 returns key "report"; also check "report_file" and "kraken_report" for compatibility
-    report = result.get("report") or result.get("report_file") or result.get("kraken_report")
+    report = (
+        _validate_result_path(result.get("report"), output_dir)
+        or _validate_result_path(result.get("report_file"), output_dir)
+        or _validate_result_path(result.get("kraken_report"), output_dir)
+    )
     if not report and output_dir:
         for cand in ["kraken2_report.txt", "classification_report.txt", "report.txt"]:
             p = Path(output_dir) / cand
@@ -224,7 +280,7 @@ def _parse_taxonomy(stdout: str, result: dict, output_dir: Optional[str]) -> str
                         continue
                     pct = float(parts[0].strip())
                     rank = parts[3].strip()
-                    name = parts[5].strip()
+                    name = _sanitize_header(parts[5].strip())
                     if name == "unclassified":
                         unclassified_pct = pct
                     elif name == "root":
@@ -253,7 +309,9 @@ def _parse_taxonomy(stdout: str, result: dict, output_dir: Optional[str]) -> str
 @_register("metaphlan", "metaphlan4")
 def _parse_metaphlan(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract top species and unclassified rate from MetaPhlAn4."""
-    profile = result.get("profile_txt")
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
+    profile = _validate_result_path(result.get("profile_txt"), output_dir)
     if not profile and output_dir:
         for cand in ["metaphlan_profile.txt", "taxonomic_profile.txt"]:
             p = Path(output_dir) / cand
@@ -276,7 +334,7 @@ def _parse_metaphlan(stdout: str, result: dict, output_dir: Optional[str]) -> st
                     if "UNCLASSIFIED" in clade.upper():
                         unclassified = pct
                     elif "|s__" in clade and pct > 0:
-                        sname = clade.split("|s__")[-1].replace("_", " ")
+                        sname = _sanitize_header(clade.split("|s__")[-1].replace("_", " "))
                         species.append((pct, sname))
             species.sort(reverse=True)
             lines = ["[MetaPhlAn4 Profile]"]
@@ -298,6 +356,8 @@ def _parse_metaphlan(stdout: str, result: dict, output_dir: Optional[str]) -> st
 @_register("metabat", "binning")
 def _parse_binning(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Count bins from MetaBAT2 output directory."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     bins_dir = result.get("bins_dir") or output_dir
     n_bins = 0
     if bins_dir and Path(bins_dir).exists():
@@ -314,8 +374,13 @@ def _parse_binning(stdout: str, result: dict, output_dir: Optional[str]) -> str:
 @_register("checkm", "checkm2", "quality")
 def _parse_checkm(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Parse CheckM2 quality statistics."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     # Look for quality_report.tsv
-    report = result.get("quality_report") or result.get("report")
+    report = (
+        _validate_result_path(result.get("quality_report"), output_dir)
+        or _validate_result_path(result.get("report"), output_dir)
+    )
     if not report and output_dir:
         for cand in ["quality_report.tsv", "checkm2_results.tsv", "results.tsv"]:
             p = Path(output_dir) / cand
@@ -332,7 +397,7 @@ def _parse_checkm(stdout: str, result: dict, output_dir: Optional[str]) -> str:
                 for row in reader:
                     comp = float(row.get("Completeness", 0))
                     cont = float(row.get("Contamination", 0))
-                    name = row.get("Name", "?")
+                    name = _sanitize_header(row.get("Name", "?"))
                     if comp >= 90 and cont <= 5:
                         hq.append((name, comp, cont))
                     elif comp >= 50 and cont <= 10:
@@ -363,8 +428,10 @@ def _parse_checkm(stdout: str, result: dict, output_dir: Optional[str]) -> str:
 @_register("prokka", "annotation", "prodigal")
 def _parse_annotation(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract gene counts from Prokka/Prodigal output."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     # Try GFF count
-    gff = result.get("gff_file")
+    gff = _validate_result_path(result.get("gff_file"), output_dir)
     if not gff and output_dir:
         for cand in Path(output_dir).rglob("*.gff"):
             gff = str(cand)
@@ -399,7 +466,12 @@ def _parse_annotation(stdout: str, result: dict, output_dir: Optional[str]) -> s
 @_register("diamond", "blast", "protein")
 def _parse_diamond(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract alignment stats from DIAMOND output."""
-    out_tsv = result.get("output_file") or result.get("tsv")
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
+    out_tsv = (
+        _validate_result_path(result.get("output_file"), output_dir)
+        or _validate_result_path(result.get("tsv"), output_dir)
+    )
     n_hits = 0
     if out_tsv and Path(out_tsv).exists():
         try:
@@ -421,7 +493,12 @@ def _parse_diamond(stdout: str, result: dict, output_dir: Optional[str]) -> str:
 @_register("amrfinder", "rgi", "amr", "resistance")
 def _parse_amr(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract AMR gene counts and drug classes from AMRFinderPlus/RGI."""
-    tsv = result.get("output_file") or result.get("amr_tsv")
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
+    tsv = (
+        _validate_result_path(result.get("output_file"), output_dir)
+        or _validate_result_path(result.get("amr_tsv"), output_dir)
+    )
     if not tsv and output_dir:
         for cand in ["amrfinderplus.tsv", "rgi_main.txt", "amr_results.tsv"]:
             p = Path(output_dir) / cand
@@ -465,9 +542,11 @@ def _parse_amr(stdout: str, result: dict, output_dir: Optional[str]) -> str:
 @_register("humann", "humann3", "pathway", "functional")
 def _parse_humann(stdout: str, result: dict, output_dir: Optional[str]) -> str:
     """Extract pathway/gene family counts from HUMAnN3."""
+    if output_dir:
+        output_dir = str(Path(output_dir).resolve())
     lines = [f"[HUMAnN3 Results]"]
     # Count pathway rows in output
-    pathways_tsv = result.get("pathabundance")
+    pathways_tsv = _validate_result_path(result.get("pathabundance"), output_dir)
     if not pathways_tsv and output_dir:
         for cand in Path(output_dir).glob("*pathabundance*"):
             pathways_tsv = str(cand)

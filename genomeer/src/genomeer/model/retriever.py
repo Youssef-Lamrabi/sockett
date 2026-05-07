@@ -57,7 +57,9 @@ def _lazy_init_embedder() -> None:
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
         # P3-B.3: Handle download failures/timeouts
-        _embed_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        _model_name = os.environ.get("GENOMEER_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        _device = os.environ.get("GENOMEER_EMBEDDING_DEVICE", "cpu")
+        _embed_model = SentenceTransformer(_model_name, device=_device)
         _EMBED_BACKEND = "sentence_transformers"
         return
     except Exception as e:

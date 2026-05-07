@@ -31,9 +31,9 @@ atexit.register(_global_cleanup)
 def run_workdir(prefix: str = "run", session_id: str | None = None):
     run_id = session_id or str(uuid.uuid4())
     path = os.path.join(BASE_TMP, f"{prefix}-{run_id}")
-    os.makedirs(path, exist_ok=True)
-    
+
     with _REGISTRY_LOCK:
+        os.makedirs(path, exist_ok=True)
         _CLEANUP_REGISTRY.add(path)
 
     try:

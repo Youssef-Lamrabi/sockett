@@ -147,39 +147,9 @@ class OrchestrationManager:
                         "abort_reason": f"[ADAPTIVE ABORT] {rule['name']} triggered. Pipeline stopped for safety."
                     }
 
-        # 2. Logique spécifique Long-Read (Flye -> Racon -> Medaka)
-        is_flye = "flye" in step_title or "flye" in step_code
-        is_ont = any(kw in (step_title + step_code + step_notes) 
-                    for kw in ("nano", "ont", "nanopore", "long-read", "nano-raw", "nano-hq"))
-        
-        if is_flye and is_ont:
-            has_racon = any("racon" in s.get("title", "").lower() for s in new_plan)
-            has_medaka = any("medaka" in s.get("title", "").lower() for s in new_plan)
-            
-            if not (has_racon or has_medaka):
-                logger.info("[ADAPTIVE] Flye+ONT detected. Injecting polishing steps.")
-                # Injection en ordre inverse pour obtenir Flye -> Racon1 -> Racon2 -> Medaka
-                new_plan.insert(current_idx + 1, {
-                    "title": "Run Medaka (ONT Consensus Polishing)",
-                    "description": "Polish with Medaka neural-network consensus.",
-                    "status": "todo",
-                    "phase": 2
-                })
-                new_plan.insert(current_idx + 1, {
-                    "title": "Run Racon Round 2 (ONT Polish)",
-                    "description": "Second Racon polishing round.",
-                    "status": "todo",
-                    "phase": 2
-                })
-                new_plan.insert(current_idx + 1, {
-                    "title": "Run Racon Round 1 (ONT Polish)",
-                    "description": "First Racon polishing round.",
-                    "status": "todo",
-                    "phase": 2
-                })
-                triggered_msgs.append(
-                    "[ADAPTIVE PLAN — LONG-READ] Flye assembly on ONT reads detected. Injecting Racon (x2) -> Medaka pipeline."
-                )
+        # 2. Logique spécifique Long-Read
+        # (Reserved for future polishing tools if added to meta-env1)
+        pass
 
         if triggered_msgs:
             return {

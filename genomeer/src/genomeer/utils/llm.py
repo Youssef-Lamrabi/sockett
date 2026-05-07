@@ -4,8 +4,31 @@ from langchain_core.language_models.chat_models import BaseChatModel
 if TYPE_CHECKING:
     from genomeer.config import GenomeerConfig
 
+
+class _SecretStr:
+    """Wrapper that prevents API key from appearing in logs or tracebacks."""
+    __slots__ = ('_value',)
+    def __init__(self, value: str): self._value = value
+    def __repr__(self): return '***REDACTED***'
+    def __str__(self): return '***REDACTED***'
+    def get_secret_value(self) -> str: return self._value
+
 SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "Custom"]
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
+
+_MODEL_MAX_OUTPUT: dict[str, int] = {
+    "claude-opus-4-7": 8192,
+    "claude-sonnet-4-6": 8192,
+    "claude-haiku-4-5": 4096,
+    "claude-3-opus-20240229": 4096,
+    "claude-3-sonnet-20240229": 4096,
+    "claude-3-haiku-20240307": 4096,
+    "gpt-4o": 4096,
+    "gpt-4-turbo": 4096,
+    "gpt-4": 4096,
+    "gpt-3.5-turbo": 4096,
+}
+_DEFAULT_MAX_OUTPUT = 4096
 
 def get_llm(
     model: str | None = None,
@@ -40,7 +63,8 @@ def get_llm(
         if base_url is None:
             base_url = config.base_url
         if api_key is None:
-            api_key = config.api_key or "EMPTY"
+            _raw_key = getattr(config, 'api_key', None) or "EMPTY"
+            api_key = _SecretStr(_raw_key)
 
     # Use defaults if still not specified
     if model is None:
@@ -48,7 +72,7 @@ def get_llm(
     if temperature is None:
         temperature = 0.7
     if api_key is None:
-        api_key = "EMPTY"
+        api_key = _SecretStr("EMPTY")
         
     # Auto-detect source from model name if not specified
     if source is None:
@@ -112,7 +136,7 @@ def get_llm(
             },
         )
         if api_key is not None:
-            kwargs["api_key"] = api_key
+            kwargs["api_key"] = api_key.get_secret_value() if isinstance(api_key, _SecretStr) else api_key
         if base_url is not None:
             kwargs["base_url"] = base_url
         return ChatOpenAI(**kwargs)
@@ -154,12 +178,17 @@ def get_llm(
             )
         if not os.getenv("ANTHROPIC_API_KEY"):
             raise ValueError("ANTHROPIC_API_KEY environment variable is required for Anthropic models.")
-        return ChatAnthropic(
+        llm = ChatAnthropic(
             model=model,
             temperature=temperature,
-            max_tokens=8192,
+            max_tokens=_MODEL_MAX_OUTPUT.get(model, _DEFAULT_MAX_OUTPUT),
             stop_sequences=stop_sequences,
         )
+        try:
+            llm = llm.with_retry(stop_after_attempt=3)
+        except AttributeError:
+            pass  # older langchain version without with_retry
+        return llm
 
     elif source == "Gemini":
         if not os.getenv("GEMINI_API_KEY"):
@@ -219,16 +248,20 @@ def get_llm(
         llm = ChatOpenAI(
             model=model,
             temperature=temperature,
-            max_tokens=8192,
+            max_tokens=_MODEL_MAX_OUTPUT.get(model, _DEFAULT_MAX_OUTPUT),
             stop=stop_sequences,
             base_url=base_url,
-            api_key=api_key,
+            api_key=api_key.get_secret_value() if isinstance(api_key, _SecretStr) else api_key,
             # Fixed: To avoid automatic tools call by ChatOpenAI->we want it as plain text in <execute></execute>
             model_kwargs={
                 "tool_choice": "none",
                 "response_format": {"type": "text"},
             },
         )
+        try:
+            llm = llm.with_retry(stop_after_attempt=3)
+        except AttributeError:
+            pass  # older langchain version without with_retry
         return llm
 
     else:

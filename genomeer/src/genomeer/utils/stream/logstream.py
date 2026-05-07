@@ -94,8 +94,11 @@ class InstallLogStream:
             self._write_file_line("<<CLOSED>>")
             self._cv.notify_all()
         if self._fp:
-            try: self._fp.close()
-            except Exception: pass
+            try:
+                self._fp.close()
+            except Exception as _e:
+                import logging as _log
+                _log.getLogger("genomeer.logstream").warning(f"[InstallLogStream] Failed to close log file: {_e}")
 
     # ---- Readers (unchanged API) ----------------------------------
     def read(self, cursor: int = 0, ephemeral_cursor: int = 0, limit: int = 1000) -> dict:
@@ -140,6 +143,9 @@ class LogRegistry:
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _path_for(self, sid: str) -> Path:
+        import re as _re
+        if not _re.match(r'^[a-zA-Z0-9_-]+$', sid):
+            raise ValueError(f"[LogRegistry] Invalid session ID (path traversal rejected): {sid!r}")
         return self.base_dir / f"{sid}.log"
 
     def create(self) -> tuple[str, InstallLogStream]:

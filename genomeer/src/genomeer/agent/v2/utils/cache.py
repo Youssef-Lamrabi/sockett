@@ -63,7 +63,6 @@ import hashlib
 import json
 import logging
 import os
-import pickle
 import sqlite3
 import threading
 import time
@@ -95,9 +94,9 @@ _CACHE_DISABLED = os.environ.get("GENOMEER_CACHE_DISABLED", "0").strip() in ("1"
 # ---------------------------------------------------------------------------
 
 def _hash(*parts: str) -> str:
-    """SHA-256 tronqué à 16 chars — lisible, collision-résistant pour notre usage."""
+    """SHA-256 tronqué à 32 chars — good collision resistance for large batch workloads."""
     combined = "\x00".join(str(p) for p in parts)
-    return hashlib.sha256(combined.encode()).hexdigest()[:16]
+    return hashlib.sha256(combined.encode()).hexdigest()[:32]
 
 
 def _hash_file(path: str) -> str:
@@ -109,9 +108,17 @@ def _hash_file(path: str) -> str:
         return _hash(path)
 
 
+def _hash_file_safe(path: str) -> str:
+    """Hash a file safely — falls back to path hash if file is deleted mid-operation."""
+    try:
+        return _hash_file(path)
+    except OSError:
+        return _hash(path)
+
+
 def _hash_files(paths: list[str]) -> str:
     """Hash combiné de plusieurs fichiers d'entrée."""
-    return _hash(*[_hash_file(p) for p in sorted(paths)])
+    return _hash(*[_hash_file_safe(p) for p in sorted(paths)])
 
 
 def _open_sqlite_conn(db_path: str) -> sqlite3.Connection:
@@ -153,18 +160,18 @@ class LLMResponseCache:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             conn = self._conn_get()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS llm_cache (
-                key       TEXT PRIMARY KEY,
-                value     TEXT NOT NULL,
-                model     TEXT,
-                node      TEXT,
-                created   REAL NOT NULL,
-                hits      INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_created ON llm_cache(created)")
-        conn.commit()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS llm_cache (
+                    key       TEXT PRIMARY KEY,
+                    value     TEXT NOT NULL,
+                    model     TEXT,
+                    node      TEXT,
+                    created   REAL NOT NULL,
+                    hits      INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_created ON llm_cache(created)")
+            conn.commit()
 
     def make_key(self, model: str, system_prompt: str, user_message: str) -> str:
         # FIX B7: hash the FULL content — truncating to 2000 chars caused hash collisions
@@ -446,6 +453,10 @@ class ToolOutputCache:
             # Copier les outputs dans le cache
             cached_output_dir = None
             if output_dir and Path(output_dir).exists():
+                import re as _re
+                if not _re.match(r'^[a-f0-9A-F_-]+$', key):
+                    logger.warning(f"[ToolCache] Skipping cache: invalid key format: {key!r}")
+                    return
                 cached_output_dir = str(self.cache_dir / f"outputs_{key}")
                 success = self._archive_outputs(output_dir, cached_output_dir)
                 if not success:
@@ -626,10 +637,12 @@ class APIResponseCache:
         try:
             with self._lock:
                 conn = _open_sqlite_conn(self.db_path)
-                row = conn.execute(
-                    "SELECT value, created FROM api_cache WHERE key=?", (key,)
-                ).fetchone()
-                conn.close()
+                try:
+                    row = conn.execute(
+                        "SELECT value, created FROM api_cache WHERE key=?", (key,)
+                    ).fetchone()
+                finally:
+                    conn.close()
             if row is None:
                 return None
             value_bytes, created = row
@@ -639,10 +652,12 @@ class APIResponseCache:
                 return None
             with self._lock:
                 conn2 = _open_sqlite_conn(self.db_path)
-                conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
-                conn2.commit()
-                conn2.close()
-            return pickle.loads(value_bytes)
+                try:
+                    conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
+                    conn2.commit()
+                finally:
+                    conn2.close()
+            return json.loads(value_bytes if isinstance(value_bytes, str) else value_bytes.decode("utf-8", errors="replace"))
         except Exception as e:
             logger.warning(f"[APICache] get failed: {e}")
             return None
@@ -654,12 +669,14 @@ class APIResponseCache:
         try:
             with self._lock:
                 conn = _open_sqlite_conn(self.db_path)
-                conn.execute(
-                    "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
-                    (key, url, pickle.dumps(value), time.time()),
-                )
-                conn.commit()
-                conn.close()
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
+                        (key, url, json.dumps(value, default=str).encode("utf-8"), time.time()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
         except Exception as e:
             logger.warning(f"[APICache] set failed: {e}")
 
@@ -684,35 +701,75 @@ class APIResponseCache:
                     try:
                         with self._lock:
                             conn = _open_sqlite_conn(self.db_path)
-                            row = conn.execute(
-                                "SELECT value, created FROM api_cache WHERE key=?", (key,)
-                            ).fetchone()
-                            conn.close()
+                            try:
+                                row = conn.execute(
+                                    "SELECT value, created FROM api_cache WHERE key=?", (key,)
+                                ).fetchone()
+                            finally:
+                                conn.close()
                         if row:
                             value_bytes, created = row
                             effective_ttl = ttl_seconds or self.default_ttl
                             if time.time() - created <= effective_ttl:
                                 with self._lock:
                                     conn2 = _open_sqlite_conn(self.db_path)
-                                    conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
-                                    conn2.commit()
-                                    conn2.close()
+                                    try:
+                                        conn2.execute("UPDATE api_cache SET hits=hits+1 WHERE key=?", (key,))
+                                        conn2.commit()
+                                    finally:
+                                        conn2.close()
                                 logger.debug(f"[APICache] HIT {fn.__name__}")
-                                return pickle.loads(value_bytes)
+                                return json.loads(value_bytes if isinstance(value_bytes, str) else value_bytes.decode("utf-8", errors="replace"))
                     except Exception:
                         pass
 
-                result = fn(*args, **kwargs)
+                # Check if another thread is already computing this key
+                with _INFLIGHT_LOCK:
+                    if key in _INFLIGHT_KEYS:
+                        _wait_event = _INFLIGHT_KEYS[key]
+                    else:
+                        _wait_event = None
+                        _INFLIGHT_KEYS[key] = threading.Event()
+
+                if _wait_event is not None:
+                    _wait_event.wait(timeout=30)
+                    # Re-check cache after waiting
+                    try:
+                        with self._lock:
+                            conn = _open_sqlite_conn(self.db_path)
+                            try:
+                                row2 = conn.execute(
+                                    "SELECT value, created FROM api_cache WHERE key=?", (key,)
+                                ).fetchone()
+                            finally:
+                                conn.close()
+                        if row2:
+                            value_bytes2, created2 = row2
+                            effective_ttl2 = ttl_seconds or self.default_ttl
+                            if time.time() - created2 <= effective_ttl2:
+                                return json.loads(value_bytes2 if isinstance(value_bytes2, str) else value_bytes2.decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+
+                try:
+                    result = fn(*args, **kwargs)
+                finally:
+                    with _INFLIGHT_LOCK:
+                        ev = _INFLIGHT_KEYS.pop(key, None)
+                        if ev:
+                            ev.set()
 
                 try:
                     with self._lock:
                         conn = _open_sqlite_conn(self.db_path)
-                        conn.execute(
-                            "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
-                            (key, fn.__name__, pickle.dumps(result), time.time()),
-                        )
-                        conn.commit()
-                        conn.close()
+                        try:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO api_cache(key,url,value,created) VALUES(?,?,?,?)",
+                                (key, fn.__name__, json.dumps(result, default=str).encode("utf-8"), time.time()),
+                            )
+                            conn.commit()
+                        finally:
+                            conn.close()
                 except Exception:
                     pass
 
@@ -724,9 +781,11 @@ class APIResponseCache:
         try:
             with self._lock:
                 conn = _open_sqlite_conn(self.db_path)
-                conn.execute("DELETE FROM api_cache WHERE key=?", (key,))
-                conn.commit()
-                conn.close()
+                try:
+                    conn.execute("DELETE FROM api_cache WHERE key=?", (key,))
+                    conn.commit()
+                finally:
+                    conn.close()
         except Exception:
             pass
 
@@ -734,12 +793,14 @@ class APIResponseCache:
         try:
             with self._lock:
                 conn = _open_sqlite_conn(self.db_path)
-                deleted = conn.execute(
-                    "DELETE FROM api_cache WHERE created < ?",
-                    (time.time() - self.default_ttl,)
-                ).rowcount
-                conn.commit()
-                conn.close()
+                try:
+                    deleted = conn.execute(
+                        "DELETE FROM api_cache WHERE created < ?",
+                        (time.time() - self.default_ttl,)
+                    ).rowcount
+                    conn.commit()
+                finally:
+                    conn.close()
             if deleted:
                 logger.info(f"[APICache] Purged {deleted} expired entries")
         except Exception as e:
@@ -797,6 +858,10 @@ class GenoCache:
 # Singleton global et son lock (Fix A1: thread-safe singleton)
 _CACHE_INSTANCE: Optional[GenoCache] = None
 _CACHE_LOCK = threading.Lock()
+
+# Per-key in-flight locks to prevent cache stampede (H-NEW-06)
+_INFLIGHT_KEYS: dict[str, threading.Event] = {}
+_INFLIGHT_LOCK = threading.Lock()
 
 def get_cache(cache_dir: Optional[str] = None) -> GenoCache:
     """Retourne le singleton GenoCache. Thread-safe."""

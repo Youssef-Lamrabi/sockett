@@ -17,7 +17,16 @@ class GenomeerConfig:
         self.path = os.getenv("GENOMEER_DATA_PATH", self.path)
         self.run_dir = os.getenv("GENOMEER_RUN_DIR", self.run_dir)
         self.llm = os.getenv("GENOMEER_LLM", self.llm)
-        self.timeout_seconds = int(os.getenv("GENOMEER_TIMEOUT_SECONDS", self.timeout_seconds))
+        _timeout_env = os.getenv("GENOMEER_TIMEOUT_SECONDS")
+        if _timeout_env is not None:
+            try:
+                _tv = int(_timeout_env)
+                self.timeout_seconds = max(60, min(_tv, 86400))
+            except ValueError:
+                import logging as _logging
+                _logging.getLogger("genomeer.config").error(
+                    f"[Config] Invalid GENOMEER_TIMEOUT_SECONDS={_timeout_env!r}; using default {self.timeout_seconds}"
+                )
         
         if os.getenv("GENOMEER_USE_TOOL_RETRIEVER"):
             self.use_tool_retriever = os.getenv("GENOMEER_USE_TOOL_RETRIEVER").lower() == "true"
@@ -28,7 +37,19 @@ class GenomeerConfig:
         self.api_key  = os.getenv("CUSTOM_MODEL_API_KEY", self.api_key)
         self.source   = os.getenv("GENOMEER_MODEL_SOURCE", self.source)
         if self.source:
-            self.source = self.source.strip("'\"") # BUG-38: handle quotes in .env
+            self.source = self.source.strip("'\"")
+            _ALLOWED_SOURCES = {"openai", "anthropic", "custom", "azure", "ollama", ""}
+            if self.source.lower() not in _ALLOWED_SOURCES:
+                import logging as _logging
+                _logging.getLogger("genomeer.config").warning(
+                    f"[Config] Unexpected model source: {self.source!r}. "
+                    f"Allowed: {_ALLOWED_SOURCES}"
+                )
+
+    def __repr__(self) -> str:
+        fields = {k: ("***REDACTED***" if "key" in k.lower() or "secret" in k.lower() or "password" in k.lower() else v)
+                  for k, v in self.__dict__.items()}
+        return f"GenomeerConfig({fields})"
 
     def to_dict(self) -> dict:
         """Convert config to dictionary for easy access."""

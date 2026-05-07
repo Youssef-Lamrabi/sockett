@@ -151,6 +151,8 @@ def load_sequences(paths: List[str], format: Optional[str] = None, max_records: 
                 if max_records and count >= max_records:
                     break
         _write_tsv(rows, out)
+        if not Path(out).exists() or Path(out).stat().st_size == 0:
+            raise RuntimeError(f"[load_sequences] TSV write failed or produced empty file: {out}")
         artifacts.append(out)
     return {"records_count": total, "format": detected or "auto", "temp_paths": artifacts}
 

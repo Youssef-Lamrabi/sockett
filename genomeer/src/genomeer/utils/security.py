@@ -97,6 +97,14 @@ _BLOCKED_BASH: List[Tuple[re.Pattern, str]] = [
     # iptables flush (désactive le firewall)
     (re.compile(r"\biptables\s+-F\b", re.IGNORECASE),
      "iptables flush (firewall disable)"),
+
+    # Process substitution: <(cmd) or >(cmd) — can construct dynamic paths
+    (re.compile(r'[<>]\s*\(', re.IGNORECASE),
+     "process substitution <(...) / >(...) not allowed in generated scripts"),
+
+    # Heredoc syntax: <<EOF or <<'EOF' — wraps commands to bypass inline detection
+    (re.compile(r'<<[-\w\'"]*\s', re.IGNORECASE),
+     "heredoc (<<EOF) syntax not allowed in generated scripts"),
 ]
 
 
@@ -142,6 +150,14 @@ _BLOCKED_PYTHON: List[Tuple[re.Pattern, str]] = [
     # os.remove / os.unlink sur chemin absolu racine
     (re.compile(r"\bos\.(remove|unlink)\s*\(\s*['\"]?\s*/(?![tT]mp|[vV]ar/[tT]mp|[hH]ome/\w+/\.genomeer)", re.IGNORECASE),
      "os.remove/unlink on root or sensitive path"),
+
+    # ctypes — direct C library access bypasses all sandbox checks
+    (re.compile(r'\bctypes\b', re.IGNORECASE),
+     "ctypes module is forbidden (direct C library / system call access)"),
+
+    # sys.modules manipulation — can replace safe modules with malicious ones
+    (re.compile(r'\bsys\s*\.\s*modules\b', re.IGNORECASE),
+     "sys.modules manipulation is forbidden"),
 ]
 
 
@@ -158,6 +174,16 @@ def _normalize_script(script: str) -> str:
     """
     if not script:
         return ""
+    # Decode ANSI-C quoting: $'...\x20...' — bash interprets hex/octal escapes
+    # that would otherwise bypass pattern matching after normalization
+    import re as _re
+    def _decode_ansi_c(m: re.Match) -> str:
+        try:
+            return m.group(1).encode('raw_unicode_escape').decode('unicode_escape')
+        except Exception:
+            return m.group(0)
+    script = _re.sub(r"\$'([^']*)'", _decode_ansi_c, script)
+
     # Retire les backslashes de continuation de ligne (\ followed by newline)
     script = script.replace("\\\n", " ")
     
@@ -165,7 +191,9 @@ def _normalize_script(script: str) -> str:
     # BUG-12: Ajout de caractères unicode 'lookalike' (U+00A0, U+200B, etc.)
     script = re.sub(r'[ \t\r\u00A0\u2000-\u200B\u202F\u205F\u3000]+', ' ', script)
     
-    return script.lower().strip()
+    import unicodedata
+    script = unicodedata.normalize('NFKC', script)
+    return script.casefold().strip()
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +216,10 @@ def check_bash_script(script: str) -> Tuple[bool, str]:
         # Extraction naïve des chaînes base64 probables (A-Za-z0-9+/=)
         for m in re.finditer(r'["\']([A-Za-z0-9+/=]{8,})["\']', script):
             try:
-                decoded = _b64.b64decode(m.group(1)).decode("utf-8", errors="ignore")
+                try:
+                    decoded = _b64.b64decode(m.group(1)).decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    return False, "[SECURITY BLOCK] Non-UTF-8 base64 payload rejected (possible binary exploit)"
                 is_safe, reason = check_bash_script(decoded)
                 if not is_safe:
                     return False, f"[SECURITY BLOCK] Dangerous content hidden in base64: {reason}"
@@ -222,6 +253,19 @@ def check_python_code(code: str) -> Tuple[bool, str]:
     try:
         tree = ast.parse(code)
         for node in ast.walk(tree):
+            # 0. Block dangerous module imports (ctypes, sys via modules)
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                _BLOCKED_MODULES = {"ctypes", "antigravity"}
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        mod = alias.name.split('.')[0]
+                        if mod in _BLOCKED_MODULES:
+                            return False, f"[SECURITY BLOCK] Forbidden module import: {alias.name}"
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    mod = (node.module or "").split('.')[0]
+                    if mod in _BLOCKED_MODULES:
+                        return False, f"[SECURITY BLOCK] Forbidden module import: {node.module}"
+
             # 1. Block direct calls to dangerous builtins
             if isinstance(node, ast.Call):
                 func = node.func
@@ -239,9 +283,16 @@ def check_python_code(code: str) -> Tuple[bool, str]:
                     reason = f"[SECURITY BLOCK] Forbidden AST call detected: {func_name}()"
                     return False, reason
 
-            # 2. Block access to __builtins__ dictionary or dangerous attributes
+            # 2. Block access to dangerous attributes (including chained access like
+            #    ().__class__.__bases__[0].__subclasses__() which bypasses top-level check)
             if isinstance(node, ast.Attribute):
-                if node.attr in ("__builtins__", "__globals__", "__subclasses__", "__bases__", "func_globals"):
+                _DANGEROUS_ATTRS = {
+                    "__builtins__", "__globals__", "__subclasses__", "__bases__",
+                    "func_globals", "__code__", "__dict__", "__class__",
+                    "__traceback__", "tb_frame", "f_globals", "f_locals",
+                    "f_back", "gi_frame", "ag_frame", "cr_frame",
+                }
+                if node.attr in _DANGEROUS_ATTRS:
                     reason = f"[SECURITY BLOCK] Forbidden attribute access: .{node.attr}"
                     return False, reason
             

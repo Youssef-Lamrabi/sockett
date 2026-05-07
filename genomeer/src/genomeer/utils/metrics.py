@@ -29,7 +29,7 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 try:
     import psutil
@@ -75,20 +75,15 @@ class RunMetrics:
     total_errors: int = 0
     peak_mem_mb: float = 0.0
     _step_starts: Dict[str, float] = field(default_factory=dict)
-    _lock_obj: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         import threading
         # BUG-16: Use a private attribute to avoid asdict() serialization issues
         object.__setattr__(self, "_metrics_lock", threading.RLock())
 
-    @property
-    def _lock_obj(self):
-        return getattr(self, "_metrics_lock")
-
     def record_step_start(self, step_idx: int, step_title: str) -> None:
         import time
-        with self._lock_obj:
+        with self._metrics_lock:
             key = f"{step_idx}:{step_title}"
             self._step_starts[key] = time.time()
             existing = next((s for s in self.steps if s.step_idx == step_idx), None)
@@ -150,9 +145,10 @@ class RunMetrics:
                     pass
 
     def record_llm_call(self, cache_hit: bool = False) -> None:
-        self.llm_calls += 1
-        if cache_hit:
-            self.llm_cache_hits += 1
+        with self._metrics_lock:
+            self.llm_calls += 1
+            if cache_hit:
+                self.llm_cache_hits += 1
 
     def finalize(self) -> None:
         self.ended_at = time.time()

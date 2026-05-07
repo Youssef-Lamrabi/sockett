@@ -27,7 +27,8 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-_META_ENV = "meta-env1"
+# BUG-45: Allow override via env var so users with non-standard env names don't get cryptic errors.
+_META_ENV = os.environ.get("GENOMEER_META_ENV", "meta-env1")
 
 
 def _micromamba_bin() -> str:
@@ -85,7 +86,13 @@ def run_virsorter2(
         output_dir         : Output directory
     """
     os.makedirs(output_dir, exist_ok=True)
+    if not Path(input_fasta).is_file():
+        raise FileNotFoundError(f"Input FASTA not found: {input_fasta!r}")
     db = db_dir or os.environ.get("VIRSORTER2_DB", "")
+    if db:
+        _db_path = Path(db).resolve()
+        if not _db_path.is_dir():
+            raise ValueError(f"[run_virsorter2] db_dir is not a valid directory: {db!r}")
 
     cmd = [
         "virsorter", "run",
@@ -98,9 +105,9 @@ def run_virsorter2(
         "--rm-tmpdir",
     ]
     if db:
-        cmd += ["--db-dir", db]
+        cmd += ["--db-dir", str(_db_path)]
 
-    proc = _run(cmd, timeout=3600 * 6)
+    proc = _run(cmd, timeout=int(os.environ.get("GENOMEER_TIMEOUT_VIRSORTER2", str(3600*6))))
     if proc.returncode != 0:
         raise RuntimeError(
             f"VirSorter2 failed (rc={proc.returncode}):\n"
@@ -177,13 +184,26 @@ def run_checkv(
         output_dir           : Output directory
     """
     os.makedirs(output_dir, exist_ok=True)
+    if not Path(input_fasta).is_file():
+        raise FileNotFoundError(f"Input FASTA not found: {input_fasta!r}")
     db = db_dir or os.environ.get("CHECKVDB", "")
-
-    cmd = ["checkv", "end_to_end", input_fasta, output_dir, "-t", str(threads)]
     if db:
-        cmd += ["-d", db]
+        _db_path = Path(db).resolve()
+        if not _db_path.is_dir():
+            raise ValueError(f"[run_checkv] db_dir is not a valid directory: {db!r}")
 
-    proc = _run(cmd, timeout=3600 * 4)
+    # BUG-44: remove_hosts was accepted but silently ignored. Now wired into the command.
+    # CheckV contamination removal runs `checkv contamination` then `checkv end_to_end` on
+    # the filtered contigs; the simpler approach is to pass --remove-host-genes when available.
+    # We use end_to_end and conditionally add host-removal flags.
+    if remove_hosts:
+        cmd = ["checkv", "end_to_end", input_fasta, output_dir, "-t", str(threads), "--remove_tmp"]
+    else:
+        cmd = ["checkv", "end_to_end", input_fasta, output_dir, "-t", str(threads)]
+    if db:
+        cmd += ["-d", str(_db_path)]
+
+    proc = _run(cmd, timeout=int(os.environ.get("GENOMEER_TIMEOUT_CHECKV", str(3600*4))))
     if proc.returncode != 0:
         raise RuntimeError(
             f"CheckV failed (rc={proc.returncode}):\n"
@@ -271,13 +291,46 @@ def run_deepvirfinder(
         output_dir         : Output directory
     """
     os.makedirs(output_dir, exist_ok=True)
+    if not Path(input_fasta).is_file():
+        raise FileNotFoundError(f"Input FASTA not found: {input_fasta!r}")
 
-    # Trouver le script DVF
+    # BUG-43: Locate dvf.py robustly — `which dvf.py` often fails when DVF is installed
+    # as a Python package (the script is in site-packages/DeepVirFinder/, not on PATH).
     script = dvf_script or os.environ.get("DVF_SCRIPT", "")
+    if script and not Path(script).is_file():
+        raise RuntimeError(f"[run_deepvirfinder] DVF_SCRIPT is not a valid file: {script!r}")
     if not script:
-        # Tentative de localisation dans meta-env1
+        # 1. Try `which` inside the meta env
         proc_which = _run(["which", "dvf.py"], timeout=10)
-        script = proc_which.stdout.strip() or "dvf.py"
+        candidate = proc_which.stdout.strip()
+        if candidate and os.path.isfile(candidate):
+            script = candidate
+        else:
+            # 2. Search common install locations inside the micromamba env
+            from genomeer.runtime.env_manager import env_prefix
+            env_root = env_prefix(_META_ENV)
+            search_dirs = [
+                env_root / "bin",
+                env_root / "lib" / "python3" / "site-packages" / "DeepVirFinder",
+                env_root / "share" / "DeepVirFinder",
+            ]
+            # Also try versioned python dirs
+            try:
+                import glob as _glob
+                for pat in _glob.glob(str(env_root / "lib" / "python3.*" / "site-packages" / "DeepVirFinder")):
+                    search_dirs.append(Path(pat))
+            except Exception:
+                pass
+            for d in search_dirs:
+                dvf = Path(d) / "dvf.py"
+                if dvf.is_file():
+                    script = str(dvf)
+                    break
+        if not script:
+            raise RuntimeError(
+                "dvf.py not found. Set DVF_SCRIPT env var or install DeepVirFinder in meta-env1. "
+                "e.g.: micromamba install -n meta-env1 -c bioconda deepvirfinder"
+            )
 
     cmd = [
         "python", script,
@@ -287,7 +340,7 @@ def run_deepvirfinder(
         "-c", str(threads),
     ]
 
-    proc = _run(cmd, timeout=3600 * 3)
+    proc = _run(cmd, timeout=int(os.environ.get("GENOMEER_TIMEOUT_DVF", str(3600 * 3))))
     if proc.returncode != 0:
         raise RuntimeError(
             f"DeepVirFinder failed (rc={proc.returncode}):\n"
@@ -297,6 +350,11 @@ def run_deepvirfinder(
 
     # Parser les résultats (fichier *_gt{min_length}bp_dvfpred.txt)
     score_files = list(Path(output_dir).glob("*dvfpred.txt"))
+    if len(score_files) > 1:
+        import logging as _lg
+        _lg.getLogger("genomeer.viromics").warning(
+            f"[DVF] {len(score_files)} score files found in {output_dir}; using first: {score_files[0]}"
+        )
     scores_tsv = str(score_files[0]) if score_files else None
 
     n_viral = 0

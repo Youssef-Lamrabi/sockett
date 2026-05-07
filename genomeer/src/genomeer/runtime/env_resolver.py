@@ -269,8 +269,12 @@ def get_meta_env_signals() -> set[str]:
         pass
     return signals
 
-# For backward compatibility with imports
-META_ENV_SIGNALS = _WRAPPERS_SIGNALS
+def _get_meta_env_signals_cached() -> set:
+    """Get meta env signals, refreshing if the registry file was modified."""
+    return get_meta_env_signals()
+
+# Keep META_ENV_SIGNALS as a property for backward compat, but refresh on each access
+META_ENV_SIGNALS = _WRAPPERS_SIGNALS  # fallback; real value fetched per-call in resolve_env_for_code
 
 
 def resolve_env_for_code(

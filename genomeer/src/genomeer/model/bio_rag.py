@@ -59,6 +59,23 @@ import requests
 
 logger = logging.getLogger("genomeer.bio_rag")
 
+
+def _sanitize_bio_text(text: str, max_len: int = 2000) -> str:
+    """Strip control characters and prompt-injection markers from external API text."""
+    import re as _re
+    # Remove control characters
+    text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Truncate
+    text = text[:max_len]
+    # Warn on suspicious prompt injection patterns
+    _suspicious = ('ignore previous', 'system:', 'assistant:', 'human:', '```python')
+    if any(marker in text.lower() for marker in _suspicious):
+        import logging as _lg
+        _lg.getLogger("genomeer.bio_rag").warning(
+            f"[BioRAG] Suspicious content in external API response: {text[:100]!r}"
+        )
+    return text.strip()
+
 # BUG-25: Global cache for embedding models to prevent repeated reloading
 _MODEL_CACHE: Dict[str, Any] = {}
 _MODEL_LOCK = threading.Lock()
@@ -70,6 +87,15 @@ def _get_model(model_name: str) -> Any:
             from sentence_transformers import SentenceTransformer
             _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
     return _MODEL_CACHE[model_name]
+
+
+def clear_model_cache(model_name: str | None = None) -> None:
+    """Release cached embedding models to free GPU/CPU memory."""
+    with _MODEL_LOCK:
+        if model_name:
+            _MODEL_CACHE.pop(model_name, None)
+        else:
+            _MODEL_CACHE.clear()
 
 # ---------------------------------------------------------------------------
 # Document — unité de base du store
@@ -242,120 +268,38 @@ class _KEGGFetcher:
 
 class _QualityThresholdsFetcher:
     """
-    Base locale des seuils qualité métagénomiques — pas d'API nécessaire.
-    Donne au LLM des références concrètes pour l'interprétation.
+    Base locale des seuils qualité métagénomiques — BUG-34: now imports from the shared
+    thresholds module (genomeer.utils.thresholds) to avoid duplication with quality_gate.py.
     """
-    _THRESHOLDS = [
-        {
-            "metric": "Assembly N50",
-            "tool": "metaSPAdes / MEGAHIT / Flye",
-            "good": "> 10,000 bp",
-            "acceptable": "1,000 – 10,000 bp",
-            "poor": "< 500 bp",
-            "interpretation": (
-                "N50 > 10 kb indicates a high-quality metagenome assembly suitable for binning. "
-                "N50 < 500 bp suggests highly fragmented assembly; consider increasing depth or switching assembler. "
-                "Reference: metaSPAdes paper (Nurk et al. 2017, Genome Research)."
-            ),
-        },
-        {
-            "metric": "MAG Completeness",
-            "tool": "CheckM2",
-            "good": ">= 90%",
-            "acceptable": "50 – 90%",
-            "poor": "< 50%",
-            "interpretation": (
-                "CheckM2 completeness >= 90% with contamination <= 5% defines a 'high-quality draft MAG' "
-                "per MIMAG standards (Bowers et al. 2017, Nature Biotechnology). "
-                "Medium quality: >= 50% complete, <= 10% contaminated. "
-                "Low quality bins (<50%) are unsuitable for genomic inference."
-            ),
-        },
-        {
-            "metric": "MAG Contamination",
-            "tool": "CheckM2",
-            "good": "<= 5%",
-            "acceptable": "5 – 10%",
-            "poor": "> 10%",
-            "interpretation": (
-                "Contamination >10% suggests chimeric bins or multiple organisms co-binned. "
-                "Use DAS_Tool for bin refinement. Re-binning with larger minimum contig size may help."
-            ),
-        },
-        {
-            "metric": "Read classification rate",
-            "tool": "Kraken2 / MetaPhlAn4",
-            "good": "> 60%",
-            "acceptable": "20 – 60%",
-            "poor": "< 5%",
-            "interpretation": (
-                "Very low classification rates (<5%) may indicate: "
-                "(1) Novel organisms not in the database; "
-                "(2) Wrong database (e.g., bacterial DB on viral metagenome); "
-                "(3) Low-quality reads. "
-                "MetaPhlAn4 typically classifies fewer reads than Kraken2 but with higher specificity."
-            ),
-        },
-        {
-            "metric": "Q30 base quality rate",
-            "tool": "fastp",
-            "good": "> 80%",
-            "acceptable": "60 – 80%",
-            "poor": "< 40%",
-            "interpretation": (
-                "Q30 = 0.1% error rate per base. "
-                "< 40% Q30 indicates poor library quality and will impair assembly significantly. "
-                "Q30 > 80% after trimming is optimal for metagenome assembly."
-            ),
-        },
-        {
-            "metric": "Shannon diversity index",
-            "tool": "vegan R / HUMAnN3",
-            "good": "> 3.0",
-            "acceptable": "1.5 – 3.0",
-            "poor": "< 1.0",
-            "interpretation": (
-                "Shannon index < 1.0 indicates very low diversity, typical of dysbiotic gut or "
-                "single-species dominated environments. "
-                "Shannon > 3.5 is typical of healthy human gut (Turnbaugh et al. 2009, Nature). "
-                "Environmental (soil/marine) samples typically show Shannon 4–6."
-            ),
-        },
-        {
-            "metric": "Coverage depth for binning",
-            "tool": "samtools / jgi_summarize_bam_contig_depths",
-            "good": "> 10x",
-            "acceptable": "5 – 10x",
-            "poor": "< 5x",
-            "interpretation": (
-                "MetaBAT2 requires minimum 5x coverage per contig for reliable binning. "
-                "< 5x: most contigs will be unbinned. "
-                "> 30x: sufficient for complete MAG recovery in most communities. "
-                "Coverage is calculated per contig, not per sample."
-            ),
-        },
-        {
-            "metric": "Number of high-quality MAGs",
-            "tool": "MetaBAT2 + CheckM2",
-            "good": "Depends on community complexity",
-            "acceptable": "1 – 10 for simple communities",
-            "poor": "0 MAGs from >1GB of reads",
-            "interpretation": (
-                "0 MAGs from sufficient data suggests: low coverage, too-short contigs, or divergent community. "
-                "In gut metagenomes, typical studies recover 10–100 MAGs from 10-20 Gbp data. "
-                "Reference: Pasolli et al. 2019, Cell (4,930 human gut MAGs)."
-            ),
-        },
-    ]
 
     @classmethod
     def fetch(cls) -> List[BioDocument]:
+        # BUG-34: import from single source of truth
+        try:
+            from genomeer.utils.thresholds import MIMAG_THRESHOLDS
+            thresholds = MIMAG_THRESHOLDS
+        except ImportError:
+            logger.warning("[Quality] Could not import shared MIMAG_THRESHOLDS — using empty fallback")
+            return []
+
+        metric_labels = {
+            "assembly_n50":      "Assembly N50",
+            "mean_completeness": "MAG Completeness",
+            "mean_contamination": "MAG Contamination",
+            "classified_pct":    "Read classification rate",
+            "q30_rate":          "Q30 base quality rate",
+            "diversity_shannon": "Shannon diversity index",
+            "coverage_depth":    "Coverage depth for binning",
+            "n_hq_mags":         "Number of high-quality MAGs",
+        }
+
         docs: List[BioDocument] = []
-        for t in cls._THRESHOLDS:
-            doc_id = f"quality_{t['metric'].lower().replace(' ', '_')}"
+        for key, t in thresholds.items():
+            label = metric_labels.get(key, key)
+            doc_id = f"quality_{key}"
             text = (
-                f"Quality threshold — {t['metric']} (tool: {t['tool']}): "
-                f"Good: {t['good']} | Acceptable: {t['acceptable']} | Poor: {t['poor']}. "
+                f"Quality threshold — {label} (tool: {t['tool']}): "
+                f"Good: {t['good_label']} | Acceptable: {t['acceptable_label']} | Poor: {t['poor_label']}. "
                 f"{t['interpretation']}"
             )
             docs.append(BioDocument(
@@ -363,7 +307,7 @@ class _QualityThresholdsFetcher:
                 text=text,
                 source="local",
                 category="quality",
-                metadata={"metric": t["metric"], "tool": t["tool"]},
+                metadata={"metric": label, "tool": t["tool"]},
             ))
         logger.info(f"[Quality] Loaded {len(docs)} threshold entries")
         return docs
@@ -394,7 +338,12 @@ class _PubMedFetcher:
         docs: List[BioDocument] = []
         seen_pmids: set = set()
 
+        _fetch_start = time.time()
+        _max_fetch_time = int(os.environ.get("GENOMEER_PUBMED_MAX_FETCH_SEC", "120"))
         for query, max_results in cls.QUERIES:
+            if time.time() - _fetch_start > _max_fetch_time:
+                logger.warning(f"[PubMedFetcher] Time budget {_max_fetch_time}s exceeded — stopping early")
+                break
             try:
                 # 1. Recherche des PMIDs
                 search_params = {
@@ -413,7 +362,7 @@ class _PubMedFetcher:
                 seen_pmids.update(new_pmids)
 
                 # 2. Récupérer les articles (XML)
-                time.sleep(0.35)  # Rate limit NCBI
+                time.sleep(float(os.environ.get("GENOMEER_NCBI_RATE_LIMIT_SEC", "0.35")))  # Rate limit NCBI
                 fetch_params = {
                     "db": "pubmed", "id": ",".join(new_pmids),
                     "retmode": "xml",
@@ -422,9 +371,13 @@ class _PubMedFetcher:
                 if fetch_resp.status_code != 200:
                     continue
 
-                # 3. Parsing XML robuste (TÂCHE 10)
+                # 3. Parsing XML robuste (TÂCHE 10) — M-NEW-10: use defusedxml when available
                 import xml.etree.ElementTree as ET
-                root = ET.fromstring(fetch_resp.text)
+                try:
+                    import defusedxml.ElementTree as _ET
+                    root = _ET.fromstring(fetch_resp.content)
+                except ImportError:
+                    root = ET.fromstring(fetch_resp.content)  # stdlib is safe for XXE on CPython
                 
                 for article in root.findall(".//PubmedArticle"):
                     pmid_node = article.find(".//PMID")
@@ -436,9 +389,11 @@ class _PubMedFetcher:
                     abstract_nodes = article.findall(".//AbstractText")
                     abstract = " ".join(["".join(node.itertext()) for node in abstract_nodes if node is not None])
                     abstract = abstract.strip()[:1200]
-                    
+
                     if not abstract:
                         continue
+
+                    abstract = _sanitize_bio_text(abstract)  # M-NEW-13
 
                     docs.append(BioDocument(
                         doc_id=f"pubmed_{pmid}",
@@ -452,7 +407,7 @@ class _PubMedFetcher:
                         },
                     ))
 
-                time.sleep(0.35)
+                time.sleep(float(os.environ.get("GENOMEER_NCBI_RATE_LIMIT_SEC", "0.35")))
 
             except Exception as e:
                 logger.warning(f"[PubMed] Failed to fetch query '{query}': {e}")
@@ -510,8 +465,8 @@ class BioRAGStore:
                     bundle_date = datetime.fromisoformat(bundle_date_str)
                     days_old = (datetime.now() - bundle_date).days
                     if days_old > 180:
-                        # TÂCHE 7.1: Élévation au niveau ERROR pour visibilité
-                        logger.error(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old} days old. Context may be outdated.")
+                        # TÂCHE 7.1: Downgraded from ERROR to WARNING (stale bundle, not a hard failure)
+                        logger.warning(f"[BioRAG] WARNING: The CARD context bundle ({card_path.name}) is {days_old} days old. Context may be outdated.")
                         self.rag_warnings["rag_bundles_stale"] = True
                         self.rag_warnings["rag_bundles_age_days"] = max(self.rag_warnings["rag_bundles_age_days"], days_old)
                 
@@ -540,8 +495,8 @@ class BioRAGStore:
                     bundle_date = datetime.fromisoformat(bundle_date_str)
                     days_old = (datetime.now() - bundle_date).days
                     if days_old > 180:
-                        # TÂCHE 7.1: Élévation au niveau ERROR
-                        logger.error(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old} days old. Context may be outdated.")
+                        # TÂCHE 7.1: Downgraded from ERROR to WARNING (stale bundle, not a hard failure)
+                        logger.warning(f"[BioRAG] WARNING: The KEGG context bundle ({kegg_path.name}) is {days_old} days old. Context may be outdated.")
                         self.rag_warnings["rag_bundles_stale"] = True
                         self.rag_warnings["rag_bundles_age_days"] = max(self.rag_warnings["rag_bundles_age_days"], days_old)
                 
@@ -640,6 +595,13 @@ class BioRAGStore:
             self._ready = False
             return self
 
+        # Explicitly release old index to free memory before building new one (M-NEW-14)
+        with self._lock:
+            old_index = getattr(self, '_index', None)
+            self._index = None
+        if old_index is not None:
+            del old_index
+
         # Construire l'index FAISS
         self._build_faiss_index()
 
@@ -659,7 +621,8 @@ class BioRAGStore:
     def _init_embedder(self):
         try:
             # BUG-25: Use the shared model cache
-            self._embedder = _get_model("all-MiniLM-L6-v2")
+            _embed_model_name = os.environ.get("GENOMEER_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+            self._embedder = _get_model(_embed_model_name)
             self._embed_backend = "sentence_transformers"
             return
         except ImportError:
@@ -675,30 +638,34 @@ class BioRAGStore:
         self._embedder = None
 
     def _embed(self, texts: List[str]):
+        if self._embedder is None:
+            raise RuntimeError("[BioRAG] No embedding backend is available. Install sentence-transformers or configure an OpenAI API key.")
+        embedder = self._embedder  # local ref prevents GC during encoding (H-NEW-10)
         import numpy as np
         if self._embed_backend == "sentence_transformers":
-            return self._embedder.encode(texts, normalize_embeddings=True).astype("float32")
+            return embedder.encode(texts, normalize_embeddings=True).astype("float32")
         elif self._embed_backend == "openai":
-            raw = self._embedder.embed_documents(texts)
+            raw = embedder.embed_documents(texts)
             arr = np.array(raw, dtype="float32")
             norms = np.linalg.norm(arr, axis=1, keepdims=True)
             return arr / (norms + 1e-10)
         raise RuntimeError("No embedder")
 
     def _build_faiss_index(self):
-        try:
-            import faiss
-            import numpy as np
-        except ImportError:
-            logger.warning("[BioRAG] faiss-cpu not installed")
-            return
+        with self._lock:
+            try:
+                import faiss
+                import numpy as np
+            except ImportError:
+                logger.warning("[BioRAG] faiss-cpu not installed")
+                return
 
-        texts = [doc.text for doc in self._documents]
-        embeddings = self._embed(texts)
-        D = embeddings.shape[1]
-        index = faiss.IndexFlatIP(D)
-        index.add(embeddings)
-        self._index = index
+            texts = [doc.text for doc in self._documents]
+            embeddings = self._embed(texts)
+            D = embeddings.shape[1]
+            index = faiss.IndexFlatIP(D)
+            index.add(embeddings)
+            self._index = index
 
     def _save_to_cache(self, index_path: Path, docs_path: Path):
         import faiss
@@ -791,6 +758,9 @@ class BioRAGRetriever:
             for score, idx in zip(scores, indices):
                 if idx < 0 or float(score) < min_score:
                     continue
+                if idx >= len(self.store._documents):
+                    logger.warning(f"[BioRAGRetriever] FAISS returned out-of-bounds index {idx} (docs={len(self.store._documents)})")
+                    continue
                 doc = self.store._documents[idx]
                 if filter_category and doc.category != filter_category:
                     continue
@@ -857,10 +827,20 @@ class BioRAGRetriever:
         return "\n\n".join(lines)
 
     def _fallback_context(self, query: str) -> List[Dict[str, Any]]:
-        """Fallback offline : retourne les entrées quality si dispo."""
+        """
+        Fallback offline: returns keyword-matched quality entries when FAISS is unavailable.
+        BUG-24: Always includes a sentinel entry so the Finalizer knows RAG was degraded.
+        """
+        sentinel = {
+            "text": "[RAG UNAVAILABLE] Biological database context could not be loaded (FAISS index not ready or embedding model missing). Interpretations below are based on LLM priors only — verify AMR/pathway results against current CARD/KEGG databases.",
+            "source": "system",
+            "category": "warning",
+            "score": 0.0,
+            "url": "",
+            "snippet": "[WARNING] Biological RAG context unavailable — report may lack up-to-date AMR/pathway references.",
+        }
         if not self.store._documents:
-            return []
-        # Chercher les documents quality qui matchent mots-clés de la query
+            return [sentinel]
         query_words = set(query.lower().split())
         scored = []
         for doc in self.store._documents:
@@ -870,11 +850,12 @@ class BioRAGRetriever:
                 if overlap > 0:
                     scored.append((overlap, doc))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [
+        results = [
             {"text": d.text, "source": d.source, "category": d.category,
              "score": s / 10, "url": d.metadata.get("url", ""), "snippet": d.to_context_snippet()}
             for s, d in scored[:3]
         ]
+        return [sentinel] + results
 
 
 # ---------------------------------------------------------------------------

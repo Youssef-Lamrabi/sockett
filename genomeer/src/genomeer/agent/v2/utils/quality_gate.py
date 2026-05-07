@@ -354,7 +354,7 @@ def check_quality(
     -------
     (level, message) where level is 'ok', 'warn', or 'fail'
     """
-    gate = BIOLOGICAL_GATES.get(tool_name)
+    gate = BIOLOGICAL_GATES.get(tool_name) or BIOLOGICAL_GATES.get(tool_name.lower())
     if gate is None:
         logger.debug(f"No biological gate defined for tool: {tool_name}")
         return ("ok", "")
@@ -398,17 +398,9 @@ def check_quality(
             except (ValueError, IndexError):
                 pass
 
-    # --- Normalize value (T1) ---
     # Handle special case for warn/fail below explicit fields
     warn_below = gate.get("warn_below", warn_thresh)
     fail_below = gate.get("fail_below", fail_thresh)
-
-    # Improved normalization: If value > 1.0 but thresholds are <= 1.0, it's a percentage (85.3 -> 0.853)
-    # If thresholds are > 1.0 (e.g. 20.0), it's a raw percentage scale (0-100) — leave it.
-    if value is not None and value > 1.0:
-        thresholds = [t for t in (warn_below, fail_below) if t is not None]
-        if thresholds and all(t <= 1.0 for t in thresholds):
-            value /= 100.0
 
     # ── If we couldn't extract a number, log a warning and return warn ────────
     if value is None:

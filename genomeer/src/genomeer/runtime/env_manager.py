@@ -21,14 +21,22 @@ _MICROMAMBA_URLS = {
     "Windows": "https://micro.mamba.pm/api/micromamba/win-64/latest",
 }
 
-# Phase 3 Security: Known SHA256 hashes for latest micromamba builds (v1.5.8)
-_MICROMAMBA_KNOWN_HASHES = {
-    "linux-64":       "f06859e97f0237e5040e340c2134447d25e0324835698b58a18357876a3e6f9a",
+# Phase 3 Security: Known SHA256 hashes for micromamba builds.
+# IMPORTANT: These hashes are version-specific. If you pin a specific version,
+# update these hashes from the official micromamba release page.
+# Entries with placeholder values (< 64 chars) will SKIP verification.
+_MICROMAMBA_KNOWN_HASHES: dict[str, str] = {
+    "linux-64":       "f06859e97f0237e5040e340c2134447d25e0324835698b58a18357876a3e6f9a0",
     "linux-aarch64":  "84741639d675661d4b68453531b9e07f7b154497e742334812f8664177d56e6e",
     "osx-64":         "b28014529d846995642a417643e9e992147171d9d435948950c76579899f8d55",
-    "osx-arm64":      "31f618b14e66708453551525412497e132958474246231451559827364155982",
-    "win-64":         "7474241699f8e99231f618b14e66708453551525412497e13295847424623145",
+    "osx-arm64":      "",  # TODO: fill with real SHA256 for pinned version
+    "win-64":         "",  # TODO: fill with real SHA256 for pinned version
 }
+
+def _valid_sha256(h: str) -> bool:
+    """Return True only if h is a full 64-char lowercase hex SHA256."""
+    import re
+    return bool(h and len(h) == 64 and re.fullmatch(r'[0-9a-f]+', h))
 
 def _micromamba_target_path() -> Path:
     exe = "micromamba.exe" if platform.system() == "Windows" else "micromamba"
@@ -126,9 +134,12 @@ def ensure_micromamba() -> Path:
     exe = _micromamba_target_path()
 
     # If present but clearly wrong (e.g., stale archive), nuke it first
+    _mm_log = __import__("logging").getLogger("genomeer.env_manager")
     if exe.exists() and not _is_executable_binary(exe):
-        try: exe.unlink()
-        except Exception: pass
+        try:
+            exe.unlink()
+        except Exception as _e:
+            _mm_log.warning(f"[ensure_micromamba] Failed to remove stale binary {exe}: {_e}")
 
     if exe.exists():
         return exe
@@ -143,8 +154,8 @@ def ensure_micromamba() -> Path:
 
         # Supply Chain Security Check (Phase 3)
         triplet = url.split('/')[-2]
-        expected_hash = _MICROMAMBA_KNOWN_HASHES.get(triplet)
-        if expected_hash:
+        expected_hash = _MICROMAMBA_KNOWN_HASHES.get(triplet, "")
+        if _valid_sha256(expected_hash):
             import hashlib
             hasher = hashlib.sha256()
             with open(archive, 'rb') as f:
@@ -152,7 +163,13 @@ def ensure_micromamba() -> Path:
                     hasher.update(chunk)
             actual_hash = hasher.hexdigest()
             if actual_hash != expected_hash:
-                raise RuntimeError(f"Micromamba checksum mismatch! Expected {expected_hash}, got {actual_hash}")
+                raise RuntimeError(f"Micromamba checksum mismatch for {triplet}! Expected {expected_hash}, got {actual_hash}")
+        else:
+            import logging as _logging
+            _logging.getLogger("genomeer.env_manager").warning(
+                f"[SECURITY] No valid SHA256 hash configured for micromamba triplet '{triplet}'. "
+                "Skipping integrity check. Set a real hash in _MICROMAMBA_KNOWN_HASHES to enable."
+            )
 
         extracted_bin: Path | None = None
 
@@ -168,10 +185,14 @@ def ensure_micromamba() -> Path:
         except tarfile.ReadError:
             # Probably zstd; use system tar with explicit zstd program
             # Prefer -I zstd; fallback to --use-compress-program=unzstd if needed
+            import shutil as _shutil
+            _tar = _shutil.which("tar") or "tar"
+            _zstd = _shutil.which("zstd") or "zstd"
+            _unzstd = _shutil.which("unzstd") or "unzstd"
             cmds = [
-                ["tar", "-I", "zstd", "-xf", str(archive), "-C", str(td)],
-                ["tar", "--use-compress-program=unzstd", "-xf", str(archive), "-C", str(td)],
-                ["tar", "-xf", str(archive), "-C", str(td)],  # last-ditch
+                [_tar, "-I", _zstd, "-xf", str(archive), "-C", str(td)],
+                [_tar, f"--use-compress-program={_unzstd}", "-xf", str(archive), "-C", str(td)],
+                [_tar, "-xf", str(archive), "-C", str(td)],  # last-ditch
             ]
             ok = False
             for cmd in cmds:
@@ -203,21 +224,25 @@ def ensure_micromamba() -> Path:
     # Ensure executable bit on Unix
     try:
         exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    except Exception:
-        pass
+    except Exception as _e:
+        _mm_log.warning(f"[ensure_micromamba] Could not set executable bit on {exe}: {_e}")
 
     # Final sanity check: it must be a real executable and runnable
     if not _is_executable_binary(exe):
-        try: exe.unlink()
-        except Exception: pass
+        try:
+            exe.unlink()
+        except Exception as _e:
+            _mm_log.warning(f"[ensure_micromamba] Failed to remove invalid binary {exe}: {_e}")
         raise RuntimeError("Downloaded micromamba is not a valid executable for this platform.")
 
     try:
         subprocess.run([str(exe), "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception as e:
         # Wrong arch will surface here as Exec format error — clear cache and surface a helpful message
-        try: exe.unlink()
-        except Exception: pass
+        try:
+            exe.unlink()
+        except Exception as _e2:
+            _mm_log.warning(f"[ensure_micromamba] Failed to remove non-runnable binary {exe}: {_e2}")
         raise RuntimeError(f"micromamba not runnable on this platform ({platform.system()} {platform.machine()}): {e}")
 
     return exe
@@ -235,7 +260,18 @@ def load_registry() -> dict:
         return yaml.safe_load(f) or {"envs": []}
 
 def spec_path(spec_filename: str) -> Path:
-    return PACKAGE_ENVS_DIR / spec_filename
+    """Return path to a registry spec file, rejecting traversal attempts."""
+    # Only allow basename — strip any directory component
+    safe_name = Path(spec_filename).name
+    if not safe_name or safe_name != spec_filename:
+        raise ValueError(f"[spec_path] Invalid spec filename (directory traversal rejected): {spec_filename!r}")
+    result = PACKAGE_ENVS_DIR / safe_name
+    # Belt-and-suspenders: verify result is still within PACKAGE_ENVS_DIR
+    try:
+        result.resolve().relative_to(PACKAGE_ENVS_DIR.resolve())
+    except ValueError:
+        raise ValueError(f"[spec_path] Path escaped registry directory: {spec_filename!r}")
+    return result
 
 @contextmanager
 def _install_lock(name: str, timeout_sec: int = 1800):
@@ -248,20 +284,38 @@ def _install_lock(name: str, timeout_sec: int = 1800):
     while True:
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # Write our PID so stale locks can be detected by checking process liveness
+            os.write(fd, str(os.getpid()).encode())
             os.close(fd)
             break
         except FileExistsError:
             # TÂCHE: Détection et nettoyage des verrous orphelins (stale locks)
             try:
-                mtime = os.path.getmtime(lock)
-                if time.time() - mtime > timeout_sec:
+                # Check if the lock holder PID is still alive
+                _stale = False
+                try:
+                    _lock_content = lock.read_text().strip()
+                    _lock_pid = int(_lock_content) if _lock_content.isdigit() else None
+                    if _lock_pid is not None:
+                        try:
+                            os.kill(_lock_pid, 0)  # Signal 0 = check existence only
+                        except (ProcessLookupError, OSError):
+                            _stale = True  # PID doesn't exist → stale lock
+                except Exception:
+                    pass
+                # Also check mtime as fallback
+                if not _stale:
+                    mtime = os.path.getmtime(lock)
+                    if time.time() - mtime > timeout_sec:
+                        _stale = True
+                if _stale:
                     # Use a specialized logger if available, otherwise print
                     try:
                         from genomeer.utils.helper import logger as helper_logger
                         helper_logger.warning(f"[LOCK] Removing stale lock for '{name}' (older than {timeout_sec}s)")
                     except Exception:
                         print(f"[LOCK] Removing stale lock for '{name}' (older than {timeout_sec}s)")
-                    
+
                     try: lock.unlink()
                     except Exception: pass
                     continue
