@@ -40,8 +40,11 @@ _SERIALIZABLE_FIELDS = {
     "retry_counts", "batch_strategy", "run_started_at",
     "next_step", "diagnostic_mode", "session_id",
     "run_id", "messages",
-    # FIX A6: env_name and env_ready must be restored on checkpoint resume,
     "env_name", "env_ready",
+    # ISSUE-9: batch-mode fields missing — without them, checkpoint resume in batch
+    # mode restarts from sample 0 instead of the failed sample.
+    "batch_mode", "current_sample_idx", "current_sample_id",
+    "per_sample_results", "sample_manifest",
 }
 
 
@@ -94,8 +97,17 @@ class CheckpointManager:
             )
             tmp_path = Path(tmp_path_str)
             try:
+                def _safe_default(obj):
+                    # BUG-12 residual: log non-serializable objects instead of
+                    # silently converting them to undeserializable repr strings.
+                    logger.warning(
+                        f"[CHECKPOINT] Non-JSON-serializable object in state "
+                        f"({type(obj).__name__}); replacing with null."
+                    )
+                    return None
+
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(serializable, f, indent=2, default=str)
+                    json.dump(serializable, f, indent=2, default=_safe_default)
                 os.replace(tmp_path_str, self.checkpoint_path)
             except Exception:
                 try:
@@ -234,25 +246,39 @@ class CheckpointManager:
                     for step in val
                 ]
             elif field == "messages" and isinstance(val, list):
-                # LangChain messages: convert to safe JSON-only dict (C-12: no arbitrary .dict())
+                # BUG-12 residual: LangChain message content can be a list (multipart /
+                # vision messages like [{"type":"text","text":"…"},{"type":"image_url",…}]).
+                # str() on a list produces an undeserializable Python repr.
+                # We use json.dumps/json.loads to round-trip list/dict content safely.
                 serializable[field] = []
                 for m in val:
                     if isinstance(m, dict):
-                        # Already a plain dict — validate it has only safe keys
                         safe_msg = {
                             k: v for k, v in m.items()
                             if k in ("role", "content", "type", "id", "name")
-                            and isinstance(v, (str, int, float, bool, type(None)))
+                            and isinstance(v, (str, int, float, bool, list, dict, type(None)))
                         }
                         serializable[field].append(safe_msg)
                     elif hasattr(m, "type") and hasattr(m, "content"):
-                        # LangChain BaseMessage — extract only primitive fields
+                        raw_content = getattr(m, "content", "")
+                        # Safely serialise list / dict content (multipart messages)
+                        if isinstance(raw_content, (list, dict)):
+                            try:
+                                content_safe = json.loads(json.dumps(raw_content, default=str))
+                            except Exception:
+                                content_safe = str(raw_content)
+                        else:
+                            content_safe = str(raw_content)
                         serializable[field].append({
                             "type": str(getattr(m, "type", "unknown")),
-                            "content": str(getattr(m, "content", "")),
+                            "content": content_safe,
                         })
                     else:
-                        serializable[field].append({"type": "unknown", "content": str(m)})
+                        # Last resort: wrap the repr so deserialization never gets a raw string
+                        serializable[field].append({
+                            "type": "unknown",
+                            "content": str(m),
+                        })
             elif isinstance(val, (str, int, float, bool, list, dict, type(None))):
                 serializable[field] = val
         return serializable

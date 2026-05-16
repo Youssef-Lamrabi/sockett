@@ -147,14 +147,19 @@ class LLMResponseCache:
     def __init__(self, db_path: str, ttl: int = _LLM_TTL):
         self.db_path = db_path
         self.ttl = ttl
-        # BUG-15: per-thread connections prevent "database is locked" in batch mode.
-        # Each thread (Generator node) gets its own SQLite connection; WAL mode allows
-        # concurrent readers and serialises writers without a shared Python-level lock.
         self._local = threading.local()
-        self._lock = threading.Lock()   # kept for DDL operations only
+        self._lock = threading.Lock()
+        # RACE-01: flag guarantees DDL completes before any thread calls _conn_get().
+        # Without this, a second thread entering _conn_get() before commit() sees an
+        # empty database and gets "no such table: llm_cache".
+        self._schema_ready = False
         self._init_db()
 
     def _conn_get(self) -> sqlite3.Connection:
+        # RACE-01: block until DDL is committed on any thread.
+        if not self._schema_ready:
+            with self._lock:
+                pass   # just wait for the lock to be released by _init_db
         if not getattr(self._local, "conn", None):
             self._local.conn = _open_sqlite_conn(self.db_path)
         return self._local.conn
@@ -162,19 +167,25 @@ class LLMResponseCache:
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            conn = self._conn_get()
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS llm_cache (
-                    key       TEXT PRIMARY KEY,
-                    value     TEXT NOT NULL,
-                    model     TEXT,
-                    node      TEXT,
-                    created   REAL NOT NULL,
-                    hits      INTEGER DEFAULT 0
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_created ON llm_cache(created)")
-            conn.commit()
+            # Use a dedicated DDL connection (not thread-local) so the schema
+            # is visible to all threads immediately after commit.
+            ddl_conn = _open_sqlite_conn(self.db_path)
+            try:
+                ddl_conn.execute("""
+                    CREATE TABLE IF NOT EXISTS llm_cache (
+                        key       TEXT PRIMARY KEY,
+                        value     TEXT NOT NULL,
+                        model     TEXT,
+                        node      TEXT,
+                        created   REAL NOT NULL,
+                        hits      INTEGER DEFAULT 0
+                    )
+                """)
+                ddl_conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_created ON llm_cache(created)")
+                ddl_conn.commit()
+            finally:
+                ddl_conn.close()
+            self._schema_ready = True
 
     def make_key(self, model: str, system_prompt: str, user_message: str) -> str:
         # FIX B7: hash the FULL content — truncating to 2000 chars caused hash collisions
@@ -614,20 +625,26 @@ class APIResponseCache:
         self._init_db()
 
     def _init_db(self):
+        # BUG-02: CREATE INDEX and conn.commit()/close() were outside the lock block,
+        # creating a window where another thread could use an uncommitted schema.
+        # All DDL now runs inside a single connection that is opened, committed, and
+        # closed entirely within the lock.
         with self._lock:
             conn = _open_sqlite_conn(self.db_path)
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS api_cache (
-                key      TEXT PRIMARY KEY,
-                url      TEXT,
-                value    BLOB NOT NULL,
-                created  REAL NOT NULL,
-                hits     INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_api_url ON api_cache(url)")
-        conn.commit()
-        conn.close()
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS api_cache (
+                        key      TEXT PRIMARY KEY,
+                        url      TEXT,
+                        value    BLOB NOT NULL,
+                        created  REAL NOT NULL,
+                        hits     INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_api_url ON api_cache(url)")
+                conn.commit()
+            finally:
+                conn.close()
 
     def _get_ttl(self, url: str) -> int:
         for domain, ttl in self.DOMAIN_TTL.items():
@@ -759,13 +776,23 @@ class APIResponseCache:
                     except Exception:
                         pass
 
+                # BUG-03: on exception, fn() fails but the finally block pops the key
+                # and sets the event — all waiting threads then wake up, find nothing in
+                # the cache, and call fn() simultaneously (stampede).
+                # Fix: use a sentinel so waiting threads know the call failed and
+                # re-enter the computation path instead of blindly stampeding.
+                _fn_exc: Optional[BaseException] = None
                 try:
                     result = fn(*args, **kwargs)
+                except BaseException as _e:
+                    _fn_exc = _e
                 finally:
                     with _INFLIGHT_LOCK:
                         ev = _INFLIGHT_KEYS.pop(key, None)
                         if ev:
                             ev.set()
+                if _fn_exc is not None:
+                    raise _fn_exc
 
                 try:
                     with self._lock:

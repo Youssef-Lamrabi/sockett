@@ -14,7 +14,9 @@ logger = logging.getLogger("genomeer.orchestration")
 ADAPTIVE_RULES = [
     {
         "name": "Fallback to MEGAHIT on low N50",
-        "signal": "assembly_n50",
+        # ISSUE-22: was "assembly_n50" — the Observer stores this signal as "n50_bp"
+        # (matching quality_gate.py metric_key for run_metaspades/run_megahit).
+        "signal": "n50_bp",
         "operator": "lt",
         "threshold": 1000,
         "condition": "metaspades",
@@ -28,7 +30,8 @@ ADAPTIVE_RULES = [
     },
     {
         "name": "Abort on critically low N50",
-        "signal": "assembly_n50",
+        # ISSUE-22: same fix — "n50_bp" is the canonical key
+        "signal": "n50_bp",
         "operator": "lt",
         "threshold": 200,
         "condition": None,
@@ -46,7 +49,8 @@ ADAPTIVE_RULES = [
     },
     {
         "name": "Re-binning on low completeness",
-        "signal": "completeness",
+        # INCONS-05: was "completeness" — manifest stores "mean_completeness" (from CheckM2 wrapper)
+        "signal": "mean_completeness",
         "operator": "lt",
         "threshold": 50.0,
         "condition": "checkm2",
@@ -60,7 +64,8 @@ ADAPTIVE_RULES = [
     },
     {
         "name": "Bin cleaning on high contamination",
-        "signal": "contamination",
+        # INCONS-05: was "contamination" — manifest stores "mean_contamination"
+        "signal": "mean_contamination",
         "operator": "gt",
         "threshold": 10.0,
         "condition": "checkm2",

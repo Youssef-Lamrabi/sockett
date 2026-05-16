@@ -82,7 +82,10 @@ class ParsedExecuteBlock(BaseModel):
     @field_validator("env")
     @classmethod
     def validate_env(cls, v: Optional[str]) -> Optional[str]:
-        VALID_ENVS = {"bio-agent-env1", "meta-env1", "btools_env_py310"}
+        # INCONS-03: panhumanpy_env is declared in registry/index.yaml but was
+        # missing here, causing all LLM-generated code targeting it to be silently
+        # re-routed to bio-agent-env1 (missing scanpy → ImportError at runtime).
+        VALID_ENVS = {"bio-agent-env1", "meta-env1", "btools_env_py310", "panhumanpy_env"}
         if v and v not in VALID_ENVS:
             return None   # env inconnu → laisser le résolveur décider
         return v
@@ -147,7 +150,11 @@ _BASH_HEURISTICS = [
 # STATUS patterns (robustes)
 _RX_STATUS_DONE    = re.compile(r"<STATUS\s*:\s*done\s*>|status[\"':\s]+done|✔|DONE", re.IGNORECASE)
 _RX_STATUS_BLOCKED = re.compile(r"<STATUS\s*:\s*blocked\s*>|status[\"':\s]+blocked|BLOCKED|FAILED", re.IGNORECASE)
-_RX_OK_STANDALONE  = re.compile(r"<OK\s*/\s*>|<ok/>|\bOK\b", re.IGNORECASE)
+# BUG-15: removed bare \bOK\b from this pattern.
+# "\bOK\b" matched any occurrence of the word "OK" including in error messages
+# like "BLOCKED - OK to retry", which caused the step to be wrongly marked DONE.
+# Only explicit XML self-closing tags <OK/> are treated as a DONE signal.
+_RX_OK_STANDALONE  = re.compile(r"<OK\s*/\s*>|<ok/>", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -316,21 +323,23 @@ class RobustLLMParser:
         reason = ""
         next_node = "orchestrator"
 
-        # Détection du statut (multi-pattern robuste)
-        if _RX_STATUS_DONE.search(text) or _RX_OK_STANDALONE.search(text):
-            status = StepStatus.DONE
-            next_node = "orchestrator"
-        elif _RX_STATUS_BLOCKED.search(text):
+        # BUG-15: check BLOCKED *before* DONE so that a message containing both
+        # (e.g. "<STATUS:blocked> …, OK to retry") is classified as BLOCKED.
+        # A BLOCKED signal always wins over a DONE/OK signal in the same text.
+        if _RX_STATUS_BLOCKED.search(text):
             status = StepStatus.BLOCKED
             next_node = "diagnostics"
 
-            # Essayer d'extraire la raison
             blocked_match = re.search(
                 r"<STATUS\s*:\s*blocked\s*>\s*(.*?)(?:</STATUS>|$)",
                 text, re.DOTALL | re.IGNORECASE
             )
             if blocked_match:
                 reason = blocked_match.group(1).strip()[:500]
+
+        elif _RX_STATUS_DONE.search(text) or _RX_OK_STANDALONE.search(text):
+            status = StepStatus.DONE
+            next_node = "orchestrator"
 
         # Extraction des métriques qualité depuis le texte (si quality_gate a été run)
         quality_signals = self._extract_quality_signals(text)

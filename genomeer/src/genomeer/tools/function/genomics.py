@@ -1,12 +1,32 @@
 import os
 
-import gget
-import gseapy
-import numpy as np
-import pandas as pd
-import scanpy as sc
+# ISSUE-24: gget, gseapy, scanpy are only available inside panhumanpy_env, not in
+# bio-agent-env1 or at the system level.  Module-level imports were crashing
+# read_module2api() / agent initialization with ImportError on every install that
+# hadn't pre-built panhumanpy_env.  Moved to lazy imports inside each function.
 
 from genomeer.utils.llm import get_llm
+
+
+# Module-level placeholders — functions will call _require_scRNA_deps() to populate these.
+gget = gseapy = np = pd = sc = None  # type: ignore[assignment]
+
+
+def _require_scRNA_deps():
+    """Lazy-import scRNA dependencies; raise ImportError with a clear message."""
+    global gget, gseapy, np, pd, sc
+    try:
+        import gget as _gget
+        import gseapy as _gseapy
+        import numpy as _np
+        import pandas as _pd
+        import scanpy as _sc
+        gget, gseapy, np, pd, sc = _gget, _gseapy, _np, _pd, _sc
+    except ImportError as _e:
+        raise ImportError(
+            f"scRNA-seq tools require panhumanpy_env: {_e}. "
+            "Run the pipeline with env='panhumanpy_env'."
+        ) from _e
 
 
 def annotate_celltype_scRNA(
@@ -34,6 +54,7 @@ def annotate_celltype_scRNA(
     - str: Steps performed and file paths where results were saved
 
     """
+    _require_scRNA_deps()
 
     def _cluster_info(cluster_id, marker_genes, composition_df=None):
         """Format cluster information for LLM prompt."""

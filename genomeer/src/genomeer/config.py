@@ -38,12 +38,29 @@ class GenomeerConfig:
         self.source   = os.getenv("GENOMEER_MODEL_SOURCE", self.source)
         if self.source:
             self.source = self.source.strip("'\"")
-            _ALLOWED_SOURCES = {"openai", "anthropic", "custom", "azure", "ollama", ""}
-            if self.source.lower() not in _ALLOWED_SOURCES:
+            # INCONS-01: align with llm.py SourceType (mixed-case).
+            # Also accept lowercase aliases and normalise to the canonical casing
+            # so that GENOMEER_MODEL_SOURCE=azure works end-to-end.
+            _ALIAS_MAP = {
+                "openai":     "OpenAI",
+                "azureopenai": "AzureOpenAI",
+                "azure":      "AzureOpenAI",
+                "anthropic":  "Anthropic",
+                "ollama":     "Ollama",
+                "gemini":     "Gemini",
+                "bedrock":    "Bedrock",
+                "groq":       "Groq",
+                "custom":     "Custom",
+            }
+            _ALLOWED_SOURCES = set(_ALIAS_MAP.values())
+            _normalised = _ALIAS_MAP.get(self.source.lower())
+            if _normalised:
+                self.source = _normalised        # canonicalise casing in-place
+            elif self.source not in _ALLOWED_SOURCES:
                 import logging as _logging
                 _logging.getLogger("genomeer.config").warning(
                     f"[Config] Unexpected model source: {self.source!r}. "
-                    f"Allowed: {_ALLOWED_SOURCES}"
+                    f"Allowed (case-insensitive): {sorted(_ALIAS_MAP.keys())}"
                 )
 
     def __repr__(self) -> str:

@@ -173,10 +173,12 @@ class _CARDFetcher:
         for entry in cls._BUILTIN:
             gene = entry["gene"]
             doc_id = f"card_{gene.lower().replace(' ', '_')}"
-            text = (
+            raw_text = (
                 f"AMR gene: {gene} | Drug class: {entry['drug_class']} | "
                 f"Mechanism: {entry['mechanism']}. {entry['description']}"
             )
+            # BUG-25: sanitize external data before indexing to block prompt-injection
+            text = _sanitize_bio_text(raw_text)
             docs.append(BioDocument(
                 doc_id=doc_id,
                 text=text,
@@ -241,28 +243,60 @@ class _KEGGFetcher:
 
     @classmethod
     def fetch(cls, use_builtin: bool = True) -> List[BioDocument]:
-        """Retourne les documents KEGG pathway depuis la liste prioritaire."""
+        """Retourne les documents KEGG pathway.
+
+        Incohérence-G: read from kegg_core_pathways.json when available so that
+        the JSON file is the single source of truth for pathway descriptions.
+        Fall back to the hardcoded PRIORITY_PATHWAYS list only when the file
+        cannot be found.
+        """
         docs: List[BioDocument] = []
 
-        for pathway_id, name, description in cls.PRIORITY_PATHWAYS:
-            doc_id = f"kegg_{pathway_id}"
-            text = (
-                f"KEGG Pathway {pathway_id}: {name}. {description} "
-                f"Pathway ID: {pathway_id}. Use query_kegg_pathway('{pathway_id}') for details."
-            )
-            docs.append(BioDocument(
-                doc_id=doc_id,
-                text=text,
-                source="kegg",
-                category="pathway",
-                metadata={
-                    "pathway_id": pathway_id,
-                    "name": name,
-                    "url": f"https://www.kegg.jp/pathway/{pathway_id}",
-                },
-            ))
+        # Try the static JSON bundle first
+        _data_dir = Path(os.path.dirname(os.path.abspath(__file__))).parent.parent.parent / "data"
+        _kegg_json = _data_dir / "kegg_core_pathways.json"
+        _loaded_from_json = False
 
-        logger.info(f"[KEGG] Loaded {len(docs)} pathway entries")
+        if _kegg_json.exists():
+            try:
+                import json as _json
+                _bundle = _json.loads(_kegg_json.read_text(encoding="utf-8"))
+                for entry in _bundle.get("entries", []):
+                    pid  = entry.get("pathway_id", "Unknown")
+                    name = entry.get("name", "")
+                    desc = entry.get("description", "")
+                    raw_text = (
+                        f"KEGG Pathway {pid}: {name}. {desc} "
+                        f"Pathway ID: {pid}. Use query_kegg_pathway('{pid}') for details."
+                    )
+                    docs.append(BioDocument(
+                        doc_id=f"kegg_{pid}",
+                        text=_sanitize_bio_text(raw_text),
+                        source="kegg",
+                        category="pathway",
+                        metadata={"pathway_id": pid, "name": name,
+                                  "url": f"https://www.kegg.jp/pathway/{pid}"},
+                    ))
+                _loaded_from_json = bool(docs)
+            except Exception as _e:
+                logger.warning(f"[KEGG] Failed to load {_kegg_json.name}: {_e}; falling back to inline list")
+
+        if not _loaded_from_json:
+            for pathway_id, name, description in cls.PRIORITY_PATHWAYS:
+                raw_text = (
+                    f"KEGG Pathway {pathway_id}: {name}. {description} "
+                    f"Pathway ID: {pathway_id}. Use query_kegg_pathway('{pathway_id}') for details."
+                )
+                docs.append(BioDocument(
+                    doc_id=f"kegg_{pathway_id}",
+                    text=_sanitize_bio_text(raw_text),
+                    source="kegg",
+                    category="pathway",
+                    metadata={"pathway_id": pathway_id, "name": name,
+                              "url": f"https://www.kegg.jp/pathway/{pathway_id}"},
+                ))
+
+        logger.info(f"[KEGG] Loaded {len(docs)} pathway entries (source: {'JSON' if _loaded_from_json else 'inline'})")
         return docs
 
 
@@ -484,7 +518,12 @@ class BioRAGStore:
                 for entry in data.get("entries", []):
                     gene = entry.get("gene", "Unknown")
                     doc_id = f"card_{gene.lower().replace(' ', '_')}"
-                    text = f"AMR gene: {gene} | Drug class: {entry.get('drug_class','')} | Mechanism: {entry.get('mechanism','')}. {entry.get('description','')}"
+                    raw_text = (
+                        f"AMR gene: {gene} | Drug class: {entry.get('drug_class','')} | "
+                        f"Mechanism: {entry.get('mechanism','')}. {entry.get('description','')}"
+                    )
+                    # BUG-25: sanitize JSON bundle content before indexing
+                    text = _sanitize_bio_text(raw_text)
                     docs.append(BioDocument(
                         doc_id=doc_id, text=text, source="card", category="amr",
                         metadata={"gene": gene, "drug_class": entry.get("drug_class"), "source_version": version}
@@ -521,7 +560,9 @@ class BioRAGStore:
                 for entry in data.get("entries", []):
                     pid = entry.get("pathway_id", "Unknown")
                     doc_id = f"kegg_{pid}"
-                    text = f"KEGG Pathway {pid}: {entry.get('name','')}. {entry.get('description','')}"
+                    raw_text = f"KEGG Pathway {pid}: {entry.get('name','')}. {entry.get('description','')}"
+                    # BUG-25: sanitize JSON bundle content before indexing
+                    text = _sanitize_bio_text(raw_text)
                     docs.append(BioDocument(
                         doc_id=doc_id, text=text, source="kegg", category="pathway",
                         metadata={"pathway_id": pid, "name": entry.get("name"), "source_version": version}
@@ -629,7 +670,11 @@ class BioRAGStore:
         except Exception as e:
             logger.warning(f"[BioRAG] Cache save failed: {e}")
 
-        self._ready = True
+        # RACE-02: set _ready inside the lock so no thread can observe _ready=True
+        # while _index is still None (the window between _build_faiss_index setting
+        # self._index and this assignment was a data race).
+        with self._lock:
+            self._ready = True
         logger.info(f"[BioRAG] Index built: {len(self._documents)} documents")
         return self
 

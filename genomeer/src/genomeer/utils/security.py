@@ -102,9 +102,11 @@ _BLOCKED_BASH: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'[<>]\s*\(', re.IGNORECASE),
      "process substitution <(...) / >(...) not allowed in generated scripts"),
 
-    # Heredoc syntax: <<EOF or <<'EOF' — wraps commands to bypass inline detection
-    (re.compile(r'<<[-\w\'"]*\s', re.IGNORECASE),
-     "heredoc (<<EOF) syntax not allowed in generated scripts"),
+    # Heredoc syntax: <<EOF, <<'EOF', <<"EOF", <<\EOF — wraps commands to bypass detection
+    # ISSUE-12: added backslash variant <<\EOF which is a valid bash heredoc form
+    # that was not caught by the original pattern ([-\w'"]*) since \w doesn't match \.
+    (re.compile(r'<<\\?[-\w\'"]*\s', re.IGNORECASE),
+     "heredoc (<<EOF / <<\\EOF) syntax not allowed in generated scripts"),
 ]
 
 
@@ -216,15 +218,19 @@ def check_bash_script(script: str) -> Tuple[bool, str]:
 
     normalized = _normalize_script(script)
 
-    # BUG-10: Détection et vérification des blocs base64
-    # Si on voit 'base64 -d' ou 'base64 --decode', on tente de trouver le contenu encodé
+    # BUG-10 / SEC-09: scan for base64-encoded payloads and decode them before
+    # applying pattern checks.  Both quoted AND unquoted base64 strings are now
+    # extracted so that `echo cm0gLXJmIC8= | base64 -d | bash` is caught.
     if "base64" in normalized and ("-d" in normalized or "decode" in normalized):
         import base64 as _b64
-        # Extraction naïve des chaînes base64 probables (A-Za-z0-9+/=)
-        for m in re.finditer(r'["\']([A-Za-z0-9+/=]{8,})["\']', script):
+        # Match both quoted and unquoted base64 candidates (≥8 chars)
+        for m in re.finditer(r'(?:["\']([A-Za-z0-9+/=]{8,})["\']|(?<!\w)([A-Za-z0-9+/=]{16,})(?!\w))', script):
+            candidate = m.group(1) or m.group(2)
+            if not candidate:
+                continue
             try:
                 try:
-                    decoded = _b64.b64decode(m.group(1)).decode("utf-8", errors="strict")
+                    decoded = _b64.b64decode(candidate).decode("utf-8", errors="strict")
                 except UnicodeDecodeError:
                     return False, "[SECURITY BLOCK] Non-UTF-8 base64 payload rejected (possible binary exploit)"
                 is_safe, reason = check_bash_script(decoded)
@@ -326,12 +332,33 @@ def check_python_code(code: str) -> Tuple[bool, str]:
                     reason = f"[SECURITY BLOCK] Forbidden attribute access: .{node.attr}"
                     return False, reason
             
-            # 3. Block access via strings (e.g. globals()['eval'])
+            # 3. Block access via strings (e.g. globals()['eval'], __builtins__['eval'])
             if isinstance(node, ast.Subscript):
+                # globals()['eval'] / locals()['exec'] etc.
                 if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
                     if node.value.func.id in ("globals", "locals", "vars"):
                         reason = f"[SECURITY BLOCK] Forbidden dynamic access via {node.value.func.id}()"
                         return False, reason
+
+                # SEC-03: __builtins__['eval'] — direct subscript on the builtins dict
+                _DANGEROUS_SUBSCRIPT_TARGETS = {"__builtins__", "__dict__"}
+                if isinstance(node.value, ast.Name) and node.value.id in _DANGEROUS_SUBSCRIPT_TARGETS:
+                    # Check if the key is a string literal naming a dangerous function
+                    _DANGEROUS_FN_NAMES = {
+                        "eval", "exec", "compile", "__import__", "open",
+                        "getattr", "setattr", "breakpoint",
+                    }
+                    slc = node.slice
+                    key_val = None
+                    if isinstance(slc, ast.Constant) and isinstance(slc.value, str):
+                        key_val = slc.value
+                    elif isinstance(slc, ast.Index) and isinstance(slc.value, ast.Constant):
+                        key_val = slc.value.value
+                    if key_val in _DANGEROUS_FN_NAMES:
+                        return False, (
+                            f"[SECURITY BLOCK] Forbidden subscript access to dangerous built-in: "
+                            f"{node.value.id}['{key_val}']"
+                        )
 
     except SyntaxError:
         pass

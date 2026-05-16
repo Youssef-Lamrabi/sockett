@@ -229,19 +229,23 @@ def _run_in_env(
         if cancel_event is not None:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                # NOUVEAU-04: Do not pass timeout to proc.communicate() inside the thread.
-                # Manage timeout via future.result() to handle exceptions properly.
                 future = executor.submit(proc.communicate, input=input_text)
+                # BUG-07: the original while-loop polled cancel_event but never
+                # enforced the timeout — a non-cancelled process could run forever.
+                # Fix: track elapsed time and raise TimeoutExpired when exceeded.
+                _deadline = time.monotonic() + timeout
                 try:
                     while not future.done():
                         if cancel_event.is_set():
                             proc.kill()
                             raise subprocess.TimeoutExpired(cmd, timeout)
+                        if time.monotonic() >= _deadline:
+                            proc.kill()
+                            raise subprocess.TimeoutExpired(cmd, timeout)
                         time.sleep(0.1)
-                    stdout, stderr = future.result(timeout=timeout)
+                    stdout, stderr = future.result(timeout=2.0)
                 except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
                     proc.kill()
-                    # Final attempt to drain pipes after kill
                     try:
                         stdout, stderr = proc.communicate(timeout=2.0)
                     except Exception:
@@ -677,8 +681,12 @@ def run_python_code(
         # If step_namespace is provided (from _executor), use it; otherwise create a fresh one.
         # TÂCHE 6.1: Restriction des __builtins__ pour la sandbox Python (Case 2)
         # NOUVEAU-03: Unified sandbox whitelist (excludes getattr, setattr, hasattr, open, __import__)
+        # ISSUE-13: in imported modules __builtins__ is the dict itself, not the
+        # builtins module — calling .__dict__ on a dict raises AttributeError.
+        # Use the builtins module explicitly to work in both __main__ and imported contexts.
+        import builtins as _builtins_module
         _SAFE_BUILTINS = {
-            k: v for k, v in __builtins__.__dict__.items()
+            k: v for k, v in vars(_builtins_module).items()
             if k in {
                 "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
                 "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
@@ -690,9 +698,12 @@ def run_python_code(
                 "None", "True", "False", "Exception", "StopIteration"
             }
         }
-        # Always start with a fresh namespace to prevent variable leakage between steps (M-NEW-03)
+        # BUG-01 / SEC-04: exec_namespace MUST have "__builtins__" set to the
+        # restricted dict; without this key Python falls back to the full built-in
+        # namespace, making _SAFE_BUILTINS entirely dead code.
         exec_ns = step_namespace if step_namespace is not None else {}
         exec_namespace = exec_ns
+        exec_namespace["__builtins__"] = _SAFE_BUILTINS
 
         # Inject RUN_TEMP_DIR into the in-process namespace as well
         if run_temp_dir and "run_dir" not in exec_namespace:

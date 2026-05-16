@@ -293,11 +293,35 @@ class ToolRetriever:
             )
             return {"tools": [], "data_lake": [], "libraries": []}
 
-        if hasattr(llm, "invoke"):
-            response = llm.invoke([HumanMessage(content=prompt)])
-            response_content = response.content
-        else:
-            response_content = str(llm(prompt))
+        # BUG-46: wrap the LLM call with a timeout and catch all exceptions.
+        # On failure we return empty selections so the agent falls back to using
+        # the full tool set rather than blocking indefinitely or crashing.
+        _llm_timeout = int(os.environ.get("GENOMEER_RETRIEVER_LLM_TIMEOUT", "30"))
+        response_content = ""
+        try:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                if hasattr(llm, "invoke"):
+                    _fut = _ex.submit(llm.invoke, [HumanMessage(content=prompt)])
+                else:
+                    _fut = _ex.submit(llm, prompt)
+                try:
+                    _resp = _fut.result(timeout=_llm_timeout)
+                    response_content = _resp.content if hasattr(_resp, "content") else str(_resp)
+                except _cf.TimeoutError:
+                    logger.warning(
+                        f"[ToolRetriever] LLM timed out after {_llm_timeout}s — "
+                        "returning empty tool selection."
+                    )
+                    _fut.cancel()
+        except Exception as exc:
+            logger.warning(
+                f"[ToolRetriever] LLM invocation failed ({exc}) — "
+                "returning empty tool selection."
+            )
+
+        if not response_content:
+            return {"tools": [], "data_lake": [], "libraries": []}
 
         selected_indices = self._parse_llm_response(response_content)
 

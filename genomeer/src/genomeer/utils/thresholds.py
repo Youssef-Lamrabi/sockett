@@ -26,6 +26,9 @@ MIMAG_THRESHOLDS: Dict[str, Dict[str, Any]] = {
         "poor_label":       "< 500 bp",
         "warn_threshold":   1_000,
         "fail_threshold":   200,
+        # SILENT-04: explicit pass_threshold so benchmark.py does not fall back to
+        # warn_threshold*2 (=2000), which is 5x below the MIMAG 10 kb standard.
+        "pass_threshold":   10_000,
         "unit":             "bp",
         "tool":             "metaSPAdes / MEGAHIT / Flye",
         "interpretation": (
@@ -123,6 +126,8 @@ MIMAG_THRESHOLDS: Dict[str, Dict[str, Any]] = {
         "poor_label":       "< 5x",
         "warn_threshold":   2.0,
         "fail_threshold":   0.5,
+        # ISSUE-15: missing pass_threshold caused benchmark to use warn*2=4x instead of 10x
+        "pass_threshold":   10.0,
         "unit":             "X",
         "tool":             "samtools / jgi_summarize_bam_contig_depths",
         "interpretation": (

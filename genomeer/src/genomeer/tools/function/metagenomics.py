@@ -859,10 +859,19 @@ def run_bracken(
     proc = _run(cmd)
     _assert_ok(proc, "Bracken")
 
+    # ISSUE-3: quality_gate uses "n_species_estimated" — count from bracken_report
+    n_species = 0
+    try:
+        with open(bracken_report) as _f:
+            n_species = sum(1 for _l in _f if _l.strip() and not _l.startswith("#"))
+    except Exception:
+        pass
+
     return {
         "bracken_output": bracken_out,
         "bracken_report": bracken_report,
         "level": level,
+        "n_species_estimated": n_species,   # consumed by quality_gate run_bracken gate
         "stdout": proc.stdout,
     }
 
@@ -932,10 +941,21 @@ def run_gtdbtk(
     _assert_ok(proc, "GTDB-Tk")
 
     summary = str(out / "gtdbtk.bac120.summary.tsv")
+
+    # ISSUE-7: quality_gate uses "n_classified" — count rows in summary TSV
+    n_classified = 0
+    if Path(summary).exists():
+        try:
+            with open(summary) as _f:
+                n_classified = sum(1 for _l in _f if _l.strip() and not _l.startswith("user_genome"))
+        except Exception:
+            pass
+
     return {
         "summary_tsv": summary if Path(summary).exists() else None,
         "ar53_summary": str(out / "gtdbtk.ar53.summary.tsv"),
         "classify_dir": str(out),
+        "n_classified": n_classified,       # consumed by quality_gate run_gtdbtk gate
         "stdout": proc.stdout[-2000:],
     }
 
@@ -1120,13 +1140,28 @@ def run_prokka(
     proc = _run(cmd, timeout=14400)
     _assert_ok(proc, "Prokka")
 
+    # ISSUE-4: quality_gate uses "n_genes_predicted" — parse from Prokka .txt stats
+    n_genes = 0
+    txt_path = Path(f"{prefix}.txt")
+    if txt_path.exists():
+        import re as _re
+        try:
+            for _line in txt_path.read_text(encoding="utf-8").splitlines():
+                _m = _re.search(r"CDS\s*:\s*(\d+)", _line)
+                if _m:
+                    n_genes = int(_m.group(1))
+                    break
+        except Exception:
+            pass
+
     return {
         "gff": f"{prefix}.gff",
         "faa": f"{prefix}.faa",
         "ffn": f"{prefix}.ffn",
         "tsv": f"{prefix}.tsv",
         "gbk": f"{prefix}.gbk",
-        "txt_stats": f"{prefix}.txt",
+        "txt_stats": str(txt_path),
+        "n_genes_predicted": n_genes,       # consumed by quality_gate run_prokka gate
         "output_dir": str(out),
     }
 
@@ -1200,7 +1235,26 @@ def run_diamond(
     except Exception:
         pass
 
-    return {"hits_tsv": hits_tsv, "n_hits": n_hits, "stdout": proc.stdout}
+    # ISSUE-5: quality_gate uses "hit_rate_pct" — derive from DIAMOND stdout
+    # DIAMOND reports "X queries aligned" in its output
+    import re as _re
+    hit_rate_pct: Optional[float] = None
+    _m = _re.search(r"(\d+)\s+queries\s+aligned", proc.stdout or "", _re.IGNORECASE)
+    _total = _re.search(r"(\d+)\s+queries\s+(?:total|processed)", proc.stdout or "", _re.IGNORECASE)
+    if _m and _total:
+        try:
+            _aligned = int(_m.group(1))
+            _tot = int(_total.group(1))
+            hit_rate_pct = round(100.0 * _aligned / _tot, 2) if _tot > 0 else 0.0
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    return {
+        "hits_tsv": hits_tsv,
+        "n_hits": n_hits,
+        "hit_rate_pct": hit_rate_pct,       # consumed by quality_gate run_diamond gate
+        "stdout": proc.stdout,
+    }
 
 
 def run_hmmer(
@@ -1273,11 +1327,31 @@ def run_humann3(
     _assert_ok(proc, "HUMAnN3")
 
     stem = Path(input_reads).stem.replace(".fastq", "").replace(".fq", "")
+
+    # ISSUE-6: quality_gate uses "mapped_reads_pct" — parse from HUMAnN3 stdout
+    import re as _re
+    mapped_reads_pct: Optional[float] = None
+    _m = _re.search(
+        r"(\d+(?:\.\d+)?)\s*%.*reads.*(?:mapped|aligned|classified)",
+        proc.stdout or "", _re.IGNORECASE
+    )
+    if not _m:
+        _m = _re.search(
+            r"Total reads mapped\s*:\s*(\d+(?:\.\d+)?)\s*%",
+            proc.stdout or "", _re.IGNORECASE
+        )
+    if _m:
+        try:
+            mapped_reads_pct = float(_m.group(1))
+        except ValueError:
+            pass
+
     return {
         "pathabundance_tsv": str(out / f"{stem}_pathabundance.tsv"),
         "pathcoverage_tsv": str(out / f"{stem}_pathcoverage.tsv"),
         "genefamilies_tsv": str(out / f"{stem}_genefamilies.tsv"),
         "output_dir": str(out),
+        "mapped_reads_pct": mapped_reads_pct,   # consumed by quality_gate run_humann3 gate
         "stdout": proc.stdout[-2000:],
     }
 

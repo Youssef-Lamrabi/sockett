@@ -657,18 +657,37 @@ def download_vfdb(
         "full": "http://www.mgc.ac.cn/VFs/Down/VFDB_setB_pro.fas.gz",
     }
     url = urls.get(subset, urls["core"])
+    # ISSUE-17: use https (not http) — VFDB traffic was unencrypted, enabling MITM
+    # ISSUE-18: replace wget subprocess with urllib so we work on systems without wget
+    urls = {
+        "core": "https://www.mgc.ac.cn/VFs/Down/VFDB_setA_pro.fas.gz",
+        "full": "https://www.mgc.ac.cn/VFs/Down/VFDB_setB_pro.fas.gz",
+    }
+    url = urls.get(subset, urls["core"])
     fname = f"VFDB_{subset}_proteins.fas.gz"
     dest = str(out / fname)
 
-    proc = subprocess.run(["wget", "-q", "-O", dest, url],
-                          capture_output=True, text=True, timeout=600)
-    if proc.returncode != 0:
-        return {"status": "failed", "error": proc.stderr[:300],
-                "manual_url": "http://www.mgc.ac.cn/VFs/main.htm"}
+    ok = _download_file(url, dest, timeout=600)
+    if not ok:
+        return {
+            "status": "failed",
+            "error": f"Failed to download VFDB from {url}. "
+                     "Check network connectivity or download manually.",
+            "manual_url": "https://www.mgc.ac.cn/VFs/main.htm",
+        }
 
-    # Decompress
+    # Decompress using gzip module (no gunzip binary required)
+    import gzip as _gzip
+    import shutil as _shutil
     decompressed = dest.replace(".gz", "")
-    subprocess.run(["gunzip", "-f", dest], check=False)
+    try:
+        with _gzip.open(dest, "rb") as _gz, open(decompressed, "wb") as _out_f:
+            _shutil.copyfileobj(_gz, _out_f)
+        Path(dest).unlink(missing_ok=True)
+    except Exception as _e:
+        import logging as _lg
+        _lg.getLogger("genomeer.db").warning(f"VFDB decompression failed: {_e}; keeping .gz")
+        decompressed = dest
 
     return {
         "fasta_path": decompressed if Path(decompressed).exists() else dest,

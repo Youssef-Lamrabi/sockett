@@ -289,7 +289,8 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
     },
 
     "run_das_tool": {
-        "metric_key":     "n_bins_refined",
+        # ISSUE-8: run_das_tool() returns "n_refined_bins" not "n_bins_refined"
+        "metric_key":     "n_refined_bins",
         "metric_label":   "Bins after DAS_Tool refinement",
         "warn_threshold": 1,
         "fail_threshold": 0,
@@ -417,6 +418,19 @@ def check_quality(
         msg = f"[QA-WARN] {metric_label}: metric could not be extracted. Manual verification recommended. {fix_hint}"
         logger.warning(f"Quality gate metric extraction failed for {tool_name}: {metric_label}")
         return ("warn", msg)
+
+    # ── BUG-14 / TEST-03: fail_on_zero — gates with this flag must return FAIL
+    # when the value is exactly 0 (e.g. 0 Bracken species, 0 MetaBAT2 bins).
+    # The threshold `fail_threshold=0` means `value < 0` which is NEVER true for
+    # natural counts, so the flag provides an explicit zero-check.
+    if gate.get("fail_on_zero") and value == 0:
+        return (
+            "fail",
+            (
+                f"[QA-FAIL] {metric_label} = 0. "
+                f"The tool produced no output — pipeline cannot continue. {fix_hint}"
+            )
+        )
 
     # ── Threshold comparisons ─────────────────────────────────────────────
 

@@ -76,6 +76,15 @@ def get_llm(
     if api_key is None:
         api_key = _SecretStr("EMPTY")
         
+    # BUG-31: validate model name before slicing — an empty string or a name
+    # shorter than the prefix being tested gives a misleading ValueError.
+    if not model or not model.strip():
+        raise ValueError(
+            "model name must be a non-empty string. "
+            "Set GENOMEER_LLM (env var) or pass model= explicitly."
+        )
+    model = model.strip()
+
     # Auto-detect source from model name if not specified
     if source is None:
         env_source = os.getenv("GENOMEER_MODEL_SOURCE")
@@ -116,7 +125,11 @@ def get_llm(
             ):
                 source = "Bedrock"
             else:
-                raise ValueError("Unable to determine model source. Please specify 'source' parameter.")
+                raise ValueError(
+                    f"Unable to determine provider for model {model!r}. "
+                    "Pass source='Anthropic'|'OpenAI'|'Ollama'|'AzureOpenAI'|'Gemini'|'Groq'|'Bedrock'|'Custom' "
+                    "or set GENOMEER_MODEL_SOURCE env var."
+                )
 
     # INternal helper
     def _mk_openai_like(source, model, temperature, stop_sequences, api_key=None, base_url=None):

@@ -308,10 +308,11 @@ class BioAgent:
 
         # [helper] to import tools-mapper, llm
         self.path = os.path.join(path, "bioagent_data")
-        
-        from genomeer.utils.version_tracker import VersionTracker
-        self._version_tracker = VersionTracker()
-        
+
+        # ISSUE-27: VersionTracker was instantiated here AND again after configure().
+        # The second assignment silently discarded the first instance.
+        # Removed the premature first instantiation; the definitive one is below.
+
         self.module2api = read_module2api()
         self.llm = get_llm(
             llm,
@@ -362,28 +363,30 @@ class BioAgent:
         
         self._bio_rag_status = "offline" if os.environ.get("GENOMEER_RAG_OFFLINE", "0") == "1" else "building"
         
-        if self._bio_rag_status != "offline":
-            def _build_rag():
-                try:
-                    self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"])
-                    if self.bio_rag_store.ready:
-                        self._bio_rag_status = "ready"
-                    else:
-                        self._bio_rag_status = "partial"
-                except Exception as e:
-                    self._log("BIORAG THREAD", f"Failed to build BioRAG: {e}", type="file")
-                    self._bio_rag_status = "offline"
-                    
-            self._rag_build_thread = threading.Thread(
-                target=_build_rag,
-                daemon=True,
-                name="bio-rag-builder"
-            )
-            self._rag_build_thread.start()
-            self._log("BIO RAG", body="Index build started in background (daemon thread)", node="init")
-        else:
-            self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"])
-            self._log("BIO RAG", body="Started in offline mode (GENOMEER_RAG_OFFLINE=1). Using cache only.", node="init")
+        def _build_rag():
+            # BUG-06: both online and offline builds now run in a background daemon
+            # thread.  Previously the offline path ran synchronously in __init__,
+            # blocking agent creation for up to 2 minutes.  Offline mode reads only
+            # from the persisted FAISS cache (no network), so it is still fast, but
+            # there is no reason to block __init__ for it.
+            try:
+                self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"])
+                if self.bio_rag_store.ready:
+                    self._bio_rag_status = "ready"
+                else:
+                    self._bio_rag_status = "partial"
+            except Exception as e:
+                self._log("BIORAG THREAD", f"Failed to build BioRAG: {e}", type="file")
+                self._bio_rag_status = "offline"
+
+        self._rag_build_thread = threading.Thread(
+            target=_build_rag,
+            daemon=True,
+            name="bio-rag-builder",
+        )
+        self._rag_build_thread.start()
+        _mode_label = "offline (cache-only)" if self._bio_rag_status == "offline" else "online"
+        self._log("BIO RAG", body=f"Index build started in background [{_mode_label}]", node="init")
             
         self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
 
@@ -393,6 +396,12 @@ class BioAgent:
 
         # ── VERSION TRACKING ────────────────────────────────────────────────────
         self._version_tracker = VersionTracker()
+
+        # BUG-35: custom functions registered by the user at runtime.
+        # Protected by a lock so that batch threads reading the dict while a
+        # new function is being registered never see a partially-written state.
+        self._custom_functions: dict = {}
+        self._custom_functions_lock = threading.Lock()
 
     @property
     def bio_rag_status(self) -> str:
@@ -2310,9 +2319,26 @@ class BioAgent:
                 self._log("OBSERVER PARSE FAILED -> FORCED BLOCKED", body=f"Raw text start: {resp.content[:500]}...", node=node)
 
             if _obs_parsed.quality_signals:
+                # BUG-36: coerce each signal value to float so adaptive_rules.py
+                # never sees a string like "N/A" and silently skips the rule.
+                # Values that cannot be converted are dropped with a warning.
+                _validated_signals: dict = {}
+                for _sig_k, _sig_v in _obs_parsed.quality_signals.items():
+                    if isinstance(_sig_v, (int, float)):
+                        _validated_signals[_sig_k] = float(_sig_v)
+                    else:
+                        try:
+                            _validated_signals[_sig_k] = float(_sig_v)
+                        except (ValueError, TypeError):
+                            self._log(
+                                "QA-SIGNAL-SKIP",
+                                body=f"quality_signal '{_sig_k}' = {_sig_v!r} is not numeric — skipped",
+                                node="observer",
+                            )
+
                 new_manifest["quality_signals"] = {
                     **dict(state["manifest"].get("quality_signals") or {}),
-                    **_obs_parsed.quality_signals,
+                    **_validated_signals,
                 }
 
             # ── Extraire les gènes AMR détectés et les persister ───────────────────
@@ -2491,13 +2517,20 @@ class BioAgent:
             last_code = (state.get("pending_code") or "").strip()
 
             prompt = instructions.DIAGNOSTICS_PROMPT
+            # BUG-49: run_temp_dir can be None early in the pipeline (state not yet
+            # initialised) or missing from a resumed checkpoint.  A None value would
+            # render literally as "None/" in the prompt, causing generated code to
+            # write outside the sandbox.  Fall back to the system temp dir.
+            import tempfile as _tf
+            _rtd = state.get("run_temp_dir") or os.path.join(_tf.gettempdir(), "genomeer_diag")
+
             ctx = instructions.DIAGNOSTICS_CTX_PROMPT.format(
                 user_goal=state.get("last_prompt", ""),
                 current_step_title=step["title"],
                 retry_count=retry_count,
                 observer_summary=observer_summary or "<none>",
                 last_code=last_code or "<none>",
-                run_temp_dir=state.get("run_temp_dir", ""),
+                run_temp_dir=_rtd,
             )
 
             msgs = [
@@ -2913,16 +2946,20 @@ class BioAgent:
         return files
     
     def _inject_custom_functions_to_repl(self):
-        """Inject custom functions into the Python REPL execution environment.
-        This makes custom tools available during code execution.
+        """Inject custom functions into the per-thread Python REPL namespace.
+
+        BUG-35: acquire _custom_functions_lock before reading the dict so that a
+        concurrent call to register_custom_function() never produces a partial view.
+        The target namespace is thread-local (via helper._get_persistent_namespace)
+        so writes are inherently safe across batch threads.
         """
-        if hasattr(self, "_custom_functions") and self._custom_functions:
-            # Access the persistent namespace used by run_python_repl
+        with self._custom_functions_lock:
+            funcs_snapshot = dict(self._custom_functions)   # O(n) copy under lock
+
+        if funcs_snapshot:
             from genomeer.utils.helper import _get_persistent_namespace
             _pns = _get_persistent_namespace()
-
-            # Inject all custom functions into the execution namespace
-            for name, func in self._custom_functions.items():
+            for name, func in funcs_snapshot.items():
                 _pns[name] = func
 
             # NOUVEAU-02 FIX: Removed builtins injection to ensure session isolation.
