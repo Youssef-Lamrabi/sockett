@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}BioAgent for Metagenomics – Landing{% endblock %}
+
+{% block body %}
+<style>
+  /* Page-specific, light & colorful */
+  .hero {
+    background:
+      radial-gradient(1000px 600px at 85% -10%, #e0f2fe 0%, rgba(224,242,254,0) 60%),
+      radial-gradient(800px 500px at -10% 0%, #dcfce7 0%, rgba(220,252,231,0) 55%),
+      var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px 16px;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 28px;
+    align-items: center;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    color: #0f172a;
+    background: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 8px 12px;
+    box-shadow: var(--shadow);
+  }
+  .kicker {
+    color: var(--muted);
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    font-size: 12px;
+  }
+  .hero h1 {
+    font-size: clamp(28px, 4vw, 44px);
+    line-height: 1.1;
+    margin: 10px 0 8px 0;
+  }
+  .hero p.lead {
+    font-size: clamp(14px, 2.2vw, 18px);
+    color: #334155;
+    max-width: 58ch;
+  }
+  .cta-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 18px;
+  }
+  .button.ghost {
+    background: #f8fafc; border-color: var(--border);
+  }
+
+  /* Code/Logs card */
+  .code-card {
+    background: #ffffff;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    border-radius: 14px;
+    padding: 14px;
+  }
+  .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .pill {
+    background: #f1f5f9;
+    border: 1px solid var(--border);
+    color: #334155;
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+
+  /* Sections */
+  .section { padding: 40px 0; }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3,1fr);
+    gap: 16px;
+  }
+  .card {
+    background: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    box-shadow: var(--shadow);
+  }
+  .card h3 { margin: 6px 0; font-size: 18px; }
+  .card p { margin: 6px 0 0 0; color: #475569; font-size: 14px; }
+
+  /* Timeline */
+  .timeline {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  .step {
+    display: grid; grid-template-columns: 42px 1fr; gap: 12px;
+    align-items: start; padding: 12px; border:1px solid var(--border); border-radius: 12px; background: #fff;
+  }
+  .num {
+    width: 42px; height: 42px; border-radius: 50%; display:grid; place-items:center;
+    border: 1px solid var(--border); background: #f8fafc; font-weight:700; color:#334155;
+  }
+
+  /* Footer */
+  .footer {
+    border-top: 1px solid var(--border);
+    background: #fff;
+    color: #475569;
+    font-size: 14px;
+  }
+
+  @media (max-width: 1000px) {
+    .hero-grid { grid-template-columns: 1fr; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .timeline { grid-template-columns: 1fr; }
+  }
+</style>
+
+<header class="hero">
+  <div class="container">
+    <nav style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+      <div class="badge">
+        <span>BioAgent • Metagenomics</span>
+      </div>
+      <div style="display:flex;gap:10px;">
+        <a href="#features" class="button ghost" style="text-decoration:none;padding:10px 12px;">Features</a>
+        <a href="#workflow" class="button ghost" style="text-decoration:none;padding:10px 12px;">Workflow</a>
+        <a href="/login"><button class="primary">Get Started</button></a>
+      </div>
+    </nav>
+
+    <div class="hero-grid">
+      <div style="margin: 5em 0;max-width:58ch;">
+        <div class="kicker">End-to-end automation</div>
+        <h1>Run complete metagenomic workflows with a single agent</h1>
+        <p class="lead">
+          BioAgent orchestrates quality control, host depletion, assembly, binning, taxonomic
+          profiling, functional annotation, and reporting—while streaming tool execution and
+          observations in real time.
+        </p>
+        <div class="cta-row">
+          <a href="/login"><button class="primary">Launch the Agent</button></a>
+          <a href="#features" class="button ghost features-btn" style="text-decoration:none;">Explore Features</a>
+        </div>
+
+        <div class="pill-row" aria-hidden="true">
+          <span class="pill">✔ QC &amp; Filtering</span>
+          <span class="pill">✔ Host Read Removal</span>
+          <span class="pill">✔ Assembly &amp; Binning</span>
+          <span class="pill">✔ Taxonomic Profiles</span>
+          <span class="pill">✔ Functional Annotation</span>
+          <span class="pill">✔ Reproducible Reports</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- Features -->
+  <section id="features" class="section">
+    <div class="container">
+      <h2 style="margin:0 0 12px 0;">Why BioAgent for Metagenomics?</h2>
+      <p class="muted" style="margin:0 0 18px 0;">Built for real datasets, long runs, and transparent execution.</p>
+      <div class="grid-3">
+        <div class="card">
+          <div class="kicker">Transparent Orchestration</div>
+          <h3>Live tool logs &amp; observations</h3>
+          <p>Every step emits <code>&lt;execute&gt;</code> and <code>&lt;observe&gt;</code> blocks to a dedicated log pane so you always know what ran—and why.</p>
+        </div>
+        <div class="card">
+          <div class="kicker">Bring Your Models</div>
+          <h3>Ollama, OpenAI, Groq, Custom</h3>
+          <p>Pick your LLM provider per user, save API settings, and switch models per chat session—no code edits required.</p>
+        </div>
+        <div class="card">
+          <div class="kicker">Reproducibility</div>
+          <h3>Environment-aware execution</h3>
+          <p>Self-managed conda/mamba envs for each run. Outputs are published as versioned artifacts you can revisit and share.</p>
+        </div>
+        <div class="card">
+          <div class="kicker">File-Aware</div>
+          <h3>Upload &amp; track context</h3>
+          <p>Uploads are staged into a run workspace; the agent summarizes detected inputs and validates requirements before it executes.</p>
+        </div>
+        <div class="card">
+          <div class="kicker">Human-in-the-Loop</div>
+          <h3>Pause, review, resume</h3>
+          <p>Optional feedback mode pauses after planning or generation. Approve or correct before the agent proceeds.</p>
+        </div>
+        <div class="card">
+          <div class="kicker">Reporting</div>
+          <h3>Final summaries &amp; artifacts</h3>
+          <p>After all steps complete, BioAgent publishes an artifact set and composes a final report of key results.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Workflow -->
+  <section id="workflow" class="section" style="background:#f8fafc;border-top:1px solid var(--border);border-bottom:1px solid var(--border);">
+    <div class="container">
+      <h2 style="margin:0 0 12px 0;">Standard metagenomic workflow</h2>
+      <p class="muted" style="margin:0 0 18px 0;">Configurable steps. The agent adapts tools to your data and resources.</p>
+      <div class="timeline">
+        <div class="step"><div class="num">1</div><div><strong>QC</strong><br/><span class="muted">Adapter/quality trimming, polyG handling, length/complexity filters</span></div></div>
+        <div class="step"><div class="num">2</div><div><strong>Host depletion</strong><br/><span class="muted">Bowtie2/Minimap2 against host genome; keep unmapped reads</span></div></div>
+        <div class="step"><div class="num">3</div><div><strong>Assembly</strong><br/><span class="muted">MEGAHIT/SPAdes with memory-aware presets; assembly QC</span></div></div>
+        <div class="step"><div class="num">4</div><div><strong>Binning</strong><br/><span class="muted">MetaBAT/DAS Tool; checkM/GTDB-Tk for bin quality and taxonomy</span></div></div>
+        <div class="step"><div class="num">5</div><div><strong>Taxonomic profiling</strong><br/><span class="muted">Kraken2/Bracken or MetaPhlAn; abundance tables &amp; plots</span></div></div>
+        <div class="step"><div class="num">6</div><div><strong>Functional annotation</strong><br/><span class="muted">KEGG/eggNOG/GO pathways; module coverage summary</span></div></div>
+      </div>
+      <div style="margin-top:18px;">
+        <a href="/login"><button class="primary">Start a Run</button></a>
+        <a href="#features" class="button ghost" style="text-decoration:none;margin-left:6px;">Back to Features</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="section">
+    <div class="container" style="text-align:center;">
+      <h2>Ready to analyze your metagenomes?</h2>
+      <p class="muted" style="max-width:70ch;margin:8px auto 16px;">Upload your reads, pick a model, and let BioAgent orchestrate the pipeline—while you watch the live logs.</p>
+      <a href="/login"><button class="primary">Get Started</button></a>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="container" style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+    <div>© {{  now().year if false else '' }} BioAgent for Metagenomics</div>
+    <div class="muted">Light theme • FastAPI • LangGraph</div>
+  </div>
+</footer>
+{% endblock %}

@@ -1,0 +1,6 @@
+{
+    "default_model": "gpt-oss:20b",
+    "default_source": "Custom",
+    "default_base_url": "http://10.52.88.105:11434/v1",
+    "default_api_key": null
+}  

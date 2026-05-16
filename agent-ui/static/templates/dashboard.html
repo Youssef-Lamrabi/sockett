@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Agent Copilot – Dashboard{% endblock %}
+{% block body %}
+<div id="app">
+  <div id="topbar">
+    <div class="left-controls">
+      <button id="btn-open-sessions" class="button ghost">
+        <i class="fa fa-bars"></i> Chats
+      </button>
+      <button id="btn-new-chat" class="button ghost" aria-label="Start a new chat">
+        <i class="fa fa-edit"></i>
+      </button>
+      <div class="select-wrap">
+        <label for="model-select" class="sr-only">Model</label>
+        <select id="model-select">
+          <option value="gpt-oss:20b">gpt-oss:20b</option>
+        </select>
+      </div>
+      <div style="font-size: 14px;">&nbsp;&nbsp;MODE</div>
+      <div class="mode-switch" id="mode-switch" role="group" aria-label="Agent mode">
+        <button id="mode-auto" class="seg active" data-mode="auto" title="Let the agent run end to end">Agent-Self-critic</button>
+        <button id="mode-feedback" class="seg" data-mode="feedback" title="Ask before running code">Human-in-loop</button>
+      </div>
+    </div>
+
+    <div class="profile">
+      <div class="avatar" id="profile-avatar">U</div>
+      <div class="user-meta">
+        <div id="profile-name">User</div>
+        <div id="profile-email" class="muted">user@example.com</div>
+      </div>
+      <button id="btn-open-settings" class="button ghost">
+        <i class="fa fa-gear"></i>
+      </button>
+      <button id="btn-logout" class="icon" title="Logout" aria-label="Logout">
+        <i class="fa fa-sign-out"></i>
+      </button>
+    </div>
+  </div>
+
+  <div id="layout">
+    <aside id="left">
+      <h3 style="margin-top: 0;font-size: 15px;">Tool / Logs</h3>
+      <div id="logs"></div>
+    </aside>
+
+    <div id="splitter" class="splitter" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize sidebar"></div>
+
+    <main id="right">
+      <div id="chat"></div>
+      <div class="composer-wrapper">
+        <div id="attach-dock" class="attach-dock" aria-live="polite"></div>
+        <div id="composer">
+          <label class="upload" title="Attach file">
+            <input type="file" id="file-input" />
+            <span>＋</span>
+          </label>
+          <textarea
+            id="message"
+            class="composer-textarea"
+            placeholder="Enter your message… "
+            rows="1"
+            autocomplete="off"
+            spellcheck="true"
+          >save a text file with inside "Hellow word" and give me link to download. formulate this as 3 steps job only.</textarea>
+          <button id="send" type="button" class="primary button-submit">Send</button>
+          <button id="stop" type="button" class="danger button-stop" style="display:none;border-radius: 0px 19px 19px 0px;" aria-label="Stop current run">
+            <i class="fa fa-stop" aria-hidden="true"></i> Stop
+          </button>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- Sessions Drawer -->
+<div id="sessions-drawer" aria-hidden="true">
+  <div class="drawer-panel">
+    <div class="drawer-header">
+      <h2>Chats</h2>
+      <button id="close-sessions" class="icon close-history" style="" aria-label="Close">✕</button>
+    </div>
+    <div id="sessions-list" class="sessions-list"></div>
+    <div class="drawer-footer">
+      <button id="drawer-new" class="primary w-full">New Chat</button>
+    </div>
+  </div>
+  <div class="drawer-backdrop" id="sessions-backdrop"></div>
+</div>
+
+<!-- Settings Modal -->
+<div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3 id="settings-title">Provider Settings</h3>
+      <button class="icon" id="settings-close" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>Add a Model</label>
+        <div class="grid2">
+          <input id="mdl-name" placeholder="gpt-4o-mini" class="modal-input" />
+          <div class="select-wrap">
+            <select id="mdl-source">
+              <option>Ollama</option>
+              <option>OpenAI</option>
+              <option>AzureOpenAI</option>
+              <option>Anthropic</option>
+              <option>Gemini</option>
+              <option>Groq</option>
+              <option>Bedrock</option>
+              <option>Custom</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid2">
+          <input id="mdl-base-url" placeholder="Model URL (optional)" class="modal-input"/>
+          <input id="mdl-api-key" placeholder="API key (optional)" class="modal-input"/>
+        </div>
+        <button id="mdl-add" class="button">Add Model</button>
+      </div>
+      
+      <br>
+      <div class="field">
+        <label>Your Models</label>
+        <div id="models-list" class="models-list"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button id="settings-save" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
