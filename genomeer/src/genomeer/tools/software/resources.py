@@ -1,8 +1,8 @@
 # Data lake dictionary with detailed descriptions
 data_lake_dict = {
-    # "https://ftp.ncbi.nlm.nih.gov/": "NCBI FTP — the central repository of the National Center for Biotechnology Information. Provides access to genomes (GCF/GCA assemblies), RefSeq, GenBank, SRA datasets, annotations (GFF/GTF), protein databases, and supporting metadata files.",
-    # "https://www.ebi.ac.uk/ena/": "European Nucleotide Archive (ENA) — comprehensive archive of nucleotide sequencing information, including raw sequencing reads, assembled genomes, and functional annotations.",
-    # "https://www.uniprot.org/": "UniProt Knowledgebase — curated protein sequence and functional information, including UniProtKB/Swiss-Prot (manually reviewed) and UniProtKB/TrEMBL (automatically annotated).",
+    # "https://ftp.ncbi.nlm.nih.gov/": "NCBI FTP  -  the central repository of the National Center for Biotechnology Information. Provides access to genomes (GCF/GCA assemblies), RefSeq, GenBank, SRA datasets, annotations (GFF/GTF), protein databases, and supporting metadata files.",
+    # "https://www.ebi.ac.uk/ena/": "European Nucleotide Archive (ENA)  -  comprehensive archive of nucleotide sequencing information, including raw sequencing reads, assembled genomes, and functional annotations.",
+    # "https://www.uniprot.org/": "UniProt Knowledgebase  -  curated protein sequence and functional information, including UniProtKB/Swiss-Prot (manually reviewed) and UniProtKB/TrEMBL (automatically annotated).",
 
     # "affinity_capture-ms.parquet": "Protein-protein interactions detected via affinity capture and mass spectrometry.",
     # "affinity_capture-rna.parquet": "Protein-RNA interactions detected by affinity capture.",
@@ -24,7 +24,19 @@ library_content_dict = {
     # Sequence Analysis Tools
     "samtools": "[CLI Tool] A suite of programs for interacting with high-throughput sequencing data. Use with subprocess.run(['samtools', ...]).",
     "bowtie2": "[CLI Tool] An ultrafast and memory-efficient tool for aligning sequencing reads to long reference sequences. Use with subprocess.run(['bowtie2', ...]).",
-    "ncbi-genome-download": """[CLI Tool] Python package specifically designed for downloading a genome from NCBI.""",
+    "ncbi-genome-download": (
+        "[CLI Tool] Downloads genomes from NCBI. "
+        "PREFERRED: use --assembly-accessions when a known accession is available - it is fast, deterministic, and never mass-lists:\n"
+        "  ncbi-genome-download --assembly-accessions GCF_000005845.2 --formats fasta --flat-output --output-folder <dir> bacteria\n"
+        "FALLBACK (by organism name) - ALWAYS include --assembly-levels complete or the tool lists ALL assemblies for the whole kingdom (thousands, hangs for hours):\n"
+        '  ncbi-genome-download --genera "Escherichia coli" --assembly-levels complete --section refseq --formats fasta --flat-output --output-folder <dir> bacteria\n'
+        "  # By taxon ID:\n"
+        "  ncbi-genome-download --taxids 562 --assembly-levels complete --section refseq --formats fasta --flat-output --output-folder <dir> bacteria\n"
+        "  Valid group args (POSITIONAL, at the END): bacteria fungi plant viral archaea all\n"
+        "  WRONG flags (do not exist): --genus  --species  --organism  --name\n"
+        "  Downloaded files are .fna.gz  -  decompress with gzip before SeqIO.parse.\n"
+        "  Always do a --dry-run first to verify the organism name matches NCBI before the real download."
+    ),
     
         # usage: ncbi-genome-download [-h] [-s {refseq,genbank}] [-F FILE_FORMATS] [-l ASSEMBLY_LEVELS] [-g GENERA] [--genus GENERA] [--fuzzy-genus] [-S STRAINS]
         #                     [-T SPECIES_TAXIDS] [-t TAXIDS] [-A ASSEMBLY_ACCESSIONS] [--fuzzy-accessions] [-R REFSEQ_CATEGORIES]

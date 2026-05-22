@@ -235,14 +235,38 @@ class BioAgent:
     # SYSTEM SETUP
     def _llm_invoke(self, node: str, purpose: str, msgs, verbose=True):
         """
-        Central LLM call: logs the full prompt and the raw LLM text response.
-        Use this instead of self.llm.invoke(...) everywhere.
+        Central LLM call with exponential backoff retry.
+        Retries on transient errors (429, 503, connection issues) up to 4 attempts.
         """
-        if verbose: prompt_txt = self._fmt_msgs(msgs)
-        if verbose: self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
-        resp = self.llm.invoke(msgs)
-        if verbose: self._log(f"LLM RESPONSE ({purpose})", getattr(resp, "content", str(resp)), node=node)
-        return resp
+        import time
+        if verbose:
+            prompt_txt = self._fmt_msgs(msgs)
+            self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
+
+        max_attempts = 4
+        base_delay = 2.0
+        last_exc = None
+        for attempt in range(max_attempts):
+            try:
+                resp = self.llm.invoke(msgs)
+                if verbose:
+                    self._log(f"LLM RESPONSE ({purpose})", getattr(resp, "content", str(resp)), node=node)
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc).lower()
+                # Retry on rate-limit, server errors, and transient connection issues
+                retryable = any(k in err_str for k in (
+                    "429", "503", "502", "rate limit", "too many requests",
+                    "connection", "timeout", "temporarily unavailable",
+                ))
+                if not retryable or attempt == max_attempts - 1:
+                    self._log(f"LLM ERROR ({purpose})", f"attempt={attempt+1} non-retryable: {exc}", node=node)
+                    raise
+                delay = base_delay * (2 ** attempt)
+                self._log(f"LLM RETRY ({purpose})", f"attempt={attempt+1} retrying in {delay:.1f}s: {exc}", node=node)
+                time.sleep(delay)
+        raise last_exc
     
     def _generate_system_prompt(
         self,
@@ -551,12 +575,16 @@ class BioAgent:
             # ------ RESUME FAST-PATH ------
             manifest = state.get("manifest") or {}
             if manifest.get("route_hint") == "ask_for_missing":
-                # user likely provided the missing info in the latest message.
-                # we don’t re-plan; we jump back into the current step’s guard.
-                self._log("RESUME", body="Pending missing inputs -> jump to input_guard", node=node)
+                # User likely provided the missing info in the latest message.
+                # Clean route_hint NOW so it cannot propagate to downstream nodes
+                # even if input_guard still finds something missing (it will re-set it).
+                clean_manifest = dict(manifest)
+                clean_manifest.pop("route_hint", None)
+                clean_manifest.pop("qa_payload", None)
+                self._log("RESUME", body="Pending missing inputs -> jump to orchestrator (manifest cleaned)", node=node)
                 return {
-                    # "next_step": "input_guard",
                     "next_step": "orchestrator",
+                    "manifest": clean_manifest,
                     "messages": [AIMessage(content="<observe>Resuming with your new inputs…</observe>")],
                 }
             # -----------------------------
@@ -564,7 +592,7 @@ class BioAgent:
             user_prompt = state["messages"][-1].content
             msgs = [
                 self.system_prompt,
-                HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
+                HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir") or "")),
             ]
             
             # ------ Interactive mode ------
@@ -626,6 +654,64 @@ class BioAgent:
             msgs.append(HumanMessage(content=user_prompt))
             resp = self._llm_invoke(node, "plan_route", msgs)
             steps, route = StateGraphHelper.parse_checklist_and_route(resp.content)
+
+            # Strip inline code from step titles.
+            # Weak models embed code both with backticks (`code`) and without (after ': ').
+            # NOTE: do NOT include bare () or [] in _CODE_SIGNALS — they appear in natural
+            # English like "(number of contigs, total length)" and would wrongly strip
+            # the entire step description down to just "Step N".
+            _CODE_SIGNALS = re.compile(
+                r'[;=]|'                               # assignment or semicolon
+                r'\bimport\s|\bfrom\s+\w+\s+import\b|'  # import statements
+                r'\bdef\s+\w+\s*\(|'                   # function definitions
+                r'\w+\.\w+\s*\('                       # method calls like SeqIO.parse(
+            )
+            # Connectors that become dangling after backtick-block removal
+            _DANGLING_END = re.compile(
+                r"\s+\b(with|using|via|by|from|and|or|et|avec|en|pour|par|de|du|des"
+                r"|the|a|an)\s*[.]?\s*$",
+                re.I,
+            )
+            _DANGLING_START = re.compile(
+                r"^\s*\b(and|or|with|et|ou|via|using|the)\b\s*",
+                re.I,
+            )
+            # Mid-sentence orphan sequences left after backtick removal.
+            # e.g. "using `Bio.SeqIO` and Python" → "using  and Python" → "and Python"
+            # e.g. "using `ncbi-genome-download` with accession" → "using  with accession" → "with accession"
+            # e.g. "save report to `ecoli.txt`." → "save report to ." → "save report"
+            _MID_ORPHAN_PREP = re.compile(
+                r"\b(using|via)\s+(with|by|and|or|,)\s*"
+                r"|\b(with|by)\s+(and|or|,)\s*",
+                re.I,
+            )
+            _TRAILING_PREP = re.compile(
+                r"\b(to|in|at|from|de|du|en)\s*[.!?,]?\s*$",
+                re.I,
+            )
+
+            def _clean_title(t: str) -> str:
+                # 1. Remove backtick-quoted code blocks
+                t = re.sub(r"`[^`]+`", "", t)
+                # 2. Collapse multiple spaces left by the removal
+                t = re.sub(r" {2,}", " ", t)
+                # 3. Clean mid-sentence orphans: "using and"→"and", "using with"→"with", "save to ."→"save"
+                t = _MID_ORPHAN_PREP.sub(lambda m: (m.group(2) or m.group(4)) + " ", t)
+                t = _TRAILING_PREP.sub("", t)
+                # 4. Strip dangling connectors at end ("Load FASTA with ")
+                t = _DANGLING_END.sub("", t)
+                # 5. Strip dangling connectors at start ("and compute N50")
+                t = _DANGLING_START.sub("", t)
+                # 6. If ': ' separator exists and suffix looks like code, drop suffix
+                if ': ' in t:
+                    label, _, rest = t.partition(': ')
+                    if _CODE_SIGNALS.search(rest):
+                        t = label
+                # 7. Drop trailing colon and tidy whitespace
+                t = re.sub(r":\s*$", "", t.strip())
+                return t.strip() or "Step"
+            steps = [{**s, "title": _clean_title(s["title"])} for s in steps]
+
             updates = {
                 "plan": steps,
                 "current_idx": 0,
@@ -686,11 +772,22 @@ class BioAgent:
                 next_step = "end" #orchestrator
             
             resp = self._llm_invoke(node, "qa", msgs)
+
+            # Always clean routing keys from manifest before exiting QA.
+            # If we don't, route_hint="ask_for_missing" is checkpointed and the planner
+            # will intercept it on the very next user message — even after our planner fix —
+            # because the planner fast-path relies on reading it from the checkpoint.
+            # Cleaning it here is the authoritative, terminal fix.
+            clean_manifest = dict(state.get("manifest") or {})
+            clean_manifest.pop("route_hint", None)
+            clean_manifest.pop("qa_payload", None)
+
             updates = {
                 "next_step": next_step,
+                "manifest": clean_manifest,
                 "messages": [AIMessage(content=resp.content)],
             }
-            self._log("EXIT NODE", body=f"next_step={state['next_step']}", node=node)
+            self._log("EXIT NODE", body=f"next_step={next_step}", node=node)
             return updates
 
         def _orchestrator(self, state: AgentState) -> AgentState:
@@ -734,8 +831,30 @@ class BioAgent:
             manifest = dict(state.get("manifest") or {})
 
             # current run storage home lsdir
-            temp_dir = state.get("run_temp_dir", "")
-            files = self._list_ctx_files(temp_dir)
+            temp_dir = state.get("run_temp_dir") or ""
+
+            # Collect text to scan for absolute paths:
+            # - original task prompt (last_prompt)
+            # - EVERY subsequent human message (user may provide file paths in follow-up answers)
+            import re as _re
+            _texts_to_scan = [user_goal]
+            _last_prompt_content = state.get("last_prompt") or ""
+            for _m in (state.get("messages") or []):
+                if getattr(_m, "type", "") == "human":
+                    _mc = getattr(_m, "content", "") or ""
+                    if _mc != _last_prompt_content and _mc.strip():
+                        _texts_to_scan.append(_mc)
+            _all_text = "\n".join(_texts_to_scan)
+
+            # Extract absolute paths (Windows and Unix, quoted or bare)
+            _quoted_win  = _re.findall(r'["\']([A-Za-z]:[/\\][^"\']+)["\']', _all_text)
+            _bare_win    = _re.findall(r'(?<!["\'/\\])([A-Za-z]:[/\\]\S+)', _all_text)
+            _quoted_unix = _re.findall(r'["\'](/(?:[^"\']+))["\']', _all_text)
+            _abs_paths = list(dict.fromkeys(
+                p.rstrip('.,;:)>]}') for p in (_quoted_win + _bare_win + _quoted_unix)
+                if p.rstrip('.,;:)>]}')
+            ))
+            files = self._list_ctx_files(temp_dir, extra_paths=_abs_paths)
             files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
 
             # step-scoped retrieval (tools/data/libs) before we call the validator
@@ -782,17 +901,21 @@ class BioAgent:
                     "next_step": "qa",
                 }
             else:
-                new_manifest = {
-                    **state["manifest"],
-                    "input_state": {
-                        "summary": [m for m in items],
-                        "root_dir": temp_dir,
-                        "files": files,
-                        "guidance": (
-                            "Use either the initial user prompt or the 'files' list "
-                            "to decide what inputs to use for code generation in this step."
-                        ),
-                    }
+                # Start from a copy, then explicitly remove stale routing keys.
+                # If route_hint="ask_for_missing" from a previous iteration survives here,
+                # the planner will intercept it and send the pipeline to QA→END even though
+                # all inputs are present. Popping them is the only safe fix.
+                new_manifest = dict(state.get("manifest") or {})
+                new_manifest.pop("route_hint", None)
+                new_manifest.pop("qa_payload", None)
+                new_manifest["input_state"] = {
+                    "summary": [m for m in items],
+                    "root_dir": temp_dir,
+                    "files": files,
+                    "guidance": (
+                        "Use either the initial user prompt or the 'files' list "
+                        "to decide what inputs to use for code generation in this step."
+                    ),
                 }
                 self._log("INPUTS OK", body="No missing items", node=node)
                 self._log("EXIT NODE", body="next_step=generator", node=node)
@@ -811,7 +934,7 @@ class BioAgent:
             manifest = state.get("manifest", {}) or {}
             repair_feedback = manifest.get("repair_feedback")
             is_diagnostic = isinstance(repair_feedback, str) and repair_feedback.strip().upper().startswith("DIAGNOSTICS_REQUEST:")
-            temp_dir = state.get("run_temp_dir", "")
+            temp_dir = state.get("run_temp_dir") or ""
             files = self._list_ctx_files(temp_dir)
             files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
 
@@ -839,21 +962,298 @@ class BioAgent:
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
                     manifest=state['manifest'].get("input_state"),
-                    run_temp_dir=state['run_temp_dir'],
+                    run_temp_dir=state.get('run_temp_dir') or "",
                 )
             
+            # Dynamically inject code pattern snippets when the step involves known-hard patterns.
+            # Small models (llama3:8b) reliably ignore rules in the general prompt but DO follow
+            # examples placed immediately before the task. This is the reliable fix for N50 / SeqIO.
+            _step_ctx = f"{step['title']} {state.get('last_prompt', '')}".lower()
+            _injections = []
+
+            if any(k in _step_ctx for k in ("n50", "assembly stat", "contig stat", "scaffold stat",
+                                             "sequence stat", "assembly metric", "stats")):
+                _injections.append(
+                    'REQUIRED — copy this N50 pattern exactly (no walrus :=, no None placeholder):\n'
+                    '    lengths = sorted([len(r.seq) for r in contigs], reverse=True)\n'
+                    '    total = sum(lengths)\n'
+                    '    cumsum, n50 = 0, 0\n'
+                    '    for l in lengths:\n'
+                    '        cumsum += l\n'
+                    '        if cumsum >= total / 2:\n'
+                    '            n50 = l\n'
+                    '            break\n'
+                    '    print(f"N50: {n50}")'
+                )
+
+            if any(k in _step_ctx for k in ("seqio", "fasta", "fastq", "parse", "sequence", "contig", "read")):
+                _injections.append(
+                    'REQUIRED — always materialise SeqIO.parse into a list before any use:\n'
+                    '    contigs = list(SeqIO.parse(fasta_path, "fasta"))  # ONE call, then reuse the list'
+                )
+
+            if any(k in _step_ctx for k in ("gc", "gc content", "gc%", "gc percent", "base composition")):
+                _injections.append(
+                    # Use single quotes for 'G'/'C' so the snippet is safe inside any f-string delimiter
+                    "REQUIRED — GC content: count actual G and C bases, NEVER divide by 4:\n"
+                    "    gc_count = sum(s.seq.count('G') + s.seq.count('C') for s in contigs)\n"
+                    "    total_bases = sum(len(s.seq) for s in contigs)\n"
+                    "    gc_pct = gc_count / total_bases * 100 if total_bases else 0.0\n"
+                    "    print(f'GC content: {gc_pct:.2f}%')\n"
+                    "WRONG (never do this): gc = total_length / (4 * num_contigs)"
+                )
+
+            if any(k in _step_ctx for k in ("ncbi", "ncbi-genome-download", "genome-download",
+                                             "download genome", "download assembly",
+                                             "download bacteria", "download organism",
+                                             "entrez", "taxid", "taxon")):
+                # Detect whether an assembly accession (GCF_ / GCA_) is already known.
+                # If yes: inject the accession-based snippet as executable code.
+                # If no:  inject the --genera snippet (with --assembly-levels complete).
+                # Small models copy the FIRST runnable code block they see — so only
+                # the correct path must appear as real code; the other is omitted.
+                _has_accession = bool(re.search(r"\bGC[FA]_\d+", _step_ctx, re.I))
+
+                if _has_accession:
+                    # Extract the accession string for the snippet
+                    _acc_match = re.search(r"\bGC[FA]_\d+(?:\.\d+)?", _step_ctx, re.I)
+                    _acc = _acc_match.group(0).upper() if _acc_match else "GCF_XXXXXXXXX.X"
+                    _injections.append(
+                        "REQUIRED — use --assembly-accessions (accession is known — DO NOT use --genera):\n"
+                        "\n"
+                        "  import subprocess, glob, os, gzip, shutil, sys\n"
+                        "\n"
+                        f'  run_dir = r"{temp_dir}"  # output folder — do not change\n'
+                        f'  accession = "{_acc}"  # use this exact accession\n'
+                        '  cmd = ["ncbi-genome-download",\n'
+                        '         "--assembly-accessions", accession,\n'
+                        '         "--formats", "fasta",\n'
+                        '         "--flat-output",\n'
+                        '         "--output-folder", run_dir,\n'
+                        '         "bacteria"]\n'
+                        "\n"
+                        "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)\n"
+                        "  print(res.stdout or res.stderr)\n"
+                        "  if res.returncode != 0:\n"
+                        '      print(f"Download failed (exit {res.returncode}): {res.stderr}")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna.gz"), recursive=True))\n'
+                        "  if not fasta_files:\n"
+                        '      print("No FASTA file found after download")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        "  fasta_path = fasta_files[0]\n"
+                        '  if fasta_path.endswith(".gz"):\n'
+                        "      unzipped = fasta_path[:-3]\n"
+                        "      with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
+                        "          shutil.copyfileobj(fi, fo)\n"
+                        "      fasta_path = unzipped\n"
+                        '  print(f"FASTA ready: {fasta_path}")\n'
+                        "\n"
+                        "  WRONG: --genus  --species  --organism  --name  (do not exist)"
+                    )
+                else:
+                    _injections.append(
+                        "REQUIRED — complete ncbi-genome-download pattern (copy and adapt):\n"
+                        "\n"
+                        "  import subprocess, glob, os, gzip, shutil, sys\n"
+                        "\n"
+                        f'  run_dir = r"{temp_dir}"  # output folder — do not change\n'
+                        "  # WARNING: ALWAYS include --assembly-levels complete.\n"
+                        "  # Without it, ncbi-genome-download lists ALL assemblies for the kingdom\n"
+                        "  # (thousands of files) and hangs for hours.\n"
+                        "  organism = \"Escherichia coli\"   # adapt to user request\n"
+                        '  cmd = ["ncbi-genome-download",\n'
+                        '         "--genera", organism,\n'
+                        '         "--assembly-levels", "complete",\n'
+                        '         "--section", "refseq",\n'
+                        '         "--formats", "fasta",\n'
+                        '         "--output-folder", run_dir,\n'
+                        '         "--flat-output",\n'
+                        '         "bacteria"]\n'
+                        "\n"
+                        "  dry = subprocess.run(cmd + [\"--dry-run\"], capture_output=True, text=True, timeout=60)\n"
+                        "  print(\"Dry-run:\", dry.stdout or dry.stderr)\n"
+                        "  if dry.returncode != 0:\n"
+                        '      print(f"Dry-run failed: {dry.stderr}")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)\n"
+                        "  print(res.stdout or res.stderr)\n"
+                        "  if res.returncode != 0:\n"
+                        '      print(f"Download failed (exit {res.returncode}): {res.stderr}")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna.gz"), recursive=True))\n'
+                        "  if not fasta_files:\n"
+                        '      print("No FASTA files found after download")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        "  fasta_path = fasta_files[0]\n"
+                        '  if fasta_path.endswith(".gz"):\n'
+                        "      unzipped = fasta_path[:-3]\n"
+                        "      with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
+                        "          shutil.copyfileobj(fi, fo)\n"
+                        "      fasta_path = unzipped\n"
+                        '  print(f"FASTA ready: {fasta_path}")\n'
+                        "\n"
+                        "  WRONG flags that DO NOT EXIST: --genus  --species  --organism  --name"
+                    )
+
+            # ExPASy / SwissProt / UniProt injection
+            if any(k in _step_ctx for k in ("expasy", "swissprot", "swiss-prot", "uniprot", "sprot", "p0a7g6", "protein entry", "protein record")):
+                _injections.append(
+                    "REQUIRED — correct Biopython API for ExPASy/SwissProt (Bio.ExPASy.ProteinDB does NOT exist):\n"
+                    "\n"
+                    "  from Bio import ExPASy, SwissProt\n"
+                    "\n"
+                    "  # Fetch a Swiss-Prot entry by UniProt accession\n"
+                    "  accession = 'P0A7G6'  # adapt to request\n"
+                    "  handle = ExPASy.get_sprot_raw(accession)\n"
+                    "  record = SwissProt.read(handle)\n"
+                    "\n"
+                    "  # EXACT fields on Bio.SwissProt.Record — verified, use only these:\n"
+                    "  seq            = record.sequence          # protein sequence string\n"
+                    "  seq_len        = record.sequence_length   # int — number of amino acids\n"
+                    "  mol_weight     = record.seqinfo[1]        # int, Daltons — seqinfo=(len, mw, crc64)\n"
+                    "  gene_name      = record.gene_name         # list of dicts\n"
+                    "  organism       = record.organism          # str e.g. 'Escherichia coli (strain K12).'\n"
+                    "  description    = record.description       # str e.g. 'RecName: Full=Protein RecA'\n"
+                    "  features       = record.features          # list of SeqFeature objects\n"
+                    "  n_features     = len(features)\n"
+                    "  keywords       = record.keywords          # list of str\n"
+                    "  accessions     = record.accessions        # list of accession IDs\n"
+                    "  # WRONG (do not exist): record.annotations  record.molecular_weight\n"
+                    "\n"
+                    "  WRONG (does not exist): from Bio.ExPASy import ProteinDB\n"
+                    "  WRONG (does not exist): Bio.ExPASy.ProteinDB.get_protein_by_accession()"
+                )
+
+            # Bio.Entrez injection
+            if any(k in _step_ctx for k in ("entrez", "efetch", "esearch", "nuccore", "pubmed", "gene db", "entrez fetch")):
+                _injections.append(
+                    "REQUIRED — correct Biopython Entrez API (copy exactly):\n"
+                    "\n"
+                    "  import time\n"
+                    "  from Bio import Entrez, SeqIO\n"
+                    "  from io import StringIO\n"
+                    "  Entrez.email = 'genomeer@example.com'  # required by NCBI\n"
+                    "\n"
+                    "  # Search for IDs\n"
+                    "  handle = Entrez.esearch(db='protein', term='RecA[gene] AND bacteria[organism]', retmax=5)\n"
+                    "  search_record = Entrez.read(handle); handle.close()\n"
+                    "  ids = search_record['IdList']\n"
+                    "  print(f'Found {len(ids)} IDs: {ids}')\n"
+                    "  if not ids: sys.exit(1)\n"
+                    "\n"
+                    "  time.sleep(1)  # NCBI rate limit\n"
+                    "\n"
+                    "  # Fetch sequences — read ALL content first, THEN parse (avoids network handle issues)\n"
+                    "  handle = Entrez.efetch(db='protein', id=','.join(ids), rettype='fasta', retmode='text')\n"
+                    "  fasta_text = handle.read(); handle.close()\n"
+                    "  print(f'Fetched {len(fasta_text)} bytes')\n"
+                    "  if not fasta_text.startswith('>'):\n"
+                    "      print('ERROR: response is not FASTA:', fasta_text[:200]); sys.exit(1)\n"
+                    "  sequences = list(SeqIO.parse(StringIO(fasta_text), 'fasta'))\n"
+                    "  print(f'Parsed {len(sequences)} sequences')\n"
+                )
+
+            if _injections:
+                content += "\n\nCODE PATTERN REMINDER (apply these in your code):\n" + "\n\n".join(_injections)
+
             msgs = [
-                self.system_prompt, 
-                HumanMessage(content=prompt), 
+                self.system_prompt,
+                HumanMessage(content=prompt),
                 HumanMessage(content=content)
             ]
-            
+
             self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nrepair_mode={bool(repair_feedback)}", node=node)
-            resp = self._llm_invoke(node, "code_gen", msgs)
-    
-            sanitized_block = StateGraphHelper.sanitize_execute_block(resp.content)
-            code, lang = StateGraphHelper.parse_execute(sanitized_block)
+
+            # Retry up to 2 extra times on: empty block OR Python SyntaxError.
+            # SyntaxErrors are detected before execution so the LLM can fix them immediately.
+            _MAX_FORMAT_RETRIES = 2
+            code = None
+            sanitized_block = ""
+            for _fmt_try in range(_MAX_FORMAT_RETRIES + 1):
+                resp = self._llm_invoke(node, f"code_gen (attempt {_fmt_try+1})", msgs)
+                sanitized_block = StateGraphHelper.sanitize_execute_block(resp.content)
+                code, lang = StateGraphHelper.parse_execute(sanitized_block)
+
+                # Determine if we should retry and why
+                _retry_reason: str | None = None
+                if not (code and code.strip()):
+                    _retry_reason = (
+                        "Your previous response contained NO <EXECUTE>...</EXECUTE> block. "
+                        "You MUST output exactly one <EXECUTE>#!PY\\n...code...\\n</EXECUTE> block "
+                        "and NOTHING else."
+                    )
+                elif not lang or lang == "PY":
+                    # Syntax-check Python before execution.
+                    try:
+                        compile(code, "<check>", "exec")
+                    except SyntaxError as _syn:
+                        # Try the deterministic fixer FIRST — avoid an LLM roundtrip when
+                        # the error is a simple f-string quote conflict that we can fix locally.
+                        _fixed = self._auto_fix_fstring_quotes(code)
+                        if _fixed is not code:  # fixer changed something
+                            try:
+                                compile(_fixed, "<check>", "exec")
+                                # Deterministic fix worked — accept it immediately.
+                                code = _fixed
+                                self._log("FSTRING AUTO-FIX (in-loop)", body=str(_syn), node=node)
+                                _syn = None  # signal success
+                            except SyntaxError:
+                                pass  # fixer didn't help — fall through to LLM retry
+
+                        if _syn is not None:
+                            _retry_reason = (
+                                f"Your generated Python code has a SyntaxError: {_syn}\n"
+                                "Most common cause: f-string with conflicting quotes, "
+                                "e.g. f'result: '{val}'' or f\"count: {seq.count(\"G\")}\".\n"
+                                "Fix: use SINGLE quotes inside f-strings delimited by double quotes:\n"
+                                "  print(f\"GC: {seq.count('G')}\")   # correct\n"
+                                "  print(f'N50: {n50}')               # correct (no inner quotes)\n"
+                                "Rewrite the ENTIRE code fixing ALL quote conflicts."
+                            )
+
+                if _retry_reason is None:
+                    break  # code is valid — stop retrying
+
+                if _fmt_try < _MAX_FORMAT_RETRIES:
+                    self._log("FORMAT RETRY", body=f"attempt {_fmt_try+1}: {_retry_reason[:120]}", node=node)
+                    msgs = msgs + [
+                        AIMessage(content=resp.content),
+                        HumanMessage(content=_retry_reason + "\n\nTry again now."),
+                    ]
             
+            # If all retries failed to produce any code, inject a synthetic failure script
+            # so the executor+observer can handle it cleanly instead of silently passing None.
+            if not code or not code.strip():
+                code = (
+                    "#!PY\nimport sys\n"
+                    "print('GENERATOR_FAILURE: no valid code was produced after all retries.')\n"
+                    "sys.exit(1)"
+                )
+                lang = "PY"
+                self._log("SYNTHETIC FAILURE CODE", body="all retries exhausted", node=node)
+
+            # Post-process Python code (deterministic fixes, LLM-independent).
+            if code and (not lang or lang == "PY"):
+                code = self._inject_missing_imports(code)
+                code = self._sanitize_output_paths(code, temp_dir)
+                code = self._fix_gc_formula(code)
+                code = self._fix_cli_commands(code)
+                code = self._fix_fasta_reading(code)
+                # Final compile() after all post-processing.
+                # If our own fixers (or residual LLM errors) produced a SyntaxError,
+                # attempt the deterministic f-string quote normalizer before giving up.
+                code = self._auto_fix_fstring_quotes(code)
+
             code_key = "diagnostic_code" if is_diagnostic else "pending_code"
             updates = {
                 code_key: code,
@@ -861,7 +1261,7 @@ class BioAgent:
                 "next_step": "ensure_env",
                 "messages": [AIMessage(content=sanitized_block)],
             }
-            
+
             # clear repair metadata once we ave generated new code
             if repair_feedback:
                 new_manifest = dict(manifest)
@@ -890,15 +1290,43 @@ class BioAgent:
             return updates
         
         def _ensure_env(self, state: AgentState) -> AgentState:
-            # Todos: (MVP) mark ready; replace with env manager later
-            # state["env_ready"] = True
-            # state["next_step"] = "executor"
-            # return state
-            from genomeer.runtime.env_manager import load_registry, spec_path, create_or_update_env, env_prefix, has_env
+            from genomeer.runtime.env_manager import (
+                load_registry, spec_path, create_or_update_env, env_prefix,
+                has_env, has_pip_installed, _pip_install_from_spec,
+            )
             env_name = state.get("env_name")
 
             if has_env(env_name):
-                prefix = str(env_prefix(env_name))
+                prefix = env_prefix(env_name)
+                if not has_pip_installed(env_name):
+                    # Conda env exists but pip packages were never installed (Windows micromamba bug).
+                    # Install explicitly now. Do NOT proceed to executor if this fails.
+                    pip_error: str | None = None
+                    try:
+                        reg = load_registry()
+                        rec = next((e for e in reg.get("envs", []) if e.get("name") == env_name), None)
+                        if rec:
+                            _pip_install_from_spec(prefix, spec_path(rec["spec"]))
+                            self._log("PIP REPAIR", body=f"pip packages installed into '{env_name}'", node="ensure_env")
+                        else:
+                            pip_error = f"Env '{env_name}' not found in registry — cannot install pip packages."
+                    except Exception as exc:
+                        pip_error = str(exc)
+                        self._log("PIP REPAIR ERROR", body=pip_error, node="ensure_env")
+
+                    # Verify sentinel was written — if not, pip failed and env is unusable.
+                    if not has_pip_installed(env_name):
+                        msg = pip_error or "pip install completed but sentinel not written."
+                        return {
+                            "env_ready": False,
+                            "next_step": "end",
+                            "messages": [AIMessage(content=(
+                                f"<observe>Environment '{env_name}' pip install failed: {msg}\n"
+                                f"Delete the env folder and retry, or install packages manually:\n"
+                                f"  micromamba run -p {prefix} pip install biopython numpy pandas</observe>"
+                            ))],
+                        }
+
                 return {
                     "env_ready": True,
                     "next_step": "executor",
@@ -1057,7 +1485,76 @@ class BioAgent:
             node = "observer"
             step = state["plan"][state["current_idx"]]
             diagnostic_mode = state.get("diagnostic_mode")
-            
+            last_result = state.get("last_result") or ""
+
+            # ── DETERMINISTIC PRE-CHECK (errors only) ───────────────────────────────
+            # Auto-done was removed: it cannot evaluate output against the step goal.
+            # A script printing os.environ would look like success but accomplish nothing.
+            # The LLM observer decides done/blocked — it knows the step title and goal.
+            # Only GENERATOR_FAILURE is short-circuited here (unambiguous failure).
+            if not diagnostic_mode and last_result and "GENERATOR_FAILURE:" in last_result:
+                self._log("OBSERVER PRE-CHECK", body="generator failure fast-path", node=node)
+                # Fall through — ModuleNotFoundError fast-path below handles this and similar
+            # ── END PRE-CHECK ────────────────────────────────────────────────────────
+
+            # Fast-path: Python import errors are always execution failures, never missing inputs.
+            # Bypass the LLM entirely to prevent small models from misrouting this to QA/user.
+            # IMPORTANT: only fire for ModuleNotFoundError (missing package) OR ImportError with
+            # "No module named" (also missing package). Do NOT fire for ImportError alone —
+            # that usually means a hallucinated class/function inside an existing module,
+            # which requires fixing the code, not pip-installing anything.
+            _has_module_not_found = bool(re.search(r"ModuleNotFoundError:", last_result))
+            _has_no_module = bool(re.search(r"No module named '", last_result))
+            _has_import_error = bool(re.search(r"ImportError:", last_result))
+            _is_missing_package = _has_module_not_found or (_has_import_error and _has_no_module)
+            _is_bad_import = _has_import_error and not _has_no_module  # hallucinated name
+
+            if not diagnostic_mode and _is_missing_package:
+                pkg_m = re.search(r"No module named '([^']+)'", last_result)
+                missing_pkg = pkg_m.group(1) if pkg_m else "unknown"
+                summary = (
+                    f"ModuleNotFoundError: package '{missing_pkg}' is not available in the environment. "
+                    f"Fix: use subprocess.run([sys.executable, '-m', 'pip', 'install', '{missing_pkg}']) "
+                    f"at the top of the script, then re-import. "
+                    f"Do NOT ask the user to install anything."
+                )
+                self._log("FAST-PATH ModuleNotFoundError", body=summary, node=node)
+            elif not diagnostic_mode and _is_bad_import:
+                # ImportError on a name that doesn't exist in an installed module.
+                # Extract what was hallucinated and give precise repair guidance.
+                bad_m = re.search(r"cannot import name '([^']+)' from '([^']+)'", last_result)
+                bad_name = bad_m.group(1) if bad_m else "unknown"
+                bad_module = bad_m.group(2) if bad_m else "unknown"
+                summary = (
+                    f"ImportError: '{bad_name}' does not exist in '{bad_module}'. "
+                    f"The code used a hallucinated API. "
+                    f"Fix: look up the correct class/function name in the module. "
+                    f"For Bio.ExPASy use: handle = ExPASy.get_sprot_raw(accession); record = SwissProt.read(handle). "
+                    f"For Bio.Entrez use: Entrez.email='x@y.com'; handle = Entrez.efetch(db=..., id=..., rettype=...). "
+                    f"Do NOT invent new class names."
+                )
+                self._log("FAST-PATH ImportError (hallucinated name)", body=summary, node=node)
+                new_manifest = dict(state["manifest"])
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["retry_count"] = rc[state["current_idx"]]
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                next_step = "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator"
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {**plan[state["current_idx"]], "notes": summary, "status": "blocked"}
+                return {
+                    "plan": plan,
+                    "current_idx": state["current_idx"],
+                    "next_step": next_step,
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
+
             if diagnostic_mode:
                 payload = instructions.OBSERVER_DIAGNOSTIC_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
@@ -1090,7 +1587,7 @@ class BioAgent:
             next_idx = state["current_idx"] + (0 if status == "blocked" else 1)
             
             new_manifest = dict(state["manifest"])
-            rc = dict(state.get("retry_counts") or {})
+            rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
             diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
             if status == "blocked":
                 rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
@@ -1150,8 +1647,8 @@ class BioAgent:
                 "manifest": new_manifest,
                 "retry_counts": rc,
                 "diagnostic_mode": False,
-                "diagnostic_code": False,
-                "diagnostic_observation": False,
+                "diagnostic_code": None,
+                "diagnostic_observation": None,
             }
             
             # ------ feedback replay mode check ------
@@ -1203,7 +1700,7 @@ class BioAgent:
 
             self._log("EXIT NODE", body="next_step=generator (probe code)", node=node)
             
-            rc = dict(state.get("retry_counts") or {})
+            rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
             if state["current_idx"] in rc:
                 rc.pop(state["current_idx"], None)
             return {
@@ -1219,7 +1716,7 @@ class BioAgent:
             self._log("ENTER NODE", body="publishing artifacts + generating report", node=node)
 
             manifest = dict(state.get("manifest") or {})
-            temp_dir = state.get("run_temp_dir", "")
+            temp_dir = state.get("run_temp_dir") or ""
             run_id = state.get("run_id")
             pub = manifest.get("publisher") or {}
             base_url = (pub.get("base_url") or "").rstrip("/")
@@ -1401,11 +1898,12 @@ class BioAgent:
                 self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
         return staged_rel
 
-    def _list_ctx_files(self, temp_dir: str):
+    def _list_ctx_files(self, temp_dir: str, extra_paths: list = None):
         """
         - This function will return a list of all files available in the the current run temp folder
         - Indeed each request have a temp storage folder - ex: `/tmp/206005a0-c0a1-4114-907c-c3eda23d3f32`
         - All uploaded file will be inside automatically and all downloaded file by agent will be there.
+        - FIX: also scans absolute paths mentioned in the prompt (extra_paths)
         Return a list of all files inside temp_dir (including subfolders).
         Each item: {'name': 'relative/path/to/file', 'ext': '.fasta', 'size_bytes': 123}
         """
@@ -1415,7 +1913,7 @@ class BioAgent:
                 for entry in sorted(entries):
                     p = os.path.join(root, entry)
                     if os.path.isfile(p):
-                        rel_path = os.path.relpath(p, temp_dir)  # keep it relative
+                        rel_path = os.path.relpath(p, temp_dir)
                         ext = os.path.splitext(entry)[1]
                         files.append({
                             "name": rel_path,
@@ -1424,6 +1922,23 @@ class BioAgent:
                         })
         except Exception as e:
             self._log("TEMP LIST ERROR", body=str(e), node="input_guard")
+
+        # FIX: aussi chercher les fichiers absolus mentionnés dans le prompt
+        import shutil
+        for abs_path in (extra_paths or []):
+            abs_path = abs_path.strip()
+            if os.path.isfile(abs_path):
+                entry = os.path.basename(abs_path)
+                dst = os.path.join(temp_dir, entry)
+                if not os.path.exists(dst):
+                    shutil.copy2(abs_path, dst)
+                    self._log("AUTO STAGE", body=f"Copied {abs_path} → {dst}", node="input_guard")
+                ext = os.path.splitext(entry)[1]
+                files.append({
+                    "name": entry,
+                    "ext": ext if ext else "",
+                    "size_bytes": os.path.getsize(dst),
+                })
         return files
     
     def _inject_custom_functions_to_repl(self):
@@ -1751,6 +2266,387 @@ class BioAgent:
             return bool(state and (state.values or state.next))
         except Exception:
             return False
+
+    def _inject_missing_imports(self, code: str) -> str:
+        """
+        Each step runs in a fresh subprocess — imports from previous steps are gone.
+        Detect common symbols used but not imported and prepend the missing import statements.
+        Works in both normal and repair mode (with or without #!PY header).
+        """
+        if not code:
+            return code
+        has_py_header = "#!PY" in code[:15]
+
+        # Map: symbol used in code → import statement to inject
+        _KNOWN = [
+            (r"\bos\b",          "import os"),
+            (r"\bsys\b",         "import sys"),
+            (r"\bre\b",          "import re"),
+            (r"\bjson\b",        "import json"),
+            (r"\bcsv\b",         "import csv"),
+            (r"\bglob\b",        "import glob"),
+            (r"\bgzip\b",        "import gzip"),
+            (r"\bshutil\b",      "import shutil"),
+            (r"\bPath\b",        "from pathlib import Path"),
+            (r"\bSeqIO\b",       "from Bio import SeqIO"),
+            (r"\bSeqRecord\b",   "from Bio.SeqRecord import SeqRecord"),
+            (r"\bSeq\b",         "from Bio.Seq import Seq"),
+            (r"\bpd\b",          "import pandas as pd"),
+            (r"\bnp\b",          "import numpy as np"),
+            (r"\bplt\b",         "import matplotlib.pyplot as plt"),
+            (r"\bsubprocess\b",  "import subprocess"),
+            (r"\btime\b",        "import time"),
+            (r"\bStringIO\b",    "from io import StringIO"),
+        ]
+
+        to_add = []
+        for symbol_rx, stmt in _KNOWN:
+            if re.search(symbol_rx, code) and stmt not in code:
+                to_add.append(stmt)
+
+        if not to_add:
+            return code
+
+        header = "\n".join(to_add) + "\n\n"
+        if has_py_header:
+            # Insert right after the #!PY line
+            return re.sub(r"(#!PY\s*\n)", r"\g<1>" + header, code, count=1)
+        else:
+            # No #!PY header (repair mode without lang marker) — prepend directly
+            return header + code
+
+    def _fix_cli_commands(self, code: str) -> str:
+        """
+        Deterministic corrections for hallucinated CLI flags — model-agnostic.
+        Runs before execution so wrong commands never reach the shell.
+        """
+        if not code:
+            return code
+
+        # ── ncbi-genome-download ────────────────────────────────────────────
+        if "ncbi-genome-download" in code:
+            # --genus → --genera  (--genus is a long-deprecated alias, use canonical)
+            code = re.sub(r"--genus\b", "--genera", code)
+            # --species <name>  does not exist → remove entirely
+            code = re.sub(r"\s+--species\s+\S+", " ", code)
+            # --organism <name>  does not exist → remove entirely
+            code = re.sub(r"\s+--organism\s+\S+", " ", code)
+            # --name <name>  does not exist → remove entirely
+            code = re.sub(r"\s+--name\s+\S+", " ", code)
+
+            # CRITICAL SAFETY: when --genera is used without --assembly-levels complete,
+            # the tool lists ALL assemblies for the whole kingdom (thousands of entries)
+            # which causes hours-long hangs and accidental mass downloads.
+            # Deterministically inject --assembly-levels complete and --section refseq
+            # whenever --genera is present but --assembly-levels is absent.
+            # This guard does NOT apply when --assembly-accessions is used (no risk there).
+            if re.search(r"--genera\b", code) and not re.search(r"--assembly-levels\b|--assembly_levels\b", code):
+                # List-style command: inject after --genera value token
+                # Pattern: "--genera", "<value>" → add flags after the value
+                # Also handles: --genera "Organism name" on CLI lines
+                def _inject_levels_after_genera(m: re.Match) -> str:
+                    return m.group(0) + ', "--assembly-levels", "complete", "--section", "refseq",'
+                new_code = re.sub(
+                    r'(\"--genera\"\s*,\s*[^,\]]+)',
+                    _inject_levels_after_genera,
+                    code,
+                )
+                if new_code != code:
+                    code = new_code
+                    self._log(
+                        "FIX_CLI",
+                        body="Injected --assembly-levels complete after --genera (safety guard)",
+                        node="generator",
+                    )
+                else:
+                    # Fallback for shell-style single-line: append before the group arg
+                    code = re.sub(
+                        r"(ncbi-genome-download\b[^\n]*?)((?:\s+\b(?:all|archaea|bacteria|fungi|invertebrate|metagenomes|plant|protozoa|vertebrate_mammalian|vertebrate_other|viral)\b)?\s*$)",
+                        r"\1 --assembly-levels complete --section refseq\2",
+                        code,
+                        flags=re.MULTILINE,
+                    )
+                    self._log(
+                        "FIX_CLI",
+                        body="Injected --assembly-levels complete (shell-style fallback)",
+                        node="generator",
+                    )
+
+            # Ensure a valid group positional arg is present.
+            # CRITICAL: check group presence in the FULL code, not per-line.
+            # A multiline list like:
+            #   cmd = ["ncbi-genome-download", "--genera", org,
+            #          "--output-folder", d, "bacteria"]   ← group on continuation line
+            # would be wrongly modified if we process line by line.
+            _GROUPS = (
+                r"\b(all|archaea|bacteria|fungi|invertebrate"
+                r"|metagenomes|plant|protozoa"
+                r"|vertebrate_mammalian|vertebrate_other|viral)\b"
+            )
+            if not re.search(_GROUPS, code):
+                # Group missing from entire code block.
+                # Only append to lines that are COMPLETE shell commands (not mid-list).
+                # A line is a continuation if it ends with , [ \ or the bracket count
+                # opened on that line is not balanced.
+                fixed_lines = []
+                for line in code.splitlines():
+                    stripped = line.rstrip()
+                    is_ncbi_line = "ncbi-genome-download" in stripped
+                    is_continuation = (
+                        stripped.endswith(",")
+                        or stripped.endswith("[")
+                        or stripped.endswith("\\")
+                        or stripped.endswith("(")
+                        or (stripped.count("[") + stripped.count("(") >
+                            stripped.count("]") + stripped.count(")"))
+                    )
+                    if is_ncbi_line and not is_continuation:
+                        stripped = stripped + " bacteria"
+                    fixed_lines.append(stripped)
+                code = "\n".join(fixed_lines)
+
+        # ── subprocess.run without timeout ──────────────────────────────────────
+        # Any subprocess.run call without timeout= can block forever on network I/O.
+        # Inject timeout=300 deterministically. 300s covers typical genome downloads;
+        # the outer run_with_timeout wrapper adds a second layer of protection.
+        if "subprocess.run(" in code:
+            def _add_timeout(m: re.Match) -> str:
+                call = m.group(0)
+                # Skip if timeout= already present
+                if "timeout=" in call:
+                    return call
+                # Find the closing paren — add timeout before it
+                # Simple approach: add before the last ) of the call
+                # We match the entire subprocess.run(...) call up to the first closing paren
+                # that balances the opening paren after "subprocess.run"
+                return call.rstrip(")") + ", timeout=300)"
+
+            code = re.sub(
+                r"subprocess\.run\([^)]+\)",
+                _add_timeout,
+                code,
+            )
+
+        return code
+
+    def _fix_gc_formula(self, code: str) -> str:
+        """
+        The LLM often computes GC% as total_length / (4 * n_contigs), which assumes
+        uniform base distribution. Replace with the correct count-based formula.
+        Detects two wrong patterns and rewrites them deterministically.
+        """
+        if not code:
+            return code
+
+        # Pattern A: gc = sum(len(r.seq) for r in contigs) / (4 * <anything>)
+        # or:        gc = total_length / (4 * <anything>)
+        code = re.sub(
+            r'(\bgc(?:_content|_pct|_percent|_ratio)?\s*=\s*)'   # gc = ...
+            r'([^\n]+?)'                                           # numerator (any expr)
+            r'\s*/\s*\(\s*4\s*\*\s*[^\)]+\)',                    # / (4 * anything)
+            lambda m: (
+                m.group(1) +
+                "sum(s.seq.count('G') + s.seq.count('C') for s in contigs) / "
+                "max(sum(len(s.seq) for s in contigs), 1)"
+            ),
+            code,
+            flags=re.IGNORECASE,
+        )
+
+        # Pattern B: gc = <expr> * 0.25  (assumes 25% each base)
+        code = re.sub(
+            r'(\bgc(?:_content|_pct|_percent|_ratio)?\s*=\s*)[^\n]+?\*\s*0\.25\b',
+            lambda m: (
+                m.group(1) +
+                "sum(s.seq.count('G') + s.seq.count('C') for s in contigs) / "
+                "max(sum(len(s.seq) for s in contigs), 1)"
+            ),
+            code,
+            flags=re.IGNORECASE,
+        )
+
+        return code
+
+    def _fix_fasta_reading(self, code: str) -> str:
+        """
+        Two deterministic fixes for common FASTA reading bugs:
+
+        1. Glob order: models put *.fna.gz before *.fna. If the gz file exists
+           and is picked first, SeqIO.parse crashes with UnicodeDecodeError (0x8b
+           = gzip magic byte). Reorder so plain *.fna comes first.
+
+        2. Gzip-safe SeqIO.parse: if code calls SeqIO.parse(fasta_path, ...) but
+           has no gzip.open guard, wrap it so .gz files are decompressed first.
+        """
+        if not code:
+            return code
+
+        # Fix 0 — replace hardcoded accession-based paths with glob discovery
+        # Pattern: SeqIO.parse(os.path.join(run_dir, f"{accession}.fna"), ...)
+        # The model invents filenames like GCF_000009045.1.fna but the real file is
+        # GCF_000009045.1_ASM904v1_genomic.fna — use glob to find the actual file.
+        if "SeqIO.parse" in code and re.search(r'os\.path\.join\([^)]*accession[^)]*\.fna', code):
+            code = re.sub(
+                r'SeqIO\.parse\(os\.path\.join\([^,]+,\s*f?["\'][^"\']*accession[^"\']*\.fna["\'][^)]*\)',
+                r'SeqIO.parse(fasta_path',
+                code,
+            )
+            # Inject glob-based fasta_path discovery before the first SeqIO.parse call
+            if "fasta_path" not in code or "glob.glob" not in code:
+                glob_snippet = (
+                    'import glob as _glob\n'
+                    '_fna_files = (_glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                    '              _glob.glob(os.path.join(run_dir, "*.fna.gz")))\n'
+                    'fasta_path = _fna_files[0] if _fna_files else None\n'
+                    'if not fasta_path:\n'
+                    '    print("No FASTA file found in run_dir"); sys.exit(1)\n'
+                )
+                # Insert after the last import statement or after run_dir definition
+                insert_m = re.search(r'(run_dir\s*=\s*r?["\'][^\n]+\n)', code)
+                if insert_m:
+                    pos = insert_m.end()
+                    code = code[:pos] + glob_snippet + code[pos:]
+            self._log("FIX_FASTA", body="Replaced hardcoded accession path with glob discovery", node="generator")
+
+        # Fix 1 — reorder glob so .fna comes before .fna.gz
+        # Pattern: glob(...*.fna.gz...) + glob(...*.fna...) → swap order
+        code = re.sub(
+            r'(glob\.glob\([^)]*\*\.fna\.gz[^)]*\))\s*\+\s*(glob\.glob\([^)]*\*\.fna[^"\']*\))',
+            r'\2 +\n               \1',
+            code,
+        )
+
+        # Fix 2 — gzip-safe SeqIO.parse
+        # If code has SeqIO.parse(fasta_path, ...) but no gzip.open guard, inject one.
+        # CRITICAL: preserve the surrounding indentation so the injected block is valid
+        # inside loops and conditionals (a fixed 4-space indent causes IndentationError
+        # when the original line was indented deeper).
+        if "SeqIO.parse(fasta_path" in code and "gzip.open" not in code:
+            def _gzip_guard(m: re.Match) -> str:
+                # Detect indentation of the matched line by looking backwards
+                start = m.start()
+                line_start = code.rfind("\n", 0, start) + 1
+                indent = ""
+                for ch in code[line_start:start]:
+                    if ch in (" ", "\t"):
+                        indent += ch
+                    else:
+                        break
+                # If the assignment itself is indented, honour that indentation
+                i = indent
+                i2 = indent + "    "
+                i3 = indent + "        "
+                var = m.group(1)
+                return (
+                    f'if fasta_path.endswith(".gz"):\n'
+                    f'{i2}import gzip\n'
+                    f'{i2}with gzip.open(fasta_path, "rt") as _gz_handle:\n'
+                    f'{i3}{var} = list(SeqIO.parse(_gz_handle, "fasta"))\n'
+                    f'{i}else:\n'
+                    f'{i2}{var} = list(SeqIO.parse(fasta_path, "fasta"))'
+                )
+
+            new_code = re.sub(
+                r'(\w+)\s*=\s*list\(SeqIO\.parse\(fasta_path,\s*["\']fasta["\']\)\)',
+                _gzip_guard,
+                code,
+            )
+            if new_code != code:
+                code = new_code
+                self._log("FIX_FASTA", body="Injected gzip-safe SeqIO.parse guard (indent-aware)", node="generator")
+
+        return code
+
+    def _auto_fix_fstring_quotes(self, code: str) -> str:
+        """
+        If code has a SyntaxError caused by conflicting f-string quotes, attempt a
+        deterministic fix: for every f-string whose outer delimiter matches inner quotes,
+        switch the outer delimiter to the other quote character.
+
+        Strategy:
+          f"...{"inner"}..."  →  f'...{"inner"}...'   (switch outer to single)
+          f'...{'inner'}...'  →  f"...{'inner'}..."   (switch outer to double)
+
+        If the fixed code still doesn't compile, return the original — the executor
+        will surface a clear error and the observer will trigger repair.
+        """
+        try:
+            compile(code, "<postcheck>", "exec")
+            return code  # already valid, nothing to do
+        except SyntaxError:
+            pass
+
+        def _swap_outer(m: re.Match) -> str:
+            outer = m.group(1)          # f" or f'
+            body  = m.group(2)
+            close = m.group(3)          # matching close quote
+            inner_q = '"' if outer[-1] == "'" else "'"
+            other_q = '"' if outer[-1] == "'" else "'"
+            # Only swap if body actually contains the conflicting quote
+            if outer[-1] in body:
+                new_outer = outer[:-1] + other_q
+                new_close = other_q
+                return new_outer + body + new_close
+            return m.group(0)
+
+        # Match f'...' or f"..." (non-greedy, single-line only — avoids multi-line edge cases)
+        fixed = re.sub(
+            r'(f["\'])((?:[^\\]|\\.)*?)(["\'])',
+            _swap_outer,
+            code,
+        )
+
+        try:
+            compile(fixed, "<postcheck>", "exec")
+            self._log("FSTRING AUTO-FIX", body="Quote conflict corrected", node="generator")
+            return fixed
+        except SyntaxError:
+            return code  # give up — executor will surface the error cleanly
+
+    def _sanitize_output_paths(self, code: str, run_dir: str) -> str:
+        """
+        Replace absolute Windows/Unix paths used for OUTPUT files with run_dir-relative paths.
+        Only targets write-mode opens and common DataFrame/array save calls — never touches
+        read-mode opens (those are valid input paths that must stay absolute).
+        """
+        if not run_dir:
+            return code
+
+        # Pattern: open("C:\\...\\file.ext", "w"/"a"/"wb"/"ab") or open('...', 'w')
+        def _replace_open(m):
+            quote = m.group(1)
+            path = m.group(2)
+            mode = m.group(3)
+            basename = os.path.basename(path.replace("\\\\", "\\").replace("\\", os.sep))
+            new_path = os.path.join(run_dir, basename).replace("\\", "\\\\")
+            return f"open({quote}{new_path}{quote}, {quote}{mode}{quote})"
+
+        # Match: open("ABS_PATH", "w" or "a" or "wb" or "ab" or "x")
+        code = re.sub(
+            r"""open\((['"]) ([A-Za-z]:[/\\\\][^'"]+|/(?:[^/'"]+/)+[^/'"]+) \1\s*,\s*['"](w|a|wb|ab|x)['"]\)""",
+            _replace_open,
+            code,
+            flags=re.VERBOSE,
+        )
+
+        # Pattern: pd.DataFrame.to_csv / to_excel / to_parquet / np.save / np.savetxt with absolute path
+        def _replace_save(m):
+            method = m.group(1)
+            quote = m.group(2)
+            path = m.group(3)
+            rest = m.group(4)
+            basename = os.path.basename(path.replace("\\\\", "\\").replace("\\", os.sep))
+            new_path = os.path.join(run_dir, basename).replace("\\", "\\\\")
+            return f"{method}({quote}{new_path}{quote}{rest}"
+
+        code = re.sub(
+            r"""(\.\s*(?:to_csv|to_excel|to_parquet|to_json|to_pickle|savetxt?|save))\((['"]) ([A-Za-z]:[/\\\\][^'"]+|/(?:[^/'"]+/)+[^/'"]+) \2 ([,)])""",
+            _replace_save,
+            code,
+            flags=re.VERBOSE,
+        )
+
+        return code
 
     def _maybe_pause(self, state: AgentState, *, resume_to: str, prompt_text: str, pause_kind: str) -> Dict[str, Any] | None:
         mode = (state.get("manifest") or {}).get("interaction_mode", "auto")

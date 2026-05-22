@@ -201,12 +201,68 @@ def ensure_micromamba() -> Path:
     return exe
 
 
+_PIP_SENTINEL = ".genomeer_pip_ok"
+
 def env_prefix(name: str) -> Path:
     """Absolute path to the env prefix directory."""
     return ENVS_DIR / name
 
 def has_env(name: str) -> bool:
     return (env_prefix(name) / "conda-meta").exists()
+
+def has_pip_installed(name: str) -> bool:
+    """True only after the explicit pip post-install step completed successfully."""
+    return (env_prefix(name) / "conda-meta" / _PIP_SENTINEL).exists()
+
+def _pip_packages_from_spec(spec_file: Path) -> list[str]:
+    """Return the pip package list from a conda YAML spec, skipping broken editable installs."""
+    try:
+        with open(spec_file, "r", encoding="utf-8") as f:
+            spec = yaml.safe_load(f) or {}
+    except Exception:
+        return []
+    packages = []
+    for dep in spec.get("dependencies", []):
+        if isinstance(dep, dict) and "pip" in dep:
+            for pkg in (dep["pip"] or []):
+                if not isinstance(pkg, str):
+                    continue
+                # Skip editable installs whose local path does not exist on this machine
+                if pkg.startswith("-e "):
+                    local_path = pkg[3:].strip()
+                    if not Path(local_path).exists():
+                        continue
+                packages.append(pkg)
+    return packages
+
+def _pip_install_from_spec(
+    prefix: Path,
+    spec_file: Path,
+    stream_cb=None,
+) -> None:
+    """
+    Explicitly install all pip: packages from the YAML spec into the given prefix.
+    Writes a sentinel file on success so the install is not repeated.
+    This works around the Windows micromamba bug where pip: sub-sections are silently skipped.
+    """
+    packages = _pip_packages_from_spec(spec_file)
+    if not packages:
+        (prefix / "conda-meta" / _PIP_SENTINEL).touch()
+        return
+
+    python_exe = prefix / ("python.exe" if platform.system() == "Windows" else "bin/python")
+    if not python_exe.exists():
+        raise RuntimeError(f"python not found in env prefix: {python_exe}")
+
+    args = [str(python_exe), "-m", "pip", "install", "--quiet"] + packages
+    proc = subprocess.Popen(
+        args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
+    )
+    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=600)
+    if rc != 0:
+        raise RuntimeError(f"pip install failed (exit {rc}) for env at {prefix}")
+
+    (prefix / "conda-meta" / _PIP_SENTINEL).touch()
 
 def load_registry() -> dict:
     with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
@@ -236,6 +292,56 @@ def _install_lock(name: str, timeout_sec: int = 1800):
         except FileNotFoundError: 
             pass
 
+def _drain_proc(proc: subprocess.Popen, stream_cb=None, timeout_sec: int = 1800) -> int:
+    """
+    Drain proc.stdout line by line with a hard wall-clock timeout.
+    Kills the process if it produces no output and hangs beyond timeout_sec.
+    Returns the process return code.
+    """
+    import threading, queue as _queue
+
+    lines_q: _queue.Queue = _queue.Queue()
+    sentinel = object()
+
+    def _reader():
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                lines_q.put(line)
+        finally:
+            lines_q.put(sentinel)
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    deadline = time.time() + timeout_sec
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            proc.kill()
+            raise TimeoutError(f"Process timed out after {timeout_sec}s")
+        try:
+            item = lines_q.get(timeout=min(remaining, 30))
+        except _queue.Empty:
+            # No output for 30 s — check if process is still alive
+            if proc.poll() is not None:
+                break
+            continue
+        if item is sentinel:
+            break
+        line = item
+        if stream_cb:
+            try:
+                stream_cb.push(line)
+            except Exception:
+                pass
+        else:
+            print(line, end="")
+
+    t.join(timeout=5)
+    return proc.wait(timeout=10)
+
+
 # [deprecated]
 def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None = None, stream_cb: Optional[Callable[[str], None]] = None,) -> None:
     mm = ensure_micromamba()
@@ -253,23 +359,13 @@ def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None 
         for ch in channels:
             args += ["-c", ch]
 
-    # # micromamba will do install or update in place
-    # res = subprocess.run(args, text=True, capture_output=True)
-    # if res.returncode != 0:
-    #     raise RuntimeError(f"micromamba create failed:\n{res.stdout}\n{res.stderr}")
-    
-    # Stream logs instead of capturing
     proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        if stream_cb:
-            try: stream_cb.push(line)
-            except Exception: pass
-        else:
-            print(line, end="")
-    rc = proc.wait()
+    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=1800)
     if rc != 0:
         raise RuntimeError("micromamba create failed")
+
+    # Explicitly install pip packages (workaround: micromamba on Windows silently skips pip: sections)
+    _pip_install_from_spec(prefix, spec_file, stream_cb=stream_cb)
 
 
 def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = None):
@@ -297,28 +393,44 @@ def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = No
             raise RuntimeError("micromamba create failed")
 
 
-def ensure_env(name: str, auto_install: bool  = True, log_cb: Optional[Callable[[str], None]] = None) -> tuple[Path, bool, str]:
-    """Ensure env exists from the registry. Returns (prefix, created, message)."""
+def ensure_env(name: str, auto_install: bool = True, log_cb: Optional[Callable[[str], None]] = None) -> tuple[Path, bool, str]:
+    """Ensure env exists and pip packages are installed. Returns (prefix, created, message)."""
     reg = load_registry()
     rec = next((e for e in reg.get("envs", []) if e.get("name") == name), None)
     if not rec:
         raise KeyError(f"Env '{name}' not found in registry")
 
     prefix = env_prefix(name)
+
     if has_env(name):
+        # Env directory exists but pip packages may be absent (Windows micromamba bug:
+        # conda create silently skips pip: sections). Check the sentinel and repair if needed.
+        if not has_pip_installed(name):
+            if auto_install:
+                _pip_install_from_spec(prefix, spec_path(rec["spec"]), stream_cb=log_cb)
+            else:
+                raise RuntimeError(
+                    f"Env '{name}' exists but pip packages are not installed "
+                    f"(sentinel {_PIP_SENTINEL} missing). Re-run with auto_install=True."
+                )
         return prefix, False, f"Environment '{name}' ready."
 
     if auto_install:
         with _install_lock(name):
             if has_env(name):
+                # Another thread just created it — still check pip sentinel.
+                if not has_pip_installed(name):
+                    _pip_install_from_spec(prefix, spec_path(rec["spec"]), stream_cb=log_cb)
                 return prefix, False, f"Environment '{name}' became ready."
 
             spec = spec_path(rec["spec"])
             ch = rec.get("channels")
-            create_or_update_env(name, spec, ch, log_cb=log_cb)
+            create_or_update_env(name, spec, ch, stream_cb=log_cb)
             return prefix, True, f"Environment '{name}' created."
     else:
-        raise KeyError(f"Env '{name}' not found in registry. Consider enable auto_install if you wanna install this env.")
+        raise KeyError(
+            f"Env '{name}' not found. Set auto_install=True to create it automatically."
+        )
 
 def list_envs() -> list[dict]:
     reg = load_registry()

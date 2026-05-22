@@ -14,17 +14,25 @@ class StateGraphHelper:
 
     @staticmethod
     def parse_checklist_and_route(text: str):
-        m = StateGraphHelper.RX_NEXT.search(text or "")
-        route = m.group(1).upper() if m else "ORCHESTRATOR"
-        # steps = lines starting with "- [ ]" (todo only at first)
+        txt = text or ""
+        m = StateGraphHelper.RX_NEXT.search(txt)
+
         steps = []
-        for line in (text or "").splitlines():
+        for line in txt.splitlines():
             line = line.strip()
             if line.startswith("- [ ]"):
                 title = line[5:].strip()
                 if title:
                     steps.append({"title": title, "status": "todo", "notes": ""})
-        return steps, ("qa" if route=="QA" else "orchestrator")
+
+        if m:
+            route = m.group(1).upper()
+        else:
+            # Heuristic fallback — no explicit tag:
+            # steps present → ORCHESTRATOR; nothing → QA
+            route = "ORCHESTRATOR" if steps else "QA"
+
+        return steps, ("qa" if route == "QA" else "orchestrator")
 
     @staticmethod
     def sanitize_execute_block(raw: str) -> str:
@@ -45,33 +53,85 @@ class StateGraphHelper:
 
         return text
 
+    # Fallback: markdown fenced code blocks  ```python / ```py / ```bash / ```r
+    RX_MARKDOWN = re.compile(
+        r"```(?P<fence_lang>python|py|bash|sh|r|)\s*\n(?P<body>.*?)```",
+        re.S | re.I,
+    )
+    _FENCE_LANG_MAP = {"python": "PY", "py": "PY", "bash": "BASH", "sh": "BASH", "r": "R", "": "PY"}
+
     @staticmethod
     def parse_execute(text: str):
         code = None
         lang = None
+
+        # Primary: <EXECUTE>...</EXECUTE> tags
         m = StateGraphHelper.RX_EXEC.search(text or "")
         if m:
             code = m.group(1).strip()
             lm = StateGraphHelper.RX_LANG.search(code or "")
             if lm:
                 lang = lm.group(1).upper()
+            return code, lang
+
+        # Fallback: markdown code fence — used by models that ignore the tag format
+        mf = StateGraphHelper.RX_MARKDOWN.search(text or "")
+        if mf:
+            body = mf.group("body").strip()
+            fence_lang = mf.group("fence_lang").lower()
+            lang = StateGraphHelper._FENCE_LANG_MAP.get(fence_lang, "PY")
+            # Prepend the lang header so downstream logic stays consistent
+            code = f"#!{lang}\n{body}"
+            return code, lang
+
         return code, lang
+
+    # Items the LLM hallucinates as MISSING for network/download steps but that are
+    # NEVER valid blockers — the code can always derive them from context or tool defaults.
+    _FALSE_POSITIVE_MISSING = re.compile(
+        r"^(accession[_\s]?id|accession|ncbi[_\s]?accession"
+        r"|url|download[_\s]?url|ncbi[_\s]?url|ftp[_\s]?url"
+        r"|database[_\s]?id|api[_\s]?key|network[_\s]?resource"
+        r"|internet[_\s]?connection|web[_\s]?access)\b",
+        re.I,
+    )
 
     @staticmethod
     def parse_missing_ok(text: str):
-        if StateGraphHelper.RX_OK.search(text or ""):
-            # return [], True
-            mp = StateGraphHelper.RX_PRESENT.search(text or "")
-            if not mp:
+        """
+        Determine whether the input_guard LLM response signals OK or MISSING.
+
+        Decision rule (deterministic, model-independent):
+          - <MISSING> present  →  NOT OK  (explicit failure signal)
+          - <MISSING> absent   →  OK      (regardless of <OK/> presence)
+
+        False-positive filter: known hallucinated items (accession_id, url, …) are
+        stripped from MISSING lists. If stripping empties the list → force OK.
+        This is the model-agnostic layer on top of the prompt rule.
+        """
+        txt = text or ""
+
+        # <MISSING> is the only authoritative failure signal.
+        mm = StateGraphHelper.RX_MISSING.search(txt)
+        if mm:
+            raw = [x.strip("- ").strip() for x in mm.group(1).strip().splitlines() if x.strip()]
+            # Strip the item name (before '::') for matching; keep the full line for reporting.
+            items = [
+                item for item in raw
+                if not StateGraphHelper._FALSE_POSITIVE_MISSING.match(item.split("::")[0].strip())
+            ]
+            if not items:
+                # All declared-missing items were known false positives → treat as OK.
                 return [], True
+            return items, False
+
+        # No <MISSING> found → treat as OK.
+        mp = StateGraphHelper.RX_PRESENT.search(txt)
+        if mp:
             items = [x.strip("- ").strip() for x in mp.group(1).strip().splitlines() if x.strip()]
             return items, True
-        mm = StateGraphHelper.RX_MISSING.search(text or "")
-        if not mm:
-            # treat as missing if we couldn't parse
-            return ["Could not parse INPUT_VALIDATOR response."], False
-        items = [x.strip("- ").strip() for x in mm.group(1).strip().splitlines() if x.strip()]
-        return items, False
+
+        return [], True
 
 
     @staticmethod

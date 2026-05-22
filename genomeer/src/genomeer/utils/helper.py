@@ -31,15 +31,20 @@ def _run_in_env(
 ) -> subprocess.CompletedProcess[str]:
     """
     Run argv inside micromamba env <env_name> and capture output.
+
+    Windows-safe: uses CREATE_NEW_PROCESS_GROUP + taskkill /F /T on timeout so
+    the entire process tree (micromamba -> python -> ncbi-genome-download ...) is
+    killed. Without this, subprocess.run timeout leaves child processes running
+    and then hangs forever draining a full pipe buffer (classic Windows deadlock).
     """
+    import platform as _platform
+
     exe = ensure_micromamba()
     prefix = ENVS_DIR / env_name
 
-    # micromamba run -p <prefix> -- <argv...>
-    cmd = [str(exe), "run", "-p", str(prefix), *argv]
-    print('---------------------------------')
-    print(cmd)
-    print('---------------------------------')
+    # --no-rc suppresses shell-init PATH warnings — only valid on Linux/macOS.
+    _extra = ["--no-rc"] if _platform.system() != "Windows" else []
+    cmd = [str(exe), "run", *_extra, "-p", str(prefix), *argv]
 
     env = dict(os.environ)
     env.pop("CONDA_PREFIX", None)
@@ -47,6 +52,48 @@ def _run_in_env(
     if extra_env:
         env.update(extra_env)
 
+    if _platform.system() == "Windows":
+        # On Windows we must create a new process group so that taskkill can
+        # kill the entire tree (not just the top-level micromamba process).
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        try:
+            stdout_b, stderr_b = proc.communicate(
+                input=input_text.encode() if input_text else None,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Kill every process in the tree, then drain the now-dead pipes.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+            )
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            stdout_b, stderr_b = proc.communicate()
+            raise subprocess.TimeoutExpired(
+                cmd, timeout,
+                output=stdout_b,
+                stderr=stderr_b,
+            )
+
+        rc = proc.returncode
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        result = subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+        if check and rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd, stdout, stderr)
+        return result
+
+    # Linux / macOS: plain subprocess.run is fine (OS kills the child group on kill()).
     return subprocess.run(
         cmd,
         input=input_text,
@@ -84,12 +131,14 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
         return "Error: Empty script"
     
     try:
-        with tempfile.NamedTemporaryFile(suffix=".R", mode="w", dir=settings.run_dir, delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".R", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
             f.write(code); path = f.name
             
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available." 
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}" 
             proc = _run_in_env(env_name, ["Rscript", path], timeout=settings.timeout_seconds)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
@@ -141,7 +190,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
     if not script: 
         return "Error: Empty script"
     
-    with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", dir=settings.run_dir, delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
         if not script.startswith("#!/"): f.write("#!/bin/bash\n")
         if "set -e" not in script: f.write("set -euo pipefail\n")
         f.write(script); path = f.name
@@ -149,8 +198,10 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
     
     try:
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}"
 
             proc = _run_in_env(env_name, ["bash", path], timeout=settings.timeout_seconds)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
@@ -209,8 +260,10 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
         argv = shlex.split(command)
         
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}"
             proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
             return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
 
@@ -231,18 +284,20 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -
     - If env_name is provided: runs it in that micromamba env (fresh process).
     - If no env_name: runs in a persistent REPL namespace in the current process.
     """
-
+    path = None  # must be initialised before try so finally never hits NameError
     code = code.strip("```").strip()
     try: 
         # --- Case 1: run in a micromamba environment ---
         if env_name:
-            if not ensure_env(env_name, auto_install=True, log_cb=log_cb):
-                return f"Environment '{env_name}' is not available."
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}"
 
             # Write the code to a temp file
             os.makedirs(settings.run_dir, exist_ok=True)
-            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", dir=settings.run_dir, delete=False) as f:
-                f.write(code)
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
+                f.write("# -*- coding: utf-8 -*-\n" + code)
                 path = f.name
 
             try:

@@ -1,6 +1,8 @@
-import re, contextlib
+import re, contextlib, concurrent.futures, threading
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+
+_RETRIEVAL_TIMEOUT_SEC = 60
 
 
 class ToolRetriever:
@@ -66,14 +68,22 @@ class ToolRetriever:
         if llm is None:
             llm = ChatOpenAI(model="gpt-4o")
 
-        # Invoke the LLM
-        if hasattr(llm, "invoke"):
-            # For LangChain-style LLMs
-            response = llm.invoke([HumanMessage(content=prompt)])
-            response_content = response.content
-        else:
-            # For other LLM interfaces
-            response_content = str(llm(prompt))
+        # Invoke the LLM with a hard timeout to prevent indefinite blocking
+        def _call_llm():
+            if hasattr(llm, "invoke"):
+                return llm.invoke([HumanMessage(content=prompt)]).content
+            return str(llm(prompt))
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_call_llm)
+                response_content = fut.result(timeout=_RETRIEVAL_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            # Retrieval timed out: fall back to returning all resources unfiltered
+            return {k: list(v) for k, v in resources.items()}
+        except Exception:
+            # Any LLM error: same safe fallback
+            return {k: list(v) for k, v in resources.items()}
 
         # Parse the response to extract the selected indices
         selected_indices = self._parse_llm_response(response_content)
