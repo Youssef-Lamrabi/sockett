@@ -124,7 +124,7 @@ def _format_proc_error(title: str, cmd: list[str] | str, rc: int, stdout: str, s
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     code = (code or "").strip()
     if not code: 
@@ -139,7 +139,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
                 ensure_env(env_name, auto_install=True, log_cb=log_cb)
             except Exception as _env_err:
                 return f"Environment '{env_name}' is not available: {_env_err}" 
-            proc = _run_in_env(env_name, ["Rscript", path], timeout=settings.timeout_seconds)
+            proc = _run_in_env(env_name, ["Rscript", path], timeout=timeout or settings.timeout_seconds)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -157,7 +157,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
             capture_output=True,
             text=True,
             check=False,
-            timeout=settings.timeout_seconds,
+            timeout=timeout or settings.timeout_seconds,
         )
         if res.returncode == 0:
             return res.stdout or ""
@@ -184,7 +184,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     script = (script or "").strip()
     if not script: 
@@ -203,7 +203,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
             except Exception as _env_err:
                 return f"Environment '{env_name}' is not available: {_env_err}"
 
-            proc = _run_in_env(env_name, ["bash", path], timeout=settings.timeout_seconds)
+            proc = _run_in_env(env_name, ["bash", path], timeout=timeout or settings.timeout_seconds)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -222,7 +222,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None)
             capture_output=True,
             text=True,
             check=False,
-            timeout=settings.timeout_seconds,
+            timeout=timeout or settings.timeout_seconds,
         )
         if res.returncode == 0:
             return res.stdout or ""
@@ -278,7 +278,7 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
 # ------------------------------------------------------------------------------------------
-def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
+def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
     """
     Executes the provided Python code.
     - If env_name is provided: runs it in that micromamba env (fresh process).
@@ -301,7 +301,7 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None) -
                 path = f.name
 
             try:
-                proc = _run_in_env(env_name, ["python", path], timeout=settings.timeout_seconds)
+                proc = _run_in_env(env_name, ["python", path], timeout=timeout or settings.timeout_seconds)
             except subprocess.TimeoutExpired as te:
                 cmd_display = getattr(te, "cmd", ["python", path])
                 return (
@@ -421,6 +421,7 @@ def read_module2api():
     fields = [
         "ncbi",
         "basic",
+        "metagenomics",
         # "artifacts",
         # "literature",
         # "biochemistry",

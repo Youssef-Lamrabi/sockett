@@ -1,15 +1,103 @@
-import re, contextlib, concurrent.futures, threading
+import re, contextlib, concurrent.futures, threading, shutil
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 _RETRIEVAL_TIMEOUT_SEC = 60
 
+# Keywords that mark a tool as a stub/toy/deprecated — excluded from retrieval
+_STUB_KEYWORDS = re.compile(
+    r"\[STUB\]|\[DEPRECATED\]|\bToy\b|\bstub\b|\bplaceholder\b|\bDO NOT USE\b",
+    re.IGNORECASE,
+)
+
+# CLI tools that must be present on PATH to be offered to the generator
+# key = tool name in description, value = CLI executable to check
+_CLI_TOOL_BINARIES = {
+    # ── Core alignment / manipulation ─────────────────────────────────────────
+    "samtools": "samtools",
+    "bowtie2": "bowtie2",
+    "bwa": "bwa",
+    "minimap2": "minimap2",
+    "blast": "blastn",
+    "bedtools": "bedtools",
+    "fastp": "fastp",
+    "seqkit": "seqkit",
+    "bbduk": "bbduk.sh",
+    "diamond": "diamond",
+    # ── Assembly / scaffolding ────────────────────────────────────────────────
+    "megahit": "megahit",
+    "spades": "spades.py",
+    "quast": "quast.py",
+    # ── Binning ───────────────────────────────────────────────────────────────
+    "semibin2": "SemiBin2",
+    "concoct": "concoct",
+    "maxbin2": "run_MaxBin2.pl",
+    # ── Bin quality ───────────────────────────────────────────────────────────
+    "checkm2": "checkm2",
+    # ── Taxonomic classification ──────────────────────────────────────────────
+    "kraken2": "kraken2",
+    "kaiju": "kaiju",
+    "sylph": "sylph",
+    # ── Gene prediction / annotation ──────────────────────────────────────────
+    "prodigal": "prodigal",
+    "prokka": "prokka",
+    "hmmer": "hmmscan",
+    "eggnog-mapper": "emapper.py",
+    "humann3": "humann",
+    # ── Specialized annotation ────────────────────────────────────────────────
+    "antismash": "antismash",
+    "genomad": "genomad",
+    "abricate": "abricate",
+    "dbcan": "run_dbcan.py",
+    "pharokka": "pharokka.py",
+    # ── Community / stats ─────────────────────────────────────────────────────
+    "lefse": "lefse_run.py",
+    "nonpareil": "nonpareil",
+}
+
+def _available_cli_tools() -> set:
+    """Return the set of CLI tool names that are actually on PATH."""
+    return {name for name, exe in _CLI_TOOL_BINARIES.items() if shutil.which(exe)}
+
+_AVAILABLE_CLI = _available_cli_tools()  # computed once at import time
+
 
 class ToolRetriever:
-    """Retrieve tools from the tool registry."""
+    """Retrieve tools from the tool registry, filtering stubs and unavailable CLIs."""
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def filter_tools(tools: list) -> list:
+        """
+        Remove tools that are:
+        1. Marked as stub/toy/deprecated in their description.
+        2. Require a CLI backend that is not installed on the current machine.
+        """
+        kept = []
+        for tool in tools:
+            desc = ""
+            if isinstance(tool, dict):
+                desc = tool.get("description", "")
+            elif hasattr(tool, "description"):
+                desc = tool.description or ""
+
+            # Skip stubs / deprecated
+            if _STUB_KEYWORDS.search(desc):
+                continue
+
+            # Skip CLI tools whose binary is absent
+            skip = False
+            for cli_name, exe in _CLI_TOOL_BINARIES.items():
+                if cli_name.lower() in desc.lower() and shutil.which(exe) is None:
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            kept.append(tool)
+        return kept
 
     def prompt_based_retrieval(self, query: str, resources: dict, llm=None) -> dict:
         """Use a prompt-based approach to retrieve the most relevant resources for a query.
@@ -22,6 +110,10 @@ class ToolRetriever:
             A dictionary with the same keys, but containing only the most relevant resources
         """
         
+        # Pre-filter: remove stubs, deprecated tools, and unavailable CLI backends
+        resources = dict(resources)
+        resources["tools"] = self.filter_tools(resources.get("tools", []))
+
         # Create a prompt for the LLM to select relevant resources
         prompt = f"""
             You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.

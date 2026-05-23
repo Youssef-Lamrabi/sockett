@@ -9,7 +9,7 @@ class StateGraphHelper:
     RX_PRESENT = re.compile(r"<PRESENT>(.*?)</PRESENT>", re.S | re.I)
     RX_OK = re.compile(r"<OK\s*/\s*>", re.I)
     RX_STATUS_WRAPPED = re.compile(r"<STATUS\s*:\s*(done|blocked)\s*>(.*?)</STATUS>", re.S | re.I)
-    RX_STATUS_INLINE  = re.compile(r"<STATUS\s*:\s*(done|blocked)\s*>", re.I)
+    RX_STATUS_INLINE  = re.compile(r"<STATUS\s*:\s*(done|blocked)>", re.I)
 
 
     @staticmethod
@@ -154,7 +154,18 @@ class StateGraphHelper:
             summary = re.sub(r"</?[^>]+>", "", summary).strip()
             return status, summary
 
-        return "blocked", "Could not parse OBSERVER status."
+        # No STATUS tag found — re-prompt the observer with the full text as context
+        # rather than wasting retries with empty repair_feedback.
+        _parse_fail_msg = (
+            "OBSERVER_FORMAT_ERROR: The previous observer response contained no "
+            "<STATUS:done> or <STATUS:blocked> tag.\n"
+            "Observer raw output was:\n"
+            f"{txt[:600]}\n\n"
+            "Re-examine the execution result and emit exactly one of:\n"
+            "  <STATUS:done>   if execution succeeded\n"
+            "  <STATUS:blocked> <explanation of what failed and how to fix it>"
+        )
+        return "blocked", _parse_fail_msg
 
 
     # # ---------- VALIDATORS (example: alignment, generic fallback) ----------

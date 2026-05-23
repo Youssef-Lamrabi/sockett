@@ -41,6 +41,54 @@ envs:
       - python-dotenv
     provides_r: []
 
+  - name: meta-env1
+    description: "Metagenomics CLI stack: binning, taxonomy, functional annotation, QC."
+    spec: "meta-env1.yaml"
+    python: "3.10"
+    provides_bins:
+      - quast.py
+      - SemiBin2
+      - concoct
+      - cut_up_fasta.py
+      - concoct_coverage_table.py
+      - merge_cutup_clustering.py
+      - extract_fasta_bins.py
+      - run_MaxBin2.pl
+      - checkm2
+      - kraken2
+      - sylph
+      - kaiju
+      - kaiju2table
+      - hmmscan
+      - hmmsearch
+      - hmmpress
+      - emapper.py
+      - diamond
+      - humann
+      - humann_renorm_table
+      - antismash
+      - genomad
+      - abricate
+      - seqkit
+      - bbduk.sh
+      - run_dbcan.py
+      - pharokka.py
+      - lefse_format_input.py
+      - lefse_run.py
+      - lefse_plot_res.py
+      - nonpareil
+      - Rscript
+    provides_py:
+      - biopython
+      - numpy
+      - pandas
+      - matplotlib
+      - scipy
+    provides_r:
+      - phyloseq
+      - ggplot2
+      - vegan
+
   - name: btools_env_py310
     description: "Bioinformatics CLI stack with CNVkit, BWA, samtools, bedtools, and OptiType (Python 3.10)."
     spec: "hla-tools.yaml"

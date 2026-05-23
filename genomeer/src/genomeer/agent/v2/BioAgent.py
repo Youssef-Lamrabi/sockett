@@ -504,6 +504,12 @@ class BioAgent:
             self_critic: Whether to enable self-critic mode
             test_time_scale_round: Number of rounds for test time scaling
         """
+        import shutil as _shutil
+        from genomeer.model.retriever import _CLI_TOOL_BINARIES
+        _missing = [exe for exe in _CLI_TOOL_BINARIES.values() if not _shutil.which(exe)]
+        _present = [exe for exe in _CLI_TOOL_BINARIES.values() if _shutil.which(exe)]
+        self._log("ENV SCAN", body=f"CLI tools available: {_present}\nCLI tools ABSENT (filtered from registry): {_missing}", node="configure")
+
         self.self_critic = self_critic
         data_lake_path = self.path + "/data_lake"
         data_lake_content = glob.glob(data_lake_path + "/*")
@@ -877,6 +883,13 @@ class BioAgent:
                 observation_state=manifest.get("observations", [])
             ).strip()
 
+            # Fix 9 — append filesystem helper reference to INPUT_GUARD context
+            try:
+                from genomeer.utils.filesystem import FILESYSTEM_PROMPT_SNIPPET as _FS_SNIPPET_IG
+                context_block += "\n\n" + _FS_SNIPPET_IG
+            except ImportError:
+                pass
+
             msgs = [
                 self.system_prompt,
                 HumanMessage(content=instructions.INPUT_VALIDATOR_PROMPT),
@@ -1038,9 +1051,10 @@ class BioAgent:
                         '      print(f"Download failed (exit {res.returncode}): {res.stderr}")\n'
                         "      sys.exit(1)\n"
                         "\n"
-                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
-                        '                 glob.glob(os.path.join(run_dir, "*.fna")) +\n'
-                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna.gz"), recursive=True))\n'
+                        '  # Prefer uncompressed .fna; fall back to .fna.gz if needed\n'
+                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna"), recursive=True))\n'
                         "  if not fasta_files:\n"
                         '      print("No FASTA file found after download")\n'
                         "      sys.exit(1)\n"
@@ -1048,8 +1062,9 @@ class BioAgent:
                         "  fasta_path = fasta_files[0]\n"
                         '  if fasta_path.endswith(".gz"):\n'
                         "      unzipped = fasta_path[:-3]\n"
-                        "      with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
-                        "          shutil.copyfileobj(fi, fo)\n"
+                        "      if not os.path.exists(unzipped):\n"
+                        "          with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
+                        "              shutil.copyfileobj(fi, fo)\n"
                         "      fasta_path = unzipped\n"
                         '  print(f"FASTA ready: {fasta_path}")\n'
                         "\n"
@@ -1087,9 +1102,10 @@ class BioAgent:
                         '      print(f"Download failed (exit {res.returncode}): {res.stderr}")\n'
                         "      sys.exit(1)\n"
                         "\n"
-                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
-                        '                 glob.glob(os.path.join(run_dir, "*.fna")) +\n'
-                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna.gz"), recursive=True))\n'
+                        '  # Prefer uncompressed .fna; fall back to .fna.gz if needed\n'
+                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna"), recursive=True))\n'
                         "  if not fasta_files:\n"
                         '      print("No FASTA files found after download")\n'
                         "      sys.exit(1)\n"
@@ -1097,8 +1113,9 @@ class BioAgent:
                         "  fasta_path = fasta_files[0]\n"
                         '  if fasta_path.endswith(".gz"):\n'
                         "      unzipped = fasta_path[:-3]\n"
-                        "      with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
-                        "          shutil.copyfileobj(fi, fo)\n"
+                        "      if not os.path.exists(unzipped):\n"
+                        "          with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
+                        "              shutil.copyfileobj(fi, fo)\n"
                         "      fasta_path = unzipped\n"
                         '  print(f"FASTA ready: {fasta_path}")\n'
                         "\n"
@@ -1165,6 +1182,47 @@ class BioAgent:
 
             if _injections:
                 content += "\n\nCODE PATTERN REMINDER (apply these in your code):\n" + "\n\n".join(_injections)
+
+            # Fix 2 — Inject file_registry from manifest so model uses exact filenames
+            # from previous steps instead of inventing them.
+            _file_registry = manifest.get("file_registry", {})
+            if _file_registry:
+                _reg_lines = []
+                for _ext, _names in sorted(_file_registry.items()):
+                    for _nm in _names:
+                        _reg_lines.append(f"  {_ext:<8} -> {_nm}")
+                content += (
+                    "\n\nFILE_REGISTRY (exact filenames produced by previous steps — "
+                    "use these, never invent paths):\n"
+                    + "\n".join(_reg_lines)
+                )
+
+            # Fix 9 — Always inject the filesystem helper reference so the model
+            # uses list_files()/get_file() instead of inventing hardcoded paths.
+            try:
+                from genomeer.utils.filesystem import FILESYSTEM_PROMPT_SNIPPET as _FS_SNIPPET
+                content += "\n\n" + _FS_SNIPPET
+            except ImportError:
+                pass
+
+            # Fix 5 — Inject exact run_dir file listing into generator prompt.
+            # The model invents filenames like "GCF_000009045.1.fna" instead of
+            # "GCF_000009045.1_ASM904v1_genomic.fna". Showing the real filenames
+            # eliminates all FileNotFoundError caused by invented paths.
+            if temp_dir and os.path.isdir(temp_dir):
+                import glob as _gl
+                _dir_files = sorted(_gl.glob(os.path.join(temp_dir, "*")))
+                if _dir_files:
+                    _file_lines = []
+                    for _fp in _dir_files:
+                        _sz = os.path.getsize(_fp) if os.path.isfile(_fp) else 0
+                        _file_lines.append(f"  {os.path.basename(_fp)}  ({_sz:,} bytes)")
+                    _rundir_section = (
+                        f"\nRUN_DIR = r\"{temp_dir}\"\n"
+                        f"FILES_CURRENTLY_IN_RUN_DIR (use these EXACT names — do not invent paths):\n"
+                        + "\n".join(_file_lines)
+                    )
+                    content += _rundir_section
 
             msgs = [
                 self.system_prompt,
@@ -1268,6 +1326,36 @@ class BioAgent:
                 new_manifest.pop("repair_feedback", None)
                 new_manifest.pop("repair_step_idx", None)
                 updates["manifest"] = new_manifest
+
+            # Fix 8 — Per-step timeout: classify the step by keyword and set the
+            # appropriate timeout_seconds in the manifest before the executor reads it.
+            _TIMEOUT_7200_KW = ("humann", "humann3", "functional profiling")
+            _TIMEOUT_3600_KW = ("assemble", "assembly", "spades", "megahit", "flye", "scaffold",
+                                "de novo", "kraken2", "kraken", "semibin", "concoct", "maxbin",
+                                "binning", "antismash", "bgc", "biosynthetic",
+                                # annotation / classification / profiling are slow inference steps
+                                "annotate", "annotation", "classify reads", "taxonomic classif",
+                                "taxonomic profil", "reads profile", "metagenomic profil")
+            _TIMEOUT_1800_KW = ("download", "ncbi", "ncbi-genome-download", "fetch genome", "ftp",
+                                "genome download", "checkm2", "checkm", "bin quality",
+                                "bin completeness", "bin contamination",
+                                "eggnog", "diamond", "emapper",
+                                "kaiju", "genomad", "pharokka")
+            _TIMEOUT_600_KW  = ("hmmer", "hmmscan", "quast", "dbcan", "nonpareil", "sylph")
+            if any(k in _step_ctx for k in _TIMEOUT_7200_KW):
+                _step_timeout = 7200
+            elif any(k in _step_ctx for k in _TIMEOUT_3600_KW):
+                _step_timeout = 3600
+            elif any(k in _step_ctx for k in _TIMEOUT_1800_KW):
+                _step_timeout = 1800
+            elif any(k in _step_ctx for k in _TIMEOUT_600_KW):
+                _step_timeout = 600
+            else:
+                _step_timeout = 600
+            _tmfest = dict(updates.get("manifest", manifest))
+            _tmfest["timeout_seconds"] = _step_timeout
+            updates["manifest"] = _tmfest
+            self._log("FIX8 TIMEOUT", body=f"step_timeout={_step_timeout}s  step_ctx_sample={_step_ctx[:80]}", node=node)
             
             # MAYBE: return to observer from here if no code;
             self._log("GENERATED CODE", body=code or "<empty>", node=node)
@@ -1418,51 +1506,42 @@ class BioAgent:
                 if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
                     r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
                     out = run_with_timeout(
-                        run_r_code, 
-                        args=[r_code], 
-                        kwargs={
-                            "env_name": env,
-                        }, 
+                        run_r_code,
+                        args=[r_code],
+                        kwargs={"env_name": env, "timeout": timeout},
                         timeout=timeout
                     )
                 elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
                     if code.strip().startswith("#!CLI"):
                         cli_command = re.sub(r"^#!CLI", "", code, 1).strip().replace("\n", " ")  # noqa: B034
                         out = run_with_timeout(
-                            # PATCH: [EXECUTION ERROR] TypeError: 'NoneType' object is not subscriptable
-                            run_bash_script, #run_cli_command, 
-                            args=[cli_command], 
-                            kwargs={
-                                "env_name": env,
-                            }, 
+                            run_bash_script,
+                            args=[cli_command],
+                            kwargs={"env_name": env, "timeout": timeout},
                             timeout=timeout
                         )
                     else:
                         bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
                         out = run_with_timeout(
-                            run_bash_script, 
-                            args=[bash_script], 
-                            kwargs={
-                                "env_name": env,
-                            },
+                            run_bash_script,
+                            args=[bash_script],
+                            kwargs={"env_name": env, "timeout": timeout},
                             timeout=timeout
                         )
                 else:
                     # Inject custom functions into the Python execution environment
-                    self._inject_custom_functions_to_repl() #  TODOs: PRORITY-CHECK
+                    self._inject_custom_functions_to_repl()
                     code = re.sub(r"^\s*#!PY\s*\r?\n", "", code, count=1)
                     out = run_with_timeout(
-                        run_python_code, 
-                        args=[code], 
-                        kwargs={
-                            "env_name": env,
-                        },
+                        run_python_code,
+                        args=[code],
+                        kwargs={"env_name": env, "timeout": timeout},
                         timeout=timeout
                     )
 
-                # bound size
+                # bound size — keep TAIL so errors (which appear last) are never lost
                 if out and len(out) > 12000:
-                    out = out[:12000] + "\n...<truncated>"
+                    out = "...<truncated head>\n" + out[-12000:]
                     
                 last_result = out or ""
                 self._log("EXECUTION RESULT", body=last_result[:2000], node=node)
@@ -1487,14 +1566,136 @@ class BioAgent:
             diagnostic_mode = state.get("diagnostic_mode")
             last_result = state.get("last_result") or ""
 
-            # ── DETERMINISTIC PRE-CHECK (errors only) ───────────────────────────────
-            # Auto-done was removed: it cannot evaluate output against the step goal.
-            # A script printing os.environ would look like success but accomplish nothing.
-            # The LLM observer decides done/blocked — it knows the step title and goal.
-            # Only GENERATOR_FAILURE is short-circuited here (unambiguous failure).
+            # ── EXIT CODE EXTRACTION (Fix 4) ────────────────────────────────────────
+            # helper.py formats failures as "Exit code: N" (with colon).
+            _exit_code_m = re.search(r"Exit code[:\s]+(\d+)", last_result, re.IGNORECASE)
+            _exit_code_nonzero = bool(_exit_code_m and _exit_code_m.group(1) != "0")
+            _exit_code_zero    = bool(_exit_code_m and _exit_code_m.group(1) == "0")
+
+            # Fix 4 — additional deterministic signals beyond exit_code
+            _has_traceback = bool(re.search(r"Traceback \(most recent call last\)", last_result))
+            _any_pyerr     = bool(re.search(
+                r"\b(?:ValueError|TypeError|RuntimeError|UnicodeDecodeError|"
+                r"OSError|IOError|ZeroDivisionError|IndexError|StopIteration|"
+                r"AssertionError|RecursionError|OverflowError):",
+                last_result,
+            ))
+
+            _ERROR_SIGNALS = re.compile(
+                r"Traceback|Error:|Exception:|GENERATOR_FAILURE|"
+                r"FileNotFoundError|NameError|KeyError|AttributeError|SyntaxError|"
+                r"ImportError|ModuleNotFoundError|TimeoutError|PermissionError",
+                re.IGNORECASE,
+            )
+            _MEANINGFUL_OUTPUT = re.compile(
+                r"\d+|percent|%|N50|GC|contig|length|sequence|scaffold|"
+                r"found|done|success|saved|written|downloaded|parsed|FASTA ready",
+                re.IGNORECASE,
+            )
+
+            # Fix 4 — file-existence check: if run_dir has files, that's a done signal
+            _temp_dir_obs = state.get("run_temp_dir", "")
+            _dir_files_obs = self._list_ctx_files(_temp_dir_obs) if _temp_dir_obs else []
+            _output_files_exist = len(_dir_files_obs) > 0
+
+            # FAST-DONE: exit_code=0 (or no exit code) AND no errors AND
+            # (meaningful stdout OR files exist in run_dir)
+            _is_exit_ok = (
+                not _exit_code_nonzero
+                and not _has_traceback
+                and not _any_pyerr
+                and last_result
+                and not _ERROR_SIGNALS.search(last_result)
+                and (_MEANINGFUL_OUTPUT.search(last_result) or _output_files_exist)
+                and len(last_result.strip()) > 5
+            )
+
+            # ── HARD BLOCK 1: non-zero exit code ────────────────────────────────────
+            if not diagnostic_mode and _exit_code_nonzero:
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    f"EXIT_CODE={_exit_code_m.group(1)}: execution failed. "
+                    f"Read the STDERR carefully and fix the root cause.\n"
+                    f"Last output:\n{last_result[-800:]}"
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log("HARD BLOCK exit_code!=0", body=f"exit_code={_exit_code_m.group(1)}", node=node)
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\nExit code {_exit_code_m.group(1)} — execution failed.")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
+
+            # ── HARD BLOCK 2: Traceback/Python error without captured exit_code ─────
+            # Catches failures where the execution wrapper swallowed the exit code
+            # but the Python traceback is still visible in the output.
+            if not diagnostic_mode and not _exit_code_nonzero and (_has_traceback or _any_pyerr):
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest = self._clean_manifest(state["manifest"])
+                _err_snippet = last_result[-600:]
+                new_manifest["repair_feedback"] = (
+                    f"Python exception detected (no exit code captured). "
+                    f"Fix the error shown below:\n{_err_snippet}"
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log("HARD BLOCK traceback", body="Traceback/PyError without exit_code", node=node)
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\nPython exception detected — execution failed.")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
+
+            # ── FAST-DONE: deterministic success ────────────────────────────────────
+            if not diagnostic_mode and _is_exit_ok:
+                summary = f"Execution succeeded.\n\nOutput:\n{last_result[:500]}"
+                _reason = "exit_code=0 + files_exist" if _output_files_exist else "exit_code=0 + meaningful output"
+                self._log("OBSERVER FAST-DONE", body=f"{_reason} → done (no LLM)", node=node)
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {**plan[state["current_idx"]], "status": "done", "notes": summary}
+                observations = list(state.get("manifest", {}).get("observations", []))
+                observations.append({
+                    "step_idx": state["current_idx"],
+                    "title": step["title"],
+                    "status": "done",
+                    "summary": summary,
+                    "stdout": last_result[:2000],
+                    "files_snapshot": _dir_files_obs,
+                })
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["observations"] = observations
+                # Fix 2 — build and store file_registry after every done step
+                new_manifest["file_registry"] = self._build_file_registry(_temp_dir_obs)
+                new_manifest["files"] = [f["name"] for f in _dir_files_obs]
+                return {
+                    "plan": plan,
+                    "current_idx": state["current_idx"] + 1,
+                    "next_step": "orchestrator",
+                    "last_result": last_result,
+                    "manifest": new_manifest,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "messages": [AIMessage(content=f"<STATUS:done>\n{summary}")],
+                }
+
             if not diagnostic_mode and last_result and "GENERATOR_FAILURE:" in last_result:
                 self._log("OBSERVER PRE-CHECK", body="generator failure fast-path", node=node)
-                # Fall through — ModuleNotFoundError fast-path below handles this and similar
             # ── END PRE-CHECK ────────────────────────────────────────────────────────
 
             # Fast-path: Python import errors are always execution failures, never missing inputs.
@@ -1508,6 +1709,80 @@ class BioAgent:
             _has_import_error = bool(re.search(r"ImportError:", last_result))
             _is_missing_package = _has_module_not_found or (_has_import_error and _has_no_module)
             _is_bad_import = _has_import_error and not _has_no_module  # hallucinated name
+
+            # Fix 7 — Deterministic error classifier: map error type → targeted repair.
+            # Each branch builds a precise summary that guides the generator directly,
+            # avoiding the LLM observer for unambiguous error patterns.
+            _temp_dir_err = state.get("run_temp_dir", "")
+            _manifest_files = state.get("manifest", {}).get("files", [])
+
+            # NameError: variable not defined
+            _nameerr_m = re.search(r"NameError: name '([^']+)' is not defined", last_result)
+            if not diagnostic_mode and _nameerr_m and not _is_missing_package and not _is_bad_import:
+                _undef_var = _nameerr_m.group(1)
+                # Check if it's a known pattern we can fix
+                if _undef_var in ("fasta_path", "run_dir", "accessions", "contigs"):
+                    _files_hint = (
+                        f"Files in run_dir: {_manifest_files}" if _manifest_files
+                        else f"run_dir = r\"{_temp_dir_err}\""
+                    )
+                    summary = (
+                        f"NameError: '{_undef_var}' is not defined. "
+                        f"Fix: define it before use. {_files_hint}. "
+                        f"For fasta_path: use glob.glob(os.path.join(run_dir, '*.fna'))[0]. "
+                        f"For run_dir: use the value from the prompt context. "
+                        f"For accessions: use [os.path.basename(f) for f in glob.glob(os.path.join(run_dir, '*.fna'))]. "
+                        f"For contigs: use list(SeqIO.parse(fasta_path, 'fasta'))."
+                    )
+                    self._log("FAST-PATH NameError", body=summary, node=node)
+                    new_manifest = self._clean_manifest(state["manifest"])
+                    rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                    rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                    new_manifest["repair_feedback"] = summary
+                    new_manifest["repair_step_idx"] = state["current_idx"]
+                    return {
+                        "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                                 for i, p in enumerate(state["plan"])],
+                        "current_idx": state["current_idx"],
+                        "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                        "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                        "manifest": new_manifest,
+                        "retry_counts": rc,
+                        "diagnostic_mode": False,
+                        "diagnostic_code": None,
+                        "diagnostic_observation": None,
+                    }
+
+            # FileNotFoundError: file path wrong
+            _fnf_m = re.search(r"FileNotFoundError.*?'([^']+)'", last_result)
+            if not diagnostic_mode and _fnf_m and not _is_missing_package:
+                _bad_path = _fnf_m.group(1)
+                _files_hint = f"Actual files in run_dir: {_manifest_files}" if _manifest_files else ""
+                summary = (
+                    f"FileNotFoundError: '{os.path.basename(_bad_path)}' not found. "
+                    f"The filename was invented — use glob to find the real file. "
+                    f"{_files_hint}. "
+                    f"Fix: fasta_path = glob.glob(os.path.join(run_dir, '*.fna'))[0]  "
+                    f"— never hardcode filenames."
+                )
+                self._log("FAST-PATH FileNotFoundError", body=summary, node=node)
+                new_manifest = self._clean_manifest(state["manifest"])
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
 
             if not diagnostic_mode and _is_missing_package:
                 pkg_m = re.search(r"No module named '([^']+)'", last_result)
@@ -1534,7 +1809,7 @@ class BioAgent:
                     f"Do NOT invent new class names."
                 )
                 self._log("FAST-PATH ImportError (hallucinated name)", body=summary, node=node)
-                new_manifest = dict(state["manifest"])
+                new_manifest = self._clean_manifest(state["manifest"])
                 rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
                 rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
                 new_manifest["retry_count"] = rc[state["current_idx"]]
@@ -1586,7 +1861,7 @@ class BioAgent:
             next_step = "generator" if status == "blocked" else "orchestrator"
             next_idx = state["current_idx"] + (0 if status == "blocked" else 1)
             
-            new_manifest = dict(state["manifest"])
+            new_manifest = self._clean_manifest(state["manifest"])
             rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
             diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
             if status == "blocked":
@@ -1621,7 +1896,7 @@ class BioAgent:
                 self._log("STATUS", body=f"done=True\nnotes=\n{summary}", node=node)
                 self._log("EXIT NODE", body=f"advance_to_idx={state['current_idx']}\nnext_step=orchestrator", node=node)
                 
-                # storing succes state observation
+                # storing success state observation
                 obs = {
                     "step_idx": state["current_idx"],
                     "title": step["title"],
@@ -1631,6 +1906,16 @@ class BioAgent:
                     "files_snapshot": self._list_ctx_files(state.get("run_temp_dir","")),
                 }
                 new_manifest["observations"] = list(new_manifest.get("observations", [])) + [obs]
+
+                # Fix 2 + Fix 6 — auto-enrich manifest with exact file paths after each done step.
+                _temp_dir = state.get("run_temp_dir", "")
+                _file_registry = self._build_file_registry(_temp_dir)
+                new_manifest["file_registry"] = _file_registry
+                new_manifest["files_by_ext"] = _file_registry  # backward compat alias
+                new_manifest["files"] = [
+                    n for names in _file_registry.values() for n in names
+                ]
+                self._log("MANIFEST ENRICHED", body=f"file_registry: {_file_registry}", node=node)
 
 
             plan = list(state["plan"])
@@ -1865,7 +2150,7 @@ class BioAgent:
             lambda s: s["next_step"],
             {
                 "generator": "generator",
-                "end": "qa",
+                "end": END,
             },
         )
         workflow.add_edge("qa", END)
@@ -1897,6 +2182,35 @@ class BioAgent:
             except Exception as e:
                 self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
         return staged_rel
+
+    @staticmethod
+    def _clean_manifest(manifest: dict) -> dict:
+        """Return a copy of manifest with all stale routing keys removed.
+        Call this on every blocked-path manifest copy to prevent route_hint
+        from a previous iteration hijacking the planner on the next cycle.
+        """
+        m = dict(manifest)
+        for k in ("route_hint", "qa_payload", "resume_to", "pause_kind"):
+            m.pop(k, None)
+        return m
+
+    def _build_file_registry(self, temp_dir: str) -> dict:
+        """Fix 2 — Build {ext: [basename, ...]} from current run_dir contents.
+
+        Returns e.g. {'.fna': ['GCF_000009045.1_ASM904v1_genomic.fna'],
+                       '.png': ['genome_comparison.png'], ...}
+        Sorted by extension so output is deterministic.
+        """
+        registry: dict = {}
+        if not temp_dir or not os.path.isdir(temp_dir):
+            return registry
+        import glob as _gl
+        for fp in sorted(_gl.glob(os.path.join(temp_dir, "*"))):
+            if os.path.isfile(fp):
+                bn  = os.path.basename(fp)
+                ext = os.path.splitext(bn)[1].lower() or ".noext"
+                registry.setdefault(ext, []).append(bn)
+        return registry
 
     def _list_ctx_files(self, temp_dir: str, extra_paths: list = None):
         """
@@ -1945,10 +2259,18 @@ class BioAgent:
         """Inject custom functions into the Python REPL execution environment.
         This makes custom tools available during code execution.
         """
-        if hasattr(self, "_custom_functions") and self._custom_functions:
-            # Access the persistent namespace used by run_python_repl
-            from genomeer.utils.helper import _persistent_namespace
+        from genomeer.utils.helper import _persistent_namespace
 
+        # Fix 9 — always inject list_files / get_file into the REPL namespace so
+        # generated code can call them without an explicit import.
+        try:
+            from genomeer.utils.filesystem import list_files as _lf, get_file as _gf
+            _persistent_namespace["list_files"] = _lf
+            _persistent_namespace["get_file"] = _gf
+        except ImportError:
+            pass
+
+        if hasattr(self, "_custom_functions") and self._custom_functions:
             # Inject all custom functions into the execution namespace
             for name, func in self._custom_functions.items():
                 _persistent_namespace[name] = func
@@ -2508,13 +2830,98 @@ class BioAgent:
                     code = code[:pos] + glob_snippet + code[pos:]
             self._log("FIX_FASTA", body="Replaced hardcoded accession path with glob discovery", node="generator")
 
+        # Fix 0b — undefined 'accessions' variable used in a for-loop
+        # Pattern: "for accession in accessions:" where accessions is never defined.
+        # Replace the whole loop with glob-based file discovery over all .fna in run_dir.
+        if re.search(r'\bfor\s+\w+\s+in\s+accessions\b', code) and 'accessions' not in re.sub(
+            r'for\s+\w+\s+in\s+accessions', '', code
+        ):
+            # Replace undefined 'accessions' with a glob list of .fna files in run_dir
+            fna_glob = (
+                'import glob as _glob\n'
+                '_fna_files = sorted(_glob.glob(os.path.join(run_dir, "*.fna")))\n'
+                'if not _fna_files:\n'
+                '    print("No .fna files found in run_dir"); sys.exit(1)\n'
+                'accessions = [os.path.basename(f) for f in _fna_files]\n'
+            )
+            insert_m = re.search(r'(run_dir\s*=\s*r?["\'][^\n]+\n)', code)
+            if insert_m:
+                pos = insert_m.end()
+                code = code[:pos] + fna_glob + code[pos:]
+                # Also fix the path construction inside the loop:
+                # f"{accession}_genomic.fna" → use full path from _fna_files
+                code = re.sub(
+                    r'os\.path\.join\(run_dir,\s*f?["\'][^"\']*\{accession\}[^"\']*["\']?\)',
+                    'os.path.join(run_dir, accession)',
+                    code,
+                )
+                self._log("FIX_FASTA", body="Injected glob-based accessions list (undefined var fix)", node="generator")
+
+        # Fix 0c — fasta_path used but never defined
+        # Pattern: SeqIO.parse(fasta_path, ...) where fasta_path= never appears in code.
+        # Inject glob-based discovery so fasta_path is always defined before use.
+        if ("fasta_path" in code
+                and "SeqIO.parse(fasta_path" in code
+                and not re.search(r'fasta_path\s*=', code)):
+            glob_snippet = (
+                'import glob as _glob\n'
+                '_fna_files = sorted(_glob.glob(os.path.join(run_dir, "*.fna"))) + \\\n'
+                '             sorted(_glob.glob(os.path.join(run_dir, "*.fna.gz")))\n'
+                'if not _fna_files:\n'
+                '    print("No FASTA file found in run_dir"); sys.exit(1)\n'
+                'fasta_path = _fna_files[0]\n'
+                'if fasta_path.endswith(".gz"):\n'
+                '    import gzip, shutil\n'
+                '    _unzipped = fasta_path[:-3]\n'
+                '    with gzip.open(fasta_path, "rb") as _fi, open(_unzipped, "wb") as _fo:\n'
+                '        shutil.copyfileobj(_fi, _fo)\n'
+                '    fasta_path = _unzipped\n'
+            )
+            insert_m = re.search(r'(run_dir\s*=\s*r?["\'][^\n]+\n)', code)
+            if insert_m:
+                pos = insert_m.end()
+                code = code[:pos] + glob_snippet + code[pos:]
+                self._log("FIX_FASTA", body="Injected fasta_path glob (undefined var fix)", node="generator")
+
+        # Fix 0d — SeqIO.parse called multiple times on same fasta_path (iterator exhausted)
+        # Replace with a single list() call stored in a variable, reused throughout.
+        if code.count("SeqIO.parse(fasta_path") > 1:
+            # Replace all occurrences with reference to a pre-materialised list
+            code = re.sub(
+                r'SeqIO\.parse\(fasta_path,\s*["\']fasta["\']\)',
+                '_contigs_cache',
+                code,
+            )
+            # Inject the cache definition after fasta_path definition or run_dir
+            cache_line = '_contigs_cache = list(SeqIO.parse(fasta_path, "fasta"))\n'
+            insert_m2 = re.search(r'(fasta_path\s*=\s*[^\n]+\n)', code)
+            if insert_m2:
+                pos2 = insert_m2.end()
+                code = code[:pos2] + cache_line + code[pos2:]
+                self._log("FIX_FASTA", body="Cached SeqIO.parse to avoid iterator exhaustion", node="generator")
+
         # Fix 1 — reorder glob so .fna comes before .fna.gz
-        # Pattern: glob(...*.fna.gz...) + glob(...*.fna...) → swap order
-        code = re.sub(
-            r'(glob\.glob\([^)]*\*\.fna\.gz[^)]*\))\s*\+\s*(glob\.glob\([^)]*\*\.fna[^"\']*\))',
-            r'\2 +\n               \1',
-            code,
-        )
+        # Simple string substitution: swap "*.fna.gz" and "*.fna" in any multi-glob line.
+        # The regex approach fails with nested parens (os.path.join), so we do line-by-line.
+        _fixed_lines = []
+        _fna_gz_line = None
+        for _ln in code.splitlines(keepends=True):
+            # Detect a line that has *.fna.gz glob but no *.fna (only gz variant)
+            if '*.fna.gz' in _ln and '*.fna"' not in _ln and '*.fna\'' not in _ln:
+                _fna_gz_line = _ln  # hold it; next line may be the *.fna glob
+            elif _fna_gz_line is not None and ('*.fna"' in _ln or '*.fna\'' in _ln):
+                # Swap: output *.fna line first, then the gz line
+                _fixed_lines.append(_ln)
+                _fixed_lines.append(_fna_gz_line)
+                _fna_gz_line = None
+            else:
+                if _fna_gz_line is not None:
+                    _fixed_lines.append(_fna_gz_line)
+                    _fna_gz_line = None
+                _fixed_lines.append(_ln)
+        if _fna_gz_line is not None:
+            _fixed_lines.append(_fna_gz_line)
+        code = "".join(_fixed_lines)
 
         # Fix 2 — gzip-safe SeqIO.parse
         # If code has SeqIO.parse(fasta_path, ...) but no gzip.open guard, inject one.
@@ -2554,6 +2961,28 @@ class BioAgent:
             if new_code != code:
                 code = new_code
                 self._log("FIX_FASTA", body="Injected gzip-safe SeqIO.parse guard (indent-aware)", node="generator")
+
+        # Fix 3 — universal gzip decompression guard before fasta_path assignment.
+        # When the model sets fasta_path from a glob that may return .gz files,
+        # inject an "if .gz → decompress to .fna" block right after the assignment.
+        # This catches any code that does fasta_path = some_list[0] without a guard.
+        if "SeqIO.parse(fasta_path" in code and "fasta_path.endswith" not in code:
+            _guard = (
+                'if fasta_path.endswith(".gz"):\n'
+                '    import gzip as _gz_mod, shutil as _sh_mod\n'
+                '    _fna_unzipped = fasta_path[:-3]\n'
+                '    if not os.path.exists(_fna_unzipped):\n'
+                '        with _gz_mod.open(fasta_path, "rb") as _fi, open(_fna_unzipped, "wb") as _fo:\n'
+                '            _sh_mod.copyfileobj(_fi, _fo)\n'
+                '    fasta_path = _fna_unzipped\n'
+            )
+            # Inject after the last fasta_path = ... assignment
+            _m3 = list(re.finditer(r'^([ \t]*fasta_path\s*=\s*.+)$', code, re.MULTILINE))
+            if _m3:
+                _last = _m3[-1]
+                _ins = _last.end()
+                code = code[:_ins] + "\n" + _guard + code[_ins:]
+                self._log("FIX_FASTA Fix-3", body="Injected universal gzip decompression guard", node="generator")
 
         return code
 
@@ -2692,18 +3121,20 @@ class BioAgent:
 
         with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
-            
+            # Keep basenames of user uploads so they survive a fatal-error cleanup.
+            _staged_basenames = {os.path.basename(p) for p in staged}
+
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
                 inputs = {
-                    "messages": [HumanMessage(content=prompt)], 
-                    "next_step": None, 
-                    "env_name": "bio-agent-env1", 
-                    "env_ready": False, 
+                    "messages": [HumanMessage(content=prompt)],
+                    "next_step": None,
+                    "env_name": "bio-agent-env1",
+                    "env_ready": False,
                     "pending_code": None,
                     "manifest": {
-                        "timeout_seconds": self.timeout_seconds, 
-                        "observations": [], 
+                        "timeout_seconds": self.timeout_seconds,
+                        "observations": [],
                         "attachments": staged,
                         "interaction_mode": getattr(self, "interaction_mode", "auto"),
                     },
@@ -2724,37 +3155,53 @@ class BioAgent:
                 msg_block = [HumanMessage(content=prompt)]
                 if staged:
                     msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {
-                    "messages": msg_block
-                }
-                
+                inputs = {"messages": msg_block}
+
             config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             self.log = []
             last_msg_text = None
+            _fatal: BaseException | None = None
 
-            for s in self.app.stream(inputs, stream_mode="values", config=config):
-                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                    # graceful exit
-                    last_msg_text = "<observe>Request canceled by client.</observe>"
-                    break
-                
-                message = s["messages"][-1]
-                if mode == "prod" and _is_human(message):
-                    continue
-            
-                text = str(message.content)
-                if text != last_msg_text:
-                    out = pretty_print(message)
-                    self.log.append(out)
-                    last_msg_text = text
-                
-                # ************* logs [dev-only] *************
-                curr_idx = s.get("current_idx", None)
-                next_step = s.get("next_step", None)
-                self._log("STEP SNAPSHOT", body=f"current_idx={curr_idx}\nnext_step={next_step}", node="driver")
-                # *******************************************
+            try:
+                for s in self.app.stream(inputs, stream_mode="values", config=config):
+                    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                        last_msg_text = "<observe>Request canceled by client.</observe>"
+                        break
 
-            return self.log, last_msg_text #str(message.content)
+                    message = s["messages"][-1]
+                    if mode == "prod" and _is_human(message):
+                        continue
+
+                    text = str(message.content)
+                    if text != last_msg_text:
+                        out = pretty_print(message)
+                        self.log.append(out)
+                        last_msg_text = text
+
+                    curr_idx = s.get("current_idx", None)
+                    next_step = s.get("next_step", None)
+                    self._log("STEP SNAPSHOT", body=f"current_idx={curr_idx}\nnext_step={next_step}", node="driver")
+
+            except BaseException as _e:
+                _fatal = _e
+                raise
+            finally:
+                if _fatal is not None:
+                    # Fatal error — remove generated files but preserve user uploads.
+                    try:
+                        import shutil as _sh
+                        for _entry in os.listdir(tmp):
+                            if _entry in _staged_basenames:
+                                continue  # preserve user's uploaded files
+                            _fp = os.path.join(tmp, _entry)
+                            if os.path.isfile(_fp):
+                                os.unlink(_fp)
+                            elif os.path.isdir(_fp):
+                                _sh.rmtree(_fp, ignore_errors=True)
+                    except Exception:
+                        pass
+
+            return self.log, last_msg_text
     
     def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
@@ -2783,18 +3230,19 @@ class BioAgent:
 
         with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
-            
+            _staged_basenames = {os.path.basename(p) for p in staged}
+
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
                 inputs = {
-                    "messages": [HumanMessage(content=prompt)], 
-                    "next_step": None, 
-                    "env_name": "bio-agent-env1", 
-                    "env_ready": False, 
+                    "messages": [HumanMessage(content=prompt)],
+                    "next_step": None,
+                    "env_name": "bio-agent-env1",
+                    "env_ready": False,
                     "pending_code": None,
                     "manifest": {
-                        "timeout_seconds": self.timeout_seconds, 
-                        "observations": [], 
+                        "timeout_seconds": self.timeout_seconds,
+                        "observations": [],
                         "attachments": staged,
                         "interaction_mode": getattr(self, "interaction_mode", "auto"),
                     },
@@ -2815,40 +3263,57 @@ class BioAgent:
                 msg_block = [HumanMessage(content=prompt)]
                 if staged:
                     msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {
-                    "messages": msg_block
-                }
+                inputs = {"messages": msg_block}
 
             config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             last_msg_text = None
             self.log = []
+            _fatal: BaseException | None = None
 
-            for s in self.app.stream(inputs, stream_mode="values", config=config):
-                # bail if canceled
-                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                    yield {"type": "message", "text": "<observe>Request canceled by client.</observe>"}
-                    return
-                
-                message = s["messages"][-1]
-                text = str(message.content)
+            try:
+                for s in self.app.stream(inputs, stream_mode="values", config=config):
+                    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                        yield {"type": "message", "text": "<observe>Request canceled by client.</observe>"}
+                        return
 
-                if mode == "prod" and _is_human(message):
-                    continue
-                if text == last_msg_text:
-                    continue
-                
-                last_msg_text = text
-                out = pretty_print(message)
-                self.log.append(out)
+                    message = s["messages"][-1]
+                    text = str(message.content)
 
-                for seg in self.extract_tagged_blocks(text):
-                    if seg["kind"] == "text":
-                        if seg["text"].strip():
-                            yield {"type": "message", "text": seg["text"]}
-                    else:
-                        tag = seg.get("tag", "BLOCK").upper()
-                        if tag == "THINK":
-                            yield {"type": "think", "tag": tag, "text": seg["text"]}
+                    if mode == "prod" and _is_human(message):
+                        continue
+                    if text == last_msg_text:
+                        continue
+
+                    last_msg_text = text
+                    out = pretty_print(message)
+                    self.log.append(out)
+
+                    for seg in self.extract_tagged_blocks(text):
+                        if seg["kind"] == "text":
+                            if seg["text"].strip():
+                                yield {"type": "message", "text": seg["text"]}
                         else:
-                            yield {"type": "block", "tag": tag, "text": seg["text"]}
+                            tag = seg.get("tag", "BLOCK").upper()
+                            if tag == "THINK":
+                                yield {"type": "think", "tag": tag, "text": seg["text"]}
+                            else:
+                                yield {"type": "block", "tag": tag, "text": seg["text"]}
+
+            except BaseException as _e:
+                _fatal = _e
+                raise
+            finally:
+                if _fatal is not None:
+                    try:
+                        import shutil as _sh
+                        for _entry in os.listdir(tmp):
+                            if _entry in _staged_basenames:
+                                continue
+                            _fp = os.path.join(tmp, _entry)
+                            if os.path.isfile(_fp):
+                                os.unlink(_fp)
+                            elif os.path.isdir(_fp):
+                                _sh.rmtree(_fp, ignore_errors=True)
+                    except Exception:
+                        pass
     
