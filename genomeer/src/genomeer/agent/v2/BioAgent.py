@@ -596,11 +596,14 @@ class BioAgent:
             # -----------------------------
                 
             user_prompt = state["messages"][-1].content
+            _past_templates = self._load_past_templates(user_prompt)
             msgs = [
                 self.system_prompt,
-                HumanMessage(content=instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir") or "")),
+                HumanMessage(content=instructions.PLANNER_PROMPT.format(
+                    temp_run_dir=state.get("run_temp_dir") or "",
+                ) + (_past_templates or "")),
             ]
-            
+
             # ------ Interactive mode ------
             if manifest.get("route_hint") == "await_user":
                 user_text = ""
@@ -1554,12 +1557,151 @@ class BioAgent:
             self._log("EXIT NODE", body="next_step=observer", node=node)
             result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
             updates = {
-                "next_step": "observer", #end
+                "next_step": "validator",
                 result_key: last_result,
                 "messages": [AIMessage(content=f"<observe>Code Execution output:  '{last_result}'</observe>")],
             }
             return updates
-        
+
+        # ── VALIDATOR ────────────────────────────────────────────────────────
+        def _validator(self, state: AgentState) -> AgentState:
+            """
+            Deterministic post-executor gate (Phase 1 + Phase 2 + Phase 3).
+
+            ok=True  + score≥0   → bookkeeping (file_registry + manifest) + orchestrator
+            ok=True  + score=-1  → no contract for this step → observer (LLM)
+            ok=False + RUNTIME=long   → 0 retries → observer immediately
+            ok=False + RUNTIME=medium → 1 retry with best hint → observer if still failing
+            ok=False + RUNTIME=fast   → up to 3 sequential variants → observer if exhausted
+            """
+            from genomeer.agent.v2.utils.validator import ToolValidator
+
+            node = "validator"
+            step        = state["plan"][state["current_idx"]]
+            run_dir     = state.get("run_temp_dir", "")
+            last_result = state.get("last_result") or ""
+
+            result = ToolValidator.validate(step["title"], run_dir, last_result)
+            max_r  = ToolValidator.max_retries(step["title"])
+            self._log(
+                "VALIDATOR",
+                body=(f"step='{step['title']}' ok={result.ok} "
+                      f"score={result.score:.2f} runtime_max_retries={max_r} "
+                      f"reason={result.reason}"),
+                node=node,
+            )
+
+            # ── no contract → observer handles it ────────────────────────────
+            if result.score == -1.0:
+                self._log("VALIDATOR PASS-THROUGH", body="no contract → observer", node=node)
+                return {"next_step": "observer"}
+
+            # ── CONTRACT OK → done bookkeeping ────────────────────────────────
+            if result.ok:
+                summary = f"[validator] {result.reason} (score={result.score:.2f})"
+                _dir_files = self._list_ctx_files(run_dir)
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {
+                    **plan[state["current_idx"]],
+                    "status": "done",
+                    "notes": summary,
+                }
+                observations = list(state.get("manifest", {}).get("observations", []))
+                observations.append({
+                    "step_idx":       state["current_idx"],
+                    "title":          step["title"],
+                    "status":         "done",
+                    "summary":        summary,
+                    "score":          result.score,
+                    "stdout":         last_result[:2000],
+                    "files_snapshot": _dir_files,
+                })
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["observations"]  = observations
+                new_manifest["file_registry"] = self._build_file_registry(run_dir)
+                new_manifest["files"]         = [f["name"] for f in _dir_files]
+                self._log("VALIDATOR DONE", body=summary, node=node)
+                return {
+                    "plan":                   plan,
+                    "current_idx":            state["current_idx"] + 1,
+                    "next_step":              "orchestrator",
+                    "last_result":            last_result,
+                    "manifest":               new_manifest,
+                    "diagnostic_mode":        False,
+                    "diagnostic_code":        None,
+                    "diagnostic_observation": None,
+                    "messages": [AIMessage(content=f"<STATUS:done>\n{summary}")],
+                }
+
+            # ── CONTRACT FAILED ────────────────────────────────────────────────
+            rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+            rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+            attempt = rc[state["current_idx"]]  # 1-based
+
+            # long tools → 0 retries allowed → inject context then observer
+            if max_r == 0:
+                hint = (result.retry_params or {}).get("hint", "check command arguments")
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    f"[VALIDATOR] '{step['title']}' failed.\n"
+                    f"score={result.score:.2f}, reason={result.reason}\n"
+                    f"Long-running tool — no auto-retry. Suggested fix: {hint}\n"
+                    f"Observer must diagnose from stdout below."
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log(
+                    "VALIDATOR → OBSERVER (long tool)",
+                    body=f"{result.reason} — long runtime, no auto-retry",
+                    node=node,
+                )
+                return {
+                    "next_step":    "observer",
+                    "retry_counts": rc,
+                    "manifest":     new_manifest,
+                }
+
+            # within retry budget → pick variant hint for this attempt
+            if attempt <= max_r:
+                fallback = (result.retry_params or {}).get("hint", "fix the command and retry")
+                # retry_idx is 0-based: attempt 1 → variant[0], attempt 2 → variant[1], …
+                hint = ToolValidator.get_variant_hint(step["title"], attempt - 1, fallback)
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    f"VALIDATOR_FAIL (attempt {attempt}/{max_r}): {result.reason}.\n"
+                    f"Parameter fix to apply: {hint}"
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log(
+                    "VALIDATOR RETRY",
+                    body=f"attempt {attempt}/{max_r} — hint: {hint[:120]}",
+                    node=node,
+                )
+                return {
+                    "plan": [
+                        {**p, "status": "blocked"} if i == state["current_idx"] else p
+                        for i, p in enumerate(state["plan"])
+                    ],
+                    "current_idx":            state["current_idx"],
+                    "next_step":              "generator",
+                    "manifest":               new_manifest,
+                    "retry_counts":           rc,
+                    "diagnostic_mode":        False,
+                    "diagnostic_code":        None,
+                    "diagnostic_observation": None,
+                    "messages": [AIMessage(content=(
+                        f"<STATUS:blocked>\n[validator] {result.reason} "
+                        f"— attempt {attempt}/{max_r}, applying: {hint}"
+                    ))],
+                }
+
+            # retries exhausted → observer for LLM judgment
+            self._log(
+                "VALIDATOR EXHAUSTED",
+                body=f"{max_r} retries used, passing to observer",
+                node=node,
+            )
+            return {"next_step": "observer", "retry_counts": rc}
+
         def _observer(self, state: AgentState) -> AgentState:
             node = "observer"
             step = state["plan"][state["current_idx"]]
@@ -2046,6 +2188,47 @@ class BioAgent:
             ]
             resp = self._llm_invoke(node, "final_report", msgs)
             self._log("EXIT NODE", body="final report generated", node=node)
+
+            # ── Phase 4: persist run memory ──────────────────────────────────
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+                from datetime import datetime as _dt
+
+                _mem_dir = _Path.home() / ".genomeer"
+                _mem_dir.mkdir(parents=True, exist_ok=True)
+                _mem_file = _mem_dir / "runs_memory.jsonl"
+
+                _plan = state.get("plan") or []
+                _scores = {
+                    obs["title"]: obs.get("score", -1.0)
+                    for obs in observations
+                    if "score" in obs
+                }
+                _winning_params = {
+                    obs["title"]: obs.get("summary", "")
+                    for obs in observations
+                    if obs.get("status") == "done"
+                }
+                _task_type = self._infer_task_type(state.get("last_prompt") or "")
+
+                _record = {
+                    "ts":           _dt.utcnow().isoformat(),
+                    "run_id":       run_id,
+                    "task_type":    _task_type,
+                    "user_goal":    (state.get("last_prompt") or "")[:300],
+                    "plan":         [{"title": s["title"], "status": s.get("status")} for s in _plan],
+                    "scores":       _scores,
+                    "winning_params": _winning_params,
+                    "done_count":   sum(1 for s in _plan if s.get("status") == "done"),
+                    "total_steps":  len(_plan),
+                }
+                with open(_mem_file, "a", encoding="utf-8") as _fh:
+                    _fh.write(_json.dumps(_record) + "\n")
+                self._log("MEMORY WRITE", body=f"appended to {_mem_file}", node=node)
+            except Exception as _me:
+                self._log("MEMORY WRITE ERROR", body=str(_me), node=node)
+
             return {
                 "manifest": manifest,
                 "next_step": "end",
@@ -2062,6 +2245,7 @@ class BioAgent:
         self.generator = types.MethodType(_generator, self)
         self.ensure_env = types.MethodType(_ensure_env, self)
         self.executor = types.MethodType(_executor, self)
+        self.validator = types.MethodType(_validator, self)
         self.observer = types.MethodType(_observer, self)
         self.diagnostics = types.MethodType(_diagnostics, self)
         self.finalizer = types.MethodType(_finalizer, self)
@@ -2076,6 +2260,7 @@ class BioAgent:
         workflow.add_node("generator", self.generator)
         workflow.add_node("ensure_env", self.ensure_env)
         workflow.add_node("executor", self.executor)
+        workflow.add_node("validator", self.validator)
         workflow.add_node("observer", self.observer)
         workflow.add_node("diagnostics", self.diagnostics)
         workflow.add_node("finalizer", self.finalizer)
@@ -2132,7 +2317,16 @@ class BioAgent:
             "executor",
             lambda s: s["next_step"],
             {
-                "observer": "observer",
+                "validator": "validator",
+            },
+        )
+        workflow.add_conditional_edges(
+            "validator",
+            lambda s: s["next_step"],
+            {
+                "observer":     "observer",
+                "orchestrator": "orchestrator",
+                "generator":    "generator",
             },
         )
         workflow.add_conditional_edges(
@@ -2182,6 +2376,77 @@ class BioAgent:
             except Exception as e:
                 self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
         return staged_rel
+
+    @staticmethod
+    @staticmethod
+    def _infer_task_type(prompt: str) -> str:
+        """Map a user prompt to a coarse task category for runs_memory indexing."""
+        p = prompt.lower()
+        if any(k in p for k in ("metagenom", "binning", "bin", "kraken", "assembly", "assemble")):
+            return "metagenomics"
+        if any(k in p for k in ("rnaseq", "rna-seq", "deseq", "differential expression", "transcriptom")):
+            return "rnaseq"
+        if any(k in p for k in ("variant", "snp", "snv", "gatk", "vcf", "mutation")):
+            return "variant_calling"
+        if any(k in p for k in ("chip-seq", "chipseq", "atac", "peak")):
+            return "epigenomics"
+        if any(k in p for k in ("16s", "amplicon", "qiime", "otu", "asv")):
+            return "amplicon"
+        return "general"
+
+    def _load_past_templates(self, prompt: str, max_records: int = 5) -> str:
+        """
+        Phase 4 — load the last N successful runs of the same task_type from
+        ~/.genomeer/runs_memory.jsonl and return a formatted string to inject
+        into the planner prompt.
+
+        Returns an empty string if the file doesn't exist or has no matches.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        mem_file = _Path.home() / ".genomeer" / "runs_memory.jsonl"
+        if not mem_file.exists():
+            return ""
+
+        task_type = self._infer_task_type(prompt)
+        matching = []
+        try:
+            with open(mem_file, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("task_type") == task_type and rec.get("done_count", 0) > 0:
+                        matching.append(rec)
+        except Exception:
+            return ""
+
+        if not matching:
+            return ""
+
+        # Keep the most recent N records
+        recent = matching[-max_records:]
+
+        lines = [
+            "\n\n---\nPAST SUCCESSFUL RUNS (use as reference templates, do not copy blindly):",
+        ]
+        for i, rec in enumerate(recent, 1):
+            steps = " → ".join(s["title"] for s in rec.get("plan", []))
+            scores_str = ", ".join(
+                f"{k}: {v:.2f}" for k, v in rec.get("scores", {}).items() if v >= 0
+            )
+            lines.append(
+                f"\n[Run {i}] goal: {rec.get('user_goal','')[:120]}\n"
+                f"  steps: {steps}\n"
+                f"  scores: {scores_str or 'n/a'}"
+            )
+        lines.append("---\n")
+        return "\n".join(lines)
 
     @staticmethod
     def _clean_manifest(manifest: dict) -> dict:
