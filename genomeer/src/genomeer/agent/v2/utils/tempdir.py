@@ -1,46 +1,47 @@
 import os, tempfile, shutil, uuid, atexit, threading
 from contextlib import contextmanager
 
-# TODO:
-# ------------------------------------------------------------------
-# - [x] Create temp home directory for each run
-# - [x] Persist the directory accross call for the same session
-# - [x] Copy/move the artifacts to a persistent location (or object 
-#       storage) and generate download URLs. -- via artifact_servive helper
-# - [x] Clean up the temp dir
-# ------------------------------------------------------------------
-
 BASE_TMP = os.environ.get("BIOAGENT_TMP_DIR", tempfile.gettempdir())
-# Set BIOAGENT_KEEP_RUNS=1 to preserve temp dirs for debugging
-KEEP_RUNS = os.environ.get("BIOAGENT_KEEP_RUNS", "0").strip() not in ("", "0", "false", "False")
 
-_CLEANUP_REGISTRY = set()
-_REGISTRY_LOCK = threading.Lock()
+# Module-level registry of active temp dirs.
+# A single atexit handler iterates it instead of one handler per run_workdir call,
+# preventing handler accumulation on long-running servers (BUG-52).
+_active_dirs: dict[str, bool] = {}   # path -> cleaned flag
+_dirs_lock = threading.Lock()
+_atexit_registered = False
 
-def _global_cleanup():
-    """BUG-52: Single atexit handler for all registered temp dirs."""
-    with _REGISTRY_LOCK:
-        for p in list(_CLEANUP_REGISTRY):
-            if os.path.isdir(p):
-                shutil.rmtree(p, ignore_errors=True)
-        _CLEANUP_REGISTRY.clear()
 
-atexit.register(_global_cleanup)
+def _cleanup_all():
+    with _dirs_lock:
+        paths = list(_active_dirs.keys())
+    for path in paths:
+        with _dirs_lock:
+            if _active_dirs.get(path):
+                continue
+            _active_dirs[path] = True
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+
 
 @contextmanager
 def run_workdir(prefix: str = "run", session_id: str | None = None):
+    global _atexit_registered
     run_id = session_id or str(uuid.uuid4())
     path = os.path.join(BASE_TMP, f"{prefix}-{run_id}")
+    os.makedirs(path, exist_ok=True)
 
-    with _REGISTRY_LOCK:
-        os.makedirs(path, exist_ok=True)
-        _CLEANUP_REGISTRY.add(path)
+    with _dirs_lock:
+        _active_dirs[path] = False
+        if not _atexit_registered:
+            atexit.register(_cleanup_all)
+            _atexit_registered = True
 
     try:
         yield path
     finally:
-        if not KEEP_RUNS:
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            with _REGISTRY_LOCK:
-                _CLEANUP_REGISTRY.discard(path)
+        # DEBUG: keep dirs for dev; flip to True to enable immediate cleanup.
+        # with _dirs_lock:
+        #     _active_dirs[path] = True
+        # if os.path.isdir(path):
+        #     shutil.rmtree(path, ignore_errors=True)
+        pass

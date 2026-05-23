@@ -2,7 +2,7 @@
 # LIBRARY
 # -----------------------------------------------
 from pathlib import Path
-import glob, inspect, os, re, threading, time, types, traceback, warnings
+import glob, inspect, os, re, threading, types, traceback
 from collections.abc import Generator
 from typing import Any, List, Dict
 from typing_extensions import TypedDict, Literal, Annotated
@@ -14,29 +14,6 @@ from langgraph.graph.message import add_messages
 from langgraph.graph import END, START, StateGraph
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage 
 from langgraph.checkpoint.memory import MemorySaver
-
-import hashlib
-import json as _json_cache
-from genomeer.utils.metrics import RunMetrics
-
-
-from genomeer.agent.v2.utils.cache import get_cache
-
-from genomeer.agent.v2.utils.structured_output import RobustLLMParser, patch_state_graph_helper
-from genomeer.agent.v2.utils.state_graph import StateGraphHelper
-patch_state_graph_helper(StateGraphHelper)   # active le parser robuste globalement
-_robust_parser = RobustLLMParser(strict_validation=True)
-
-
-_NOCACHE_LLM_NODES = {"planner"}
-
-# ── AXE 2.3: SqliteSaver for cross-session persistence ──
-try:
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    import sqlite3
-    _SQLITE_OK = True
-except ImportError:
-    _SQLITE_OK = False
 
 from genomeer.config import settings
 from genomeer.tools.software.resources import data_lake_dict, library_content_dict, runtime_envs_dicts
@@ -57,36 +34,15 @@ from genomeer.tools.registry import ToolRegistry
 from genomeer.utils.stream.shared import REGISTRY
 from genomeer.agent.v2.utils import instructions
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
-from genomeer.agent.v2.utils.quality_gate import check_quality, format_quality_message  # GAP4 fix
-from genomeer.utils.version_tracker import VersionTracker
-from genomeer.runtime.env_resolver import resolve_env_for_code
 from genomeer.model.feedback import FeedbackParser
-# ── AXE 3.3: Intelligent output parsers ──
-try:
-    from genomeer.tools.parsers import parse_tool_output as _smart_parse_output
-    _PARSERS_OK = True
-except ImportError:
-    _PARSERS_OK = False
-    def _smart_parse_output(tool, stdout, result=None, output_dir=None):
-        return stdout[:2000] if stdout else ""
-# ── AXE 2.1: Template Library ──
-try:
-    from genomeer.memory.template_library import TemplateLibrary as _TemplateLibrary
-    _TEMPLATE_LIB = _TemplateLibrary()
-    _TEMPLATE_OK = True
-except Exception:
-    _TEMPLATE_OK = False
-    _TEMPLATE_LIB = None
 
 # -----------------------------------------------
 # UTILS
 # -----------------------------------------------
-
 dotenv_path = find_dotenv()
 if dotenv_path:
     load_dotenv(dotenv_path, override=False)
-    import logging
-    logging.getLogger(__name__).info(f"Loaded environment variables from {dotenv_path}")
+    print(f"Loaded environment variables from {dotenv_path}")
 
 from genomeer.agent.v2.utils.tempdir import run_workdir
 
@@ -94,7 +50,6 @@ class Step(TypedDict):
     title: str
     status: Literal["todo","done","blocked"]
     notes: str
-    phase: int | None
     
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages] # List[BaseMessage]
@@ -102,7 +57,6 @@ class AgentState(TypedDict):
         "qa",
         "planner",
         "orchestrator",
-        "batch_orchestrator",
         "input_guard",
         "generator",
         "ensure_env",
@@ -127,107 +81,6 @@ class AgentState(TypedDict):
     diagnostic_mode: bool
     diagnostic_code: str | None
     diagnostic_observation: str | None
-    # ── Phase 2: multi-sample / batch support ──────────────────────────────
-    batch_mode: bool | None
-    batch_strategy: Literal["independent", "coassembly"] | None
-    sample_manifest: List[Dict[str, Any]] | None  # [{id, r1, r2, metadata}]
-    current_sample_idx: int | None
-    current_sample_id: str | None
-    per_sample_results: Dict[str, Any] | None     # {sample_id: {step_results}}
-    # ── Run metadata ───────────────────────────────────────────────────────
-    run_started_at: float | None          # epoch time of run start (T6.3 global timeout guard)
-    session_id: str | None                # LangGraph thread_id / CheckpointManager key
-
-    
-    # ---------------------------------------------------------------------------
-# METAGENOMICS ENV AUTO-DETECTION
-# ---------------------------------------------------------------------------
- 
-# CLI tools that require meta-env1
-from genomeer.runtime.env_resolver import META_ENV_SIGNALS as _META_ENV_BINS
- 
-# Adaptive timeouts for heavy metagenomics steps (seconds)
-_HEAVY_STEPS = {
-    "assembly": 21600,      # 6h — metaSPAdes / MEGAHIT
-    "assembl":  21600,
-    "metaspades": 21600,
-    "megahit":  14400,
-    "flye":     21600,
-    "assemble": 21600,
-    "binning":  7200,       # 2h — MetaBAT2
-    "metabat":  7200,
-    "das_tool": 7200,
-    "checkm":   3600,       # 1h
-    "gtdbtk":   10800,      # 3h
-    "humann":   10800,
-    "diamond":  7200,
-    "hmmer":    3600,
-    "download": 3600,       # 1h — large DB downloads
-    "kraken2":  1800,       # 30min
-    "metaphlan":1800,
-    "annotation": 3600,
-    "annotate": 3600,
-    "prokka":   3600,
-}
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Adaptive retry escalation
-# When a step keeps failing, suggest a different strategy instead of retrying
-# the exact same approach. Format: {keyword_in_step_title: {retry_n: hint}}
-# ---------------------------------------------------------------------------
-RETRY_ESCALATION: Dict[str, Dict[int, str]] = {
-    "metaspades": {
-        2: "[ESCALATION] metaSPAdes failed twice. Try MEGAHIT (lower RAM): run_megahit() instead.",
-        3: "[ESCALATION] Both assemblers failed. Subsample reads to 20% and retry: seqtk sample -s 42 reads.fq 0.2",
-    },
-    "megahit": {
-        2: "[ESCALATION] MEGAHIT failed. Try with fewer threads (--num-cpu-threads 4) or more memory.",
-        3: "[ESCALATION] Assembly failed 3 times. Check read quality with FastQC before retrying.",
-    },
-    "kraken2": {
-        2: "[ESCALATION] Kraken2 classification very low. Try --confidence 0.05 or switch to MetaPhlAn4: run_metaphlan4().",
-        3: "[ESCALATION] Taxonomic classification failed. The database may be incompatible; try run_bracken() re-estimation on existing output.",
-    },
-    "metabat": {
-        2: "[ESCALATION] MetaBAT2 produced 0 bins. Increase min-contig to 2500bp and ensure coverage file is correct.",
-        3: "[ESCALATION] Binning failed repeatedly. Check coverage depth — must be >5X for reliable bins.",
-    },
-    "binning": {
-        2: "[ESCALATION] Binning failed. Verify that jgi_summarize_bam_contig_depths was run and produced a valid depth file.",
-        3: "[ESCALATION] Binning failed 3 times. Run DAS_Tool with existing bins from any previous partial runs.",
-    },
-    "checkm": {
-        2: "[ESCALATION] CheckM2 failed. Ensure the database was downloaded: checkm2 database --download.",
-        3: "[ESCALATION] Quality assessment failed. Try CheckM1 lineage_wf as fallback.",
-    },
-    "gtdbtk": {
-        2: "[ESCALATION] GTDB-Tk failed. Check GTDBTK_DATA_PATH env var; database may not be downloaded.",
-        3: "[ESCALATION] Taxonomy classification failed. Use NCBI lineage as fallback via run_ncbi_taxonomy().",
-    },
-    "humann": {
-        2: "[ESCALATION] HUMAnN3 failed. Try with --bypass-nucleotide-index and --metaphlan-options '--index latest'.",
-        3: "[ESCALATION] Functional profiling failed. Use KEGG annotation via run_diamond() + KEGG DB as fallback.",
-    },
-    "prokka": {
-        2: "[ESCALATION] Prokka annotation failed. Try --compliant flag or check if contigs have non-standard characters.",
-        3: "[ESCALATION] Prokka failed 3 times. Use Prodigal gene prediction as partial fallback: run_prodigal().",
-    },
-    "diamond": {
-        2: "[ESCALATION] DIAMOND failed. Try --more-sensitive flag or reduce --threads.",
-        3: "[ESCALATION] DIAMOND failed 3 times. Ensure database is compiled for this DIAMOND version: diamond makedb.",
-    },
-}
- 
-
- 
- # FIX G5: resolve_env_for_code is already imported from genomeer.runtime.env_resolver (line 46)
- # The local re-definition below was silently masking that import — REMOVED.
- # Use the canonical version from env_resolver.py going forward.
- 
-    
-    
-    
     
     
 # -----------------------------------------------
@@ -279,7 +132,7 @@ class BioAgent:
 
         # display configuration in a nice, readable format
         print("\n" + "=" * 50)
-        print("BioAgent_v2 CONFIGURATION")
+        print("BioAgent_v1 CONFIGURATION")
         print("=" * 50)
 
         # get the actual LLM values that will be used by the agent
@@ -295,7 +148,7 @@ class BioAgent:
 
         # show agent-specific LLM if different from default
         if agent_llm != settings.llm or agent_source != settings.source:
-            print("\n AGENT LLM (Constructor Override):")
+            print("\n🤖 AGENT LLM (Constructor Override):")
             print(f"  LLM Model: {agent_llm}")
             if agent_source is not None:
                 print(f"  Source: {agent_source}")
@@ -308,11 +161,6 @@ class BioAgent:
 
         # [helper] to import tools-mapper, llm
         self.path = os.path.join(path, "bioagent_data")
-
-        # ISSUE-27: VersionTracker was instantiated here AND again after configure().
-        # The second assignment silently discarded the first instance.
-        # Removed the premature first instantiation; the definitive one is below.
-
         self.module2api = read_module2api()
         self.llm = get_llm(
             llm,
@@ -332,8 +180,6 @@ class BioAgent:
         self._install_iters = {}
         self.log_registry = REGISTRY
         self._install_threads = {}
-        self._install_threads_lock = threading.Lock()
-        self._install_iters_lock = threading.Lock()    # LOCK for self._install_iters
         
         # Interaction mode
         self.interaction_mode = interaction_mode
@@ -342,70 +188,19 @@ class BioAgent:
         self.timeout_seconds = timeout_seconds
         self.configure()
         
-        # FIX B3: use system temp dir instead of CWD to avoid permission errors and workspace pollution
-        import tempfile as _tf
-        _debug_log_path = os.path.join(_tf.gettempdir(), "genomeer_agent_debug.log")
-        self._set_debug_log(_debug_log_path)
+        # [DEV-ONLY] logs
+        # self._set_debug_log("/home/biolab-office-1/DATALAB/2025/Genomeer/genomeer/src/genomeer/agent/v2/agent_debug.log")
+        self._set_debug_log("./agent_debug.log")
         
         # CONSTANTS
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics
         self.MAX_DIAG_ROUNDS_PER_STEP = 2  # how many times we allow re-entering diagnostics for the same step
-        self.MAX_TOTAL_RUN_SECONDS = int(os.environ.get("GENOMEER_MAX_RUN_SECONDS", str(4 * 3600)))  # 4h global cap
         
         # Artifact server
         self.artifacts_base_url = os.getenv("PUBLIC_ARTIFACTS_URL", "http://localhost:8910/api/v1/artifacts")
         if auto_start_artifacts:
             self._start_artifacts_server_in_bg(host=artifacts_host, port=artifacts_port, prefix=artifacts_prefix)
 
-        # BIO RAG
-        from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever
-        self.bio_rag_store = BioRAGStore(persist_dir=str(Path(self.path) / ".genomeer_rag_cache"))
-        
-        self._bio_rag_status = "offline" if os.environ.get("GENOMEER_RAG_OFFLINE", "0") == "1" else "building"
-        
-        def _build_rag():
-            # BUG-06: both online and offline builds now run in a background daemon
-            # thread.  Previously the offline path ran synchronously in __init__,
-            # blocking agent creation for up to 2 minutes.  Offline mode reads only
-            # from the persisted FAISS cache (no network), so it is still fast, but
-            # there is no reason to block __init__ for it.
-            try:
-                self.bio_rag_store.build(sources=["card", "kegg_pathways", "quality_thresholds"])
-                if self.bio_rag_store.ready:
-                    self._bio_rag_status = "ready"
-                else:
-                    self._bio_rag_status = "partial"
-            except Exception as e:
-                self._log("BIORAG THREAD", f"Failed to build BioRAG: {e}", type="file")
-                self._bio_rag_status = "offline"
-
-        self._rag_build_thread = threading.Thread(
-            target=_build_rag,
-            daemon=True,
-            name="bio-rag-builder",
-        )
-        self._rag_build_thread.start()
-        _mode_label = "offline (cache-only)" if self._bio_rag_status == "offline" else "online"
-        self._log("BIO RAG", body=f"Index build started in background [{_mode_label}]", node="init")
-            
-        self.bio_retriever = BioRAGRetriever(self.bio_rag_store)
-
-        # ── CACHE MULTI-COUCHE ──────────────────────────────────────────────────
-        self._cache = get_cache()
-        self._log("CACHE", body=f"Cache dir: {self._cache.cache_dir}", node="init")
-
-        # ── VERSION TRACKING ────────────────────────────────────────────────────
-        self._version_tracker = VersionTracker()
-
-        # BUG-35: custom functions registered by the user at runtime.
-        # Protected by a lock so that batch threads reading the dict while a
-        # new function is being registered never see a partially-written state.
-        self._custom_functions: dict = {}
-        self._custom_functions_lock = threading.Lock()
-
-    @property
-    def bio_rag_status(self) -> str:
-        return getattr(self, "_bio_rag_status", "offline")
 
     # LOGS UTILS [DEV-ONLY]
     def _set_debug_log(self, path: str | None = None):
@@ -414,122 +209,6 @@ class BioAgent:
         os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
         with open(self.debug_log_path, "w", encoding="utf-8") as f:
             f.write("\n===== NEW SESSION =====\n")
-        
-        # A5: use thread-safe queue instead of blocking list+lock
-        import queue
-        self._log_queue = queue.Queue()
-        
-        def _log_worker():
-            while True:
-                item = self._log_queue.get()
-                if item is None: break
-                lines = [item]
-                while not self._log_queue.empty():
-                    try: lines.append(self._log_queue.get_nowait())
-                    except queue.Empty: break
-                if lines:
-                    with open(self.debug_log_path, "a", encoding="utf-8") as f:
-                        f.writelines(lines)
-        
-        if not hasattr(self, "_log_thread") or not self._log_thread.is_alive():
-            self._log_thread = threading.Thread(target=_log_worker, daemon=True, name="log_worker")
-            self._log_thread.start()
-
-    def _slim_manifest(self, manifest: dict, node: str) -> dict:
-        if node in ("observer", "generator", "diagnostics"):
-            out = {
-                "input_state":      manifest.get("input_state"),
-                "timeout_seconds":  manifest.get("timeout_seconds"),
-                "retry_count":      manifest.get("retry_count"),
-                "quality_signals":  manifest.get("quality_signals"),
-                "repair_feedback":  manifest.get("repair_feedback"),
-            }
-            if node == "generator":
-                out["diagnostics_rounds"] = manifest.get("diagnostics_rounds")
-                out["file_registry"] = manifest.get("file_registry")
-            return out
-        if node == "finalizer":
-            return {
-                "quality_signals":      manifest.get("quality_signals"),
-                "amr_genes_detected":   manifest.get("amr_genes_detected"),
-                "top_pathways":         manifest.get("top_pathways"),
-                "observations":         manifest.get("observations"),
-            }
-        return manifest
-
-    def _extract_tools_from_code(self, code: str) -> List[str]:
-        """TÂCHE 11: Extrait les wrappers métagénomiques réellement appelés dans le code."""
-        if not code:
-            return []
-        
-        # Liste des wrappers Genomeer connus (run_*)
-        KNOWN_WRAPPERS = {
-            "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
-            "run_metaspades", "run_megahit", "run_flye", "run_host_decontamination",
-            "compute_coverage_samtools", "run_metabat2", "run_checkm2",
-            "run_bracken", "run_gtdbtk", "run_das_tool", "run_medaka",
-            "run_virsorter2", "run_checkv", "run_prokka", "run_bakta",
-            "run_prodigal", "run_diamond", "run_hmmer", "run_antismash",
-            "run_deepbgc", "run_vibrant", "run_pharokka", "run_rgi",
-            "run_amrfinder", "run_abricate", "run_mob_suite", "run_plasmidfinder",
-            "run_seqtk", "run_samtools", "run_minimap2", "run_bowtie2",
-            "run_humann", "run_strainphlan", "run_metaspades_hyb" # Added missing
-        }
-        
-        found = []
-        import re
-        for tool in KNOWN_WRAPPERS:
-            if re.search(rf"\b{tool}\b", code):
-                found.append(tool)
-        return sorted(found)
-
-    def _trim_messages(self, messages: list, keep_first: int = 1, keep_last: int = 30) -> list:
-        """
-        P3-A: Trim messages to prevent context explosion on long runs.
-        Returns a list of RemoveMessage objects.
-        Note (Fix B8): In LangGraph, returning `{"messages": trim_msgs + new_msgs}` 
-        where `trim_msgs` contains RemoveMessage objects will delete those IDs from state 
-        and then append new_msgs. If empty, it just appends new_msgs without deletion.
-        """
-        import os
-        keep_last = int(os.environ.get("GENOMEER_MAX_MESSAGES", str(keep_last)))
-        
-        if len(messages) <= keep_first + keep_last:
-            return []
-            
-        first_msgs = messages[:keep_first]
-        remaining_msgs = messages[keep_first:]
-        
-        cutoff_idx = max(0, len(remaining_msgs) - keep_last)
-        older_msgs = remaining_msgs[:cutoff_idx]
-        
-        # Priority 3: Do not delete AIMessages with <observe> tags containing biological metrics
-        important_older_ids = set()
-        for m in older_msgs:
-            if hasattr(m, 'content') and getattr(m, 'type', '') == 'ai':
-                if '<observe>' in m.content:
-                    lower_content = m.content.lower()
-                    if any(kw in lower_content for kw in ('n50', 'q30', 'contig', 'classified', 'genes', 'quality', 'metric', 'rate', 'reads')):
-                        important_older_ids.add(getattr(m, 'id', None) or str(id(m)))
-        
-        try:
-            from langchain_core.messages import RemoveMessage
-        except ImportError:
-            return []
-            
-        to_remove = []
-        for m in older_msgs:
-            m_id = getattr(m, 'id', None)
-            if not m_id:
-                # LangGraph usually assigns an ID. If missing, we use Python's id() as fallback.
-                # However, RemoveMessage might fail to match if the state doesn't track this ID.
-                self._log("TRIM MESSAGES", body=f"Warning: Message of type {getattr(m, 'type', 'unknown')} has no ID. Using id(m) fallback.", node="system")
-                m_id = str(id(m))
-                
-            if m_id and m_id not in important_older_ids:
-                to_remove.append(RemoveMessage(id=m_id))
-                
-        return to_remove
 
     def _log(self, title: str, body: str = "", node: str | None = None, type: str = 'file'):
         """Append a structured block to the debug log."""
@@ -538,14 +217,10 @@ class BioAgent:
             line += "\n" + (">"*60)
         line += f"\n[{node or '-'}] {title}\n{body}\n" + ("-"*60) + "\n"
         if type == 'file':
-            if hasattr(self, "_log_queue"):
-                self._log_queue.put(line)
+            with open(getattr(self, "debug_log_path", os.path.abspath("./bioagent_debug.log")), "a", encoding="utf-8") as f:
+                f.write(line)
         elif type == 'stdout':
             print(line)
-
-    def _flush_log(self):
-        # Deprecated: _log_worker now flushes continuously
-        pass
 
     def _fmt_msgs(self, msgs):
         """Pretty format a LangChain message list for logging."""
@@ -556,129 +231,43 @@ class BioAgent:
             parts.append(f"--- {role.upper()} ---\n{content}")
         return "\n".join(parts)
 
+    
     # SYSTEM SETUP
     def _llm_invoke(self, node: str, purpose: str, msgs, verbose=True):
         """
-        Central LLM call with cache layer and exponential backoff.
-        Cache skipped for: planner, orchestrator, finalizer (non-deterministic nodes).
+        Central LLM call with exponential backoff retry.
+        Retries on transient errors (429, 503, connection issues) up to 4 attempts.
         """
-        # ── Cache lookup ────────────────────────────────────────────────────
-        _cache_eligible = node not in _NOCACHE_LLM_NODES
-        
-        sys_msg  = next((getattr(m, "content", "") for m in msgs if getattr(m, "type", "") == "system"), "")
-        user_msg = next((getattr(m, "content", "") for m in reversed(msgs) if getattr(m, "type", "") == "human"), "")
-        model_name = str(getattr(self.llm, "model_name", self.llm.__class__.__name__))
-        
-        # BUG-20: Normalize prompt to exclude session-specific paths/IDs from cache key
-        import re
-        def _norm(txt: str) -> str:
-            if not txt: return ""
-            # UUIDs and session IDs
-            txt = re.sub(r'[a-f0-9-]{36}', 'UUID', txt)
-            txt = re.sub(r'[a-f0-9]{32}', 'SESSION-ID', txt)
-            # Temporary paths
-            if state_dir := os.environ.get("RUN_TEMP_DIR"):
-                txt = txt.replace(state_dir, "/tmp/bioagent")
-            # Runtime env home
-            if env_home := os.environ.get("BIOAGENT_RUNTIME_ENV_HOME"):
-                txt = txt.replace(env_home, "/envs")
-            return txt
-
-        norm_sys_msg  = _norm(sys_msg)
-        norm_user_msg = _norm(user_msg)
-        cache_key = self._cache.llm.make_key(model_name, norm_sys_msg, norm_user_msg)
-
-        if _cache_eligible:
-            cached = self._cache.llm.get(cache_key, node=node)
-            if cached:
-                self._log(f"LLM CACHE HIT ({purpose})", cached[:200], node=node)
-                from langchain_core.messages import AIMessage as _AIMsg
-                if hasattr(self, "_metrics") and self._metrics:
-                    self._metrics.record_llm_call(cache_hit=True)
-                return _AIMsg(content=cached)
-        else:
-            self._log(f"LLM CACHE SKIP ({purpose})", body=f"node={node} is non-deterministic", node=node)
-        # ── End cache lookup ────────────────────────────────────────────────
-
+        import time
         if verbose:
             prompt_txt = self._fmt_msgs(msgs)
             self._log(f"LLM REQUEST ({purpose})", prompt_txt, node=node)
 
-        # BUG-39: Exponential Backoff for LLM calls (429, 503, timeouts)
-        resp = None
-        max_retries = 5
-        for i in range(max_retries):
+        max_attempts = 4
+        base_delay = 2.0
+        last_exc = None
+        for attempt in range(max_attempts):
             try:
                 resp = self.llm.invoke(msgs)
-                break
-            except Exception as e:
-                if i == max_retries - 1: raise
-                wait = (2 ** i) + (0.1 * i)
-                self._log("LLM RETRY", body=f"Retry {i+1}/{max_retries} after {wait}s due to: {e}", node=node)
-                time.sleep(wait)
-
-        content = getattr(resp, "content", str(resp))
-
-        if verbose:
-            self._log(f"LLM RESPONSE ({purpose})", content, node=node)
-
-        # ── Cache save (skips planner/orchestrator/finalizer automatiquement) ──
-        if _cache_eligible:
-            self._cache.llm.set(cache_key, content, model=model_name, node=node)
-
-        if hasattr(self, "_metrics") and self._metrics:
-            self._metrics.record_llm_call(cache_hit=False)
-
-        return resp
+                if verbose:
+                    self._log(f"LLM RESPONSE ({purpose})", getattr(resp, "content", str(resp)), node=node)
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc).lower()
+                # Retry on rate-limit, server errors, and transient connection issues
+                retryable = any(k in err_str for k in (
+                    "429", "503", "502", "rate limit", "too many requests",
+                    "connection", "timeout", "temporarily unavailable",
+                ))
+                if not retryable or attempt == max_attempts - 1:
+                    self._log(f"LLM ERROR ({purpose})", f"attempt={attempt+1} non-retryable: {exc}", node=node)
+                    raise
+                delay = base_delay * (2 ** attempt)
+                self._log(f"LLM RETRY ({purpose})", f"attempt={attempt+1} retrying in {delay:.1f}s: {exc}", node=node)
+                time.sleep(delay)
+        raise last_exc
     
-    def _route_blocked_step(self, state, rc, diag_rounds, summary, step, new_manifest, node="observer"):
-        """Unified routing for blocked steps. Handles retry counts, escalation hints, and the diag_rounds cap (T1.2/P1-C)."""
-        rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
-        _MAX_PER_STEP = int(os.environ.get("GENOMEER_MAX_RETRIES_PER_STEP", "10"))
-        if rc[state["current_idx"]] >= _MAX_PER_STEP:
-            logger.warning(f"[BioAgent] Step {state['current_idx']} hit per-step retry cap ({_MAX_PER_STEP}); routing to diagnostics")
-            return {"next_step": "diagnostics", "messages": []}
-        current_retry = rc[state["current_idx"]]
-        new_manifest["retry_count"] = current_retry
-        new_manifest["repair_step_idx"] = state["current_idx"]
-
-        # Phase 3: Adaptive escalation hint
-        step_title_lower = step["title"].lower()
-        escalation_hint = ""
-        for keyword, hints in RETRY_ESCALATION.items():
-            if keyword in step_title_lower:
-                escalation_hint = hints.get(current_retry, "")
-                if not escalation_hint and current_retry >= max(hints.keys()):
-                    escalation_hint = hints[max(hints.keys())]
-                break
-        
-        if escalation_hint:
-            new_manifest["repair_feedback"] = f"{summary}\n\n{escalation_hint}"
-            self._log("ESCALATION HINT", body=escalation_hint, node=node)
-        else:
-            new_manifest["repair_feedback"] = summary
-
-        # T1.2 / P1-C: Check diag_rounds cap BEFORE routing to diagnostics
-        _diag_count = diag_rounds.get(state["current_idx"], 0)
-        if current_retry > self.MAX_STEP_RETRIES and _diag_count >= self.MAX_DIAG_ROUNDS_PER_STEP:
-            self._log(
-                "DIAG ROUNDS CAP",
-                body=f"step_idx={state['current_idx']} diag_rounds={_diag_count} >= cap={self.MAX_DIAG_ROUNDS_PER_STEP}. Escalating to QA.",
-                node=node,
-            )
-            new_manifest["route_hint"] = "finalize"
-            new_manifest["qa_payload"] = (
-                f"Step '{step['title']}' failed after {current_retry} retries "
-                f"and {_diag_count} diagnostic rounds. Last error:\n{summary}\n\n"
-                "The pipeline cannot continue automatically. Please review the logs and try a different approach."
-            )
-            return "qa"
-        elif current_retry > self.MAX_STEP_RETRIES:
-            return "diagnostics"
-        else:
-            return "generator"
-
-
     def _generate_system_prompt(
         self,
         tool_desc,
@@ -915,6 +504,12 @@ class BioAgent:
             self_critic: Whether to enable self-critic mode
             test_time_scale_round: Number of rounds for test time scaling
         """
+        import shutil as _shutil
+        from genomeer.model.retriever import _CLI_TOOL_BINARIES
+        _missing = [exe for exe in _CLI_TOOL_BINARIES.values() if not _shutil.which(exe)]
+        _present = [exe for exe in _CLI_TOOL_BINARIES.values() if _shutil.which(exe)]
+        self._log("ENV SCAN", body=f"CLI tools available: {_present}\nCLI tools ABSENT (filtered from registry): {_missing}", node="configure")
+
         self.self_critic = self_critic
         data_lake_path = self.path + "/data_lake"
         data_lake_content = glob.glob(data_lake_path + "/*")
@@ -975,27 +570,6 @@ class BioAgent:
             custom_data=custom_data if custom_data else None,
             custom_software=custom_software if custom_software else None,
         )
-
-        # ── Phase 1: Build FAISS semantic index (once, sub-ms per query after this) ──
-        if self.use_tool_retriever and hasattr(self, "retriever"):
-            # Build flat tool list from module2api for the retriever
-            all_tools = []
-            for module_path, api_list in self.module2api.items():
-                for entry in api_list:
-                    if isinstance(entry, dict):
-                        all_tools.append(entry)
-                    elif isinstance(entry, str):
-                        all_tools.append({"name": entry, "description": "", "module": module_path})
-            # Library list
-            all_libs = [
-                {"name": k, "description": v if isinstance(v, str) else str(v)}
-                for k, v in self.library_content_dict.items()
-            ]
-            try:
-                self.retriever.build_index(all_tools, data_lake_with_desc, all_libs)
-                self._log("FAISS INDEX", body=f"Built index: {len(all_tools)} tools, {len(data_lake_with_desc)} data items, {len(all_libs)} libs", node="configure")
-            except Exception as e:
-                self._log("FAISS INDEX (warn)", body=f"Index build failed (fallback to LLM): {e}", node="configure")
         
         
         # Define the nodes(functions)
@@ -1006,47 +580,30 @@ class BioAgent:
 
             # ------ RESUME FAST-PATH ------
             manifest = state.get("manifest") or {}
-
-            # Si le plan existe déjà et des steps sont en cours, ne pas re-planifier
-            existing_plan = state.get("plan", [])
-            todo_steps = [s for s in existing_plan if s.get("status") == "todo"]
-            if existing_plan and todo_steps and not manifest.get("route_hint"):
-                self._log("PLANNER SKIP", body=f"Plan already exists with {len(todo_steps)} pending steps. Routing directly to orchestrator.", node=node)
-                return {
-                    "next_step": "orchestrator",
-                    "messages": [AIMessage(content=f"<observe>Resuming existing plan ({len(todo_steps)} steps remaining).</observe>")],
-                }
-
             if manifest.get("route_hint") == "ask_for_missing":
-                # user likely provided the missing info in the latest message.
-                # we don’t re-plan; we jump back into the current step’s guard.
-                self._log("RESUME", body="Pending missing inputs -> jump to input_guard", node=node)
+                # User likely provided the missing info in the latest message.
+                # Clean route_hint NOW so it cannot propagate to downstream nodes
+                # even if input_guard still finds something missing (it will re-set it).
+                clean_manifest = dict(manifest)
+                clean_manifest.pop("route_hint", None)
+                clean_manifest.pop("qa_payload", None)
+                self._log("RESUME", body="Pending missing inputs -> jump to orchestrator (manifest cleaned)", node=node)
                 return {
-                    # "next_step": "input_guard",
                     "next_step": "orchestrator",
+                    "manifest": clean_manifest,
                     "messages": [AIMessage(content="<observe>Resuming with your new inputs…</observe>")],
                 }
             # -----------------------------
                 
             user_prompt = state["messages"][-1].content
-            batch_strategy = state.get("batch_strategy", "independent")
+            _past_templates = self._load_past_templates(user_prompt)
             msgs = [
                 self.system_prompt,
-                HumanMessage(content=f"CURRENT BATCH STRATEGY: {batch_strategy}\n\n" + instructions.PLANNER_PROMPT.format(temp_run_dir=state.get("run_temp_dir", ""))),
+                HumanMessage(content=instructions.PLANNER_PROMPT.format(
+                    temp_run_dir=state.get("run_temp_dir") or "",
+                ) + (_past_templates or "")),
             ]
-            # FIX G2a: Inject similar past pipelines from TemplateLibrary as few-shot examples
-            if _TEMPLATE_OK and _TEMPLATE_LIB:
-                try:
-                    embed_fn = None
-                    if hasattr(self, "bio_retriever") and hasattr(self.bio_retriever, "_embed"):
-                        embed_fn = self.bio_retriever._embed
-                    template_hints = _TEMPLATE_LIB.format_for_planner(user_prompt, n=3, embed_fn=embed_fn)
-                    if template_hints:
-                        msgs.append(HumanMessage(content=template_hints))
-                        self._log("TEMPLATE HINTS", body=f"{_TEMPLATE_LIB.count()} templates available", node=node)
-                except Exception as _te:
-                    self._log("TEMPLATE HINTS (warn)", body=str(_te), node=node)
-            
+
             # ------ Interactive mode ------
             if manifest.get("route_hint") == "await_user":
                 user_text = ""
@@ -1106,6 +663,64 @@ class BioAgent:
             msgs.append(HumanMessage(content=user_prompt))
             resp = self._llm_invoke(node, "plan_route", msgs)
             steps, route = StateGraphHelper.parse_checklist_and_route(resp.content)
+
+            # Strip inline code from step titles.
+            # Weak models embed code both with backticks (`code`) and without (after ': ').
+            # NOTE: do NOT include bare () or [] in _CODE_SIGNALS — they appear in natural
+            # English like "(number of contigs, total length)" and would wrongly strip
+            # the entire step description down to just "Step N".
+            _CODE_SIGNALS = re.compile(
+                r'[;=]|'                               # assignment or semicolon
+                r'\bimport\s|\bfrom\s+\w+\s+import\b|'  # import statements
+                r'\bdef\s+\w+\s*\(|'                   # function definitions
+                r'\w+\.\w+\s*\('                       # method calls like SeqIO.parse(
+            )
+            # Connectors that become dangling after backtick-block removal
+            _DANGLING_END = re.compile(
+                r"\s+\b(with|using|via|by|from|and|or|et|avec|en|pour|par|de|du|des"
+                r"|the|a|an)\s*[.]?\s*$",
+                re.I,
+            )
+            _DANGLING_START = re.compile(
+                r"^\s*\b(and|or|with|et|ou|via|using|the)\b\s*",
+                re.I,
+            )
+            # Mid-sentence orphan sequences left after backtick removal.
+            # e.g. "using `Bio.SeqIO` and Python" → "using  and Python" → "and Python"
+            # e.g. "using `ncbi-genome-download` with accession" → "using  with accession" → "with accession"
+            # e.g. "save report to `ecoli.txt`." → "save report to ." → "save report"
+            _MID_ORPHAN_PREP = re.compile(
+                r"\b(using|via)\s+(with|by|and|or|,)\s*"
+                r"|\b(with|by)\s+(and|or|,)\s*",
+                re.I,
+            )
+            _TRAILING_PREP = re.compile(
+                r"\b(to|in|at|from|de|du|en)\s*[.!?,]?\s*$",
+                re.I,
+            )
+
+            def _clean_title(t: str) -> str:
+                # 1. Remove backtick-quoted code blocks
+                t = re.sub(r"`[^`]+`", "", t)
+                # 2. Collapse multiple spaces left by the removal
+                t = re.sub(r" {2,}", " ", t)
+                # 3. Clean mid-sentence orphans: "using and"→"and", "using with"→"with", "save to ."→"save"
+                t = _MID_ORPHAN_PREP.sub(lambda m: (m.group(2) or m.group(4)) + " ", t)
+                t = _TRAILING_PREP.sub("", t)
+                # 4. Strip dangling connectors at end ("Load FASTA with ")
+                t = _DANGLING_END.sub("", t)
+                # 5. Strip dangling connectors at start ("and compute N50")
+                t = _DANGLING_START.sub("", t)
+                # 6. If ': ' separator exists and suffix looks like code, drop suffix
+                if ': ' in t:
+                    label, _, rest = t.partition(': ')
+                    if _CODE_SIGNALS.search(rest):
+                        t = label
+                # 7. Drop trailing colon and tidy whitespace
+                t = re.sub(r":\s*$", "", t.strip())
+                return t.strip() or "Step"
+            steps = [{**s, "title": _clean_title(s["title"])} for s in steps]
+
             updates = {
                 "plan": steps,
                 "current_idx": 0,
@@ -1166,11 +781,22 @@ class BioAgent:
                 next_step = "end" #orchestrator
             
             resp = self._llm_invoke(node, "qa", msgs)
+
+            # Always clean routing keys from manifest before exiting QA.
+            # If we don't, route_hint="ask_for_missing" is checkpointed and the planner
+            # will intercept it on the very next user message — even after our planner fix —
+            # because the planner fast-path relies on reading it from the checkpoint.
+            # Cleaning it here is the authoritative, terminal fix.
+            clean_manifest = dict(state.get("manifest") or {})
+            clean_manifest.pop("route_hint", None)
+            clean_manifest.pop("qa_payload", None)
+
             updates = {
                 "next_step": next_step,
+                "manifest": clean_manifest,
                 "messages": [AIMessage(content=resp.content)],
             }
-            self._log("EXIT NODE", body=f"next_step={state['next_step']}", node=node)
+            self._log("EXIT NODE", body=f"next_step={next_step}", node=node)
             return updates
 
         def _orchestrator(self, state: AgentState) -> AgentState:
@@ -1179,368 +805,65 @@ class BioAgent:
 
             idx = state["current_idx"]
             plan = state["plan"]
-            rc = state.get("retry_counts") or {}
-
-            # ── T6.3: Global elapsed time guard ──────────────────────────────────
-            # If the run has exceeded MAX_TOTAL_RUN_SECONDS, force finalizer immediately
-            run_started_at = state.get("run_started_at")
-            if run_started_at:
-                elapsed = time.time() - run_started_at
-                if elapsed > self.MAX_TOTAL_RUN_SECONDS:
-                    self._log(
-                        "GLOBAL TIMEOUT",
-                        body=f"Run exceeded {self.MAX_TOTAL_RUN_SECONDS}s ({elapsed:.0f}s elapsed). Forcing finalizer.",
-                        node=node,
-                    )
-                    return {
-                        "next_step": "finalizer",
-                        "messages": [AIMessage(content=f"<observe>[GLOBAL TIMEOUT] Run exceeded {self.MAX_TOTAL_RUN_SECONDS}s. Generating partial report.</observe>")],
-                    }
-
-            # ── T1.3: Global retry guard ──────────────────────────────────────────
-            # If cumulative retries across all steps exceed the safety ceiling,
-            # something is stuck in an undetected loop — force finalizer.
-            _global_retry_ceiling = self.MAX_STEP_RETRIES * max(len(plan), 1) * 2
-            if sum(rc.values()) > _global_retry_ceiling:
-                self._log(
-                    "GLOBAL RETRY CAP",
-                    body=f"sum(retry_counts)={sum(rc.values())} > ceiling={_global_retry_ceiling}. Forcing finalizer.",
-                    node=node,
-                )
-                return {
-                    "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>[GLOBAL RETRY CAP] Too many retries across steps. Generating partial report.</observe>")],
-                }
-            # ─────────────────────────────────────────────────────────────────────
-
-            if not plan:
-                self._log("ORCHESTRATOR WARN", body="Empty plan received from planner. Routing to QA for clarification.", node=node)
-                new_manifest = dict(state.get("manifest") or {})
-                new_manifest["route_hint"] = "finalize"
-                new_manifest["qa_payload"] = (
-                    "The planner could not generate a step-by-step plan for your request. "
-                    "Please rephrase your request or provide more details about the data and goal."
-                )
-                return {
-                    "manifest": new_manifest,
-                    "next_step": "qa",
-                    "messages": [AIMessage(content="<observe>No plan generated. Asking user for clarification.</observe>")],
-                }
-
-            # --- Orchestration adaptative centralisée (T4) ---
-            if idx < len(plan) and plan[idx].get("status") == "done":
-                try:
-                    from genomeer.agent.v2.adaptive_rules import OrchestrationManager
-                    adaptation = OrchestrationManager.evaluate_rules(plan, idx, state.get("manifest", {}))
-                    if adaptation:
-                        if "plan" in adaptation:
-                            plan = adaptation["plan"]
-                        if "adaptation_messages" in adaptation:
-                            for msg in adaptation["adaptation_messages"]:
-                                self._log("ADAPTIVE TRIGGER", body=msg, node=node)
-                                state.setdefault("messages", []).append(AIMessage(content=f"<observe>{msg}</observe>"))
-                        if adaptation.get("next_step") == "finalizer":
-                            return {
-                                "next_step": "finalizer",
-                                "messages": [AIMessage(content=adaptation.get("abort_reason", "[ADAPTIVE ABORT]"))],
-                            }
-                except Exception as _adapt_exc:
-                    self._log("ADAPTIVE ORCHESTRATOR (warn)", body=str(_adapt_exc), node=node)
-            # --------------------------------------------------
-            # --------------------------------------------------
-
             while idx < len(plan) and plan[idx]["status"] != "todo":
                 idx += 1
             state["current_idx"] = idx
             
             if idx >= len(plan):
                 # all steps are done -> hand off to FINALIZER
+                # initially this was QA's responsibility, but we'll ease that up for this
+                # new_manifest = {
+                #     **state["manifest"],
+                #     "route_hint": "finalize",
+                #     "qa_payload": "All steps completed. Provide a clean final answer.",
+                # }
                 self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
-                trim_msgs = self._trim_messages(state.get("messages", []))
                 return {
                     "current_idx": idx,
-                    "per_sample_results": state.get("per_sample_results"),
                     "next_step": "finalizer",
-                    "messages": trim_msgs + [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
-                }
-            
-            # P4-D: Parallel Batch Mode detection
-            if state.get("batch_mode") and state.get("sample_manifest"):
-                is_coassembly_phase2 = state.get("batch_strategy") == "coassembly" and plan[idx].get("phase") == 2
-                is_independent = state.get("batch_strategy") == "independent"
-                
-                if is_coassembly_phase2 or is_independent:
-                    self._log("BATCH DISPATCH", body=f"Delegating parallel execution to batch_orchestrator (idx={idx})", node=node)
-                    return {
-                        "current_idx": idx,
-                        "next_step": "batch_orchestrator",
-                        "messages": [AIMessage(content="<observe>Dispatching independent steps in parallel.</observe>")]
-                    }
-
-                self._log("EXIT NODE", body=f"all_done=True -> next_step=finalizer", node=node)
-                trim_msgs = self._trim_messages(state.get("messages", []))
-                return {
-                    "current_idx": idx,
-                    "per_sample_results": state.get("per_sample_results"),
-                    "next_step": "finalizer",
-                    "messages": trim_msgs + [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
+                    "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
                 }
             
             # otherwise go check inputs
             self._log("EXIT NODE", body=f"all_done=False\ncurrent_idx={idx}\nnext_step=input_guard", node=node)
-            trim_msgs = self._trim_messages(state.get("messages", []))
             return {
                 "current_idx": idx,
                 "next_step": "input_guard",
-                "messages": trim_msgs + [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
-            }
-
-        def _batch_orchestrator(self, state: AgentState) -> AgentState:
-            import os
-            import copy
-            import json
-            import threading
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            
-            node = "batch_orchestrator"
-            self._log("ENTER NODE", body="Starting parallel execution of independent steps", node=node)
-            
-            samples = state.get("sample_manifest") or []
-            if not samples:
-                return {"next_step": "finalizer", "messages": [AIMessage(content="<observe>Error: batch_orchestrator called without sample_manifest.</observe>")]}
-
-            session_id = state.get("session_id") or state.get("run_id") or "unknown"
-            progress_file = os.path.join(state.get("run_temp_dir", ""), f".batch_progress_{session_id}.json")
-            progress_lock = threading.Lock()
-
-            with progress_lock:
-                if os.path.exists(progress_file):
-                    with open(progress_file) as f:
-                        per_sample = json.load(f)
-                    # Ne relancer que les samples non encore complétés
-                    remaining_samples = [s for s in samples if s.get("id") not in per_sample]
-                else:
-                    per_sample = dict(state.get("per_sample_results") or {})
-                    remaining_samples = samples
-
-            def _save_batch_progress(results: dict, run_temp_dir: str, sid: str) -> None:
-                try:
-                    # Atomic write (temp + replace)
-                    tmp_file = progress_file + ".tmp"
-                    with open(tmp_file, "w") as f:
-                        json.dump(results, f, default=str)
-                    os.replace(tmp_file, progress_file)
-                except Exception:
-                    pass
-
-            # Bug 4 Fix: pre-install environment once before parallel threads
-            env_name = state.get("env_name", "bio-agent-env1")
-            from genomeer.runtime.env_manager import has_env, create_or_update_env
-            from genomeer.utils.helper import preload_tool_versions
-            
-            if not has_env(env_name):
-                self._log("BATCH ENV", body=f"Pre-installing environment '{env_name}' before launching parallel threads...", node=node)
-                try:
-                    create_or_update_env(env_name)
-                except Exception as e:
-                    self._log("BATCH ENV ERROR", body=f"Failed to install {env_name}: {e}", node=node)
-                    return {"next_step": "finalizer", "messages": [AIMessage(content=f"<observe>Fatal error: Failed to prepare environment {env_name}. Error: {e}</observe>")]}
-                
-            # Bug 1 Fix: pre-warm version cache for common tools in a background thread
-            tools_to_cache = [
-                "fastp", "fastqc", "kraken2", "metaphlan4", "metaspades", "megahit", 
-                "flye", "bowtie2", "samtools", "metabat2", "checkm2", "bracken", 
-                "gtdbtk", "das_tool", "prokka", "diamond", "hmmer", "humann3"
-            ]
-            threading.Thread(target=preload_tool_versions, args=(env_name, tools_to_cache), daemon=True, name="tool-version-preloader").start()
-                
-            # P4-D.2: Semaphore for concurrency control
-            concurrency = int(os.environ.get("GENOMEER_BATCH_CONCURRENCY", "4"))
-            
-            # T9: Proportional RAM per worker
-            max_ram_total = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
-            per_worker_ram = max(4.0, max_ram_total / concurrency)
-            
-            semaphore = threading.Semaphore(concurrency)
-            results_lock = threading.Lock()  # FIX A3: Lock to prevent data races on per_sample
-            idx = state["current_idx"]
-            plan = state["plan"]
-            
-            def process_sample(sample_idx: int, sample_dict: dict) -> tuple:
-                with semaphore:
-                    sample_id = sample_dict.get("id", f"sample_{sample_idx}")
-                    
-                    # Clone state to isolate thread execution
-                    local_state = dict(state)
-                    local_state["manifest"] = copy.deepcopy(state.get("manifest", {}))
-                    # Wipe global quality signals so they don't bleed between samples
-                    local_state["manifest"].pop("quality_signals", None)
-                    local_state["manifest"].pop("amr_genes_detected", None)
-                    local_state["manifest"].pop("observations", None)
-                    
-                    local_state["plan"] = copy.deepcopy(plan)
-                    # FIX: Preserve messages to maintain context in batch mode
-                    local_state["messages"] = list(state.get("messages", []))
-                    import time as _time
-                    local_state["run_started_at"] = _time.time()  # Point Faible 4: reset global timeout timer
-                    local_state["current_idx"] = idx
-                    local_state["retry_counts"] = {}
-                    local_state["current_sample_id"] = sample_id
-                    local_state["current_sample_idx"] = sample_idx
-                    local_state["_per_worker_ram_gb"] = per_worker_ram # T9
-                    
-                    # P4-D.3: Isolated run_temp_dir
-                    local_state["run_temp_dir"] = os.path.join(state["run_temp_dir"], sample_id)
-                    os.makedirs(local_state["run_temp_dir"], exist_ok=True)
-                    
-                    # Bug 3 Fix: global iterations cap to avoid infinite loops across step retries
-                    max_iterations = self.MAX_STEP_RETRIES * len(local_state["plan"]) * 3
-                    iteration_count = 0
-                    
-                    # Manual node chaining loop for this sub-plan
-                    while local_state["current_idx"] < len(local_state["plan"]):
-                        if self.current_cancel_event and self.current_cancel_event.is_set():
-                            logger.info(f"[batch] Sample cancelled mid-execution; stopping.")
-                            break
-                        if iteration_count > max_iterations:
-                            self._log("BATCH FATAL", body=f"Sample {sample_id} exceeded max iterations ({max_iterations}). Breaking out.", node=node)
-                            break
-                        iteration_count += 1
-                        
-                        curr_idx = local_state["current_idx"]
-                        step = local_state["plan"][curr_idx]
-                        if step["status"] != "todo":
-                            local_state["current_idx"] += 1
-                            continue
-                            
-                        # _input_guard
-                        updates = self._input_guard(local_state)
-                        local_state.update(updates)
-                        if local_state.get("next_step") == "qa":
-                            step["status"] = "error"
-                            step["notes"] = "QA requested during batch parallel execution (unsupported)."
-                            local_state["current_idx"] += 1
-                            continue
-                            
-                        # _generator
-                        updates = self._generator(local_state)
-                        local_state.update(updates)
-                        if local_state.get("next_step") == "qa":
-                            step["status"] = "error"
-                            step["notes"] = "QA requested during generation (unsupported)."
-                            local_state["current_idx"] += 1
-                            continue
-                            
-                        # _ensure_env
-                        updates = self._ensure_env(local_state)
-                        local_state.update(updates)
-                        
-                        # _executor
-                        updates = self._executor(local_state)
-                        local_state.update(updates)
-                        
-                        # _observer
-                        updates = self._observer(local_state)
-                        local_state.update(updates)
-                        
-                    while local_state.get("current_idx", 0) < len(local_state["plan"]):
-                        curr_idx = local_state["current_idx"]
-                        step = local_state["plan"][curr_idx]
-
-                        # BUG-02: Propagation de l'événement d'annulation
-                        if self.current_cancel_event.is_set():
-                            self._log("BATCH CANCEL", body=f"Sample {sample_id} cancelled by global event.", node=node)
-                            return sample_id, {"status": "cancelled"}
-
-                        # ... execute step logic ...
-                        # (simplifié pour le remplacement, on garde la logique existante)
-                        local_state = self._input_guard(local_state)
-                        if local_state.get("next_step") == "generator":
-                            local_state = self._generator(local_state)
-                            local_state = self._ensure_env(local_state)
-                            local_state = self._executor(local_state)
-                            local_state = self._observer(local_state)
-
-                        next_step = local_state.get("next_step")
-
-                        if next_step == "diagnostics":
-                            updates = self._diagnostics(local_state)
-                            local_state.update(updates)
-                            next_step = local_state.get("next_step")
-
-                        if next_step == "generator":
-                            local_state["plan"][curr_idx]["status"] = "todo"
-                        else:
-                            local_state["current_idx"] += 1
-                        
-                    manifest = local_state.get("manifest", {})
-                    result = {
-                        "quality_signals": manifest.get("quality_signals", {}),
-                        "amr_genes_detected": manifest.get("amr_genes_detected", []),
-                        "observations": manifest.get("observations", []),
-                        "retry_counts": local_state.get("retry_counts", {})
-                    }
-                    return sample_id, result
-                    
-            # Launch ThreadPool
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = []
-                for s in remaining_samples:
-                    orig_i = next((i for i, xs in enumerate(samples) if xs.get("id") == s.get("id")), 0)
-                    futures.append(executor.submit(process_sample, orig_i, s))
-                    
-                for future in as_completed(futures):
-                    try:
-                        sample_id, res = future.result()
-                        with results_lock:
-                            per_sample[sample_id] = res
-                            # FIX: Use a dedicated lock for file IO in addition to memory dict lock
-                            with progress_lock:
-                                _save_batch_progress(
-                                    per_sample,
-                                    state.get("run_temp_dir", "/tmp"),
-                                    session_id
-                                )
-                        self._log("BATCH ORCHESTRATOR", body=f"Sample {sample_id} completed successfully.", node=node)
-                    except Exception as e:
-                        self._log("BATCH ORCHESTRATOR ERROR", body=f"Future raised exception: {e}. Triggering global cancel.", node=node)
-                        # BUG-02: Propagate cancellation if a worker crashes
-                        if hasattr(self, "current_cancel_event"):
-                            self.current_cancel_event.set()
-                        
-            self._log("EXIT NODE", body="All parallel samples completed. Routing to finalizer.", node=node)
-            try:
-                if os.path.exists(progress_file):
-                    os.remove(progress_file)
-            except Exception:
-                pass
-            return {
-                "per_sample_results": per_sample,
-                "current_idx": len(plan), # mark plan as complete
-                "next_step": "finalizer",
-                "messages": [AIMessage(content=f"<observe>Processed {len(samples)} samples in parallel mode.</observe>")]
+                "messages": [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
             }
         
         def _input_guard(self, state: AgentState) -> AgentState:
-            sid = state.get("current_sample_id")
-            node = f"input_guard|{sid}" if sid else "input_guard"
-
-            # T7: Safe step accessor
-            step = self._get_current_step(state)
-            if step is None:
-                self._log("INPUT_GUARD GUARD", body="current_idx out of bounds — routing to finalizer", node=node)
-                return {
-                    "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>[GUARD] Plan index out of bounds in input_guard. Finalizing.</observe>")],
-                }
-
+            node = "input_guard"
+            step = state["plan"][state["current_idx"]]
             current_step_title = step["title"].strip()
-            user_goal = state.get("last_prompt") or (state.get("messages", [HumanMessage(content="")])[0].content)
+            user_goal = state.get("last_prompt") or (state["messages"][0].content if state.get("messages") else "")
             manifest = dict(state.get("manifest") or {})
 
             # current run storage home lsdir
-            temp_dir = state.get("run_temp_dir") or os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
-            files = self._list_ctx_files(temp_dir)
+            temp_dir = state.get("run_temp_dir") or ""
+
+            # Collect text to scan for absolute paths:
+            # - original task prompt (last_prompt)
+            # - EVERY subsequent human message (user may provide file paths in follow-up answers)
+            import re as _re
+            _texts_to_scan = [user_goal]
+            _last_prompt_content = state.get("last_prompt") or ""
+            for _m in (state.get("messages") or []):
+                if getattr(_m, "type", "") == "human":
+                    _mc = getattr(_m, "content", "") or ""
+                    if _mc != _last_prompt_content and _mc.strip():
+                        _texts_to_scan.append(_mc)
+            _all_text = "\n".join(_texts_to_scan)
+
+            # Extract absolute paths (Windows and Unix, quoted or bare)
+            _quoted_win  = _re.findall(r'["\']([A-Za-z]:[/\\][^"\']+)["\']', _all_text)
+            _bare_win    = _re.findall(r'(?<!["\'/\\])([A-Za-z]:[/\\]\S+)', _all_text)
+            _quoted_unix = _re.findall(r'["\'](/(?:[^"\']+))["\']', _all_text)
+            _abs_paths = list(dict.fromkeys(
+                p.rstrip('.,;:)>]}') for p in (_quoted_win + _bare_win + _quoted_unix)
+                if p.rstrip('.,;:)>]}')
+            ))
+            files = self._list_ctx_files(temp_dir, extra_paths=_abs_paths)
             files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
 
             # step-scoped retrieval (tools/data/libs) before we call the validator
@@ -1562,6 +885,13 @@ class BioAgent:
                 files_str=files_str,
                 observation_state=manifest.get("observations", [])
             ).strip()
+
+            # Fix 9 — append filesystem helper reference to INPUT_GUARD context
+            try:
+                from genomeer.utils.filesystem import FILESYSTEM_PROMPT_SNIPPET as _FS_SNIPPET_IG
+                context_block += "\n\n" + _FS_SNIPPET_IG
+            except ImportError:
+                pass
 
             msgs = [
                 self.system_prompt,
@@ -1587,17 +917,21 @@ class BioAgent:
                     "next_step": "qa",
                 }
             else:
-                new_manifest = {
-                    **state["manifest"],
-                    "input_state": {
-                        "summary": [m for m in items],
-                        "root_dir": temp_dir,
-                        "files": files,
-                        "guidance": (
-                            "Use either the initial user prompt or the 'files' list "
-                            "to decide what inputs to use for code generation in this step."
-                        ),
-                    }
+                # Start from a copy, then explicitly remove stale routing keys.
+                # If route_hint="ask_for_missing" from a previous iteration survives here,
+                # the planner will intercept it and send the pipeline to QA→END even though
+                # all inputs are present. Popping them is the only safe fix.
+                new_manifest = dict(state.get("manifest") or {})
+                new_manifest.pop("route_hint", None)
+                new_manifest.pop("qa_payload", None)
+                new_manifest["input_state"] = {
+                    "summary": [m for m in items],
+                    "root_dir": temp_dir,
+                    "files": files,
+                    "guidance": (
+                        "Use either the initial user prompt or the 'files' list "
+                        "to decide what inputs to use for code generation in this step."
+                    ),
                 }
                 self._log("INPUTS OK", body="No missing items", node=node)
                 self._log("EXIT NODE", body="next_step=generator", node=node)
@@ -1608,126 +942,427 @@ class BioAgent:
                 }
         
         def _generator(self, state: AgentState) -> AgentState:
-            sid = state.get("current_sample_id")
-            node = f"generator|{sid}" if sid else "generator"
-
-            # T7: Safe step accessor
-            step = self._get_current_step(state)
-            if step is None:
-                self._log("GENERATOR GUARD", body="current_idx out of bounds — routing to finalizer", node=node)
-                return {
-                    "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>[GUARD] Plan index out of bounds in generator. Finalizing.</observe>")],
-                }
+            node = "generator"
+            step = state["plan"][state["current_idx"]]
             env_name = state["env_name"]
             
             # detect repair mode
             manifest = state.get("manifest", {}) or {}
             repair_feedback = manifest.get("repair_feedback")
             is_diagnostic = isinstance(repair_feedback, str) and repair_feedback.strip().upper().startswith("DIAGNOSTICS_REQUEST:")
-            temp_dir = state.get("run_temp_dir", "")
+            temp_dir = state.get("run_temp_dir") or ""
             files = self._list_ctx_files(temp_dir)
             files_str = "\n".join(f"- {f['name']} ({f['ext']}, {f['size_bytes']} bytes)" for f in files) or "<none>"
-
-            # T8.4 (Residual): Format file registry for the context prompt in both normal and repair modes
-            _file_registry = manifest.get("file_registry", {})
-            _freg_str = "\n".join(
-                f"  [{step_name}]: {', '.join(paths)}"
-                for step_name, paths in _file_registry.items()
-            ) or "<none>"
-            files_str = f"{files_str}\n\nFiles produced by previous steps:\n{_freg_str}"
-            
-            _diag_rounds_dict = manifest.get("diagnostics_rounds", {})
-            _diag_round = _diag_rounds_dict.get(state["current_idx"], 0)
 
             if repair_feedback:
                 if is_diagnostic:
                     prompt = instructions.GENERATOR_PROMPT
                     content = instructions.GENERATOR_DIAGNOSTICS_MODE_PROMPT.format(
                         diagnostics_feedback=repair_feedback,
-                        run_temp_dir=temp_dir,
-                        file_registry=_freg_str,
                     )
                 else:
                     prompt = instructions.GENERATOR_PROMPT_REPAIR
-                    _slim_gen = self._slim_manifest(manifest, "generator")
-                    _input_state_for_prompt = _slim_gen.get("input_state") or {"root_dir": temp_dir, "files": files}
                     content = instructions.GENERATOR_REPAIR_CTX_PROMPT.format(
                         user_goal=state['last_prompt'],
                         current_step_title=step['title'],
-                        manifest=_input_state_for_prompt,
+                        manifest=manifest.get("input_state"),
                         run_temp_dir=temp_dir,
                         repair_feedback=repair_feedback,
                         previous_code=(state.get("pending_code") or "").strip(),
                         last_result=(state.get("last_result") or "").strip(),
                         files_str=files_str,
-                        file_registry=_freg_str,
-                        diag_round=_diag_round,
                     )
             else:
                 prompt = instructions.GENERATOR_PROMPT
-                
                 content = instructions.GENERATOR_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
                     current_step_title=step['title'],
-                    manifest=self._slim_manifest(state['manifest'], "generator").get("input_state"),
-                    run_temp_dir=temp_dir,
-                    file_registry=_freg_str,
-                    diag_round=_diag_round,
+                    manifest=state['manifest'].get("input_state"),
+                    run_temp_dir=state.get('run_temp_dir') or "",
                 )
             
+            # Dynamically inject code pattern snippets when the step involves known-hard patterns.
+            # Small models (llama3:8b) reliably ignore rules in the general prompt but DO follow
+            # examples placed immediately before the task. This is the reliable fix for N50 / SeqIO.
+            _step_ctx = f"{step['title']} {state.get('last_prompt', '')}".lower()
+            _injections = []
+
+            if any(k in _step_ctx for k in ("n50", "assembly stat", "contig stat", "scaffold stat",
+                                             "sequence stat", "assembly metric", "stats")):
+                _injections.append(
+                    'REQUIRED — copy this N50 pattern exactly (no walrus :=, no None placeholder):\n'
+                    '    lengths = sorted([len(r.seq) for r in contigs], reverse=True)\n'
+                    '    total = sum(lengths)\n'
+                    '    cumsum, n50 = 0, 0\n'
+                    '    for l in lengths:\n'
+                    '        cumsum += l\n'
+                    '        if cumsum >= total / 2:\n'
+                    '            n50 = l\n'
+                    '            break\n'
+                    '    print(f"N50: {n50}")'
+                )
+
+            if any(k in _step_ctx for k in ("seqio", "fasta", "fastq", "parse", "sequence", "contig", "read")):
+                _injections.append(
+                    'REQUIRED — always materialise SeqIO.parse into a list before any use:\n'
+                    '    contigs = list(SeqIO.parse(fasta_path, "fasta"))  # ONE call, then reuse the list'
+                )
+
+            if any(k in _step_ctx for k in ("gc", "gc content", "gc%", "gc percent", "base composition")):
+                _injections.append(
+                    # Use single quotes for 'G'/'C' so the snippet is safe inside any f-string delimiter
+                    "REQUIRED — GC content: count actual G and C bases, NEVER divide by 4:\n"
+                    "    gc_count = sum(s.seq.count('G') + s.seq.count('C') for s in contigs)\n"
+                    "    total_bases = sum(len(s.seq) for s in contigs)\n"
+                    "    gc_pct = gc_count / total_bases * 100 if total_bases else 0.0\n"
+                    "    print(f'GC content: {gc_pct:.2f}%')\n"
+                    "WRONG (never do this): gc = total_length / (4 * num_contigs)"
+                )
+
+            if any(k in _step_ctx for k in ("ncbi", "ncbi-genome-download", "genome-download",
+                                             "download genome", "download assembly",
+                                             "download bacteria", "download organism",
+                                             "entrez", "taxid", "taxon")):
+                # Detect whether an assembly accession (GCF_ / GCA_) is already known.
+                # If yes: inject the accession-based snippet as executable code.
+                # If no:  inject the --genera snippet (with --assembly-levels complete).
+                # Small models copy the FIRST runnable code block they see — so only
+                # the correct path must appear as real code; the other is omitted.
+                _has_accession = bool(re.search(r"\bGC[FA]_\d+", _step_ctx, re.I))
+
+                if _has_accession:
+                    # Extract the accession string for the snippet
+                    _acc_match = re.search(r"\bGC[FA]_\d+(?:\.\d+)?", _step_ctx, re.I)
+                    _acc = _acc_match.group(0).upper() if _acc_match else "GCF_XXXXXXXXX.X"
+                    _injections.append(
+                        "REQUIRED — use --assembly-accessions (accession is known — DO NOT use --genera):\n"
+                        "\n"
+                        "  import subprocess, glob, os, gzip, shutil, sys\n"
+                        "\n"
+                        f'  run_dir = r"{temp_dir}"  # output folder — do not change\n'
+                        f'  accession = "{_acc}"  # use this exact accession\n'
+                        '  cmd = ["ncbi-genome-download",\n'
+                        '         "--assembly-accessions", accession,\n'
+                        '         "--formats", "fasta",\n'
+                        '         "--flat-output",\n'
+                        '         "--output-folder", run_dir,\n'
+                        '         "bacteria"]\n'
+                        "\n"
+                        "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)\n"
+                        "  print(res.stdout or res.stderr)\n"
+                        "  if res.returncode != 0:\n"
+                        '      print(f"Download failed (exit {res.returncode}): {res.stderr}")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        '  # Prefer uncompressed .fna; fall back to .fna.gz if needed\n'
+                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna"), recursive=True))\n'
+                        "  if not fasta_files:\n"
+                        '      print("No FASTA file found after download")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        "  fasta_path = fasta_files[0]\n"
+                        '  if fasta_path.endswith(".gz"):\n'
+                        "      unzipped = fasta_path[:-3]\n"
+                        "      if not os.path.exists(unzipped):\n"
+                        "          with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
+                        "              shutil.copyfileobj(fi, fo)\n"
+                        "      fasta_path = unzipped\n"
+                        '  print(f"FASTA ready: {fasta_path}")\n'
+                        "\n"
+                        "  WRONG: --genus  --species  --organism  --name  (do not exist)"
+                    )
+                else:
+                    _injections.append(
+                        "REQUIRED — complete ncbi-genome-download pattern (copy and adapt):\n"
+                        "\n"
+                        "  import subprocess, glob, os, gzip, shutil, sys\n"
+                        "\n"
+                        f'  run_dir = r"{temp_dir}"  # output folder — do not change\n'
+                        "  # WARNING: ALWAYS include --assembly-levels complete.\n"
+                        "  # Without it, ncbi-genome-download lists ALL assemblies for the kingdom\n"
+                        "  # (thousands of files) and hangs for hours.\n"
+                        "  organism = \"Escherichia coli\"   # adapt to user request\n"
+                        '  cmd = ["ncbi-genome-download",\n'
+                        '         "--genera", organism,\n'
+                        '         "--assembly-levels", "complete",\n'
+                        '         "--section", "refseq",\n'
+                        '         "--formats", "fasta",\n'
+                        '         "--output-folder", run_dir,\n'
+                        '         "--flat-output",\n'
+                        '         "bacteria"]\n'
+                        "\n"
+                        "  dry = subprocess.run(cmd + [\"--dry-run\"], capture_output=True, text=True, timeout=60)\n"
+                        "  print(\"Dry-run:\", dry.stdout or dry.stderr)\n"
+                        "  if dry.returncode != 0:\n"
+                        '      print(f"Dry-run failed: {dry.stderr}")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)\n"
+                        "  print(res.stdout or res.stderr)\n"
+                        "  if res.returncode != 0:\n"
+                        '      print(f"Download failed (exit {res.returncode}): {res.stderr}")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        '  # Prefer uncompressed .fna; fall back to .fna.gz if needed\n'
+                        '  fasta_files = (glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "*.fna.gz")) +\n'
+                        '                 glob.glob(os.path.join(run_dir, "**", "*.fna"), recursive=True))\n'
+                        "  if not fasta_files:\n"
+                        '      print("No FASTA files found after download")\n'
+                        "      sys.exit(1)\n"
+                        "\n"
+                        "  fasta_path = fasta_files[0]\n"
+                        '  if fasta_path.endswith(".gz"):\n'
+                        "      unzipped = fasta_path[:-3]\n"
+                        "      if not os.path.exists(unzipped):\n"
+                        "          with gzip.open(fasta_path, 'rb') as fi, open(unzipped, 'wb') as fo:\n"
+                        "              shutil.copyfileobj(fi, fo)\n"
+                        "      fasta_path = unzipped\n"
+                        '  print(f"FASTA ready: {fasta_path}")\n'
+                        "\n"
+                        "  WRONG flags that DO NOT EXIST: --genus  --species  --organism  --name"
+                    )
+
+            # ExPASy / SwissProt / UniProt injection
+            if any(k in _step_ctx for k in ("expasy", "swissprot", "swiss-prot", "uniprot", "sprot", "p0a7g6", "protein entry", "protein record")):
+                _injections.append(
+                    "REQUIRED — correct Biopython API for ExPASy/SwissProt (Bio.ExPASy.ProteinDB does NOT exist):\n"
+                    "\n"
+                    "  from Bio import ExPASy, SwissProt\n"
+                    "\n"
+                    "  # Fetch a Swiss-Prot entry by UniProt accession\n"
+                    "  accession = 'P0A7G6'  # adapt to request\n"
+                    "  handle = ExPASy.get_sprot_raw(accession)\n"
+                    "  record = SwissProt.read(handle)\n"
+                    "\n"
+                    "  # EXACT fields on Bio.SwissProt.Record — verified, use only these:\n"
+                    "  seq            = record.sequence          # protein sequence string\n"
+                    "  seq_len        = record.sequence_length   # int — number of amino acids\n"
+                    "  mol_weight     = record.seqinfo[1]        # int, Daltons — seqinfo=(len, mw, crc64)\n"
+                    "  gene_name      = record.gene_name         # list of dicts\n"
+                    "  organism       = record.organism          # str e.g. 'Escherichia coli (strain K12).'\n"
+                    "  description    = record.description       # str e.g. 'RecName: Full=Protein RecA'\n"
+                    "  features       = record.features          # list of SeqFeature objects\n"
+                    "  n_features     = len(features)\n"
+                    "  keywords       = record.keywords          # list of str\n"
+                    "  accessions     = record.accessions        # list of accession IDs\n"
+                    "  # WRONG (do not exist): record.annotations  record.molecular_weight\n"
+                    "\n"
+                    "  WRONG (does not exist): from Bio.ExPASy import ProteinDB\n"
+                    "  WRONG (does not exist): Bio.ExPASy.ProteinDB.get_protein_by_accession()"
+                )
+
+            # Bio.Entrez injection
+            if any(k in _step_ctx for k in ("entrez", "efetch", "esearch", "nuccore", "pubmed", "gene db", "entrez fetch")):
+                _injections.append(
+                    "REQUIRED — correct Biopython Entrez API (copy exactly):\n"
+                    "\n"
+                    "  import time\n"
+                    "  from Bio import Entrez, SeqIO\n"
+                    "  from io import StringIO\n"
+                    "  Entrez.email = 'genomeer@example.com'  # required by NCBI\n"
+                    "\n"
+                    "  # Search for IDs\n"
+                    "  handle = Entrez.esearch(db='protein', term='RecA[gene] AND bacteria[organism]', retmax=5)\n"
+                    "  search_record = Entrez.read(handle); handle.close()\n"
+                    "  ids = search_record['IdList']\n"
+                    "  print(f'Found {len(ids)} IDs: {ids}')\n"
+                    "  if not ids: sys.exit(1)\n"
+                    "\n"
+                    "  time.sleep(1)  # NCBI rate limit\n"
+                    "\n"
+                    "  # Fetch sequences — read ALL content first, THEN parse (avoids network handle issues)\n"
+                    "  handle = Entrez.efetch(db='protein', id=','.join(ids), rettype='fasta', retmode='text')\n"
+                    "  fasta_text = handle.read(); handle.close()\n"
+                    "  print(f'Fetched {len(fasta_text)} bytes')\n"
+                    "  if not fasta_text.startswith('>'):\n"
+                    "      print('ERROR: response is not FASTA:', fasta_text[:200]); sys.exit(1)\n"
+                    "  sequences = list(SeqIO.parse(StringIO(fasta_text), 'fasta'))\n"
+                    "  print(f'Parsed {len(sequences)} sequences')\n"
+                )
+
+            if _injections:
+                content += "\n\nCODE PATTERN REMINDER (apply these in your code):\n" + "\n\n".join(_injections)
+
+            # Fix 2 — Inject file_registry from manifest so model uses exact filenames
+            # from previous steps instead of inventing them.
+            _file_registry = manifest.get("file_registry", {})
+            if _file_registry:
+                _reg_lines = []
+                for _ext, _names in sorted(_file_registry.items()):
+                    for _nm in _names:
+                        _reg_lines.append(f"  {_ext:<8} -> {_nm}")
+                content += (
+                    "\n\nFILE_REGISTRY (exact filenames produced by previous steps — "
+                    "use these, never invent paths):\n"
+                    + "\n".join(_reg_lines)
+                )
+
+            # Fix 9 — Always inject the filesystem helper reference so the model
+            # uses list_files()/get_file() instead of inventing hardcoded paths.
+            try:
+                from genomeer.utils.filesystem import FILESYSTEM_PROMPT_SNIPPET as _FS_SNIPPET
+                content += "\n\n" + _FS_SNIPPET
+            except ImportError:
+                pass
+
+            # Fix 5 — Inject exact run_dir file listing into generator prompt.
+            # The model invents filenames like "GCF_000009045.1.fna" instead of
+            # "GCF_000009045.1_ASM904v1_genomic.fna". Showing the real filenames
+            # eliminates all FileNotFoundError caused by invented paths.
+            if temp_dir and os.path.isdir(temp_dir):
+                import glob as _gl
+                _dir_files = sorted(_gl.glob(os.path.join(temp_dir, "*")))
+                if _dir_files:
+                    _file_lines = []
+                    for _fp in _dir_files:
+                        _sz = os.path.getsize(_fp) if os.path.isfile(_fp) else 0
+                        _file_lines.append(f"  {os.path.basename(_fp)}  ({_sz:,} bytes)")
+                    _rundir_section = (
+                        f"\nRUN_DIR = r\"{temp_dir}\"\n"
+                        f"FILES_CURRENTLY_IN_RUN_DIR (use these EXACT names — do not invent paths):\n"
+                        + "\n".join(_file_lines)
+                    )
+                    content += _rundir_section
+
             msgs = [
-                self.system_prompt, 
-                HumanMessage(content=prompt), 
+                self.system_prompt,
+                HumanMessage(content=prompt),
                 HumanMessage(content=content)
             ]
-            
+
             self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nrepair_mode={bool(repair_feedback)}", node=node)
-            resp = self._llm_invoke(node, "code_gen", msgs)
-    
-            sanitized_block = StateGraphHelper.sanitize_execute_block(resp.content)
-            code, lang, env_hint = StateGraphHelper.parse_execute(sanitized_block)
-        
-            # AUTO-DETECT best environment from generated code
-            resolved_env = resolve_env_for_code(
-                code=code or "",
-                lang=lang,
-                env_hint=env_hint,
-                current_env=env_name,
-            )
-            self._log("ENV RESOLVED", body=f"current={env_name} -> resolved={resolved_env}", node=node)
-        
-            # ADAPTIVE TIMEOUT: long-running metagenomics steps get more time
-            step_title_lower = step["title"].lower()
-            from genomeer.utils.metrics import compute_adaptive_timeout, get_available_ram_gb
-            adaptive_timeout = compute_adaptive_timeout(
-                base_seconds=manifest.get("timeout_seconds", 600),
-                input_files=[],
-                tool_name=step_title_lower,
-                available_ram_gb=get_available_ram_gb()
-            )
-            new_manifest = dict(manifest)
-            new_manifest["timeout_seconds"] = adaptive_timeout
-        
+
+            # Retry up to 2 extra times on: empty block OR Python SyntaxError.
+            # SyntaxErrors are detected before execution so the LLM can fix them immediately.
+            _MAX_FORMAT_RETRIES = 2
+            code = None
+            sanitized_block = ""
+            for _fmt_try in range(_MAX_FORMAT_RETRIES + 1):
+                resp = self._llm_invoke(node, f"code_gen (attempt {_fmt_try+1})", msgs)
+                sanitized_block = StateGraphHelper.sanitize_execute_block(resp.content)
+                code, lang = StateGraphHelper.parse_execute(sanitized_block)
+
+                # Determine if we should retry and why
+                _retry_reason: str | None = None
+                if not (code and code.strip()):
+                    _retry_reason = (
+                        "Your previous response contained NO <EXECUTE>...</EXECUTE> block. "
+                        "You MUST output exactly one <EXECUTE>#!PY\\n...code...\\n</EXECUTE> block "
+                        "and NOTHING else."
+                    )
+                elif not lang or lang == "PY":
+                    # Syntax-check Python before execution.
+                    try:
+                        compile(code, "<check>", "exec")
+                    except SyntaxError as _syn:
+                        # Try the deterministic fixer FIRST — avoid an LLM roundtrip when
+                        # the error is a simple f-string quote conflict that we can fix locally.
+                        _fixed = self._auto_fix_fstring_quotes(code)
+                        if _fixed is not code:  # fixer changed something
+                            try:
+                                compile(_fixed, "<check>", "exec")
+                                # Deterministic fix worked — accept it immediately.
+                                code = _fixed
+                                self._log("FSTRING AUTO-FIX (in-loop)", body=str(_syn), node=node)
+                                _syn = None  # signal success
+                            except SyntaxError:
+                                pass  # fixer didn't help — fall through to LLM retry
+
+                        if _syn is not None:
+                            _retry_reason = (
+                                f"Your generated Python code has a SyntaxError: {_syn}\n"
+                                "Most common cause: f-string with conflicting quotes, "
+                                "e.g. f'result: '{val}'' or f\"count: {seq.count(\"G\")}\".\n"
+                                "Fix: use SINGLE quotes inside f-strings delimited by double quotes:\n"
+                                "  print(f\"GC: {seq.count('G')}\")   # correct\n"
+                                "  print(f'N50: {n50}')               # correct (no inner quotes)\n"
+                                "Rewrite the ENTIRE code fixing ALL quote conflicts."
+                            )
+
+                if _retry_reason is None:
+                    break  # code is valid — stop retrying
+
+                if _fmt_try < _MAX_FORMAT_RETRIES:
+                    self._log("FORMAT RETRY", body=f"attempt {_fmt_try+1}: {_retry_reason[:120]}", node=node)
+                    msgs = msgs + [
+                        AIMessage(content=resp.content),
+                        HumanMessage(content=_retry_reason + "\n\nTry again now."),
+                    ]
+            
+            # If all retries failed to produce any code, inject a synthetic failure script
+            # so the executor+observer can handle it cleanly instead of silently passing None.
+            if not code or not code.strip():
+                code = (
+                    "#!PY\nimport sys\n"
+                    "print('GENERATOR_FAILURE: no valid code was produced after all retries.')\n"
+                    "sys.exit(1)"
+                )
+                lang = "PY"
+                self._log("SYNTHETIC FAILURE CODE", body="all retries exhausted", node=node)
+
+            # Post-process Python code (deterministic fixes, LLM-independent).
+            if code and (not lang or lang == "PY"):
+                code = self._inject_missing_imports(code)
+                code = self._sanitize_output_paths(code, temp_dir)
+                code = self._fix_gc_formula(code)
+                code = self._fix_cli_commands(code)
+                code = self._fix_fasta_reading(code)
+                # Final compile() after all post-processing.
+                # If our own fixers (or residual LLM errors) produced a SyntaxError,
+                # attempt the deterministic f-string quote normalizer before giving up.
+                code = self._auto_fix_fstring_quotes(code)
+
             code_key = "diagnostic_code" if is_diagnostic else "pending_code"
             updates = {
                 code_key: code,
-                "env_name": resolved_env,
-                "manifest": new_manifest,
+                "env_name": env_name,
                 "next_step": "ensure_env",
                 "messages": [AIMessage(content=sanitized_block)],
             }
-            
+
             # clear repair metadata once we ave generated new code
             if repair_feedback:
                 new_manifest = dict(manifest)
                 new_manifest.pop("repair_feedback", None)
                 new_manifest.pop("repair_step_idx", None)
                 updates["manifest"] = new_manifest
+
+            # Fix 8 — Per-step timeout: classify the step by keyword and set the
+            # appropriate timeout_seconds in the manifest before the executor reads it.
+            _TIMEOUT_7200_KW = ("humann", "humann3", "functional profiling")
+            _TIMEOUT_3600_KW = ("assemble", "assembly", "spades", "megahit", "flye", "scaffold",
+                                "de novo", "kraken2", "kraken", "semibin", "concoct", "maxbin",
+                                "binning", "antismash", "bgc", "biosynthetic",
+                                # annotation / classification / profiling are slow inference steps
+                                "annotate", "annotation", "classify reads", "taxonomic classif",
+                                "taxonomic profil", "reads profile", "metagenomic profil")
+            _TIMEOUT_1800_KW = ("download", "ncbi", "ncbi-genome-download", "fetch genome", "ftp",
+                                "genome download", "checkm2", "checkm", "bin quality",
+                                "bin completeness", "bin contamination",
+                                "eggnog", "diamond", "emapper",
+                                "kaiju", "genomad", "pharokka")
+            _TIMEOUT_600_KW  = ("hmmer", "hmmscan", "quast", "dbcan", "nonpareil", "sylph")
+            if any(k in _step_ctx for k in _TIMEOUT_7200_KW):
+                _step_timeout = 7200
+            elif any(k in _step_ctx for k in _TIMEOUT_3600_KW):
+                _step_timeout = 3600
+            elif any(k in _step_ctx for k in _TIMEOUT_1800_KW):
+                _step_timeout = 1800
+            elif any(k in _step_ctx for k in _TIMEOUT_600_KW):
+                _step_timeout = 600
+            else:
+                _step_timeout = 600
+            _tmfest = dict(updates.get("manifest", manifest))
+            _tmfest["timeout_seconds"] = _step_timeout
+            updates["manifest"] = _tmfest
+            self._log("FIX8 TIMEOUT", body=f"step_timeout={_step_timeout}s  step_ctx_sample={_step_ctx[:80]}", node=node)
             
             # MAYBE: return to observer from here if no code;
             self._log("GENERATED CODE", body=code or "<empty>", node=node)
-
+            
             # ------ feedback replay mode check ------
             pause = self._maybe_pause(
                 state,
@@ -1746,28 +1381,43 @@ class BioAgent:
             return updates
         
         def _ensure_env(self, state: AgentState) -> AgentState:
-            sid = state.get("current_sample_id")
-            node = f"ensure_env|{sid}" if sid else "ensure_env"
-
-            # ── CI / Windows E2E bypass ───────────────────────────────────────
-            if os.environ.get("GENOMEER_SKIP_ENV_INSTALL", "0") == "1":
-                env_name = state.get("env_name") or "mocked_env"
-                self._log("ENSURE_ENV SKIP", body=f"GENOMEER_SKIP_ENV_INSTALL=1 -> skipping install for '{env_name}'", node=node)
-                return {
-                    "env_ready": True,
-                    "next_step": "executor",
-                    "messages": [AIMessage(content=f"<observe>[SKIP] Environment '{env_name}' install bypassed (GENOMEER_SKIP_ENV_INSTALL=1).</observe>")],
-                }
-            # ─────────────────────────────────────────────────────────────────
-
-            # state["env_ready"] = True
-            # state["next_step"] = "executor"
-            # return state
-            from genomeer.runtime.env_manager import load_registry, spec_path, create_or_update_env, env_prefix, has_env
+            from genomeer.runtime.env_manager import (
+                load_registry, spec_path, create_or_update_env, env_prefix,
+                has_env, has_pip_installed, _pip_install_from_spec,
+            )
             env_name = state.get("env_name")
 
             if has_env(env_name):
-                prefix = str(env_prefix(env_name))
+                prefix = env_prefix(env_name)
+                if not has_pip_installed(env_name):
+                    # Conda env exists but pip packages were never installed (Windows micromamba bug).
+                    # Install explicitly now. Do NOT proceed to executor if this fails.
+                    pip_error: str | None = None
+                    try:
+                        reg = load_registry()
+                        rec = next((e for e in reg.get("envs", []) if e.get("name") == env_name), None)
+                        if rec:
+                            _pip_install_from_spec(prefix, spec_path(rec["spec"]))
+                            self._log("PIP REPAIR", body=f"pip packages installed into '{env_name}'", node="ensure_env")
+                        else:
+                            pip_error = f"Env '{env_name}' not found in registry — cannot install pip packages."
+                    except Exception as exc:
+                        pip_error = str(exc)
+                        self._log("PIP REPAIR ERROR", body=pip_error, node="ensure_env")
+
+                    # Verify sentinel was written — if not, pip failed and env is unusable.
+                    if not has_pip_installed(env_name):
+                        msg = pip_error or "pip install completed but sentinel not written."
+                        return {
+                            "env_ready": False,
+                            "next_step": "end",
+                            "messages": [AIMessage(content=(
+                                f"<observe>Environment '{env_name}' pip install failed: {msg}\n"
+                                f"Delete the env folder and retry, or install packages manually:\n"
+                                f"  micromamba run -p {prefix} pip install biopython numpy pandas</observe>"
+                            ))],
+                        }
+
                 return {
                     "env_ready": True,
                     "next_step": "executor",
@@ -1821,14 +1471,10 @@ class BioAgent:
                     "messages": [AIMessage(content=f"<observe>Environment '{env_name}' ready at {prefix}</observe>")]
                 }
             except Exception as e:
-                try:
-                    entry["stream"].push(f"ERROR: {e}\n")
-                except Exception as _se:
-                    logger.warning(f"[ensure_env_node] Stream push failed: {_se}")
-                try:
-                    entry["stream"].close()
-                except Exception as _ce:
-                    logger.warning(f"[ensure_env_node] Stream close failed: {_ce}")
+                try: entry["stream"].push(f"ERROR: {e}\n")
+                except Exception: pass
+                try: entry["stream"].close()
+                except Exception: pass
                 self._install_threads.pop(env_name, None)
                 return {
                     "next_step": "end",
@@ -1836,563 +1482,547 @@ class BioAgent:
                 }
         
         def _executor(self, state: AgentState) -> AgentState:
-            sid = state.get("current_sample_id")
-            node = f"executor|{sid}" if sid else "executor"
+            node = "executor"
             code = (state.get("pending_code") or "").strip()
             diagnostic_code = (state.get("diagnostic_code") or "").strip()
             diagnostic_mode = state.get("diagnostic_mode")
-
-            # Point Faible 3: use external cancel_event if provided
-            _cancel_event = getattr(self, "current_cancel_event", None) or threading.Event()
-
-            # T2.5: Assert/fallback for run_temp_dir before any subprocess is launched.
-            # Fix it at the process level so subprocesses always inherit RUN_TEMP_DIR.
-            _run_temp_dir = state.get("run_temp_dir")
-            if not _run_temp_dir:
-                _run_temp_dir = os.environ.get("BIOAGENT_TMP_DIR", "/tmp/bioagent")
-                self._log("RUN_TEMP_DIR FIX", body=f"run_temp_dir was None, using fallback: {_run_temp_dir}", node=node)
-            # Always sync to os.environ so subprocess inheritance is guaranteed
-            os.environ["RUN_TEMP_DIR"] = _run_temp_dir
-            os.makedirs(_run_temp_dir, exist_ok=True)
-            # Propagate the fix back into state for downstream nodes
-            if not state.get("run_temp_dir"):
-                state = {**state, "run_temp_dir": _run_temp_dir}
-
-            # T2.3: Build extra_env dict — injected into every subprocess call
-            _extra_env = {"RUN_TEMP_DIR": _run_temp_dir}
-            
-            # T9: Support per-worker RAM quota in batch mode
-            _ram_quota = state.get("_per_worker_ram_gb")
-            if _ram_quota:
-                _extra_env["GENOMEER_MAX_RAM_GB"] = str(_ram_quota)
-                # Also update current process env so that helper.py reads it
-                os.environ["GENOMEER_MAX_RAM_GB"] = str(_ram_quota)
-
             env = state["env_name"]
-
-            # ── CI / Windows E2E bypass ───────────────────────────────────────
-            # Force in-process execution: no micromamba, no subprocess.
-            # The step_namespace below already injects 'manifest' so mock PY
-            # steps work correctly without any external env.
-            if os.environ.get("GENOMEER_SKIP_ENV_INSTALL", "0") == "1":
-                env = None
-                self._log("EXECUTOR SKIP", body="GENOMEER_SKIP_ENV_INSTALL=1 -> running code in-process (env=None)", node=node)
-            # ─────────────────────────────────────────────────────────────────
-
-            _default_timeout = state["manifest"].get("timeout_seconds", 600)
-
-            
-            # P2-B.2 & Point Faible 1: Extract input files including paths without quotes
-            import re as _re
-            _matches = _re.findall(
-                r'(?:["\']([^"\']+\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))["\'])|((?:/[^/\s][^\n=]+|\w:[^\n=]+)\.(?:fastq|fq|fasta|fa|fna|bam|gz|fastq\.gz|fq\.gz))', 
-                code or ''
-            )
-            _input_files = [m[0] or m[1] for m in _matches if os.path.exists(m[0] or m[1])]
-            
-            step = self._get_current_step(state)
-            step_title = step["title"] if step else "unknown step"
-            
-            from genomeer.utils.metrics import compute_adaptive_timeout, get_available_ram_gb
-            timeout = compute_adaptive_timeout(
-                base_seconds=_default_timeout,
-                input_files=_input_files,
-                tool_name=step_title,
-                available_ram_gb=get_available_ram_gb()
-            )
-            
+            timeout = state["manifest"].get("timeout_seconds", 600)
             last_result = ""
 
-            if hasattr(self, "_metrics") and self._metrics:
-                pass # moved after cache lookup
-
-            self._log("ENTER NODE", body=f"env={env}\ntimeout={timeout}s\nRUN_TEMP_DIR={_run_temp_dir}\ncode_preview=\n{code[:500] or '<no code>'}", node=node)
+            self._log("ENTER NODE", body=f"env={env}\ntimeout={timeout}s\ncode_preview=\n{code[:500] or '<no code>'}", node=node)
 
             if not code or (diagnostic_mode and not diagnostic_code):
-                self._log("NO CODE", body="Skipping execution", node=node)
-                self._log("EXIT NODE", body="next_step=observer", node=node)
-                return {
+                updates = {
                     "next_step": "observer",
                     "last_result": "No code produced by GENERATOR.",
-                    "messages": [AIMessage(content="No code produced for this step.")],
+                    "messages": [AIMessage(content="No code produced by for this step.")],
                 }
+                self._log("NO CODE", body="Skipping execution", node=node)
+                self._log("EXIT NODE", body="next_step=observer", node=node)
+                return updates
 
             if diagnostic_mode:
                 code = diagnostic_code
                 
             try:
-                _cancel_event = threading.Event()
-                state["cancel_event"] = _cancel_event
-
-                # ── TOOL OUTPUT CACHE (Fix 5.1) ────────────────────────────────────────
-                _tool_cache_key = None
-                _cached_result = None
-                
-                # S'assurer que le dossier temporaire est valide pour la restauration
-                _run_temp_dir = state.get("run_temp_dir", "")
-                if not _run_temp_dir or not os.path.exists(_run_temp_dir):
-                    self._log("TOOL CACHE WARN", body="run_temp_dir missing - cache restoration disabled", node=node)
-                    _cache_output_dir = None
-                else:
-                    _cache_output_dir = _run_temp_dir
-
-                if hasattr(self, "_cache") and self._cache and self._cache.tool:
-                    try:
-                        import hashlib
-                        _code_hash = hashlib.sha256((code or "").encode()).hexdigest()[:16]
-                        _env_hash = str(env)
-                        
-                        # BUG-37: Detect tools/DBs BEFORE cache check to include versions in key
-                        if hasattr(self, "_version_tracker"):
-                            self._version_tracker.auto_record_from_step(step_title, code, env_name=env or "meta-env1")
-                            _tool_versions = self._version_tracker.as_dict()
-                        else:
-                            _tool_versions = {}
-                        
-                        _files_snapshot = sorted([
-                            f"{f['name']}:{f.get('size_bytes', 0)}"
-                            for f in self._list_ctx_files(_run_temp_dir)
-                        ])
-                        _tool_cache_key = self._cache.tool.make_key(
-                            step_title,
-                            {
-                                "code_hash": _code_hash, 
-                                "env": _env_hash, 
-                                "files": _files_snapshot,
-                                "tool_versions": _tool_versions
-                            },
-                            {},
-                        )
-                        _cached_result = self._cache.tool.get(_tool_cache_key, output_dir=_cache_output_dir)
-                        if _cached_result:
-                            self._log("TOOL CACHE HIT", body=f"step={step_title}", node=node)
-                            out = _cached_result.get("output", "") if isinstance(_cached_result, dict) else str(_cached_result)
-                    except Exception as _ce:
-                        self._log("TOOL CACHE (warn)", body=str(_ce), node=node)
-                # ── END TOOL CACHE LOOKUP ──────────────────────────────────────────────
-                if hasattr(self, "_metrics") and self._metrics:
-                    self._metrics.record_step_start(state.get("current_idx", 0), step_title)
-
-                if not _cached_result:
-                    if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
-                        r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
+                if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
+                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
+                    out = run_with_timeout(
+                        run_r_code,
+                        args=[r_code],
+                        kwargs={"env_name": env, "timeout": timeout},
+                        timeout=timeout
+                    )
+                elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
+                    if code.strip().startswith("#!CLI"):
+                        cli_command = re.sub(r"^#!CLI", "", code, 1).strip().replace("\n", " ")  # noqa: B034
                         out = run_with_timeout(
-                            run_r_code,
-                            args=[r_code],
-                            kwargs={
-                                "env_name": env,
-                                "extra_env": _extra_env,      # T2.3
-                                "run_temp_dir": _run_temp_dir, # T2.1
-                                "cancel_event": _cancel_event, # T7
-                            },
-                            timeout=timeout,
-                            cancel_event=_cancel_event,
+                            run_bash_script,
+                            args=[cli_command],
+                            kwargs={"env_name": env, "timeout": timeout},
+                            timeout=timeout
                         )
-                    elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
-                        if code.strip().startswith("#!CLI"):
-                            cli_command = re.sub(r"^#!CLI", "", code, 1).strip().replace("\n", " ")  # noqa: B034
-                            out = run_with_timeout(
-                                run_bash_script,
-                                args=[cli_command],
-                                kwargs={
-                                    "env_name": env,
-                                    "extra_env": _extra_env,      # T2.3
-                                    "run_temp_dir": _run_temp_dir, # T2.1
-                                    "cancel_event": _cancel_event, # T7
-                                },
-                                timeout=timeout,
-                                cancel_event=_cancel_event,
-                            )
-
-                # ── TOOL CACHE SAVE block moved ─────────────────────────────────────────
                     else:
                         bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, 1).strip()  # noqa: B034
                         out = run_with_timeout(
                             run_bash_script,
                             args=[bash_script],
-                            kwargs={
-                                "env_name": env,
-                                "extra_env": _extra_env,      # T2.3
-                                "run_temp_dir": _run_temp_dir, # T2.1
-                                "cancel_event": _cancel_event, # T7
-                            },
-                            timeout=timeout,
-                            cancel_event=_cancel_event,
+                            kwargs={"env_name": env, "timeout": timeout},
+                            timeout=timeout
                         )
                 else:
                     # Inject custom functions into the Python execution environment
-                    self._inject_custom_functions_to_repl()  # for _persistent_namespace only
+                    self._inject_custom_functions_to_repl()
                     code = re.sub(r"^\s*#!PY\s*\r?\n", "", code, count=1)
-                    # TÂCHE 6.1/Flaw 6: Restriction stricte des __builtins__ pour la sandbox Python
-                    # On ne garde que les fonctions sûres (print, len, range, etc.)
-                    # et on bloque open, __import__, eval, exec, breakpoint.
-                    _SAFE_BUILTINS = {
-                        k: v for k, v in __builtins__.__dict__.items()
-                        if k in {
-                            "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
-                            "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
-                            "format", "frozenset", "hash", "hex", "id",
-                            "int", "isinstance", "issubclass", "iter", "len", "list", "map",
-                            "max", "min", "next", "object", "oct", "ord", "pow", "print",
-                            "property", "range", "repr", "reversed", "round", "set",
-                            "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
-                            "None", "True", "False", "Exception", "StopIteration"
-                        }
-                    }
-                    
-                    _manifest_copy = dict(state.get("manifest") or {})
-                    _step_namespace = {
-                        "__builtins__": _SAFE_BUILTINS,
-                        "run_dir": _run_temp_dir,          # always available to generated code
-                        "manifest": _manifest_copy,        # allow mock steps to mutate quality_signals
-                    }
-                    # Copy custom functions from _persistent_namespace if present (T4 preserves custom tools)
-                    from genomeer.utils.helper import _get_persistent_namespace as _gpns
-                    _pns = _gpns()
-                    for _k, _v in _pns.items():
-                        if callable(_v):
-                            _step_namespace[_k] = _v
                     out = run_with_timeout(
                         run_python_code,
                         args=[code],
-                        kwargs={
-                            "env_name": env,
-                            "extra_env": _extra_env,           # T2.3
-                            "run_temp_dir": _run_temp_dir,     # T2.1
-                            "step_namespace": _step_namespace, # T4
-                        },
-                        timeout=timeout,
-                        cancel_event=_cancel_event,
+                        kwargs={"env_name": env, "timeout": timeout},
+                        timeout=timeout
                     )
-                    # Propagate changes from the step namespace back to the state
-                    import copy as _copy
-                    new_manifest = _copy.deepcopy(_step_namespace.get("manifest") or _manifest_copy or {})
-                    
-                    # TÂCHE 11: Tracking des wrappers réels
-                    detected_tools = self._extract_tools_from_code(code)
-                    if detected_tools:
-                        step_tools = dict(new_manifest.get("step_tools_used", {}))
-                        step_tools[str(state.get("current_idx", 0))] = detected_tools
-                        new_manifest["step_tools_used"] = step_tools
-                        self._log("TOOL TRACKING", body=f"Detected: {', '.join(detected_tools)}", node=node)
 
-                    state = {**state, "manifest": new_manifest}
-
-
-                # ── TOOL CACHE SAVE (Fix 1) ─────────────────────────────────────────
-                if _tool_cache_key and not _cached_result and out:
-                    try:
-                        self._cache.tool.set(
-                            _tool_cache_key,
-                            step_title,
-                            {"output": out},
-                            output_dir=_run_temp_dir,
-                        )
-                        self._log("TOOL CACHE SAVED", body=f"step={step_title}", node=node)
-                    except Exception as _cse:
-                        self._log("TOOL CACHE SAVE (warn)", body=str(_cse), node=node)
-
-                # ── AXE 3.3: Intelligent output parser instead of blind truncation ──
-                # FIX-2: retrieve step from state directly (step was undefined in this scope)
-                _current_plan = state.get("plan", [])
-                _current_idx  = state.get("current_idx", 0)
-                _step_obj     = _current_plan[_current_idx] if _current_plan and _current_idx < len(_current_plan) else {}
-                step_title    = _step_obj.get("title", "")
-                out_dir = state.get("run_temp_dir", "")
-                if _PARSERS_OK and out and len(out) > 2000:
-                    # TÂCHE 9: Sauvegarde de l'output complet sur le disque avant troncature/parsing
-                    if out and out_dir:
-                        try:
-                            _step_filename = f"step_{_current_idx:02d}_output.txt"
-                            _step_output_path = Path(out_dir) / _step_filename
-                            _step_output_path.write_text(out, encoding="utf-8")
-                            self._log("FULL OUTPUT SAVED", body=f"Saved to {_step_filename}", node=node)
-                        except Exception as _wse:
-                            self._log("FULL OUTPUT SAVE (warn)", body=str(_wse), node=node)
-
-                    parsed = _smart_parse_output(
-                        step_title,
-                        out,
-                        result_dict=None,
-                        output_dir=out_dir,
-                    )
-                    if parsed and len(parsed) < len(out):
-                        out = parsed
-                elif out and len(out) > 12000:
-                    # TÂCHE 9: Sauvegarde avant troncature simple
-                    if out_dir:
-                        try:
-                            _step_filename = f"step_{_current_idx:02d}_output.txt"
-                            Path(out_dir).joinpath(_step_filename).write_text(out, encoding="utf-8")
-                            self._log("FULL OUTPUT SAVED", body=f"Saved to {_step_filename} (pre-truncation)", node=node)
-                        except Exception: pass
-
-                    out = out[:12000] + "\n...<truncated>"
+                # bound size — keep TAIL so errors (which appear last) are never lost
+                if out and len(out) > 12000:
+                    out = "...<truncated head>\n" + out[-12000:]
                     
                 last_result = out or ""
                 self._log("EXECUTION RESULT", body=last_result[:2000], node=node)
             except Exception as e:
                 tb = traceback.format_exc()
-                _etype = type(e).__name__
-                # T6.2: Distinguish explicit timeout from other errors for clearer observer feedback
-                if "Timeout" in _etype or "TimeoutError" in _etype:
-                    _current_plan = state.get("plan", [])
-                    _current_idx  = state.get("current_idx", 0)
-                    _step_obj     = _current_plan[_current_idx] if _current_plan and _current_idx < len(_current_plan) else {}
-                    step_title    = _step_obj.get("title", "unknown step")
-                    last_result = (
-                        f"[TIMEOUT] Step '{step_title}' exceeded {timeout}s time limit. "
-                        f"No output produced. The subprocess may still be running in the background. "
-                        f"Consider increasing the timeout or breaking this step into smaller sub-steps."
-                    )
-                else:
-                    last_result = f"[EXECUTION ERROR] {_etype}: {e}\n"
-                    last_result += f"traceback: {tb}"
+                last_result = f"[EXECUTION ERROR] {type(e).__name__}: {e}\n"
+                last_result += f"traceback: {tb}"
                 self._log("EXECUTION ERROR", body=last_result, node=node)
-            
-            
+                
             self._log("EXIT NODE", body="next_step=observer", node=node)
             result_key = "diagnostic_observation" if diagnostic_mode else "last_result"
-            
-            _stored_result = last_result[:4000] + "\n...<truncated for state storage>" if len(last_result) > 4000 else last_result
-            
             updates = {
-                "next_step": "observer", #end
+                "next_step": "validator",
                 result_key: last_result,
-                "messages": [AIMessage(content=f"<observe>Code Execution output: '{_stored_result}'</observe>")],
-                "manifest": state.get("manifest"),
+                "messages": [AIMessage(content=f"<observe>Code Execution output:  '{last_result}'</observe>")],
             }
             return updates
-        
-        def _observer(self, state: AgentState) -> AgentState:
-            sid = state.get("current_sample_id")
-            node = f"observer|{sid}" if sid else "observer"
 
-            # T7: Safe step accessor — prevents IndexError when current_idx >= len(plan)
-            step = self._get_current_step(state)
-            if step is None:
-                self._log("OBSERVER GUARD", body="current_idx out of bounds — routing to finalizer", node=node)
+        # ── VALIDATOR ────────────────────────────────────────────────────────
+        def _validator(self, state: AgentState) -> AgentState:
+            """
+            Deterministic post-executor gate (Phase 1 + Phase 2 + Phase 3).
+
+            ok=True  + score≥0   → bookkeeping (file_registry + manifest) + orchestrator
+            ok=True  + score=-1  → no contract for this step → observer (LLM)
+            ok=False + RUNTIME=long   → 0 retries → observer immediately
+            ok=False + RUNTIME=medium → 1 retry with best hint → observer if still failing
+            ok=False + RUNTIME=fast   → up to 3 sequential variants → observer if exhausted
+            """
+            from genomeer.agent.v2.utils.validator import ToolValidator
+
+            node = "validator"
+            step        = state["plan"][state["current_idx"]]
+            run_dir     = state.get("run_temp_dir", "")
+            last_result = state.get("last_result") or ""
+
+            result = ToolValidator.validate(step["title"], run_dir, last_result)
+            max_r  = ToolValidator.max_retries(step["title"])
+            self._log(
+                "VALIDATOR",
+                body=(f"step='{step['title']}' ok={result.ok} "
+                      f"score={result.score:.2f} runtime_max_retries={max_r} "
+                      f"reason={result.reason}"),
+                node=node,
+            )
+
+            # ── no contract → observer handles it ────────────────────────────
+            if result.score == -1.0:
+                self._log("VALIDATOR PASS-THROUGH", body="no contract → observer", node=node)
+                return {"next_step": "observer"}
+
+            # ── CONTRACT OK → done bookkeeping ────────────────────────────────
+            if result.ok:
+                summary = f"[validator] {result.reason} (score={result.score:.2f})"
+                _dir_files = self._list_ctx_files(run_dir)
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {
+                    **plan[state["current_idx"]],
+                    "status": "done",
+                    "notes": summary,
+                }
+                observations = list(state.get("manifest", {}).get("observations", []))
+                observations.append({
+                    "step_idx":       state["current_idx"],
+                    "title":          step["title"],
+                    "status":         "done",
+                    "summary":        summary,
+                    "score":          result.score,
+                    "stdout":         last_result[:2000],
+                    "files_snapshot": _dir_files,
+                })
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["observations"]  = observations
+                new_manifest["file_registry"] = self._build_file_registry(run_dir)
+                new_manifest["files"]         = [f["name"] for f in _dir_files]
+                self._log("VALIDATOR DONE", body=summary, node=node)
                 return {
-                    "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>[GUARD] Plan index out of bounds. Finalizing.</observe>")],
+                    "plan":                   plan,
+                    "current_idx":            state["current_idx"] + 1,
+                    "next_step":              "orchestrator",
+                    "last_result":            last_result,
+                    "manifest":               new_manifest,
+                    "diagnostic_mode":        False,
+                    "diagnostic_code":        None,
+                    "diagnostic_observation": None,
+                    "messages": [AIMessage(content=f"<STATUS:done>\n{summary}")],
                 }
 
-            diagnostic_mode = state.get("diagnostic_mode")
-            
-            if diagnostic_mode:
-                payload = instructions.OBSERVER_DIAGNOSTIC_CTX_PROMPT.format(
-                    user_goal=state['last_prompt'],
-                    current_step_title=step['title'],
-                    manifest=self._slim_manifest(state['manifest'], "observer"),
-                    code=(state.get("pending_code") or "").strip(),
-                    result=(state.get("last_result") or state.get("diagnostic_observation") or "(no output)"),
-                    diagnostic_code=(state.get("diagnostic_code") or "").strip(),
-                    diagnostic_output=(state.get("diagnostic_observation") or "").strip(),
+            # ── CONTRACT FAILED ────────────────────────────────────────────────
+            rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+            rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+            attempt = rc[state["current_idx"]]  # 1-based
+
+            # long tools → 0 retries allowed → inject context then observer
+            if max_r == 0:
+                hint = (result.retry_params or {}).get("hint", "check command arguments")
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    f"[VALIDATOR] '{step['title']}' failed.\n"
+                    f"score={result.score:.2f}, reason={result.reason}\n"
+                    f"Long-running tool — no auto-retry. Suggested fix: {hint}\n"
+                    f"Observer must diagnose from stdout below."
                 )
-            else:
-                payload = instructions.OBSERVER_CTX_PROMPT.format(
-                    user_goal=state['last_prompt'],
-                    current_step_title=step['title'],
-                    manifest=self._slim_manifest(state['manifest'], "observer"),
-                    code=(state.get("pending_code") or "").strip(),
-                    result=(state.get("last_result") or state.get("diagnostic_observation") or "(no output)"),
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log(
+                    "VALIDATOR → OBSERVER (long tool)",
+                    body=f"{result.reason} — long runtime, no auto-retry",
+                    node=node,
                 )
-            msgs = [
-                self.system_prompt,
-                HumanMessage(content=instructions.OBSERVER_PROMPT),
-                HumanMessage(content=payload),
-            ]
-
-            self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nstep_title={step['title']}", node=node)
-
-            # ── Biological Quality Gate (GAP4 — multi-tool, FIX G10) ─────────────
-            import json as _json_qg
-            pending_code = (state.get("pending_code") or "").lower()
-            last_result_text = (state.get("last_result") or "")
-            quality_annotations = []
-            first_fail_msg: str | None = None
-
-            for tool_name in [
-                "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
-                "run_metaspades", "run_megahit", "run_flye",
-                "run_host_decontamination",
-                "compute_coverage_samtools", "run_metabat2", "run_checkm2",
-                "run_bracken", "run_gtdbtk", "run_das_tool",
-                "run_medaka", "run_virsorter2", "run_checkv",
-                "run_prokka", "run_bakta", "run_rgi", "run_amrfinder", # Added
-            ]:
-                if tool_name.lower() not in pending_code:
-                    continue
-                # Try to extract result dict (nested JSON-aware)
-                result_dict = None
-                try:
-                    for _jm in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', last_result_text):
-                        try:
-                            result_dict = _json_qg.loads(_jm.group())
-                            break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-                qa_level, qa_msg = check_quality(tool_name, result_dict, last_result_text)
-                quality_annotations.append(format_quality_message(qa_level, qa_msg))
-                self._log("QUALITY GATE", body=f"tool={tool_name} level={qa_level}\n{qa_msg}", node=node)
-                # FIX G10: collect ALL fails instead of breaking at first match
-                if qa_level == "fail" and first_fail_msg is None:
-                    first_fail_msg = qa_msg
-
-            quality_annotation = "\n".join(quality_annotations)
-
-            # Hard fail: any gate failure forces blocked immediately (skip LLM)
-            if first_fail_msg:
-                rc = dict(state.get("retry_counts") or {})
-                diag_rounds = dict(state.get("manifest", {}).get("diagnostics_rounds", {}))
-                new_manifest = dict(state["manifest"])
-                
-                next_step = self._route_blocked_step(
-                    state, rc, diag_rounds, first_fail_msg, step, new_manifest, node="observer"
-                )
-                
-                plan = list(state["plan"])
-                plan[state["current_idx"]] = {**plan[state["current_idx"]], "status": "blocked", "notes": first_fail_msg}
-                self._log("QUALITY GATE BLOCK", body=f"Forcing blocked: {first_fail_msg}", node=node)
                 return {
-                    "plan": plan,
+                    "next_step":    "observer",
+                    "retry_counts": rc,
+                    "manifest":     new_manifest,
+                }
+
+            # within retry budget → pick variant hint for this attempt
+            if attempt <= max_r:
+                fallback = (result.retry_params or {}).get("hint", "fix the command and retry")
+                # retry_idx is 0-based: attempt 1 → variant[0], attempt 2 → variant[1], …
+                hint = ToolValidator.get_variant_hint(step["title"], attempt - 1, fallback)
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    f"VALIDATOR_FAIL (attempt {attempt}/{max_r}): {result.reason}.\n"
+                    f"Parameter fix to apply: {hint}"
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log(
+                    "VALIDATOR RETRY",
+                    body=f"attempt {attempt}/{max_r} — hint: {hint[:120]}",
+                    node=node,
+                )
+                return {
+                    "plan": [
+                        {**p, "status": "blocked"} if i == state["current_idx"] else p
+                        for i, p in enumerate(state["plan"])
+                    ],
+                    "current_idx":            state["current_idx"],
+                    "next_step":              "generator",
+                    "manifest":               new_manifest,
+                    "retry_counts":           rc,
+                    "diagnostic_mode":        False,
+                    "diagnostic_code":        None,
+                    "diagnostic_observation": None,
+                    "messages": [AIMessage(content=(
+                        f"<STATUS:blocked>\n[validator] {result.reason} "
+                        f"— attempt {attempt}/{max_r}, applying: {hint}"
+                    ))],
+                }
+
+            # retries exhausted → observer for LLM judgment
+            self._log(
+                "VALIDATOR EXHAUSTED",
+                body=f"{max_r} retries used, passing to observer",
+                node=node,
+            )
+            return {"next_step": "observer", "retry_counts": rc}
+
+        def _observer(self, state: AgentState) -> AgentState:
+            node = "observer"
+            step = state["plan"][state["current_idx"]]
+            diagnostic_mode = state.get("diagnostic_mode")
+            last_result = state.get("last_result") or ""
+
+            # ── EXIT CODE EXTRACTION (Fix 4) ────────────────────────────────────────
+            # helper.py formats failures as "Exit code: N" (with colon).
+            _exit_code_m = re.search(r"Exit code[:\s]+(\d+)", last_result, re.IGNORECASE)
+            _exit_code_nonzero = bool(_exit_code_m and _exit_code_m.group(1) != "0")
+            _exit_code_zero    = bool(_exit_code_m and _exit_code_m.group(1) == "0")
+
+            # Fix 4 — additional deterministic signals beyond exit_code
+            _has_traceback = bool(re.search(r"Traceback \(most recent call last\)", last_result))
+            _any_pyerr     = bool(re.search(
+                r"\b(?:ValueError|TypeError|RuntimeError|UnicodeDecodeError|"
+                r"OSError|IOError|ZeroDivisionError|IndexError|StopIteration|"
+                r"AssertionError|RecursionError|OverflowError):",
+                last_result,
+            ))
+
+            _ERROR_SIGNALS = re.compile(
+                r"Traceback|Error:|Exception:|GENERATOR_FAILURE|"
+                r"FileNotFoundError|NameError|KeyError|AttributeError|SyntaxError|"
+                r"ImportError|ModuleNotFoundError|TimeoutError|PermissionError",
+                re.IGNORECASE,
+            )
+            _MEANINGFUL_OUTPUT = re.compile(
+                r"\d+|percent|%|N50|GC|contig|length|sequence|scaffold|"
+                r"found|done|success|saved|written|downloaded|parsed|FASTA ready",
+                re.IGNORECASE,
+            )
+
+            # Fix 4 — file-existence check: if run_dir has files, that's a done signal
+            _temp_dir_obs = state.get("run_temp_dir", "")
+            _dir_files_obs = self._list_ctx_files(_temp_dir_obs) if _temp_dir_obs else []
+            _output_files_exist = len(_dir_files_obs) > 0
+
+            # FAST-DONE: exit_code=0 (or no exit code) AND no errors AND
+            # (meaningful stdout OR files exist in run_dir)
+            _is_exit_ok = (
+                not _exit_code_nonzero
+                and not _has_traceback
+                and not _any_pyerr
+                and last_result
+                and not _ERROR_SIGNALS.search(last_result)
+                and (_MEANINGFUL_OUTPUT.search(last_result) or _output_files_exist)
+                and len(last_result.strip()) > 5
+            )
+
+            # ── HARD BLOCK 1: non-zero exit code ────────────────────────────────────
+            if not diagnostic_mode and _exit_code_nonzero:
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    f"EXIT_CODE={_exit_code_m.group(1)}: execution failed. "
+                    f"Read the STDERR carefully and fix the root cause.\n"
+                    f"Last output:\n{last_result[-800:]}"
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log("HARD BLOCK exit_code!=0", body=f"exit_code={_exit_code_m.group(1)}", node=node)
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
                     "current_idx": state["current_idx"],
-                    "next_step": next_step,
-                    "messages": [AIMessage(content=f"<observe>{quality_annotation}</observe>")],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\nExit code {_exit_code_m.group(1)} — execution failed.")],
                     "manifest": new_manifest,
                     "retry_counts": rc,
                     "diagnostic_mode": False,
                     "diagnostic_code": None,
                     "diagnostic_observation": None,
                 }
-            # ── End Quality Gate ─────────────────────────────────────────────────
 
-            # Prepend quality annotation to observer payload if we have one
-            if quality_annotation:
-                payload = f"{quality_annotation}\n\n{payload}"
+            # ── HARD BLOCK 2: Traceback/Python error without captured exit_code ─────
+            # Catches failures where the execution wrapper swallowed the exit code
+            # but the Python traceback is still visible in the output.
+            if not diagnostic_mode and not _exit_code_nonzero and (_has_traceback or _any_pyerr):
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest = self._clean_manifest(state["manifest"])
+                _err_snippet = last_result[-600:]
+                new_manifest["repair_feedback"] = (
+                    f"Python exception detected (no exit code captured). "
+                    f"Fix the error shown below:\n{_err_snippet}"
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log("HARD BLOCK traceback", body="Traceback/PyError without exit_code", node=node)
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\nPython exception detected — execution failed.")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
 
+            # ── FAST-DONE: deterministic success ────────────────────────────────────
+            if not diagnostic_mode and _is_exit_ok:
+                summary = f"Execution succeeded.\n\nOutput:\n{last_result[:500]}"
+                _reason = "exit_code=0 + files_exist" if _output_files_exist else "exit_code=0 + meaningful output"
+                self._log("OBSERVER FAST-DONE", body=f"{_reason} → done (no LLM)", node=node)
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {**plan[state["current_idx"]], "status": "done", "notes": summary}
+                observations = list(state.get("manifest", {}).get("observations", []))
+                observations.append({
+                    "step_idx": state["current_idx"],
+                    "title": step["title"],
+                    "status": "done",
+                    "summary": summary,
+                    "stdout": last_result[:2000],
+                    "files_snapshot": _dir_files_obs,
+                })
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["observations"] = observations
+                # Fix 2 — build and store file_registry after every done step
+                new_manifest["file_registry"] = self._build_file_registry(_temp_dir_obs)
+                new_manifest["files"] = [f["name"] for f in _dir_files_obs]
+                return {
+                    "plan": plan,
+                    "current_idx": state["current_idx"] + 1,
+                    "next_step": "orchestrator",
+                    "last_result": last_result,
+                    "manifest": new_manifest,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "messages": [AIMessage(content=f"<STATUS:done>\n{summary}")],
+                }
+
+            if not diagnostic_mode and last_result and "GENERATOR_FAILURE:" in last_result:
+                self._log("OBSERVER PRE-CHECK", body="generator failure fast-path", node=node)
+            # ── END PRE-CHECK ────────────────────────────────────────────────────────
+
+            # Fast-path: Python import errors are always execution failures, never missing inputs.
+            # Bypass the LLM entirely to prevent small models from misrouting this to QA/user.
+            # IMPORTANT: only fire for ModuleNotFoundError (missing package) OR ImportError with
+            # "No module named" (also missing package). Do NOT fire for ImportError alone —
+            # that usually means a hallucinated class/function inside an existing module,
+            # which requires fixing the code, not pip-installing anything.
+            _has_module_not_found = bool(re.search(r"ModuleNotFoundError:", last_result))
+            _has_no_module = bool(re.search(r"No module named '", last_result))
+            _has_import_error = bool(re.search(r"ImportError:", last_result))
+            _is_missing_package = _has_module_not_found or (_has_import_error and _has_no_module)
+            _is_bad_import = _has_import_error and not _has_no_module  # hallucinated name
+
+            # Fix 7 — Deterministic error classifier: map error type → targeted repair.
+            # Each branch builds a precise summary that guides the generator directly,
+            # avoiding the LLM observer for unambiguous error patterns.
+            _temp_dir_err = state.get("run_temp_dir", "")
+            _manifest_files = state.get("manifest", {}).get("files", [])
+
+            # NameError: variable not defined
+            _nameerr_m = re.search(r"NameError: name '([^']+)' is not defined", last_result)
+            if not diagnostic_mode and _nameerr_m and not _is_missing_package and not _is_bad_import:
+                _undef_var = _nameerr_m.group(1)
+                # Check if it's a known pattern we can fix
+                if _undef_var in ("fasta_path", "run_dir", "accessions", "contigs"):
+                    _files_hint = (
+                        f"Files in run_dir: {_manifest_files}" if _manifest_files
+                        else f"run_dir = r\"{_temp_dir_err}\""
+                    )
+                    summary = (
+                        f"NameError: '{_undef_var}' is not defined. "
+                        f"Fix: define it before use. {_files_hint}. "
+                        f"For fasta_path: use glob.glob(os.path.join(run_dir, '*.fna'))[0]. "
+                        f"For run_dir: use the value from the prompt context. "
+                        f"For accessions: use [os.path.basename(f) for f in glob.glob(os.path.join(run_dir, '*.fna'))]. "
+                        f"For contigs: use list(SeqIO.parse(fasta_path, 'fasta'))."
+                    )
+                    self._log("FAST-PATH NameError", body=summary, node=node)
+                    new_manifest = self._clean_manifest(state["manifest"])
+                    rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                    rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                    new_manifest["repair_feedback"] = summary
+                    new_manifest["repair_step_idx"] = state["current_idx"]
+                    return {
+                        "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                                 for i, p in enumerate(state["plan"])],
+                        "current_idx": state["current_idx"],
+                        "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                        "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                        "manifest": new_manifest,
+                        "retry_counts": rc,
+                        "diagnostic_mode": False,
+                        "diagnostic_code": None,
+                        "diagnostic_observation": None,
+                    }
+
+            # FileNotFoundError: file path wrong
+            _fnf_m = re.search(r"FileNotFoundError.*?'([^']+)'", last_result)
+            if not diagnostic_mode and _fnf_m and not _is_missing_package:
+                _bad_path = _fnf_m.group(1)
+                _files_hint = f"Actual files in run_dir: {_manifest_files}" if _manifest_files else ""
+                summary = (
+                    f"FileNotFoundError: '{os.path.basename(_bad_path)}' not found. "
+                    f"The filename was invented — use glob to find the real file. "
+                    f"{_files_hint}. "
+                    f"Fix: fasta_path = glob.glob(os.path.join(run_dir, '*.fna'))[0]  "
+                    f"— never hardcode filenames."
+                )
+                self._log("FAST-PATH FileNotFoundError", body=summary, node=node)
+                new_manifest = self._clean_manifest(state["manifest"])
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
+
+            if not diagnostic_mode and _is_missing_package:
+                pkg_m = re.search(r"No module named '([^']+)'", last_result)
+                missing_pkg = pkg_m.group(1) if pkg_m else "unknown"
+                summary = (
+                    f"ModuleNotFoundError: package '{missing_pkg}' is not available in the environment. "
+                    f"Fix: use subprocess.run([sys.executable, '-m', 'pip', 'install', '{missing_pkg}']) "
+                    f"at the top of the script, then re-import. "
+                    f"Do NOT ask the user to install anything."
+                )
+                self._log("FAST-PATH ModuleNotFoundError", body=summary, node=node)
+            elif not diagnostic_mode and _is_bad_import:
+                # ImportError on a name that doesn't exist in an installed module.
+                # Extract what was hallucinated and give precise repair guidance.
+                bad_m = re.search(r"cannot import name '([^']+)' from '([^']+)'", last_result)
+                bad_name = bad_m.group(1) if bad_m else "unknown"
+                bad_module = bad_m.group(2) if bad_m else "unknown"
+                summary = (
+                    f"ImportError: '{bad_name}' does not exist in '{bad_module}'. "
+                    f"The code used a hallucinated API. "
+                    f"Fix: look up the correct class/function name in the module. "
+                    f"For Bio.ExPASy use: handle = ExPASy.get_sprot_raw(accession); record = SwissProt.read(handle). "
+                    f"For Bio.Entrez use: Entrez.email='x@y.com'; handle = Entrez.efetch(db=..., id=..., rettype=...). "
+                    f"Do NOT invent new class names."
+                )
+                self._log("FAST-PATH ImportError (hallucinated name)", body=summary, node=node)
+                new_manifest = self._clean_manifest(state["manifest"])
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["retry_count"] = rc[state["current_idx"]]
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                next_step = "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator"
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {**plan[state["current_idx"]], "notes": summary, "status": "blocked"}
+                return {
+                    "plan": plan,
+                    "current_idx": state["current_idx"],
+                    "next_step": next_step,
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
+
+            if diagnostic_mode:
+                payload = instructions.OBSERVER_DIAGNOSTIC_CTX_PROMPT.format(
+                    user_goal=state['last_prompt'],
+                    current_step_title=step['title'],
+                    manifest=state['manifest'],
+                    code=(state.get("pending_code") or "").strip(),
+                    result=state['last_result'],
+                    diagnostic_code=state.get("diagnostic_code").strip(),
+                    diagnostic_output=state.get("diagnostic_observation").strip(),
+                )
+            else:
+                payload = instructions.OBSERVER_CTX_PROMPT.format(
+                    user_goal=state['last_prompt'],
+                    current_step_title=step['title'],
+                    manifest=state['manifest'],
+                    code=(state.get("pending_code") or "").strip(),
+                    result=state['last_result'],
+                )
+            msgs = [
+                self.system_prompt,
+                HumanMessage(content=instructions.OBSERVER_PROMPT),
+                HumanMessage(content=payload),
+            ]
+            
+            self._log("ENTER NODE", body=f"step_idx={state['current_idx']}\nstep_title={step['title']}", node=node)
             resp = self._llm_invoke(node, "observe_and_status", msgs)
-
+                    
             status, summary = StateGraphHelper.parse_status(resp.content)
-
-            # T11.2: Handle 'unknown' status (tag absent from LLM output) — ask again with a short prompt
-            if status == "unknown":
-                self._log("STATUS UNKNOWN", body="Observer omitted <STATUS> tag. Retrying with clarification prompt.", node=node)
-                try:
-                    _retry_msgs = [
-                        self.system_prompt,
-                        HumanMessage(content=(
-                            f"You just wrote this observation:\n\n{resp.content[:2000]}\n\n"
-                            "Was the step successful? Reply with EXACTLY ONE of the following lines (nothing else):\n"
-                            "<STATUS:done>\n<STATUS:blocked>"
-                        )),
-                    ]
-                    _retry_resp = self._llm_invoke(node, "status_clarification", _retry_msgs)
-                    status, summary = StateGraphHelper.parse_status(_retry_resp.content)
-                    if status == "unknown":
-                        # T11.2 fallback: check for success keywords if status still unknown
-                        _c = _retry_resp.content.lower()
-                        if any(kw in _c for kw in ["success", "done", "complete", "finished", "passed"]):
-                            status = "done"
-                        else:
-                            status = "blocked"
-                        summary = f"[OBSERVER FALLBACK] Status inferred as {status}. Raw: {_retry_resp.content[:100]}"
-                    else:
-                        self._log("STATUS UNKNOWN \u2192 CLARIFIED", body=f"Clarified as {status}", node=node)
-                except Exception as _retry_exc:
-                    self._log("STATUS UNKNOWN (retry error)", body=str(_retry_exc), node=node)
-                    status = "blocked"
-                    summary = "[STATUS UNKNOWN] Could not determine step status."
-
             next_step = "generator" if status == "blocked" else "orchestrator"
             next_idx = state["current_idx"] + (0 if status == "blocked" else 1)
             
-            new_manifest = dict(state["manifest"])
-
-            # ── Extraire et persister les quality_signals dans le manifest ──────────
-            _obs_parsed = _robust_parser.parse_observer_output(resp.content, step_title=step["title"])
-            
-            # TÂCHE 3: Log si le parsing a échoué (fallback BLOCKED)
-            if _obs_parsed.parse_failed:
-                self._log("OBSERVER PARSE FAILED -> FORCED BLOCKED", body=f"Raw text start: {resp.content[:500]}...", node=node)
-
-            if _obs_parsed.quality_signals:
-                # BUG-36: coerce each signal value to float so adaptive_rules.py
-                # never sees a string like "N/A" and silently skips the rule.
-                # Values that cannot be converted are dropped with a warning.
-                _validated_signals: dict = {}
-                for _sig_k, _sig_v in _obs_parsed.quality_signals.items():
-                    if isinstance(_sig_v, (int, float)):
-                        _validated_signals[_sig_k] = float(_sig_v)
-                    else:
-                        try:
-                            _validated_signals[_sig_k] = float(_sig_v)
-                        except (ValueError, TypeError):
-                            self._log(
-                                "QA-SIGNAL-SKIP",
-                                body=f"quality_signal '{_sig_k}' = {_sig_v!r} is not numeric — skipped",
-                                node="observer",
-                            )
-
-                new_manifest["quality_signals"] = {
-                    **dict(state["manifest"].get("quality_signals") or {}),
-                    **_validated_signals,
-                }
-
-            # ── Extraire les gènes AMR détectés et les persister ───────────────────
-            _found_amr = []
-            try:
-                from genomeer.tools.function.viromics import parse_amr_tsv
-                import glob
-                _tmp = state.get("run_temp_dir", "")
-                _tsv_files = glob.glob(os.path.join(_tmp, "**", "*.tsv"), recursive=True) + glob.glob(os.path.join(_tmp, "**", "*.txt"), recursive=True)
-                for _tsv in _tsv_files:
-                    if "amr" in _tsv.lower() or "rgi" in _tsv.lower() or "card" in _tsv.lower():
-                        res = parse_amr_tsv(_tsv)
-                        if res.get("genes"):
-                            _found_amr.extend(res["genes"])
-            except Exception:
-                pass
-
-            if not _found_amr:
-                _amr_pattern = re.compile(
-                    r'\b(bla[A-Z]{2,6}|van[A-Z]|mec[A-Z]|mcr-\d|erm[A-Z]|tet[A-Z]|qnr[A-Z]|sul\d|aac\([0-9\'\"]+\)|aph\([0-9\'\"]+\)|cfr)\b'
-                )
-                _last_result_text = (state.get("last_result") or "")
-                _found_amr = list(set(_amr_pattern.findall(_last_result_text)))
-
-            if _found_amr:
-                _found_amr = list(set(_found_amr))
-                _existing_amr = list(new_manifest.get("amr_genes_detected") or [])
-                new_manifest["amr_genes_detected"] = list(set(_existing_amr + _found_amr))
-
-            rc = dict(state.get("retry_counts") or {})
-            diag_rounds = dict(state.get("manifest", {}).get("diagnostics_rounds", {}))
+            new_manifest = self._clean_manifest(state["manifest"])
+            rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+            diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
             if status == "blocked":
-                next_step = self._route_blocked_step(
-                    state, rc, diag_rounds, summary, step, new_manifest, node="observer"
-                )
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["retry_count"] = rc[state["current_idx"]]
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
                 
+                # routing
+                if rc[state["current_idx"]] > self.MAX_STEP_RETRIES:
+                    next_step = "diagnostics"
+                    next_idx = state["current_idx"]
+                else:
+                    next_step = "generator"
+                    next_idx = state["current_idx"]
+                    
                 # logs
                 self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
-                self._log("EXIT NODE", body=f"next_step={next_step} (retry same step)", node=node)
-
-                if hasattr(self, "_metrics") and self._metrics:
-                    try:
-                        self._metrics.record_step_end(
-                            step_idx=state["current_idx"],
-                            step_title=step["title"],
-                            status="blocked",
-                            tool_name=step.get("title", ""),
-                            retry_count=rc.get(state["current_idx"], 0),
-                            quality_level="fail",
-                            env_used=state.get("env_name"),
-                        )
-                    except Exception:
-                        pass
-
+                self._log("EXIT NODE", body="next_step=input_guard (retry same step)", node=node)
             else:
                 new_manifest.pop("repair_feedback", None)
                 new_manifest.pop("repair_step_idx", None)
@@ -2408,7 +2038,7 @@ class BioAgent:
                 self._log("STATUS", body=f"done=True\nnotes=\n{summary}", node=node)
                 self._log("EXIT NODE", body=f"advance_to_idx={state['current_idx']}\nnext_step=orchestrator", node=node)
                 
-                # storing succes state observation
+                # storing success state observation
                 obs = {
                     "step_idx": state["current_idx"],
                     "title": step["title"],
@@ -2417,53 +2047,18 @@ class BioAgent:
                     "stdout": (state.get("last_result") or "")[:12000],
                     "files_snapshot": self._list_ctx_files(state.get("run_temp_dir","")),
                 }
-                # T8.1: Keep last 10 observations instead of 5 to avoid losing file context
-                _all_obs = list(new_manifest.get("observations", [])) + [obs]
-                new_manifest["observations"] = _all_obs[-10:]
+                new_manifest["observations"] = list(new_manifest.get("observations", [])) + [obs]
 
-                # T8.2/8.3: Populate file_registry with new files produced by this step
-                try:
-                    _temp_dir = state.get("run_temp_dir", "")
-                    if _temp_dir:
-                        _before_files = set(
-                            f["name"] for obs_prev in new_manifest.get("observations", [])[:-1]
-                            for f in obs_prev.get("files_snapshot", [])
-                        )
-                        _after_files = self._list_ctx_files(_temp_dir)
-                        _new_files = [
-                            os.path.join(_temp_dir, f["name"])
-                            for f in _after_files
-                            if f["name"] not in _before_files
-                        ]
-                        if _new_files:
-                            _freg = dict(new_manifest.get("file_registry") or {})
-                            _freg[step["title"]] = _new_files
-                            new_manifest["file_registry"] = _freg
-                            self._log("FILE REGISTRY", body=f"{len(_new_files)} new files registered for '{step['title']}'", node=node)
-                except Exception as _freg_exc:
-                    self._log("FILE REGISTRY (warn)", body=str(_freg_exc), node=node)
+                # Fix 2 + Fix 6 — auto-enrich manifest with exact file paths after each done step.
+                _temp_dir = state.get("run_temp_dir", "")
+                _file_registry = self._build_file_registry(_temp_dir)
+                new_manifest["file_registry"] = _file_registry
+                new_manifest["files_by_ext"] = _file_registry  # backward compat alias
+                new_manifest["files"] = [
+                    n for names in _file_registry.values() for n in names
+                ]
+                self._log("MANIFEST ENRICHED", body=f"file_registry: {_file_registry}", node=node)
 
-
-            if status == "done":
-                # --- FIX 5: Sauvegarde du Checkpoint ---
-                from genomeer.utils.checkpoint import CheckpointManager
-                cp = CheckpointManager(state.get("run_temp_dir", ""), state.get("session_id") or state.get("run_id") or "unknown")
-                cp.save(state, state["current_idx"])
-
-                if hasattr(self, "_version_tracker"):
-                    self._version_tracker.auto_record_from_step(
-                        step["title"],
-                        state.get("pending_code", ""),
-                        env_name=state.get("env_name", "meta-env1")
-                    )
-
-                if hasattr(self, "_metrics") and self._metrics:
-                    self._metrics.record_step_end(
-                        state["current_idx"],
-                        step["title"],
-                        status="done",
-                        tool_name=""
-                    )
 
             plan = list(state["plan"])
             plan[state["current_idx"]] = {
@@ -2482,7 +2077,7 @@ class BioAgent:
                 "diagnostic_code": None,
                 "diagnostic_observation": None,
             }
-
+            
             # ------ feedback replay mode check ------
             if status == "blocked":
                 pause = self._maybe_pause(
@@ -2499,38 +2094,21 @@ class BioAgent:
             return updates
         
         def _diagnostics(self, state: AgentState) -> AgentState:
-            sid = state.get("current_sample_id")
-            node = f"diagnostics|{sid}" if sid else "diagnostics"
-
-            # T7: Safe step accessor
-            step = self._get_current_step(state)
-            if step is None:
-                self._log("DIAGNOSTICS GUARD", body="current_idx out of bounds — routing to finalizer", node=node)
-                return {
-                    "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>[GUARD] Plan index out of bounds in diagnostics. Finalizing.</observe>")],
-                }
-
-            _slim = self._slim_manifest(state.get("manifest", {}), "diagnostics") or {}
-            retry_count = _slim.get("retry_count", 0)
-            observer_summary = _slim.get("repair_feedback", "").strip()
+            node = "diagnostics"
+            step = state["plan"][state["current_idx"]]
+            manifest = state.get("manifest", {}) or {}
+            retry_count = manifest.get("retry_count", 0)
+            observer_summary = manifest.get("repair_feedback", "").strip()
             last_code = (state.get("pending_code") or "").strip()
 
             prompt = instructions.DIAGNOSTICS_PROMPT
-            # BUG-49: run_temp_dir can be None early in the pipeline (state not yet
-            # initialised) or missing from a resumed checkpoint.  A None value would
-            # render literally as "None/" in the prompt, causing generated code to
-            # write outside the sandbox.  Fall back to the system temp dir.
-            import tempfile as _tf
-            _rtd = state.get("run_temp_dir") or os.path.join(_tf.gettempdir(), "genomeer_diag")
-
             ctx = instructions.DIAGNOSTICS_CTX_PROMPT.format(
-                user_goal=state.get("last_prompt", ""),
+                user_goal=state.get("last_prompt",""),
                 current_step_title=step["title"],
                 retry_count=retry_count,
                 observer_summary=observer_summary or "<none>",
                 last_code=last_code or "<none>",
-                run_temp_dir=_rtd,
+                run_temp_dir=state.get("run_temp_dir",""),
             )
 
             msgs = [
@@ -2538,38 +2116,22 @@ class BioAgent:
                 HumanMessage(content=prompt),
                 HumanMessage(content=ctx) 
             ]
-            # M3 FIX: do NOT call _trim_messages before _llm_invoke here.
-            # _trim_messages() returns RemoveMessage objects (LangGraph state update directives),
-            # NOT plain messages for llm.invoke(). The msgs list (3 items) is already compact.
             self._log("ENTER NODE", body=f"retry_count={retry_count}\nstep={step['title']}", node=node)
             resp = self._llm_invoke(node, "diagnostics_plan", msgs)
 
             # Reuse GENERATOR to actually produce the probe code
             # We piggyback repair flow by stuffing the plan into 'repair_feedback'
-            new_manifest = dict(state.get("manifest", {}))
+            new_manifest = dict(manifest)
             new_manifest["repair_feedback"] = f"DIAGNOSTICS_REQUEST:\n{resp.content}"
             new_manifest["repair_step_idx"] = state["current_idx"]
 
             self._log("EXIT NODE", body="next_step=generator (probe code)", node=node)
-
-            # T1.1: Do NOT reset retry_counts here — rc.pop() was the root cause of the infinite loop.
-            # Keeping rc intact means the observer can correctly detect when retries are exhausted
-            # and route OUT of diagnostics instead of looping back endlessly.
-            rc = dict(state.get("retry_counts") or {})
-
-            # T1.1: Increment diag_rounds for this step so _observer can enforce MAX_DIAG_ROUNDS_PER_STEP
-            diag_rounds = dict(new_manifest.get("diagnostics_rounds") or {})
-            _current_diag_n = diag_rounds.get(state["current_idx"], 0) + 1
-            diag_rounds[state["current_idx"]] = _current_diag_n
-            new_manifest["diagnostics_rounds"] = diag_rounds
-            self._log(
-                "DIAG ROUND COUNTER",
-                body=f"step_idx={state['current_idx']} diag_round={_current_diag_n}/{self.MAX_DIAG_ROUNDS_PER_STEP}",
-                node=node,
-            )
-
+            
+            rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()}
+            if state["current_idx"] in rc:
+                rc.pop(state["current_idx"], None)
             return {
-                "retry_counts": rc,      # preserved — NOT reset
+                "retry_counts": rc,
                 "manifest": new_manifest,
                 "diagnostic_mode": True,
                 "next_step": "generator",
@@ -2579,159 +2141,93 @@ class BioAgent:
         def _finalizer(self, state: AgentState) -> AgentState:
             node = "finalizer"
             self._log("ENTER NODE", body="publishing artifacts + generating report", node=node)
-            
-            temp_dir = state.get("run_temp_dir", "")
 
-            # --- BUG-03: Bloc try-finally pour garantir la sauvegarde des métriques ---
+            manifest = dict(state.get("manifest") or {})
+            temp_dir = state.get("run_temp_dir") or ""
+            run_id = state.get("run_id")
+            pub = manifest.get("publisher") or {}
+            base_url = (pub.get("base_url") or "").rstrip("/")
+
+            files = self._list_ctx_files(temp_dir)
+            def _want(relname: str) -> bool:
+                name = relname.lower()
+                SKIP = (".cache/", "__pycache__", ".ipynb_checkpoints", ".mamba", ".micromamba")
+                return not any(x in name for x in SKIP)
+
+            expose_paths = [f["name"] for f in files if _want(f["name"])]
+
+            artifacts = {}
+            observations = manifest.get("observations", [])
             try:
-                # BUG-04: Robust thread join
-                if getattr(self, "_rag_build_thread", None):
-                    self._rag_build_thread.join(timeout=30)
-                    if self._rag_build_thread.is_alive():
-                        self._log("FINALIZER WARN", body="BioRAG thread still alive after 30s join. Proceeding with partial data.", node=node)
-
-                manifest = dict(state.get("manifest") or {})
-
-                # VersionTracker
-                if hasattr(self, "_version_tracker") and self._version_tracker:
-                    try:
-                        self._version_tracker.compute_db_checksums_async(temp_dir)
-                        self._version_tracker.wait_for_completion(timeout=10.0)
-                        self._version_tracker.save(temp_dir)
-                        manifest["tool_versions"] = self._version_tracker.as_dict()
-                    except Exception as _vt_exc:
-                        self._log("VERSION TRACKER ERROR", body=str(_vt_exc), node=node)
-
-                run_id = state.get("run_id")
-                pub = manifest.get("publisher") or {}
-                base_url = (pub.get("base_url") or "").rstrip("/")
-
-                files = self._list_ctx_files(temp_dir)
-                def _want(relname: str) -> bool:
-                    name = relname.lower()
-                    SKIP = (".cache/", "__pycache__", ".ipynb_checkpoints", ".mamba", ".micromamba")
-                    return not any(x in name for x in SKIP)
-
-                expose_paths = [f["name"] for f in files if _want(f["name"])]
-
-                # Auto-évaluation quantifiée
+                # from genomeer.tools.function.artifacts import create_run, upload_files, publish_run
+                from genomeer.agent.v2.utils.artifacts_service import create_run, upload_files, publish_run_http
                 try:
-                    from genomeer.evaluation.benchmark import PipelineOutputEval
-                    _eval_metrics = {
-                        **(manifest.get("quality_signals") or {}),
-                        "amr_genes_detected": manifest.get("amr_genes_detected", []),
-                        "output_files": [str(Path(temp_dir) / p) for p in expose_paths[:20]],
-                    }
-                    _eval_report = PipelineOutputEval().evaluate(_eval_metrics)
-                    manifest["eval_score"] = round(_eval_report.overall_score, 3)
-                    manifest["eval_fails"] = _eval_report.fail_count
-                    manifest["eval_warns"] = _eval_report.warn_count
-                    manifest["eval_coverage_rate"] = round(_eval_report.coverage_rate, 3)
-                except Exception as _eval_exc:
-                    self._log("PIPELINE EVAL (warn)", body=str(_eval_exc), node=node)
-
-                artifacts = {}
-                observations = manifest.get("observations", [])
-                try:
-                    from genomeer.agent.v2.utils.artifacts_service import create_run, upload_files, publish_run_http
                     create_run(run_id, base_url=self.artifacts_base_url)
-                    abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
-                    if abs_paths:
-                        upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
-                    expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
-                    art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
-                    artifacts = art_manifest or {}
-                except Exception as e:
-                    self._log("PUBLISH ERROR", body=str(e), node=node)
-                    artifacts = {"artifacts": [], "error": str(e)}
+                except Exception:
+                    pass
 
-                # RAG Alerts
-                if hasattr(self, "bio_rag_store") and hasattr(self.bio_rag_store, "rag_warnings"):
-                    rag_warns = self.bio_rag_store.rag_warnings
-                    if rag_warns.get("rag_bundles_stale"):
-                        age = rag_warns.get("rag_bundles_age_days", 0)
-                        stale_notice = f"\n\n> [!CAUTION]\n> ⚠️ **AVERTISSEMENT : Les bases de données AMR/KEGG ont {age} jours.**\n"
-                        observations.append(stale_notice)
+                abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
+                if abs_paths:
+                    upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
 
-                # RAG Interpretation
-                rag_context = ""
-                if hasattr(self, "bio_retriever"):
-                    try:
-                        from genomeer.model.bio_rag import build_finalizer_rag_context
-                        _pipeline_results = {
-                            "amr_genes": manifest.get("amr_genes_detected", []),
-                            "pathways": manifest.get("top_pathways", []),
-                            "assembly_n50": manifest.get("quality_signals", {}).get("n50_bp"),
-                            "mean_completeness": manifest.get("quality_signals", {}).get("mean_completeness"),
-                            "classified_pct": manifest.get("quality_signals", {}).get("classified_pct"),
-                        }
-                        rag_context = build_finalizer_rag_context(self.bio_retriever, _pipeline_results)
-                    except Exception as _rag_exc:
-                        self._log("RAG CONTEXT (warn)", body=str(_rag_exc), node=node)
+                expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
+                art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
+                artifacts = art_manifest or {}
+            except Exception as e:
+                self._log("PUBLISH ERROR", body=str(e), node=node)
+                artifacts = {"artifacts": [], "error": str(e)}
 
-                msgs = [
-                    SystemMessage(content=instructions.FINALIZER_PROMPT),
-                    HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
-                        user_goal=state.get("last_prompt"),
-                        plan=state.get("plan"),
-                        observation="\n".join(observations) if isinstance(observations, list) else observations,
-                        artifacts=artifacts,
-                        biological_context=rag_context,
-                    ))
-                ]
-                resp = self._llm_invoke(node, "final_report", msgs)
-                return {
-                    "messages": [AIMessage(content=resp.content)],
-                    "next_step": "end"
+            msgs = [
+                SystemMessage(content=instructions.FINALIZER_PROMPT),
+                HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
+                    user_goal=state.get("last_prompt"),
+                    plan=state.get("plan"),
+                    observation=observations,
+                    artifacts=artifacts
+                ))
+            ]
+            resp = self._llm_invoke(node, "final_report", msgs)
+            self._log("EXIT NODE", body="final report generated", node=node)
+
+            # ── Phase 4: persist run memory ──────────────────────────────────
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+                from datetime import datetime as _dt
+
+                _mem_dir = _Path.home() / ".genomeer"
+                _mem_dir.mkdir(parents=True, exist_ok=True)
+                _mem_file = _mem_dir / "runs_memory.jsonl"
+
+                _plan = state.get("plan") or []
+                _scores = {
+                    obs["title"]: obs.get("score", -1.0)
+                    for obs in observations
+                    if "score" in obs
                 }
+                _winning_params = {
+                    obs["title"]: obs.get("summary", "")
+                    for obs in observations
+                    if obs.get("status") == "done"
+                }
+                _task_type = self._infer_task_type(state.get("last_prompt") or "")
 
-            finally:
-                # BUG-03: Sauvegarde forcée des métriques quoi qu'il arrive
-                if hasattr(self, "_metrics") and self._metrics:
-                    try:
-                        self._metrics.save(temp_dir)
-                        self._log("FINALIZER", body="Run metrics saved successfully.", node=node)
-                    except Exception as _m_exc:
-                        self._log("METRICS SAVE ERROR", body=str(_m_exc), node=node)
-
-            # FIX G2b: persist successful pipeline to TemplateLibrary for future few-shot reuse
-            if _TEMPLATE_OK and _TEMPLATE_LIB:
-                try:
-                    plan_steps = state.get("plan", [])
-                    all_done = plan_steps and all(s.get("status") == "done" for s in plan_steps)
-                    if all_done:
-                        import re
-                        tools_used = []
-                        # TÂCHE 11: Agrégation des outils réels trackés dans le manifest
-                        step_tools_dict = manifest.get("step_tools_used", {})
-                        if step_tools_dict:
-                            for tools in step_tools_dict.values():
-                                for t in tools:
-                                    if t not in tools_used:
-                                        tools_used.append(t)
-                        
-                        # Fallback (ancien comportement) si aucun outil tracké
-                        if not tools_used:
-                            for s in plan_steps:
-                                for m in re.findall(r"\brun_[a-zA-Z0-9_]+\b", s.get("code", "")):
-                                    if m not in tools_used:
-                                        tools_used.append(m)
-                        _TEMPLATE_LIB.save(
-                            task_summary=(state.get("last_prompt") or "")[:200],
-                            steps=plan_steps,
-                            tools_used=tools_used,
-                            success_metrics=manifest.get("quality_signals") or {},
-                        )
-                        self._log("TEMPLATE SAVED", body=f"Saved pipeline. Total templates: {_TEMPLATE_LIB.count()}", node=node)
-                        
-                        # FIX C3: Cleanup checkpoint after successful pipeline completion
-                        try:
-                            from genomeer.utils.checkpoint import CheckpointManager
-                            CheckpointManager(state.get("run_temp_dir", ""), state.get("session_id", "unknown")).delete()
-                        except Exception:
-                            pass
-                except Exception as _te:
-                    self._log("TEMPLATE SAVE (warn)", body=str(_te), node=node)
+                _record = {
+                    "ts":           _dt.utcnow().isoformat(),
+                    "run_id":       run_id,
+                    "task_type":    _task_type,
+                    "user_goal":    (state.get("last_prompt") or "")[:300],
+                    "plan":         [{"title": s["title"], "status": s.get("status")} for s in _plan],
+                    "scores":       _scores,
+                    "winning_params": _winning_params,
+                    "done_count":   sum(1 for s in _plan if s.get("status") == "done"),
+                    "total_steps":  len(_plan),
+                }
+                with open(_mem_file, "a", encoding="utf-8") as _fh:
+                    _fh.write(_json.dumps(_record) + "\n")
+                self._log("MEMORY WRITE", body=f"appended to {_mem_file}", node=node)
+            except Exception as _me:
+                self._log("MEMORY WRITE ERROR", body=str(_me), node=node)
 
             return {
                 "manifest": manifest,
@@ -2749,10 +2245,10 @@ class BioAgent:
         self.generator = types.MethodType(_generator, self)
         self.ensure_env = types.MethodType(_ensure_env, self)
         self.executor = types.MethodType(_executor, self)
+        self.validator = types.MethodType(_validator, self)
         self.observer = types.MethodType(_observer, self)
         self.diagnostics = types.MethodType(_diagnostics, self)
         self.finalizer = types.MethodType(_finalizer, self)
-        self.batch_orchestrator = types.MethodType(_batch_orchestrator, self)
         
         # Create the workflow
         # --------------------------------------------------------------------------------
@@ -2764,10 +2260,10 @@ class BioAgent:
         workflow.add_node("generator", self.generator)
         workflow.add_node("ensure_env", self.ensure_env)
         workflow.add_node("executor", self.executor)
+        workflow.add_node("validator", self.validator)
         workflow.add_node("observer", self.observer)
         workflow.add_node("diagnostics", self.diagnostics)
         workflow.add_node("finalizer", self.finalizer)
-        workflow.add_node("batch_orchestrator", self.batch_orchestrator)
 
         # defining workflow edges
         workflow.add_edge(START, "planner")
@@ -2789,14 +2285,6 @@ class BioAgent:
             {
                 "planner": "planner",
                 "input_guard": "input_guard",
-                "batch_orchestrator": "batch_orchestrator",
-                "finalizer": "finalizer",
-            },
-        )
-        workflow.add_conditional_edges(
-            "batch_orchestrator",
-            lambda s: s["next_step"],
-            {
                 "finalizer": "finalizer",
             },
         )
@@ -2829,7 +2317,16 @@ class BioAgent:
             "executor",
             lambda s: s["next_step"],
             {
-                "observer": "observer",
+                "validator": "validator",
+            },
+        )
+        workflow.add_conditional_edges(
+            "validator",
+            lambda s: s["next_step"],
+            {
+                "observer":     "observer",
+                "orchestrator": "orchestrator",
+                "generator":    "generator",
             },
         )
         workflow.add_conditional_edges(
@@ -2847,7 +2344,7 @@ class BioAgent:
             lambda s: s["next_step"],
             {
                 "generator": "generator",
-                "end": "qa",
+                "end": END,
             },
         )
         workflow.add_edge("qa", END)
@@ -2856,48 +2353,8 @@ class BioAgent:
         # Compile the workflow
         # --------------------------------------------------------------------------------
         self.app = workflow.compile()
-
-        # ── AXE 2.3: SqliteSaver for cross-session persistence (fallback to MemorySaver) ──
-        if _SQLITE_OK:
-            try:
-                _sqlite_path = str(
-                    Path.home() / ".genomeer" / "checkpoints.db"
-                )
-                Path(_sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-                _conn = sqlite3.connect(_sqlite_path, check_same_thread=False)
-                self._sqlite_path = _sqlite_path
-                self.checkpointer = SqliteSaver(_conn)
-                self._log("CHECKPOINTER", body=f"SqliteSaver -> {_sqlite_path}", node="init")
-            except Exception as _e:
-                self.checkpointer = MemorySaver()
-                self._log("CHECKPOINTER", body=f"SqliteSaver failed ({_e}), fallback to MemorySaver", node="init")
-        else:
-            self.checkpointer = MemorySaver()
-            self._log("CHECKPOINTER", body="MemorySaver (install langgraph-checkpoint-sqlite for persistence)", node="init")
+        self.checkpointer = MemorySaver()
         self.app.checkpointer = self.checkpointer
-
-        # Purge sessions LangGraph plus vieilles que 30 jours (non-bloquant)
-        def _purge_old_sessions(db_path, days=30):
-            try:
-                import sqlite3, time
-                cutoff = time.time() - (days * 86400)
-                conn = sqlite3.connect(db_path)
-                for table in ("checkpoints", "writes"):
-                    try:
-                        conn.execute(f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
-                    except Exception:
-                        pass
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-
-        if _SQLITE_OK and hasattr(self, '_sqlite_path'):
-            threading.Thread(
-                target=_purge_old_sessions,
-                args=(self._sqlite_path,),
-                daemon=True
-            ).start()
 
 
     # OTHER UTILS
@@ -2920,11 +2377,112 @@ class BioAgent:
                 self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
         return staged_rel
 
-    def _list_ctx_files(self, temp_dir: str):
+    @staticmethod
+    @staticmethod
+    def _infer_task_type(prompt: str) -> str:
+        """Map a user prompt to a coarse task category for runs_memory indexing."""
+        p = prompt.lower()
+        if any(k in p for k in ("metagenom", "binning", "bin", "kraken", "assembly", "assemble")):
+            return "metagenomics"
+        if any(k in p for k in ("rnaseq", "rna-seq", "deseq", "differential expression", "transcriptom")):
+            return "rnaseq"
+        if any(k in p for k in ("variant", "snp", "snv", "gatk", "vcf", "mutation")):
+            return "variant_calling"
+        if any(k in p for k in ("chip-seq", "chipseq", "atac", "peak")):
+            return "epigenomics"
+        if any(k in p for k in ("16s", "amplicon", "qiime", "otu", "asv")):
+            return "amplicon"
+        return "general"
+
+    def _load_past_templates(self, prompt: str, max_records: int = 5) -> str:
+        """
+        Phase 4 — load the last N successful runs of the same task_type from
+        ~/.genomeer/runs_memory.jsonl and return a formatted string to inject
+        into the planner prompt.
+
+        Returns an empty string if the file doesn't exist or has no matches.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        mem_file = _Path.home() / ".genomeer" / "runs_memory.jsonl"
+        if not mem_file.exists():
+            return ""
+
+        task_type = self._infer_task_type(prompt)
+        matching = []
+        try:
+            with open(mem_file, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("task_type") == task_type and rec.get("done_count", 0) > 0:
+                        matching.append(rec)
+        except Exception:
+            return ""
+
+        if not matching:
+            return ""
+
+        # Keep the most recent N records
+        recent = matching[-max_records:]
+
+        lines = [
+            "\n\n---\nPAST SUCCESSFUL RUNS (use as reference templates, do not copy blindly):",
+        ]
+        for i, rec in enumerate(recent, 1):
+            steps = " → ".join(s["title"] for s in rec.get("plan", []))
+            scores_str = ", ".join(
+                f"{k}: {v:.2f}" for k, v in rec.get("scores", {}).items() if v >= 0
+            )
+            lines.append(
+                f"\n[Run {i}] goal: {rec.get('user_goal','')[:120]}\n"
+                f"  steps: {steps}\n"
+                f"  scores: {scores_str or 'n/a'}"
+            )
+        lines.append("---\n")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _clean_manifest(manifest: dict) -> dict:
+        """Return a copy of manifest with all stale routing keys removed.
+        Call this on every blocked-path manifest copy to prevent route_hint
+        from a previous iteration hijacking the planner on the next cycle.
+        """
+        m = dict(manifest)
+        for k in ("route_hint", "qa_payload", "resume_to", "pause_kind"):
+            m.pop(k, None)
+        return m
+
+    def _build_file_registry(self, temp_dir: str) -> dict:
+        """Fix 2 — Build {ext: [basename, ...]} from current run_dir contents.
+
+        Returns e.g. {'.fna': ['GCF_000009045.1_ASM904v1_genomic.fna'],
+                       '.png': ['genome_comparison.png'], ...}
+        Sorted by extension so output is deterministic.
+        """
+        registry: dict = {}
+        if not temp_dir or not os.path.isdir(temp_dir):
+            return registry
+        import glob as _gl
+        for fp in sorted(_gl.glob(os.path.join(temp_dir, "*"))):
+            if os.path.isfile(fp):
+                bn  = os.path.basename(fp)
+                ext = os.path.splitext(bn)[1].lower() or ".noext"
+                registry.setdefault(ext, []).append(bn)
+        return registry
+
+    def _list_ctx_files(self, temp_dir: str, extra_paths: list = None):
         """
         - This function will return a list of all files available in the the current run temp folder
         - Indeed each request have a temp storage folder - ex: `/tmp/206005a0-c0a1-4114-907c-c3eda23d3f32`
         - All uploaded file will be inside automatically and all downloaded file by agent will be there.
+        - FIX: also scans absolute paths mentioned in the prompt (extra_paths)
         Return a list of all files inside temp_dir (including subfolders).
         Each item: {'name': 'relative/path/to/file', 'ext': '.fasta', 'size_bytes': 123}
         """
@@ -2934,7 +2492,7 @@ class BioAgent:
                 for entry in sorted(entries):
                     p = os.path.join(root, entry)
                     if os.path.isfile(p):
-                        rel_path = os.path.relpath(p, temp_dir)  # keep it relative
+                        rel_path = os.path.relpath(p, temp_dir)
                         ext = os.path.splitext(entry)[1]
                         files.append({
                             "name": rel_path,
@@ -2943,27 +2501,51 @@ class BioAgent:
                         })
         except Exception as e:
             self._log("TEMP LIST ERROR", body=str(e), node="input_guard")
+
+        # FIX: aussi chercher les fichiers absolus mentionnés dans le prompt
+        import shutil
+        for abs_path in (extra_paths or []):
+            abs_path = abs_path.strip()
+            if os.path.isfile(abs_path):
+                entry = os.path.basename(abs_path)
+                dst = os.path.join(temp_dir, entry)
+                if not os.path.exists(dst):
+                    shutil.copy2(abs_path, dst)
+                    self._log("AUTO STAGE", body=f"Copied {abs_path} → {dst}", node="input_guard")
+                ext = os.path.splitext(entry)[1]
+                files.append({
+                    "name": entry,
+                    "ext": ext if ext else "",
+                    "size_bytes": os.path.getsize(dst),
+                })
         return files
     
     def _inject_custom_functions_to_repl(self):
-        """Inject custom functions into the per-thread Python REPL namespace.
-
-        BUG-35: acquire _custom_functions_lock before reading the dict so that a
-        concurrent call to register_custom_function() never produces a partial view.
-        The target namespace is thread-local (via helper._get_persistent_namespace)
-        so writes are inherently safe across batch threads.
+        """Inject custom functions into the Python REPL execution environment.
+        This makes custom tools available during code execution.
         """
-        with self._custom_functions_lock:
-            funcs_snapshot = dict(self._custom_functions)   # O(n) copy under lock
+        from genomeer.utils.helper import _persistent_namespace
 
-        if funcs_snapshot:
-            from genomeer.utils.helper import _get_persistent_namespace
-            _pns = _get_persistent_namespace()
-            for name, func in funcs_snapshot.items():
-                _pns[name] = func
+        # Fix 9 — always inject list_files / get_file into the REPL namespace so
+        # generated code can call them without an explicit import.
+        try:
+            from genomeer.utils.filesystem import list_files as _lf, get_file as _gf
+            _persistent_namespace["list_files"] = _lf
+            _persistent_namespace["get_file"] = _gf
+        except ImportError:
+            pass
 
-            # NOUVEAU-02 FIX: Removed builtins injection to ensure session isolation.
-            # Custom tools are already available via the persistent namespace in run_python_repl.
+        if hasattr(self, "_custom_functions") and self._custom_functions:
+            # Inject all custom functions into the execution namespace
+            for name, func in self._custom_functions.items():
+                _persistent_namespace[name] = func
+
+            # Also make them available in builtins for broader access
+            import builtins
+
+            if not hasattr(builtins, "_bioagent_custom_functions"):
+                builtins._bioagent_custom_functions = {}
+            builtins._bioagent_custom_functions.update(self._custom_functions)
             
     def _prepare_resources_for_retrieval(self, prompt):
         """Prepare resources for retrieval and return selected resource names.
@@ -3014,14 +2596,9 @@ class BioAgent:
             "libraries": library_descriptions,
         }
 
-        # FIX G1: use FAISS semantic_retrieval (sub-ms, no tokens wasted)
-        # Falls back automatically to prompt_based_retrieval if index not built
-        if hasattr(self, "retriever") and self.retriever._index is not None:
-            step_query = prompt  # caller already combines user_goal + step title
-            selected_resources = self.retriever.semantic_retrieval(step_query, k=15)
-        else:
-            # Fallback: LLM-based retrieval (FAISS index not ready)
-            selected_resources = self.retriever.prompt_based_retrieval(prompt, resources, llm=self.llm)
+        # Use prompt-based retrieval with the agent's LLM
+        selected_resources = self.retriever.prompt_based_retrieval(prompt, resources, llm=self.llm)
+        print("Using prompt-based retrieval with the agent's LLM")
 
         # Extract the names from the selected resources for the system prompt
         selected_resources_names = {
@@ -3049,20 +2626,8 @@ class BioAgent:
         Intended for local/dev workflows. In production, prefer mounting the router in main API.
         """
         def _run():
-            try:
-                import uvicorn
-                from fastapi import FastAPI
-                from genomeer.agent.v2.utils.artifacts_service import create_artifacts_router
-            except ImportError:
-                self._log(
-                    "ARTIFACTS SERVER (warn)",
-                    body="fastapi/uvicorn not installed. Run: pip install genomeer[server]",
-                    node="init"
-                )
-                return
-            app = FastAPI()
-            app.include_router(create_artifacts_router(prefix=prefix))
-            uvicorn.run(app, host=host, port=port, log_level="warning")
+            from genomeer.agent.v2.utils.artifacts_service import start_artifacts_server
+            start_artifacts_server(host=host, port=port, prefix=prefix)
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         self._log("ARTIFACT SERVER", f"Started on http://{host}:{port}{prefix}", node="driver")
@@ -3090,13 +2655,8 @@ class BioAgent:
 
                 # If still not found, use a default (fallback)
                 if not module_name:
-                    module_name = "genomeer.tools.function.metagenomics"  # T10: correct fallback module
+                    module_name = "genomeer.tool.scRNA_tools"
                     tool["module"] = module_name
-                    warnings.warn(
-                        f"[T10] Could not resolve module for tool '{tool.get('name', '?')}'. "
-                        "Falling back to 'genomeer.tools.function.metagenomics'.",
-                        stacklevel=2,
-                    )
             else:
                 module_name = getattr(tool, "module_name", None)
 
@@ -3115,13 +2675,8 @@ class BioAgent:
 
                 # If still not found, use a default
                 if not module_name:
-                    module_name = "genomeer.tools.function.metagenomics"  # T10: correct fallback module
+                    module_name = "genomeer.tool.scRNA_tools"  # Default to scRNA_tools as a fallback
                     tool.module_name = module_name
-                    warnings.warn(
-                        f"[T10] Could not resolve module for tool '{getattr(tool, 'name', '?')}'. "
-                        "Falling back to 'genomeer.tools.function.metagenomics'.",
-                        stacklevel=2,
-                    )
 
             if module_name not in tool_desc:
                 tool_desc[module_name] = []
@@ -3197,14 +2752,12 @@ class BioAgent:
         import base64, requests
         from IPython.display import Image, display
 
-        # FIX A7: always compute mmd first — was undefined outside the "manual" branch
-        mmd = self.app.get_graph().draw_mermaid()
-
-        if mode == "manual":
+        if mode  == "manual":
+            mmd = self.app.get_graph().draw_mermaid()
             print(mmd)
             print("Open : https://mermaid.live/edit and pass this code to render the graph.")
             return mmd
-
+        
         encoded = base64.urlsafe_b64encode(mmd.encode("utf-8")).decode("ascii")
         url = f"https://mermaid.ink/svg/{encoded}"
 
@@ -3301,6 +2854,494 @@ class BioAgent:
         except Exception:
             return False
 
+    def _inject_missing_imports(self, code: str) -> str:
+        """
+        Each step runs in a fresh subprocess — imports from previous steps are gone.
+        Detect common symbols used but not imported and prepend the missing import statements.
+        Works in both normal and repair mode (with or without #!PY header).
+        """
+        if not code:
+            return code
+        has_py_header = "#!PY" in code[:15]
+
+        # Map: symbol used in code → import statement to inject
+        _KNOWN = [
+            (r"\bos\b",          "import os"),
+            (r"\bsys\b",         "import sys"),
+            (r"\bre\b",          "import re"),
+            (r"\bjson\b",        "import json"),
+            (r"\bcsv\b",         "import csv"),
+            (r"\bglob\b",        "import glob"),
+            (r"\bgzip\b",        "import gzip"),
+            (r"\bshutil\b",      "import shutil"),
+            (r"\bPath\b",        "from pathlib import Path"),
+            (r"\bSeqIO\b",       "from Bio import SeqIO"),
+            (r"\bSeqRecord\b",   "from Bio.SeqRecord import SeqRecord"),
+            (r"\bSeq\b",         "from Bio.Seq import Seq"),
+            (r"\bpd\b",          "import pandas as pd"),
+            (r"\bnp\b",          "import numpy as np"),
+            (r"\bplt\b",         "import matplotlib.pyplot as plt"),
+            (r"\bsubprocess\b",  "import subprocess"),
+            (r"\btime\b",        "import time"),
+            (r"\bStringIO\b",    "from io import StringIO"),
+        ]
+
+        to_add = []
+        for symbol_rx, stmt in _KNOWN:
+            if re.search(symbol_rx, code) and stmt not in code:
+                to_add.append(stmt)
+
+        if not to_add:
+            return code
+
+        header = "\n".join(to_add) + "\n\n"
+        if has_py_header:
+            # Insert right after the #!PY line
+            return re.sub(r"(#!PY\s*\n)", r"\g<1>" + header, code, count=1)
+        else:
+            # No #!PY header (repair mode without lang marker) — prepend directly
+            return header + code
+
+    def _fix_cli_commands(self, code: str) -> str:
+        """
+        Deterministic corrections for hallucinated CLI flags — model-agnostic.
+        Runs before execution so wrong commands never reach the shell.
+        """
+        if not code:
+            return code
+
+        # ── ncbi-genome-download ────────────────────────────────────────────
+        if "ncbi-genome-download" in code:
+            # --genus → --genera  (--genus is a long-deprecated alias, use canonical)
+            code = re.sub(r"--genus\b", "--genera", code)
+            # --species <name>  does not exist → remove entirely
+            code = re.sub(r"\s+--species\s+\S+", " ", code)
+            # --organism <name>  does not exist → remove entirely
+            code = re.sub(r"\s+--organism\s+\S+", " ", code)
+            # --name <name>  does not exist → remove entirely
+            code = re.sub(r"\s+--name\s+\S+", " ", code)
+
+            # CRITICAL SAFETY: when --genera is used without --assembly-levels complete,
+            # the tool lists ALL assemblies for the whole kingdom (thousands of entries)
+            # which causes hours-long hangs and accidental mass downloads.
+            # Deterministically inject --assembly-levels complete and --section refseq
+            # whenever --genera is present but --assembly-levels is absent.
+            # This guard does NOT apply when --assembly-accessions is used (no risk there).
+            if re.search(r"--genera\b", code) and not re.search(r"--assembly-levels\b|--assembly_levels\b", code):
+                # List-style command: inject after --genera value token
+                # Pattern: "--genera", "<value>" → add flags after the value
+                # Also handles: --genera "Organism name" on CLI lines
+                def _inject_levels_after_genera(m: re.Match) -> str:
+                    return m.group(0) + ', "--assembly-levels", "complete", "--section", "refseq",'
+                new_code = re.sub(
+                    r'(\"--genera\"\s*,\s*[^,\]]+)',
+                    _inject_levels_after_genera,
+                    code,
+                )
+                if new_code != code:
+                    code = new_code
+                    self._log(
+                        "FIX_CLI",
+                        body="Injected --assembly-levels complete after --genera (safety guard)",
+                        node="generator",
+                    )
+                else:
+                    # Fallback for shell-style single-line: append before the group arg
+                    code = re.sub(
+                        r"(ncbi-genome-download\b[^\n]*?)((?:\s+\b(?:all|archaea|bacteria|fungi|invertebrate|metagenomes|plant|protozoa|vertebrate_mammalian|vertebrate_other|viral)\b)?\s*$)",
+                        r"\1 --assembly-levels complete --section refseq\2",
+                        code,
+                        flags=re.MULTILINE,
+                    )
+                    self._log(
+                        "FIX_CLI",
+                        body="Injected --assembly-levels complete (shell-style fallback)",
+                        node="generator",
+                    )
+
+            # Ensure a valid group positional arg is present.
+            # CRITICAL: check group presence in the FULL code, not per-line.
+            # A multiline list like:
+            #   cmd = ["ncbi-genome-download", "--genera", org,
+            #          "--output-folder", d, "bacteria"]   ← group on continuation line
+            # would be wrongly modified if we process line by line.
+            _GROUPS = (
+                r"\b(all|archaea|bacteria|fungi|invertebrate"
+                r"|metagenomes|plant|protozoa"
+                r"|vertebrate_mammalian|vertebrate_other|viral)\b"
+            )
+            if not re.search(_GROUPS, code):
+                # Group missing from entire code block.
+                # Only append to lines that are COMPLETE shell commands (not mid-list).
+                # A line is a continuation if it ends with , [ \ or the bracket count
+                # opened on that line is not balanced.
+                fixed_lines = []
+                for line in code.splitlines():
+                    stripped = line.rstrip()
+                    is_ncbi_line = "ncbi-genome-download" in stripped
+                    is_continuation = (
+                        stripped.endswith(",")
+                        or stripped.endswith("[")
+                        or stripped.endswith("\\")
+                        or stripped.endswith("(")
+                        or (stripped.count("[") + stripped.count("(") >
+                            stripped.count("]") + stripped.count(")"))
+                    )
+                    if is_ncbi_line and not is_continuation:
+                        stripped = stripped + " bacteria"
+                    fixed_lines.append(stripped)
+                code = "\n".join(fixed_lines)
+
+        # ── subprocess.run without timeout ──────────────────────────────────────
+        # Any subprocess.run call without timeout= can block forever on network I/O.
+        # Inject timeout=300 deterministically. 300s covers typical genome downloads;
+        # the outer run_with_timeout wrapper adds a second layer of protection.
+        if "subprocess.run(" in code:
+            def _add_timeout(m: re.Match) -> str:
+                call = m.group(0)
+                # Skip if timeout= already present
+                if "timeout=" in call:
+                    return call
+                # Find the closing paren — add timeout before it
+                # Simple approach: add before the last ) of the call
+                # We match the entire subprocess.run(...) call up to the first closing paren
+                # that balances the opening paren after "subprocess.run"
+                return call.rstrip(")") + ", timeout=300)"
+
+            code = re.sub(
+                r"subprocess\.run\([^)]+\)",
+                _add_timeout,
+                code,
+            )
+
+        return code
+
+    def _fix_gc_formula(self, code: str) -> str:
+        """
+        The LLM often computes GC% as total_length / (4 * n_contigs), which assumes
+        uniform base distribution. Replace with the correct count-based formula.
+        Detects two wrong patterns and rewrites them deterministically.
+        """
+        if not code:
+            return code
+
+        # Pattern A: gc = sum(len(r.seq) for r in contigs) / (4 * <anything>)
+        # or:        gc = total_length / (4 * <anything>)
+        code = re.sub(
+            r'(\bgc(?:_content|_pct|_percent|_ratio)?\s*=\s*)'   # gc = ...
+            r'([^\n]+?)'                                           # numerator (any expr)
+            r'\s*/\s*\(\s*4\s*\*\s*[^\)]+\)',                    # / (4 * anything)
+            lambda m: (
+                m.group(1) +
+                "sum(s.seq.count('G') + s.seq.count('C') for s in contigs) / "
+                "max(sum(len(s.seq) for s in contigs), 1)"
+            ),
+            code,
+            flags=re.IGNORECASE,
+        )
+
+        # Pattern B: gc = <expr> * 0.25  (assumes 25% each base)
+        code = re.sub(
+            r'(\bgc(?:_content|_pct|_percent|_ratio)?\s*=\s*)[^\n]+?\*\s*0\.25\b',
+            lambda m: (
+                m.group(1) +
+                "sum(s.seq.count('G') + s.seq.count('C') for s in contigs) / "
+                "max(sum(len(s.seq) for s in contigs), 1)"
+            ),
+            code,
+            flags=re.IGNORECASE,
+        )
+
+        return code
+
+    def _fix_fasta_reading(self, code: str) -> str:
+        """
+        Two deterministic fixes for common FASTA reading bugs:
+
+        1. Glob order: models put *.fna.gz before *.fna. If the gz file exists
+           and is picked first, SeqIO.parse crashes with UnicodeDecodeError (0x8b
+           = gzip magic byte). Reorder so plain *.fna comes first.
+
+        2. Gzip-safe SeqIO.parse: if code calls SeqIO.parse(fasta_path, ...) but
+           has no gzip.open guard, wrap it so .gz files are decompressed first.
+        """
+        if not code:
+            return code
+
+        # Fix 0 — replace hardcoded accession-based paths with glob discovery
+        # Pattern: SeqIO.parse(os.path.join(run_dir, f"{accession}.fna"), ...)
+        # The model invents filenames like GCF_000009045.1.fna but the real file is
+        # GCF_000009045.1_ASM904v1_genomic.fna — use glob to find the actual file.
+        if "SeqIO.parse" in code and re.search(r'os\.path\.join\([^)]*accession[^)]*\.fna', code):
+            code = re.sub(
+                r'SeqIO\.parse\(os\.path\.join\([^,]+,\s*f?["\'][^"\']*accession[^"\']*\.fna["\'][^)]*\)',
+                r'SeqIO.parse(fasta_path',
+                code,
+            )
+            # Inject glob-based fasta_path discovery before the first SeqIO.parse call
+            if "fasta_path" not in code or "glob.glob" not in code:
+                glob_snippet = (
+                    'import glob as _glob\n'
+                    '_fna_files = (_glob.glob(os.path.join(run_dir, "*.fna")) +\n'
+                    '              _glob.glob(os.path.join(run_dir, "*.fna.gz")))\n'
+                    'fasta_path = _fna_files[0] if _fna_files else None\n'
+                    'if not fasta_path:\n'
+                    '    print("No FASTA file found in run_dir"); sys.exit(1)\n'
+                )
+                # Insert after the last import statement or after run_dir definition
+                insert_m = re.search(r'(run_dir\s*=\s*r?["\'][^\n]+\n)', code)
+                if insert_m:
+                    pos = insert_m.end()
+                    code = code[:pos] + glob_snippet + code[pos:]
+            self._log("FIX_FASTA", body="Replaced hardcoded accession path with glob discovery", node="generator")
+
+        # Fix 0b — undefined 'accessions' variable used in a for-loop
+        # Pattern: "for accession in accessions:" where accessions is never defined.
+        # Replace the whole loop with glob-based file discovery over all .fna in run_dir.
+        if re.search(r'\bfor\s+\w+\s+in\s+accessions\b', code) and 'accessions' not in re.sub(
+            r'for\s+\w+\s+in\s+accessions', '', code
+        ):
+            # Replace undefined 'accessions' with a glob list of .fna files in run_dir
+            fna_glob = (
+                'import glob as _glob\n'
+                '_fna_files = sorted(_glob.glob(os.path.join(run_dir, "*.fna")))\n'
+                'if not _fna_files:\n'
+                '    print("No .fna files found in run_dir"); sys.exit(1)\n'
+                'accessions = [os.path.basename(f) for f in _fna_files]\n'
+            )
+            insert_m = re.search(r'(run_dir\s*=\s*r?["\'][^\n]+\n)', code)
+            if insert_m:
+                pos = insert_m.end()
+                code = code[:pos] + fna_glob + code[pos:]
+                # Also fix the path construction inside the loop:
+                # f"{accession}_genomic.fna" → use full path from _fna_files
+                code = re.sub(
+                    r'os\.path\.join\(run_dir,\s*f?["\'][^"\']*\{accession\}[^"\']*["\']?\)',
+                    'os.path.join(run_dir, accession)',
+                    code,
+                )
+                self._log("FIX_FASTA", body="Injected glob-based accessions list (undefined var fix)", node="generator")
+
+        # Fix 0c — fasta_path used but never defined
+        # Pattern: SeqIO.parse(fasta_path, ...) where fasta_path= never appears in code.
+        # Inject glob-based discovery so fasta_path is always defined before use.
+        if ("fasta_path" in code
+                and "SeqIO.parse(fasta_path" in code
+                and not re.search(r'fasta_path\s*=', code)):
+            glob_snippet = (
+                'import glob as _glob\n'
+                '_fna_files = sorted(_glob.glob(os.path.join(run_dir, "*.fna"))) + \\\n'
+                '             sorted(_glob.glob(os.path.join(run_dir, "*.fna.gz")))\n'
+                'if not _fna_files:\n'
+                '    print("No FASTA file found in run_dir"); sys.exit(1)\n'
+                'fasta_path = _fna_files[0]\n'
+                'if fasta_path.endswith(".gz"):\n'
+                '    import gzip, shutil\n'
+                '    _unzipped = fasta_path[:-3]\n'
+                '    with gzip.open(fasta_path, "rb") as _fi, open(_unzipped, "wb") as _fo:\n'
+                '        shutil.copyfileobj(_fi, _fo)\n'
+                '    fasta_path = _unzipped\n'
+            )
+            insert_m = re.search(r'(run_dir\s*=\s*r?["\'][^\n]+\n)', code)
+            if insert_m:
+                pos = insert_m.end()
+                code = code[:pos] + glob_snippet + code[pos:]
+                self._log("FIX_FASTA", body="Injected fasta_path glob (undefined var fix)", node="generator")
+
+        # Fix 0d — SeqIO.parse called multiple times on same fasta_path (iterator exhausted)
+        # Replace with a single list() call stored in a variable, reused throughout.
+        if code.count("SeqIO.parse(fasta_path") > 1:
+            # Replace all occurrences with reference to a pre-materialised list
+            code = re.sub(
+                r'SeqIO\.parse\(fasta_path,\s*["\']fasta["\']\)',
+                '_contigs_cache',
+                code,
+            )
+            # Inject the cache definition after fasta_path definition or run_dir
+            cache_line = '_contigs_cache = list(SeqIO.parse(fasta_path, "fasta"))\n'
+            insert_m2 = re.search(r'(fasta_path\s*=\s*[^\n]+\n)', code)
+            if insert_m2:
+                pos2 = insert_m2.end()
+                code = code[:pos2] + cache_line + code[pos2:]
+                self._log("FIX_FASTA", body="Cached SeqIO.parse to avoid iterator exhaustion", node="generator")
+
+        # Fix 1 — reorder glob so .fna comes before .fna.gz
+        # Simple string substitution: swap "*.fna.gz" and "*.fna" in any multi-glob line.
+        # The regex approach fails with nested parens (os.path.join), so we do line-by-line.
+        _fixed_lines = []
+        _fna_gz_line = None
+        for _ln in code.splitlines(keepends=True):
+            # Detect a line that has *.fna.gz glob but no *.fna (only gz variant)
+            if '*.fna.gz' in _ln and '*.fna"' not in _ln and '*.fna\'' not in _ln:
+                _fna_gz_line = _ln  # hold it; next line may be the *.fna glob
+            elif _fna_gz_line is not None and ('*.fna"' in _ln or '*.fna\'' in _ln):
+                # Swap: output *.fna line first, then the gz line
+                _fixed_lines.append(_ln)
+                _fixed_lines.append(_fna_gz_line)
+                _fna_gz_line = None
+            else:
+                if _fna_gz_line is not None:
+                    _fixed_lines.append(_fna_gz_line)
+                    _fna_gz_line = None
+                _fixed_lines.append(_ln)
+        if _fna_gz_line is not None:
+            _fixed_lines.append(_fna_gz_line)
+        code = "".join(_fixed_lines)
+
+        # Fix 2 — gzip-safe SeqIO.parse
+        # If code has SeqIO.parse(fasta_path, ...) but no gzip.open guard, inject one.
+        # CRITICAL: preserve the surrounding indentation so the injected block is valid
+        # inside loops and conditionals (a fixed 4-space indent causes IndentationError
+        # when the original line was indented deeper).
+        if "SeqIO.parse(fasta_path" in code and "gzip.open" not in code:
+            def _gzip_guard(m: re.Match) -> str:
+                # Detect indentation of the matched line by looking backwards
+                start = m.start()
+                line_start = code.rfind("\n", 0, start) + 1
+                indent = ""
+                for ch in code[line_start:start]:
+                    if ch in (" ", "\t"):
+                        indent += ch
+                    else:
+                        break
+                # If the assignment itself is indented, honour that indentation
+                i = indent
+                i2 = indent + "    "
+                i3 = indent + "        "
+                var = m.group(1)
+                return (
+                    f'if fasta_path.endswith(".gz"):\n'
+                    f'{i2}import gzip\n'
+                    f'{i2}with gzip.open(fasta_path, "rt") as _gz_handle:\n'
+                    f'{i3}{var} = list(SeqIO.parse(_gz_handle, "fasta"))\n'
+                    f'{i}else:\n'
+                    f'{i2}{var} = list(SeqIO.parse(fasta_path, "fasta"))'
+                )
+
+            new_code = re.sub(
+                r'(\w+)\s*=\s*list\(SeqIO\.parse\(fasta_path,\s*["\']fasta["\']\)\)',
+                _gzip_guard,
+                code,
+            )
+            if new_code != code:
+                code = new_code
+                self._log("FIX_FASTA", body="Injected gzip-safe SeqIO.parse guard (indent-aware)", node="generator")
+
+        # Fix 3 — universal gzip decompression guard before fasta_path assignment.
+        # When the model sets fasta_path from a glob that may return .gz files,
+        # inject an "if .gz → decompress to .fna" block right after the assignment.
+        # This catches any code that does fasta_path = some_list[0] without a guard.
+        if "SeqIO.parse(fasta_path" in code and "fasta_path.endswith" not in code:
+            _guard = (
+                'if fasta_path.endswith(".gz"):\n'
+                '    import gzip as _gz_mod, shutil as _sh_mod\n'
+                '    _fna_unzipped = fasta_path[:-3]\n'
+                '    if not os.path.exists(_fna_unzipped):\n'
+                '        with _gz_mod.open(fasta_path, "rb") as _fi, open(_fna_unzipped, "wb") as _fo:\n'
+                '            _sh_mod.copyfileobj(_fi, _fo)\n'
+                '    fasta_path = _fna_unzipped\n'
+            )
+            # Inject after the last fasta_path = ... assignment
+            _m3 = list(re.finditer(r'^([ \t]*fasta_path\s*=\s*.+)$', code, re.MULTILINE))
+            if _m3:
+                _last = _m3[-1]
+                _ins = _last.end()
+                code = code[:_ins] + "\n" + _guard + code[_ins:]
+                self._log("FIX_FASTA Fix-3", body="Injected universal gzip decompression guard", node="generator")
+
+        return code
+
+    def _auto_fix_fstring_quotes(self, code: str) -> str:
+        """
+        If code has a SyntaxError caused by conflicting f-string quotes, attempt a
+        deterministic fix: for every f-string whose outer delimiter matches inner quotes,
+        switch the outer delimiter to the other quote character.
+
+        Strategy:
+          f"...{"inner"}..."  →  f'...{"inner"}...'   (switch outer to single)
+          f'...{'inner'}...'  →  f"...{'inner'}..."   (switch outer to double)
+
+        If the fixed code still doesn't compile, return the original — the executor
+        will surface a clear error and the observer will trigger repair.
+        """
+        try:
+            compile(code, "<postcheck>", "exec")
+            return code  # already valid, nothing to do
+        except SyntaxError:
+            pass
+
+        def _swap_outer(m: re.Match) -> str:
+            outer = m.group(1)          # f" or f'
+            body  = m.group(2)
+            close = m.group(3)          # matching close quote
+            inner_q = '"' if outer[-1] == "'" else "'"
+            other_q = '"' if outer[-1] == "'" else "'"
+            # Only swap if body actually contains the conflicting quote
+            if outer[-1] in body:
+                new_outer = outer[:-1] + other_q
+                new_close = other_q
+                return new_outer + body + new_close
+            return m.group(0)
+
+        # Match f'...' or f"..." (non-greedy, single-line only — avoids multi-line edge cases)
+        fixed = re.sub(
+            r'(f["\'])((?:[^\\]|\\.)*?)(["\'])',
+            _swap_outer,
+            code,
+        )
+
+        try:
+            compile(fixed, "<postcheck>", "exec")
+            self._log("FSTRING AUTO-FIX", body="Quote conflict corrected", node="generator")
+            return fixed
+        except SyntaxError:
+            return code  # give up — executor will surface the error cleanly
+
+    def _sanitize_output_paths(self, code: str, run_dir: str) -> str:
+        """
+        Replace absolute Windows/Unix paths used for OUTPUT files with run_dir-relative paths.
+        Only targets write-mode opens and common DataFrame/array save calls — never touches
+        read-mode opens (those are valid input paths that must stay absolute).
+        """
+        if not run_dir:
+            return code
+
+        # Pattern: open("C:\\...\\file.ext", "w"/"a"/"wb"/"ab") or open('...', 'w')
+        def _replace_open(m):
+            quote = m.group(1)
+            path = m.group(2)
+            mode = m.group(3)
+            basename = os.path.basename(path.replace("\\\\", "\\").replace("\\", os.sep))
+            new_path = os.path.join(run_dir, basename).replace("\\", "\\\\")
+            return f"open({quote}{new_path}{quote}, {quote}{mode}{quote})"
+
+        # Match: open("ABS_PATH", "w" or "a" or "wb" or "ab" or "x")
+        code = re.sub(
+            r"""open\((['"]) ([A-Za-z]:[/\\\\][^'"]+|/(?:[^/'"]+/)+[^/'"]+) \1\s*,\s*['"](w|a|wb|ab|x)['"]\)""",
+            _replace_open,
+            code,
+            flags=re.VERBOSE,
+        )
+
+        # Pattern: pd.DataFrame.to_csv / to_excel / to_parquet / np.save / np.savetxt with absolute path
+        def _replace_save(m):
+            method = m.group(1)
+            quote = m.group(2)
+            path = m.group(3)
+            rest = m.group(4)
+            basename = os.path.basename(path.replace("\\\\", "\\").replace("\\", os.sep))
+            new_path = os.path.join(run_dir, basename).replace("\\", "\\\\")
+            return f"{method}({quote}{new_path}{quote}{rest}"
+
+        code = re.sub(
+            r"""(\.\s*(?:to_csv|to_excel|to_parquet|to_json|to_pickle|savetxt?|save))\((['"]) ([A-Za-z]:[/\\\\][^'"]+|/(?:[^/'"]+/)+[^/'"]+) \2 ([,)])""",
+            _replace_save,
+            code,
+            flags=re.VERBOSE,
+        )
+
+        return code
+
     def _maybe_pause(self, state: AgentState, *, resume_to: str, prompt_text: str, pause_kind: str) -> Dict[str, Any] | None:
         mode = (state.get("manifest") or {}).get("interaction_mode", "auto")
         if mode != "feedback":
@@ -3325,128 +3366,6 @@ class BioAgent:
 
 
     # AGENT RUNNER
-    def _get_current_step(self, state: "AgentState") -> dict | None:
-        """T7: Safe accessor for the current plan step.
-
-        Returns None if current_idx is out of bounds instead of raising IndexError.
-        All nodes should use this instead of state["plan"][state["current_idx"]] directly.
-        """
-        plan = state.get("plan") or []
-        idx = state.get("current_idx", 0)
-        if idx < 0 or idx >= len(plan):
-            self._log(
-                "_get_current_step: OOB",
-                body=f"current_idx={idx} len(plan)={len(plan)} — routing to finalizer",
-                node="guard",
-            )
-            return None
-        return plan[idx]
-
-    def _build_initial_state(self, prompt: str, staged: list, session_id: str | None, tmp: str) -> dict:
-        """
-        FIX-1: Single source of truth for the initial AgentState.
-        Eliminates the verbatim duplication between go() and go_stream().
-        """
-        import os as _os
-        # T2.5: ensure RUN_TEMP_DIR is set at the process level immediately
-        if tmp:
-            os.environ["RUN_TEMP_DIR"] = tmp
-        return {
-            "messages": [HumanMessage(content=prompt)],
-            "next_step": None,
-            "env_name": "bio-agent-env1",
-            "env_ready": False,
-            "pending_code": None,
-            "manifest": {
-                "timeout_seconds": self.timeout_seconds,
-                "observations": [],
-                "file_registry": {},   # T8.2: persistent file registry {step_title: [abs_paths]}
-                "attachments": staged,
-                "interaction_mode": getattr(self, "interaction_mode", "auto"),
-                "diagnostics_rounds": {},  # T1.1: {step_idx: n_diag_rounds}
-            },
-            "plan": [],
-            "current_idx": 0,
-            "last_prompt": None,
-            "last_result": None,
-            "missing": [],
-            "run_temp_dir": tmp,
-            "retry_counts": {},
-            "diagnostic_mode": False,
-            "diagnostic_code": None,
-            "diagnostic_observation": None,
-            "run_id": tmp.split(_os.sep)[-1],
-            "session_id": session_id,          # FIX: session_id was missing from initial state
-            "run_started_at": time.time(),    # T6.3: global elapsed time guard
-            "batch_mode": None,
-            "batch_strategy": "independent",
-            "sample_manifest": None,
-            "current_sample_idx": None,
-            "current_sample_id": None,         # FIX: removed duplicate key
-            "per_sample_results": None,
-        }
-
-    def _prepare_run_inputs(self, prompt: str, attachments: list[str] | None, session_id: str | None, thread_id: str, tmp: str):
-        if self.use_tool_retriever:
-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
-            self.update_system_prompt_with_selected_resources(selected_resources_names)
-
-        staged = self._stage_attachments(tmp, attachments or [])
-        
-        # --- FIX 3: Purge des modules & Fix 5: Checkpoints ---
-        from genomeer.utils.helper import clear_persistent_namespace
-        clear_persistent_namespace()
-        
-        from genomeer.utils.checkpoint import CheckpointManager
-        from genomeer.utils.metrics import RunMetrics
-        
-        cp = CheckpointManager(tmp, thread_id)
-        if cp.exists():
-            inputs = cp.load()
-            if isinstance(inputs, dict):
-                inputs["run_started_at"] = time.time()  # FIX C1: Reset timer on resume
-                
-                # BUG-05: Restore integer keys for retry counts and diagnostic rounds
-                # JSON serialization converts int keys to strings, which breaks state[idx] lookups
-                if "retry_counts" in inputs and isinstance(inputs["retry_counts"], dict):
-                    inputs["retry_counts"] = {int(k): v for k, v in inputs["retry_counts"].items() if str(k).isdigit()}
-                
-                if "manifest" in inputs and isinstance(inputs["manifest"], dict):
-                    diag = inputs["manifest"].get("diagnostics_rounds")
-                    if isinstance(diag, dict):
-                        inputs["manifest"]["diagnostics_rounds"] = {int(k): v for k, v in diag.items() if str(k).isdigit()}
-
-                # Reconstruct LangChain message objects
-                if "messages" in inputs and isinstance(inputs["messages"], list):
-                    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-                    new_msgs = []
-                    for m in inputs["messages"]:
-                        if isinstance(m, dict):
-                            mtype = (m.get("type") or m.get("role", "human")).lower()
-                            if mtype == "human": new_msgs.append(HumanMessage(**m))
-                            elif mtype == "ai": new_msgs.append(AIMessage(**m))
-                            elif mtype == "system": new_msgs.append(SystemMessage(**m))
-                            elif mtype == "tool": new_msgs.append(ToolMessage(**m))
-                            else: new_msgs.append(HumanMessage(**m)) # fallback
-                        else:
-                            new_msgs.append(m)
-                    inputs["messages"] = new_msgs
-            self._log("CHECKPOINT", body=f"Resuming from step {inputs.get('current_idx', 0)}", node="driver")
-            self._metrics = RunMetrics(thread_id, tmp)
-        else:
-            if not self._has_session_state(thread_id):
-                inputs = self._build_initial_state(prompt, staged, session_id, tmp)
-                self._metrics = RunMetrics(thread_id, tmp)
-            else:
-                msg_block = [HumanMessage(content=prompt)]
-                if staged:
-                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {"messages": msg_block}
-            
-        config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
-        return inputs, config
-
-
     def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
         """Execute the agent with the given prompt.
         Args:
@@ -3455,42 +3374,99 @@ class BioAgent:
         """
         self.critic_count = 0
         self.user_task = prompt
-        self.current_cancel_event = cancel_event
         thread_id = session_id or str(uuid4())
         
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
         def _is_human(msg) -> bool:
             return getattr(msg, "type", "").lower() == "human"
 
+        if self.use_tool_retriever:
+            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+            self.update_system_prompt_with_selected_resources(selected_resources_names)
+
         with run_workdir("run", session_id) as tmp:
-            inputs, config = self._prepare_run_inputs(prompt, attachments, session_id, thread_id, tmp)
+            staged = self._stage_attachments(tmp, attachments or [])
+            # Keep basenames of user uploads so they survive a fatal-error cleanup.
+            _staged_basenames = {os.path.basename(p) for p in staged}
+
+            if not self._has_session_state(thread_id):
+                # FIRST TURN OF THIS SESSION -> full bootstrap state
+                inputs = {
+                    "messages": [HumanMessage(content=prompt)],
+                    "next_step": None,
+                    "env_name": "bio-agent-env1",
+                    "env_ready": False,
+                    "pending_code": None,
+                    "manifest": {
+                        "timeout_seconds": self.timeout_seconds,
+                        "observations": [],
+                        "attachments": staged,
+                        "interaction_mode": getattr(self, "interaction_mode", "auto"),
+                    },
+                    "plan": [],
+                    "current_idx": 0,
+                    "last_prompt": None,
+                    "last_result": None,
+                    "missing": [],
+                    "run_temp_dir": tmp,
+                    "retry_counts": {},
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                    "run_id": tmp.split('run')[1][1:],
+                }
+            else:
+                # FOLLOW-UP TURN -> only append the new message and record any new attachments
+                msg_block = [HumanMessage(content=prompt)]
+                if staged:
+                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                inputs = {"messages": msg_block}
+
+            config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             self.log = []
             last_msg_text = None
+            _fatal: BaseException | None = None
 
-            for s in self.app.stream(inputs, stream_mode="values", config=config):
-                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                    # graceful exit
-                    last_msg_text = "<observe>Request canceled by client.</observe>"
-                    break
-                
-                message = s["messages"][-1]
-                if mode == "prod" and _is_human(message):
-                    continue
-            
-                text = str(message.content)
-                if text != last_msg_text:
-                    out = pretty_print(message)
-                    self.log.append(out)
-                    last_msg_text = text
-                
-                # ************* logs [dev-only] *************
-                curr_idx = s.get("current_idx", None)
-                next_step = s.get("next_step", None)
-                self._log("STEP SNAPSHOT", body=f"current_idx={curr_idx}\nnext_step={next_step}", node="driver")
-                # *******************************************
+            try:
+                for s in self.app.stream(inputs, stream_mode="values", config=config):
+                    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                        last_msg_text = "<observe>Request canceled by client.</observe>"
+                        break
 
-            self._flush_log()
-            return self.log, s
+                    message = s["messages"][-1]
+                    if mode == "prod" and _is_human(message):
+                        continue
+
+                    text = str(message.content)
+                    if text != last_msg_text:
+                        out = pretty_print(message)
+                        self.log.append(out)
+                        last_msg_text = text
+
+                    curr_idx = s.get("current_idx", None)
+                    next_step = s.get("next_step", None)
+                    self._log("STEP SNAPSHOT", body=f"current_idx={curr_idx}\nnext_step={next_step}", node="driver")
+
+            except BaseException as _e:
+                _fatal = _e
+                raise
+            finally:
+                if _fatal is not None:
+                    # Fatal error — remove generated files but preserve user uploads.
+                    try:
+                        import shutil as _sh
+                        for _entry in os.listdir(tmp):
+                            if _entry in _staged_basenames:
+                                continue  # preserve user's uploaded files
+                            _fp = os.path.join(tmp, _entry)
+                            if os.path.isfile(_fp):
+                                os.unlink(_fp)
+                            elif os.path.isdir(_fp):
+                                _sh.rmtree(_fp, ignore_errors=True)
+                    except Exception:
+                        pass
+
+            return self.log, last_msg_text
     
     def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
@@ -3513,38 +3489,96 @@ class BioAgent:
         def _is_human(msg) -> bool:
             return getattr(msg, "type", "").lower() == "human"
 
+        if self.use_tool_retriever:
+            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+            self.update_system_prompt_with_selected_resources(selected_resources_names)
+
         with run_workdir("run", session_id) as tmp:
-            inputs, config = self._prepare_run_inputs(prompt, attachments, session_id, thread_id, tmp)
+            staged = self._stage_attachments(tmp, attachments or [])
+            _staged_basenames = {os.path.basename(p) for p in staged}
+
+            if not self._has_session_state(thread_id):
+                # FIRST TURN OF THIS SESSION -> full bootstrap state
+                inputs = {
+                    "messages": [HumanMessage(content=prompt)],
+                    "next_step": None,
+                    "env_name": "bio-agent-env1",
+                    "env_ready": False,
+                    "pending_code": None,
+                    "manifest": {
+                        "timeout_seconds": self.timeout_seconds,
+                        "observations": [],
+                        "attachments": staged,
+                        "interaction_mode": getattr(self, "interaction_mode", "auto"),
+                    },
+                    "plan": [],
+                    "current_idx": 0,
+                    "last_prompt": None,
+                    "last_result": None,
+                    "missing": [],
+                    "run_temp_dir": tmp,
+                    "retry_counts": {},
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                    "run_id": tmp.split('run')[1][1:],
+                }
+            else:
+                # FOLLOW-UP TURN -> only append the new message and record any new attachments
+                msg_block = [HumanMessage(content=prompt)]
+                if staged:
+                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
+                inputs = {"messages": msg_block}
+
+            config = {"recursion_limit": 500, "configurable": {"thread_id": thread_id}}
             last_msg_text = None
             self.log = []
+            _fatal: BaseException | None = None
 
-            for s in self.app.stream(inputs, stream_mode="values", config=config):
-                # bail if canceled
-                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                    yield {"type": "message", "text": "<observe>Request canceled by client.</observe>"}
-                    self._flush_log()
-                    return
-                
-                message = s["messages"][-1]
-                text = str(message.content)
+            try:
+                for s in self.app.stream(inputs, stream_mode="values", config=config):
+                    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                        yield {"type": "message", "text": "<observe>Request canceled by client.</observe>"}
+                        return
 
-                if mode == "prod" and _is_human(message):
-                    continue
-                if text == last_msg_text:
-                    continue
-                
-                last_msg_text = text
-                out = pretty_print(message)
-                self.log.append(out)
+                    message = s["messages"][-1]
+                    text = str(message.content)
 
-                for seg in self.extract_tagged_blocks(text):
-                    if seg["kind"] == "text":
-                        if seg["text"].strip():
-                            yield {"type": "message", "text": seg["text"]}
-                    else:
-                        tag = seg.get("tag", "BLOCK").upper()
-                        if tag == "THINK":
-                            yield {"type": "think", "tag": tag, "text": seg["text"]}
+                    if mode == "prod" and _is_human(message):
+                        continue
+                    if text == last_msg_text:
+                        continue
+
+                    last_msg_text = text
+                    out = pretty_print(message)
+                    self.log.append(out)
+
+                    for seg in self.extract_tagged_blocks(text):
+                        if seg["kind"] == "text":
+                            if seg["text"].strip():
+                                yield {"type": "message", "text": seg["text"]}
                         else:
-                            yield {"type": "block", "tag": tag, "text": seg["text"]}
-            self._flush_log()
+                            tag = seg.get("tag", "BLOCK").upper()
+                            if tag == "THINK":
+                                yield {"type": "think", "tag": tag, "text": seg["text"]}
+                            else:
+                                yield {"type": "block", "tag": tag, "text": seg["text"]}
+
+            except BaseException as _e:
+                _fatal = _e
+                raise
+            finally:
+                if _fatal is not None:
+                    try:
+                        import shutil as _sh
+                        for _entry in os.listdir(tmp):
+                            if _entry in _staged_basenames:
+                                continue
+                            _fp = os.path.join(tmp, _entry)
+                            if os.path.isfile(_fp):
+                                os.unlink(_fp)
+                            elif os.path.isdir(_fp):
+                                _sh.rmtree(_fp, ignore_errors=True)
+                    except Exception:
+                        pass
+    

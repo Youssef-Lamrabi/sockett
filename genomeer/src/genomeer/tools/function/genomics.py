@@ -1,32 +1,12 @@
 import os
 
-# ISSUE-24: gget, gseapy, scanpy are only available inside panhumanpy_env, not in
-# bio-agent-env1 or at the system level.  Module-level imports were crashing
-# read_module2api() / agent initialization with ImportError on every install that
-# hadn't pre-built panhumanpy_env.  Moved to lazy imports inside each function.
+import gget
+import gseapy
+import numpy as np
+import pandas as pd
+import scanpy as sc
 
 from genomeer.utils.llm import get_llm
-
-
-# Module-level placeholders — functions will call _require_scRNA_deps() to populate these.
-gget = gseapy = np = pd = sc = None  # type: ignore[assignment]
-
-
-def _require_scRNA_deps():
-    """Lazy-import scRNA dependencies; raise ImportError with a clear message."""
-    global gget, gseapy, np, pd, sc
-    try:
-        import gget as _gget
-        import gseapy as _gseapy
-        import numpy as _np
-        import pandas as _pd
-        import scanpy as _sc
-        gget, gseapy, np, pd, sc = _gget, _gseapy, _np, _pd, _sc
-    except ImportError as _e:
-        raise ImportError(
-            f"scRNA-seq tools require panhumanpy_env: {_e}. "
-            "Run the pipeline with env='panhumanpy_env'."
-        ) from _e
 
 
 def annotate_celltype_scRNA(
@@ -54,7 +34,6 @@ def annotate_celltype_scRNA(
     - str: Steps performed and file paths where results were saved
 
     """
-    _require_scRNA_deps()
 
     def _cluster_info(cluster_id, marker_genes, composition_df=None):
         """Format cluster information for LLM prompt."""
@@ -93,11 +72,7 @@ def annotate_celltype_scRNA(
 
     # TODO: this can be optimized
     czi_celltype_path = data_lake_path + "/czi_census_datasets_v4.parquet"
-    try:
-        df = pd.read_parquet(czi_celltype_path)
-    except FileNotFoundError:
-        return f"Error: The reference dataset {czi_celltype_path} is missing from the Data Lake. Please ensure it is downloaded."
-    
+    df = pd.read_parquet(czi_celltype_path)
     czi_celltype_set = {cell_type.strip() for cell_types in df["cell_type"] for cell_type in str(cell_types).split(";")}
     czi_celltype = ", ".join(sorted(czi_celltype_set))
 
@@ -206,14 +181,30 @@ def annotate_celltype_with_panhumanpy(
     """
     import json
     import shutil
+    import subprocess
     import tempfile
-    from genomeer.utils.helper import _run_in_env
-    from genomeer.runtime.env_manager import ensure_env
+
+    def conda_env_exists(env_name):
+        try:
+            result = subprocess.run(["conda", "env", "list"], capture_output=True, text=True, check=True)
+            return any(env_name in line.split() for line in result.stdout.splitlines())
+        except Exception:
+            return False
+
+    def create_panhumanpy_env(env_name):
+        # Create env and install panhumanpy
+        subprocess.run(["conda", "create", "-y", "-n", env_name, "python=3.10"], check=True)
+        # Install panhumanpy in the new env
+        subprocess.run(
+            ["conda", "run", "-n", env_name, "pip", "install", "git+https://github.com/satijalab/panhumanpy.git"],
+            check=True,
+        )
 
     PANHUMANPY_ENV = "panhumanpy_env"
 
-    # 1. Ensure the environment is built via standard micromamba workflow
-    ensure_env(PANHUMANPY_ENV)
+    # 1. Check/create panhumanpy_env
+    if not conda_env_exists(PANHUMANPY_ENV):
+        create_panhumanpy_env(PANHUMANPY_ENV)
 
     # 2. Write a temp script to run in the panhumanpy_env
     temp_dir = tempfile.mkdtemp()
@@ -325,10 +316,11 @@ except Exception as e:
 
     # 3. Run the script in the panhumanpy_env
     try:
-        proc = _run_in_env(PANHUMANPY_ENV, ["python", script_path], timeout=7200, check=True)
-    except Exception as e:
+        run_cmd = ["conda", "run", "-n", PANHUMANPY_ENV, "python", script_path]
+        subprocess.run(run_cmd, check=True)
+    except subprocess.CalledProcessError as e:
         shutil.rmtree(temp_dir)
-        return f"Error running panhumanpy in micromamba env: {e}"
+        return f"Error running panhumanpy in conda env: {e}"
 
     # 4. Read the result
     try:
@@ -478,12 +470,7 @@ def map_to_ima_interpret_scRNA(adata_filename, data_dir, custom_args=None):
 
     steps.append("adata.obs['X_uce'] found. Proceeding with cell type mapping.")
 
-    ima_path = f"{data_dir}/uce_10000_per_dataset_33l_8ep_coarse_ct.h5ad"
-    try:
-        IMA_adata = sc.read_h5ad(ima_path)
-    except FileNotFoundError:
-        return f"Error: The IMA reference dataset is missing ({ima_path})."
-        
+    IMA_adata = sc.read_h5ad(f"{data_dir}/uce_10000_per_dataset_33l_8ep_coarse_ct.h5ad")
     steps.append("Loaded Integrated Megascale Atlas (IMA) reference dataset")
 
     if adata.obsm["X_uce"].shape[1] != IMA_adata.X.shape[1]:

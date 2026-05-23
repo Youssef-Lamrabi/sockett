@@ -1,7 +1,6 @@
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
-import logging
-import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys, platform, time
+import os, tempfile, subprocess, traceback, shlex, threading, importlib, ast, sys
 from typing import Any, Callable, Iterable, Mapping, Optional
 from pydantic import BaseModel, Field, ValidationError
 from langchain_core.messages.base import get_msg_title_repr
@@ -13,135 +12,10 @@ from genomeer.runtime.env_manager import (
     ensure_env,
     ENVS_DIR
 )
-
-logger = logging.getLogger("genomeer.helper")
-
-# Thread-local storage for custom function injection to ensure isolation between concurrent requests.
-_thread_local = threading.local()
-
-def _get_persistent_namespace():
-    if not hasattr(_thread_local, "namespace"):
-        _thread_local.namespace = {}
-    return _thread_local.namespace
-
-def clear_persistent_namespace():
-    _thread_local.namespace = {}
+_persistent_namespace = {} 
 class api_schema(BaseModel):
     """api schema specification."""
     api_schema: str | None = Field(description="The api schema as a dictionary")
-
-_version_cache = {}
-_version_cache_lock = threading.Lock()
-
-def clear_version_cache(env_name: Optional[str] = None):
-    """Clear the version cache for a specific environment or globally."""
-    global _version_cache
-    with _version_cache_lock:
-        if env_name:
-            _version_cache = {k: v for k, v in _version_cache.items() if not k.startswith(f"{env_name}::")}
-        else:
-            _version_cache.clear()
-
-def get_tool_version(tool_name: str, env_name: str) -> str:
-    """Run `<tool> --version` inside the specified environment and cache the result."""
-    if not env_name or not tool_name:
-        return "unknown"
-    
-    # Check cache
-    cache_key = f"{env_name}::{tool_name}"
-    with _version_cache_lock:
-        if cache_key in _version_cache:
-            return _version_cache[cache_key]
-    
-    try:
-        proc = _run_in_env(env_name, [tool_name, "--version"], timeout=10.0)
-        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        
-        # Take the first non-empty line as version, capped to 100 chars to avoid huge hashes
-        lines = [line.strip() for line in output.split("\n") if line.strip()]
-        version_str = lines[0][:100] if lines else "unknown"
-        
-        with _version_cache_lock:
-            _version_cache[cache_key] = version_str
-        return version_str
-    except Exception:
-        # Fallback to unknown if the tool does not support --version or fails
-        with _version_cache_lock:
-            _version_cache[cache_key] = "unknown"
-        return "unknown"
-
-def preload_tool_versions(env_name: str, tools: list[str]):
-    """Run `<tool> --version` for multiple tools in a single subprocess to warm the cache."""
-    if not env_name or not tools:
-        return
-        
-    import platform
-    if platform.system() == "Windows":
-        return
-        
-    with _version_cache_lock:
-        tools_to_check = [t for t in set(tools) if f"{env_name}::{t}" not in _version_cache]
-    if not tools_to_check:
-        return
-        
-    cmds = []
-    for t in tools_to_check:
-        cmds.append(f"echo '===TOOL:{t}===' && {t} --version")
-    
-    script = "\n".join(cmds)
-    try:
-        proc = _run_in_env(env_name, ["bash", "-c", script], timeout=30.0)
-        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        
-        current_tool = None
-        current_version = "unknown"
-        for line in output.split("\n"):
-            line = line.strip()
-            if not line: continue
-            
-            if line.startswith("===TOOL:") and line.endswith("==="):
-                if current_tool:
-                    with _version_cache_lock:
-                        _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
-                current_tool = line[8:-3]
-                current_version = "unknown"
-            elif current_tool and current_version == "unknown":
-                current_version = line
-                
-        if current_tool:
-            with _version_cache_lock:
-                _version_cache[f"{env_name}::{current_tool}"] = current_version[:100]
-    except Exception:
-        pass
-
-# ------------------------------------------------------------------------------------------
-# Resource Limiter Utility
-# ------------------------------------------------------------------------------------------
-def _make_resource_limiter(max_ram_gb: float, max_cpu_seconds: int) -> Optional[Callable[[], None]]:
-    """Returns a function to be used as preexec_fn in Popen to limit resources."""
-    if platform.system() == "Windows":
-        return None
-
-    def limit_resources():
-        try:
-            import resource
-            # RAM limit
-            limit_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
-            # RLIMIT_AS: The maximum size of the process's virtual memory (address space) in bytes.
-            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-            
-            # CPU limit
-            # RLIMIT_CPU: The maximum amount of CPU time (in seconds) that the process can use.
-            resource.setrlimit(resource.RLIMIT_CPU, (max_cpu_seconds, max_cpu_seconds))
-            
-            # Subprocesses limit (extra safety)
-            resource.setrlimit(resource.RLIMIT_NPROC, (512, 512))
-        except (ImportError, ValueError, OSError) as e:
-            # Note: preexec_fn runs in the child, logging might not be safe/visible.
-            # We rely on the parent logging any startup failures if possible.
-            pass
-            
-    return limit_resources
 
 # ------------------------------------------------------------------------------------------
 # internal utility to run in env
@@ -152,131 +26,82 @@ def _run_in_env(
     *,
     timeout: float,
     extra_env: Optional[Mapping[str, str]] = None,
-    run_temp_dir: Optional[str] = None,
     check: bool = False,
     input_text: Optional[str] = None,
-    cancel_event: Optional[threading.Event] = None,
 ) -> subprocess.CompletedProcess[str]:
     """
     Run argv inside micromamba env <env_name> and capture output.
 
-    Parameters
-    ----------
-    env_name     : Name of the micromamba environment.
-    argv         : Command + arguments to execute.
-    timeout      : Max seconds before subprocess.TimeoutExpired is raised.
-    extra_env    : Additional environment variables to inject into the subprocess.
-    run_temp_dir : If provided, exported as RUN_TEMP_DIR in the subprocess env.
-                   This ensures LLM-generated code can always find the working directory.
-    check        : Raise CalledProcessError on non-zero exit code.
-    input_text   : Text to pass on stdin.
+    Windows-safe: uses CREATE_NEW_PROCESS_GROUP + taskkill /F /T on timeout so
+    the entire process tree (micromamba -> python -> ncbi-genome-download ...) is
+    killed. Without this, subprocess.run timeout leaves child processes running
+    and then hangs forever draining a full pipe buffer (classic Windows deadlock).
     """
+    import platform as _platform
+
     exe = ensure_micromamba()
     prefix = ENVS_DIR / env_name
 
-    # micromamba run -p <prefix> -- <argv...>
-    cmd = [str(exe), "run", "-p", str(prefix), *argv]
-    # T3: replaced print() debug with logging.debug() — do NOT revert to print()
-    logger.debug("[_run_in_env] cmd=%s", " ".join(str(x) for x in cmd))
+    # --no-rc suppresses shell-init PATH warnings — only valid on Linux/macOS.
+    _extra = ["--no-rc"] if _platform.system() != "Windows" else []
+    cmd = [str(exe), "run", *_extra, "-p", str(prefix), *argv]
 
     env = dict(os.environ)
     env.pop("CONDA_PREFIX", None)
     env["MAMBA_ROOT_PREFIX"] = str(ENVS_DIR.parent.parent)
-
-    # T2.1: Always inject RUN_TEMP_DIR into the subprocess environment so that
-    # LLM-generated code using os.environ.get("RUN_TEMP_DIR") never gets None.
-    if run_temp_dir:
-        _abs_tmp = os.path.realpath(run_temp_dir)
-        _allowed_base = os.path.realpath(os.environ.get("BIOAGENT_TMP_DIR", tempfile.gettempdir()))
-        if not _abs_tmp.startswith(_allowed_base):
-            logger.warning(f"[_run_in_env] run_temp_dir '{run_temp_dir}' is outside allowed base '{_allowed_base}'; using fallback")
-            _abs_tmp = _allowed_base
-        env["RUN_TEMP_DIR"] = _abs_tmp
     if extra_env:
-        import re as _re
-        for _k, _v in extra_env.items():
-            if not _re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', str(_k)):
-                logger.warning(f"[_run_in_env] Skipping extra_env key with invalid characters: {_k!r}")
-                continue
-            env[str(_k)] = str(_v)
-    # If RUN_TEMP_DIR still not set, use a safe fallback
-    if "RUN_TEMP_DIR" not in env:
-        env["RUN_TEMP_DIR"] = os.environ.get("BIOAGENT_TMP_DIR", os.path.join(tempfile.gettempdir(), "bioagent"))
-    max_ram_gb = float(env.get("GENOMEER_MAX_RAM_GB", "32"))
-    max_cpu_seconds = int(env.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
-    
-    preexec = None
-    if platform.system() != "Windows":
-        preexec = _make_resource_limiter(max_ram_gb, max_cpu_seconds)
-    else:
-        logger.warning("[_run_in_env] Resource limits (RAM/CPU) are not supported on Windows.")
+        env.update(extra_env)
 
-    try:
+    if _platform.system() == "Windows":
+        # On Windows we must create a new process group so that taskkill can
+        # kill the entire tree (not just the top-level micromamba process).
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE if input_text is not None else None,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             env=env,
-            preexec_fn=preexec,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-    except Exception as e:
-        logger.error(f"[_run_in_env] Failed to start subprocess: {e} (RAM Config: {max_ram_gb} GB, CPU: {max_cpu_seconds}s)")
-        raise e
-
-    try:
-        if cancel_event is not None:
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(proc.communicate, input=input_text)
-                # BUG-07: the original while-loop polled cancel_event but never
-                # enforced the timeout — a non-cancelled process could run forever.
-                # Fix: track elapsed time and raise TimeoutExpired when exceeded.
-                _deadline = time.monotonic() + timeout
-                try:
-                    while not future.done():
-                        if cancel_event.is_set():
-                            proc.kill()
-                            raise subprocess.TimeoutExpired(cmd, timeout)
-                        if time.monotonic() >= _deadline:
-                            proc.kill()
-                            raise subprocess.TimeoutExpired(cmd, timeout)
-                        time.sleep(0.1)
-                    stdout, stderr = future.result(timeout=2.0)
-                except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
-                    proc.kill()
-                    try:
-                        stdout, stderr = proc.communicate(timeout=2.0)
-                    except Exception:
-                        stdout, stderr = "", ""
-                    raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
-        else:
-            stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        # BUG-09: Robust cleanup on timeout
         try:
-            proc.kill()
-            outs, errs = proc.communicate(timeout=2.0)
-            exc.stdout = outs
-            exc.stderr = errs
-        except Exception:
-            # If kill/communicate fails, ensure we still raise the timeout
-            pass
-        max_ram_gb_str = env.get("GENOMEER_MAX_RAM_GB", "32")
-        logger.error(f"[_run_in_env] TimeoutExpired: L'outil {' '.join(cmd)} a dépassé les limites de temps. (CPU: {timeout}s, RAM Configurée: {max_ram_gb_str} GB)")
-        raise
+            stdout_b, stderr_b = proc.communicate(
+                input=input_text.encode() if input_text else None,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Kill every process in the tree, then drain the now-dead pipes.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+            )
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            stdout_b, stderr_b = proc.communicate()
+            raise subprocess.TimeoutExpired(
+                cmd, timeout,
+                output=stdout_b,
+                stderr=stderr_b,
+            )
 
-    retcode = proc.poll()
-    if retcode == -9:
-        logger.error(f"[_run_in_env] Le processus a été tué par SIGKILL (OOM-Killer ou timeout CPU) : {' '.join(cmd)}")
-        max_ram_gb = os.environ.get("GENOMEER_MAX_RAM_GB", "32")
-        stderr = (stderr or "") + f"\n\n[SYSTEM] Le processus a été tué (SIGKILL / -9). Limite RAM ({max_ram_gb}GB) ou CPU dépassée."
-        if check:
-            raise subprocess.CalledProcessError(retcode, cmd, output=stdout, stderr=stderr)
-    elif check and retcode:
-        raise subprocess.CalledProcessError(retcode, cmd, output=stdout, stderr=stderr)
-    return subprocess.CompletedProcess(proc.args, retcode, stdout, stderr)
+        rc = proc.returncode
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        result = subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+        if check and rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd, stdout, stderr)
+        return result
+
+    # Linux / macOS: plain subprocess.run is fine (OS kills the child group on kill()).
+    return subprocess.run(
+        cmd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=timeout,
+    )
     
 def _tail(text: str, limit: int = 20000) -> str:
     if not text:
@@ -299,42 +124,23 @@ def _format_proc_error(title: str, cmd: list[str] | str, rc: int, stdout: str, s
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(
-    code: str,
-    *,
-    env_name: Optional[str] = None,
-    extra_env: Optional[dict] = None,
-    run_temp_dir: Optional[str] = None,
-    cancel_event: Optional[threading.Event] = None,
-    log_cb=None,
-) -> str:
+def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     code = (code or "").strip()
-    if not code:
+    if not code: 
         return "Error: Empty script"
-
+    
     try:
-        import stat as _stat
-        _fd, path = tempfile.mkstemp(suffix=".R", dir=settings.run_dir)
-        try:
-            os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
-        except OSError:
-            pass
-        with os.fdopen(_fd, "w", encoding="utf-8") as f:
-            f.write(code)
-
+        with tempfile.NamedTemporaryFile(suffix=".R", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
+            f.write(code); path = f.name
+            
         if env_name:
-            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
-            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
-                return f"Environment '{env_name}' is not available. {_env_msg}"
-            proc = _run_in_env(
-                env_name, ["Rscript", path],
-                timeout=settings.timeout_seconds,
-                extra_env=extra_env,
-                run_temp_dir=run_temp_dir,
-                cancel_event=cancel_event,
-            )
-            cmd_display = proc.args if hasattr(proc, "args") else ["Rscript", path]
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}" 
+            proc = _run_in_env(env_name, ["Rscript", path], timeout=timeout or settings.timeout_seconds)
+            cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
             return _format_proc_error(
@@ -345,61 +151,27 @@ def run_r_code(
                 proc.stderr or "",
             )
 
-        import time
-        env = dict(os.environ)
-        if extra_env:
-            env.update(extra_env)
-        
-        # BUG-19: apply resource limits to host-fallback R process (same as bash fallback)
-        _r_preexec = None
-        if platform.system() != "Windows":
-            _r_preexec = _make_resource_limiter(
-                float(env.get("GENOMEER_MAX_RAM_GB", "32")),
-                int(env.get("GENOMEER_MAX_CPU_SECONDS", "7200")),
-            )
-        proc = subprocess.Popen(
+        # fallback: host R
+        res = subprocess.run(
             ["Rscript", path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
-            env=env,
-            preexec_fn=_r_preexec,
+            check=False,
+            timeout=timeout or settings.timeout_seconds,
         )
-        res_stdout, res_stderr = "", ""
-        try:
-            if cancel_event is not None:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(proc.communicate)
-                    while not future.done():
-                        if cancel_event.is_set():
-                            proc.kill()
-                            break
-                        time.sleep(0.1)
-                    try:
-                        res_stdout, res_stderr = future.result(timeout=settings.timeout_seconds)
-                    except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
-                        proc.kill()
-                        res_stdout, res_stderr = proc.communicate(timeout=2.0)
-            else:
-                res_stdout, res_stderr = proc.communicate(timeout=settings.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            res_stdout, res_stderr = proc.communicate()
-        res_returncode = proc.poll()
-
-        if res_returncode == 0:
-            return res_stdout or ""
+        if res.returncode == 0:
+            return res.stdout or ""
         return _format_proc_error(
-            "Error running R script",   # FIX: was incorrectly 'Error running Bash script'
+            "Error running Bash script",
             [path],
-            res_returncode,
-            res_stdout or "",
-            res_stderr or "",
+            res.returncode,
+            res.stdout or "",
+            res.stderr or "",
         )
     except Exception as e:
+        # return f"Error running R code: {e}"
         tb = traceback.format_exc()
-        return f"Error running R script: {tb}"
+        return f"Error running Bash script: {tb}"
     finally:
         try:
             os.unlink(path)
@@ -412,62 +184,26 @@ def run_r_code(
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(
-    script: str,
-    *,
-    env_name: Optional[str] = None,
-    extra_env: Optional[dict] = None,
-    run_temp_dir: Optional[str] = None,
-    cancel_event: Optional[threading.Event] = None,
-    log_cb=None,
-) -> str:
-    """Run a bash script, optionally inside a micromamba env.
-
-    Parameters
-    ----------
-    script       : Bash script content.
-    env_name     : Micromamba env name. If None, uses host bash.
-    extra_env    : Extra environment variables to inject (T2.2).
-    run_temp_dir : Exported as RUN_TEMP_DIR in the subprocess (T2.1).
-    log_cb       : Optional streaming log callback.
-    """
+def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     script = (script or "").strip()
-    if not script:
+    if not script: 
         return "Error: Empty script"
-
-    # --- FIX 2: SANDBOX / SÉCURITÉ ---
-    from genomeer.utils.security import check_bash_script
-    _is_safe, _reason = check_bash_script(script)
-    if not _is_safe:
-        return f"Error: {_reason}\nRewrite the script without the dangerous command."
-
-    import stat as _stat
-    _fd, path = tempfile.mkstemp(suffix=".sh", dir=settings.run_dir)
-    try:
-        os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR | _stat.S_IXUSR)
-    except OSError:
-        pass
-    with os.fdopen(_fd, "w", encoding="utf-8") as f:
-        if not script.startswith("#!/"):
-            f.write("#!/bin/bash\n")
-        if "set -e" not in script:
-            f.write("set -euo pipefail\n")
-        f.write(script)
-
+    
+    with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
+        if not script.startswith("#!/"): f.write("#!/bin/bash\n")
+        if "set -e" not in script: f.write("set -euo pipefail\n")
+        f.write(script); path = f.name
+    os.chmod(path, 0o755)
+    
     try:
         if env_name:
-            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
-            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
-                return f"Environment '{env_name}' is not available. {_env_msg}"
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}"
 
-            proc = _run_in_env(
-                env_name, ["bash", path],
-                timeout=settings.timeout_seconds,
-                extra_env=extra_env,
-                run_temp_dir=run_temp_dir,
-                cancel_event=cancel_event,
-            )
+            proc = _run_in_env(env_name, ["bash", path], timeout=timeout or settings.timeout_seconds)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -480,66 +216,27 @@ def run_bash_script(
             )
 
         # fallback: host bash
-        import time
-        env = dict(os.environ)
-        if extra_env:
-            env.update(extra_env)
-            
-        max_ram_gb = float(env.get("GENOMEER_MAX_RAM_GB", "32"))
-        max_cpu_seconds = int(env.get("GENOMEER_MAX_CPU_SECONDS", "7200"))
-        
-        preexec = None
-        if platform.system() != "Windows":
-            preexec = _make_resource_limiter(max_ram_gb, max_cpu_seconds)
-        else:
-            logger.warning("[run_bash_script] Resource limits (RAM/CPU) are not supported on Windows.")
-
-        try:
-            proc = subprocess.Popen(
-                [path],
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                preexec_fn=preexec,
-                env=env,
-            )
-        except Exception as e:
-            logger.error(f"[run_bash_script] Failed to start host subprocess: {e}")
-            return f"Error: Failed to start host subprocess: {e}"
-        try:
-            if cancel_event is not None:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(proc.communicate)
-                    while not future.done():
-                        if cancel_event.is_set():
-                            proc.kill()
-                            break
-                        time.sleep(0.1)
-                    try:
-                        res_stdout, res_stderr = future.result(timeout=settings.timeout_seconds)
-                    except (concurrent.futures.TimeoutError, subprocess.TimeoutExpired):
-                        proc.kill()
-                        res_stdout, res_stderr = proc.communicate(timeout=2.0)
-            else:
-                res_stdout, res_stderr = proc.communicate(timeout=settings.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            res_stdout, res_stderr = proc.communicate()
-        res_returncode = proc.poll()
-
-        if res_returncode == 0:
-            return res_stdout or ""
+        res = subprocess.run(
+            [path],
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout or settings.timeout_seconds,
+        )
+        if res.returncode == 0:
+            return res.stdout or ""
         return _format_proc_error(
             "Error running Bash script",
             [path],
-            res_returncode,
-            res_stdout or "",
-            res_stderr or "",
+            res.returncode,
+            res.stdout or "",
+            res.stderr or "",
         )
     except Exception as e:
+        # traceback.print_exc()
         tb = traceback.format_exc()
+        # return f"Error running Bash script: {e}"
         return f"Error running Bash script: {tb}"
     finally:
         try:
@@ -551,21 +248,10 @@ def run_bash_script(
 # ------------------------------------------------------------------------------------------
 # Function: run_cli_command
 # Desc: Helper function for LLM to run command in shell while using tools
-# DEPRECATED: Do not use for new code. Kept for backward compatibility. Secured.
+# TODO: This tool doesn't accept input agrs yet. To be done.
+# UPDATE: Stop maintaining this helper 25.09.25
 # ------------------------------------------------------------------------------------------
 def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None) -> str:
-    import warnings
-    warnings.warn(
-        "run_cli_command() is deprecated and will be removed in a future version. "
-        "Use run_bash_script() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    from genomeer.utils.security import check_bash_script
-    _is_safe, _reason = check_bash_script(command)
-    if not _is_safe:
-        return f"Error: {_reason}\nRewrite the command without the dangerous operation."
-
     os.makedirs(settings.run_dir, exist_ok=True)
     try:
         command = (command or "").strip()
@@ -574,88 +260,48 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
         argv = shlex.split(command)
         
         if env_name:
-            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
-            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
-                return f"Environment '{env_name}' is not available. {_env_msg}"
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}"
             proc = _run_in_env(env_name, argv, timeout=settings.timeout_seconds)
             return proc.stdout if proc.returncode == 0 else f"Error running command in '{env_name}':\n{proc.stderr}"
 
         # fallback: host
-        # BUG-08: systematic returncode check
         res = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=settings.timeout_seconds)
-        if res.returncode != 0:
-            return f"Error running command '{command}' (Exit {res.returncode}):\n{res.stderr}"
-        return res.stdout if res.stdout else "Command completed successfully (no output)."
+        return res.stdout if res.returncode == 0 else f"Error running command '{command}':\n{res.stderr}"
     except Exception as e:
         return f"Error running command '{command}': {e}"
-
+    
+    
 # ------------------------------------------------------------------------------------------
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
 # ------------------------------------------------------------------------------------------
-def run_python_code(
-    code: str,
-    *,
-    env_name: Optional[str] = None,
-    extra_env: Optional[dict] = None,
-    run_temp_dir: Optional[str] = None,
-    step_namespace: Optional[dict] = None,
-    cancel_event: Optional[threading.Event] = None,
-    log_cb=None,
-) -> str:
+def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
     """
     Executes the provided Python code.
-
     - If env_name is provided: runs it in that micromamba env (fresh process).
-      RUN_TEMP_DIR is always exported into the subprocess env (T2.1).
-    - If no env_name: runs in an isolated namespace per call (T4).
-      Pass step_namespace to control what variables are pre-injected.
-      Falls back to _persistent_namespace only for legacy custom function calls.
-
-    Parameters
-    ----------
-    code           : Python code string to execute.
-    env_name       : Micromamba env name. If None, runs in-process.
-    extra_env      : Extra env vars for subprocess (T2.2).
-    run_temp_dir   : Exported as RUN_TEMP_DIR in subprocess (T2.1).
-    step_namespace : If provided, used as exec namespace (T4 isolation).
-                     If None and no env_name, falls back to _persistent_namespace.
-    log_cb         : Optional streaming log callback.
+    - If no env_name: runs in a persistent REPL namespace in the current process.
     """
-    path = None
+    path = None  # must be initialised before try so finally never hits NameError
     code = code.strip("```").strip()
-    
-    # Vérification sécurité avant exec
-    from genomeer.utils.security import check_python_code
-    _is_safe, _reason = check_python_code(code)
-    if not _is_safe:
-        return f"Error: {_reason}\nRewrite the Python code without the dangerous operation."
-        
-    try:
+    try: 
         # --- Case 1: run in a micromamba environment ---
         if env_name:
-            _env_prefix, _env_created, _env_msg = ensure_env(env_name, auto_install=True, log_cb=log_cb)
-            if not _env_prefix or not (_env_prefix / "conda-meta").exists():
-                return f"Environment '{env_name}' is not available. {_env_msg}"
+            try:
+                ensure_env(env_name, auto_install=True, log_cb=log_cb)
+            except Exception as _env_err:
+                return f"Environment '{env_name}' is not available: {_env_err}"
 
+            # Write the code to a temp file
             os.makedirs(settings.run_dir, exist_ok=True)
-            import stat as _stat
-            _fd, path = tempfile.mkstemp(suffix=".py", dir=settings.run_dir)
-            try:
-                os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
-            except OSError:
-                pass
-            with os.fdopen(_fd, "w", encoding="utf-8") as f:
-                f.write(code)
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
+                f.write("# -*- coding: utf-8 -*-\n" + code)
+                path = f.name
 
             try:
-                proc = _run_in_env(
-                    env_name, ["python", path],
-                    timeout=settings.timeout_seconds,
-                    extra_env=extra_env,
-                    run_temp_dir=run_temp_dir,
-                    cancel_event=cancel_event,
-                )
+                proc = _run_in_env(env_name, ["python", path], timeout=timeout or settings.timeout_seconds)
             except subprocess.TimeoutExpired as te:
                 cmd_display = getattr(te, "cmd", ["python", path])
                 return (
@@ -677,44 +323,16 @@ def run_python_code(
                 proc.stderr or "",
             )
 
-        # T4: Use an isolated namespace per call to prevent variable leakage between steps.
-        # If step_namespace is provided (from _executor), use it; otherwise create a fresh one.
-        # TÂCHE 6.1: Restriction des __builtins__ pour la sandbox Python (Case 2)
-        # NOUVEAU-03: Unified sandbox whitelist (excludes getattr, setattr, hasattr, open, __import__)
-        # ISSUE-13: in imported modules __builtins__ is the dict itself, not the
-        # builtins module — calling .__dict__ on a dict raises AttributeError.
-        # Use the builtins module explicitly to work in both __main__ and imported contexts.
-        import builtins as _builtins_module
-        _SAFE_BUILTINS = {
-            k: v for k, v in vars(_builtins_module).items()
-            if k in {
-                "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
-                "callable", "chr", "dict", "divmod", "enumerate", "filter", "float",
-                "format", "frozenset", "hash", "hex", "id",
-                "int", "isinstance", "issubclass", "iter", "len", "list", "map",
-                "max", "min", "next", "object", "oct", "ord", "pow", "print",
-                "property", "range", "repr", "reversed", "round", "set",
-                "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
-                "None", "True", "False", "Exception", "StopIteration"
-            }
-        }
-        # BUG-01 / SEC-04: exec_namespace MUST have "__builtins__" set to the
-        # restricted dict; without this key Python falls back to the full built-in
-        # namespace, making _SAFE_BUILTINS entirely dead code.
-        exec_ns = step_namespace if step_namespace is not None else {}
-        exec_namespace = exec_ns
-        exec_namespace["__builtins__"] = _SAFE_BUILTINS
 
-        # Inject RUN_TEMP_DIR into the in-process namespace as well
-        if run_temp_dir and "run_dir" not in exec_namespace:
-            exec_namespace["run_dir"] = run_temp_dir
-
+        # --- Case 2: run in persistent in-process REPL ---
         stdout_buf, stderr_buf = StringIO(), StringIO()
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
             try:
+                # compile first to get better syntax errors with filename "<repl>"
                 compiled = compile(code, "<repl>", "exec")
-                exec(compiled, exec_namespace)
+                exec(compiled, _persistent_namespace)
             except Exception:
+                # include full traceback + whatever was printed so far
                 tb = traceback.format_exc()
                 out = stdout_buf.getvalue()
                 err = stderr_buf.getvalue()
@@ -725,17 +343,28 @@ def run_python_code(
                     f"\n--- STDERR (so far) ---\n{_tail(err)}"
                 ).strip()
 
-        # Update the persistent namespace with any new functions defined in this step
-        if step_namespace is not None:
-             pns = _get_persistent_namespace()
-             for k, v in exec_namespace.items():
-                 if k != "__builtins__" and callable(v):
-                     pns[k] = v
-
+        # success: return combined stdout+stderr (stderr might contain warnings/prints)
         out = stdout_buf.getvalue()
         err = stderr_buf.getvalue()
         return (out + (("\n" + err) if err else "")).rstrip("\n")
+    
+        # else:
+        #     def execute_in_repl(command: str) -> str:
+        #         """Helper to execute inside persistent namespace."""
+        #         old_stdout = sys.stdout
+        #         sys.stdout = mystdout = StringIO()
 
+        #         global _persistent_namespace
+        #         try:
+        #             exec(command, _persistent_namespace)
+        #             output = mystdout.getvalue()
+        #         except Exception as e:
+        #             output = f"Error: {str(e)}"
+        #         finally:
+        #             sys.stdout = old_stdout
+        #         return output
+        #     return execute_in_repl(code)
+        
     except Exception as e:
         tb = traceback.format_exc()
         return f"Error running Python script: {tb}"
@@ -771,13 +400,8 @@ def run_with_timeout(
     
     args = [] if args is None else list(args)
     kwargs = {} if kwargs is None else dict(kwargs)
-    # BUG-20: use setdefault only when cancel_event is not None; if the caller
-    # explicitly passed cancel_event=None we must still inject our own event so
-    # the subprocess can be cancelled on timeout.
     if cancel_event is not None:
-        kwargs["cancel_event"] = cancel_event
-    elif "cancel_event" not in kwargs:
-        kwargs["cancel_event"] = None
+        kwargs.setdefault("cancel_event", cancel_event)
 
     with cf.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(func, *args, **kwargs)
@@ -796,11 +420,9 @@ def run_with_timeout(
 def read_module2api():
     fields = [
         "ncbi",
+        "basic",
         "metagenomics",
-        "metagenomics_db",
-        "genomics",         # Enabled: 1710L scRNA-seq, Hi-C, ChIP-seq, epigenomics wrappers (GAP5 fixed)
-        "viromics",         # Added Phase 3 viromics support
-        # "artifacts",      # Pending: description file not yet created
+        # "artifacts",
         # "literature",
         # "biochemistry",
         # "bioengineering",
@@ -809,6 +431,7 @@ def read_module2api():
         # "cell_biology",
         # "molecular_biology",
         # "genetics",
+        # "genomics",
         # "immunology",
         # "microbiology",
         # "pathology",
@@ -823,12 +446,8 @@ def read_module2api():
     module2api = {}
     for field in fields:
         module_name = f"genomeer.tools.description.{field}"
-        try:
-            module = importlib.import_module(module_name)
-            module2api[f"genomeer.tools.function.{field}"] = module.description
-        except ImportError:
-            import warnings
-            warnings.warn(f"[read_module2api] Could not import '{module_name}' — skipping.", stacklevel=2)
+        module = importlib.import_module(module_name)
+        module2api[f"genomeer.tools.function.{field}"] = module.description
     return module2api
 
 
@@ -864,8 +483,8 @@ def function_to_api_schema(function_string, llm):
             return ast.literal_eval(api)  # -> prefer "default": None
             # return json.loads(api) # -> prefer "default": null
         except Exception as e:
-            logger.debug("API string: %s", locals().get("api", "<undefined>"))
-            logger.debug("Error parsing the API string: %s", e)
+            print("API string:", api)
+            print("Error parsing the API string:", e)
             continue
     return "Error: Could not parse the API schema"
     

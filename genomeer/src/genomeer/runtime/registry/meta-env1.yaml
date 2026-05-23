@@ -1,0 +1,63 @@
+name: meta-env1
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+
+  # ── Assembly QC ─────────────────────────────────────────────────────────────
+  - quast                  # run_quast   → quast.py
+
+  # ── Binning ─────────────────────────────────────────────────────────────────
+  - semibin2               # run_semibin2 → SemiBin2
+  - concoct                # run_concoct  → concoct, cut_up_fasta.py, concoct_coverage_table.py,
+                           #                merge_cutup_clustering.py, extract_fasta_bins.py
+  - maxbin2                # run_maxbin2  → run_MaxBin2.pl
+
+  # ── Bin quality ──────────────────────────────────────────────────────────────
+  - checkm2                # run_checkm2  → checkm2
+
+  # ── Taxonomic classification ─────────────────────────────────────────────────
+  - kraken2                # run_kraken2  → kraken2
+  - sylph                  # run_sylph    → sylph
+  - kaiju                  # run_kaiju    → kaiju, kaiju2table
+
+  # ── Functional annotation ────────────────────────────────────────────────────
+  - hmmer                  # run_hmmer    → hmmscan, hmmsearch, hmmpress
+  - eggnog-mapper          # run_eggnog   → emapper.py
+  - diamond                # run_diamond  → diamond
+  - humann                 # run_humann3  → humann, humann_renorm_table
+
+  # ── Specialized annotation ───────────────────────────────────────────────────
+  - antismash              # run_antismash → antismash
+  - genomad                # run_genomad   → genomad
+  - abricate               # run_abricate  → abricate
+  - run-dbcan              # run_dbcan     → run_dbcan.py
+  - pharokka               # run_pharokka  → pharokka.py
+
+  # ── Sequence manipulation ────────────────────────────────────────────────────
+  - seqkit                 # run_seqkit   → seqkit
+  - bbtools                # run_bbduk    → bbduk.sh
+
+  # ── Community / diversity ────────────────────────────────────────────────────
+  - lefse                  # run_lefse    → lefse_format_input.py, lefse_run.py, lefse_plot_res.py
+  - nonpareil              # run_nonpareil → nonpareil
+
+  # ── R stack for phyloseq ─────────────────────────────────────────────────────
+  - r-base>=4.2            # run_phyloseq → Rscript
+  - bioconductor-phyloseq  # run_phyloseq → phyloseq R package
+  - r-ggplot2              # run_phyloseq → ggplot2 R package
+  - r-vegan                # beta diversity in phyloseq
+
+  # ── Core Python dependencies ─────────────────────────────────────────────────
+  - biopython
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - tqdm
+
+  - pip:
+      - genomeer           # local package — installs utils/helper imports

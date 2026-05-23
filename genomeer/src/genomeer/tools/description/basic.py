@@ -1,7 +1,7 @@
 description = [
     {
         "name": "load_sequences",
-        "description": "Load FASTA/FASTQ files into lightweight line-delimited TSVs (id, seq[, qual]).",
+        "description": "[TIMEOUT: 120s] Load FASTA/FASTQ files into lightweight line-delimited TSVs (id, seq[, qual]).",
         "required_parameters": [
             {"name": "paths", "type": "list", "description": "List of input file paths."}
         ],
@@ -26,7 +26,7 @@ description = [
     },
     {
         "name": "subsample_reads",
-        "description": "Randomly subsample reads from FASTA/FASTQ.",
+        "description": "[TIMEOUT: 120s] Randomly subsample reads from FASTA/FASTQ.",
         "required_parameters": [
             {"name": "input_path", "type": "str"},
             {"name": "output_path", "type": "str"},
@@ -235,7 +235,7 @@ description = [
     },
     {
         "name": "annotate_functions_hmm",
-        "description": "[STUB — DO NOT USE IN PRODUCTION PIPELINES] Toy functional annotation stub: labels ALL proteins as 'unknown_function' regardless of input. For real HMM annotation use run_hmmer() (HMMER against Pfam/TIGRFAM) or run_prokka() instead.",
+        "description": "[DEPRECATED] Use run_prokka() or run_hmmer() instead for real functional annotation.",
         "required_parameters": [
             {"name": "proteins_faa", "type": "str"},
             {"name": "db_path", "type": "str"}
@@ -285,7 +285,7 @@ description = [
     },
     {
         "name": "assemble_greedy_baseline",
-        "description": "[STUB — DO NOT USE IN PRODUCTION PIPELINES] Toy assembler that simply concatenates reads into fake 'contigs' without any De Bruijn graph construction. Produces biologically meaningless output. For real assembly use run_metaspades() (Illumina) or run_megahit() (large datasets) or run_flye() (Nanopore).",
+        "description": "[TIMEOUT: 3600s] Very simple greedy baseline assembler (toy concat).",
         "required_parameters": [
             {"name": "reads", "type": "list"},
             {"name": "output_fasta", "type": "str"}

@@ -1,643 +1,505 @@
 """
-Genomeer — Metagenomics Tool Descriptions
-==========================================
-API schema list for genomeer.tools.function.metagenomics
-Follows the exact same structure as description/basic.py and description/ncbi.py.
-30 tools covering the full metagenomics pipeline including long-read (ONT) polishing.
+Metagenomics tool descriptions for ToolRegistry.
+All tools here are CLI wrappers — the LLM generates subprocess.run() calls.
+Detailed usage snippets live in tools/software/resources.py.
 """
 
 description = [
-
-    # =========================================================================
-    # QC & PREPROCESSING
-    # =========================================================================
+    # ── ASSEMBLY QC ──────────────────────────────────────────────────────────
     {
-        "name": "validate_fastq_input",
+        "name": "run_quast",
         "description": (
-            "Quick validation of a FASTQ file before running the pipeline. "
-            "Checks: file exists, is non-empty, has valid FASTQ format, and estimates read count. "
-            "Run this as the FIRST step of any pipeline that takes FASTQ input."
-        ),
-        "required_parameters": [
-            {"name": "fastq_path", "type": "str", "description": "Path to the FASTQ file (.fastq or .fastq.gz)."},
-        ],
-        "optional_parameters": [
-            {"name": "min_reads", "type": "int", "default": 1000, "description": "Minimum reads threshold for a warning."},
-        ],
-        "returns": "dict(valid, format_ok, file_size_mb, n_reads_estimated, message)",
-    },
-    {
-        "name": "run_host_decontamination",
-        "description": (
-            "Remove host DNA reads from metagenomic FASTQ files using Bowtie2. "
-            "MANDATORY for clinical samples (human gut, skin, respiratory, blood). "
-            "Maps reads against a host genome index (e.g., hg38 for human). "
-            "Returns only the unaligned (non-host / microbial) reads for assembly. "
-            "Run AFTER fastp QC and BEFORE assembly for clinical samples."
-        ),
-        "required_parameters": [
-            {"name": "input_r1", "type": "str", "description": "Path to R1 FASTQ (after fastp)."},
-            {"name": "input_r2", "type": "str", "description": "Path to R2 FASTQ (after fastp)."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-            {"name": "host_index", "type": "str", "description": "Bowtie2 index prefix for the host genome (e.g., /db/hg38/hg38)."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-        ],
-        "returns": "dict(clean_r1, clean_r2, host_alignment_pct, microbial_pct)",
-    },
-    {
-        "name": "run_fastp",
-        "description": (
-            "Run fastp for adapter trimming and quality control on Illumina FASTQ reads. "
-            "Supports both single-end and paired-end inputs (optionally gzipped). "
-            "Produces trimmed FASTQ files, a JSON stats report, and an interactive HTML QC report. "
-            "Recommended first step for all short-read metagenomics pipelines."
-        ),
-        "required_parameters": [
-            {"name": "input_r1", "type": "str", "description": "Path to R1 FASTQ file (can be .gz)."},
-            {"name": "output_dir", "type": "str", "description": "Directory where trimmed reads and reports are written."},
-        ],
-        "optional_parameters": [
-            {"name": "input_r2", "type": "str", "default": None, "description": "Path to R2 FASTQ file for paired-end mode."},
-            {"name": "threads", "type": "int", "default": 4, "description": "Number of CPU threads."},
-            {"name": "min_quality", "type": "int", "default": 20, "description": "Minimum phred quality score."},
-            {"name": "min_length", "type": "int", "default": 50, "description": "Minimum read length after trimming."},
-            {"name": "detect_adapter_for_pe", "type": "bool", "default": True, "description": "Auto-detect adapters for paired-end data."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra fastp CLI flags as a string."},
-        ],
-        "returns": "dict(out_r1, out_r2, json_report, html_report, summary)",
-    },
-    {
-        "name": "run_fastqc",
-        "description": (
-            "Run FastQC to assess per-base quality, GC content, adapter contamination, "
-            "and sequence duplication on one or more FASTQ files. "
-            "Produces an HTML report per file. Complementary to fastp for initial QC."
-        ),
-        "required_parameters": [
-            {"name": "input_files", "type": "list", "description": "List of paths to FASTQ files."},
-            {"name": "output_dir", "type": "str", "description": "Directory for HTML/ZIP reports."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 4, "description": "Number of threads."},
-        ],
-        "returns": "dict(output_dir, html_reports)",
-    },
-    {
-        "name": "run_multiqc",
-        "description": (
-            "Run MultiQC to aggregate QC results from fastp, FastQC, Kraken2, samtools, "
-            "and other tools into a single interactive HTML report. "
-            "Scans input_dir recursively for recognized log/report files."
-        ),
-        "required_parameters": [
-            {"name": "input_dir", "type": "str", "description": "Directory to scan for QC reports."},
-            {"name": "output_dir", "type": "str", "description": "Directory for the MultiQC HTML output."},
-        ],
-        "optional_parameters": [
-            {"name": "report_name", "type": "str", "default": "multiqc_report", "description": "HTML report filename (without extension)."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra MultiQC CLI flags."},
-        ],
-        "returns": "dict(html_report, data_dir)",
-    },
-    {
-        "name": "run_nanostat",
-        "description": (
-            "Run NanoStat to compute quality statistics on Oxford Nanopore long reads: "
-            "N50, mean read length, mean quality score, total bases, and length distribution. "
-            "Essential QC step before long-read assembly with Flye."
-        ),
-        "required_parameters": [
-            {"name": "input_fastq", "type": "str", "description": "Path to Nanopore FASTQ file."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for the stats report."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 4, "description": "Number of threads."},
-        ],
-        "returns": "dict(stats_file, stdout)",
-    },
-
-    # =========================================================================
-    # ASSEMBLY
-    # =========================================================================
-    {
-        "name": "run_metaspades",
-        "description": (
-            "Run metaSPAdes for de-novo metagenome assembly from Illumina short reads. "
-            "Recommended for complex communities; produces high-quality contigs and scaffolds. "
-            "Supports paired-end (reads_r1 + reads_r2) or single-end (reads_single) input. "
-            "More memory-intensive but more accurate than MEGAHIT."
-        ),
-        "required_parameters": [
-            {"name": "output_dir", "type": "str", "description": "Directory for assembly output."},
-        ],
-        "optional_parameters": [
-            {"name": "reads_r1", "type": "str", "default": None, "description": "Path to R1 paired-end reads."},
-            {"name": "reads_r2", "type": "str", "default": None, "description": "Path to R2 paired-end reads."},
-            {"name": "reads_single", "type": "str", "default": None, "description": "Path to single-end reads."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "memory_gb", "type": "int", "default": 16, "description": "Memory limit in GB."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra SPAdes CLI flags."},
-        ],
-        "returns": "dict(contigs_fasta, scaffolds_fasta, assembly_graph, log, output_dir)",
-    },
-    {
-        "name": "run_megahit",
-        "description": (
-            "Run MEGAHIT for fast, memory-efficient metagenome assembly. "
-            "More suitable than metaSPAdes for very large datasets or low-memory systems. "
-            "Supports paired-end and single-end Illumina reads."
-        ),
-        "required_parameters": [
-            {"name": "output_dir", "type": "str", "description": "Directory for assembly output."},
-        ],
-        "optional_parameters": [
-            {"name": "reads_r1", "type": "str", "default": None, "description": "Path to R1 reads."},
-            {"name": "reads_r2", "type": "str", "default": None, "description": "Path to R2 reads."},
-            {"name": "reads_single", "type": "str", "default": None, "description": "Path to single-end reads."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "memory_fraction", "type": "float", "default": 0.5, "description": "Fraction of system RAM to use."},
-            {"name": "min_contig_len", "type": "int", "default": 500, "description": "Minimum output contig length."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra MEGAHIT CLI flags."},
-        ],
-        "returns": "dict(contigs_fasta, output_dir, log)",
-    },
-    {
-        "name": "run_flye",
-        "description": (
-            "Run Flye assembler optimized for Oxford Nanopore or PacBio long reads. "
-            "Use --meta mode (enabled by default) for metagenomics. "
-            "read_type options: 'nano-raw', 'nano-hq', 'nano-corr', 'pacbio-raw', 'pacbio-hifi'. "
-            "genome_size: estimated metagenome size (e.g. '5m', '100m', '1g')."
-        ),
-        "required_parameters": [
-            {"name": "input_reads", "type": "str", "description": "Path to long-read FASTQ file."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-        ],
-        "optional_parameters": [
-            {"name": "read_type", "type": "str", "default": "nano-raw", "description": "Read type: 'nano-raw', 'nano-hq', 'pacbio-raw', 'pacbio-hifi'."},
-            {"name": "genome_size", "type": "str", "default": "5m", "description": "Estimated metagenome size (e.g. '100m', '1g')."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra Flye CLI flags."},
-        ],
-        "returns": "dict(assembly_fasta, assembly_info, log, output_dir)",
-    },
-    {
-        "name": "run_racon",
-        "description": (
-            "Polish a long-read assembly using Racon (rapid consensus from overlaps). "
-            "Takes raw ONT reads, a minimap2 PAF overlap file, and a draft assembly FASTA. "
-            "Run 1-2 rounds of Racon BEFORE Medaka polishing for best results. "
-            "Generate the PAF with: minimap2 -x map-ont assembly.fasta reads.fastq > overlaps.paf. "
-            "Part of the recommended ONT long-read pipeline: Flye → Racon (x1-2) → Medaka → CheckM2."
-        ),
-        "required_parameters": [
-            {"name": "reads_fastq", "type": "str", "description": "Path to raw ONT reads FASTQ."},
-            {"name": "overlaps_paf", "type": "str", "description": "Path to minimap2 PAF overlap file (map-ont preset)."},
-            {"name": "assembly_fasta", "type": "str", "description": "Path to draft assembly FASTA (from Flye or previous Racon round)."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra Racon CLI flags."},
-        ],
-        "returns": "dict(polished_fasta, output_dir)",
-    },
-    {
-        "name": "run_medaka",
-        "description": (
-            "Polish an ONT assembly using Medaka neural-network consensus. "
-            "Medaka is the most accurate polishing tool for Oxford Nanopore assemblies. "
-            "Run AFTER 1-2 rounds of Racon for best results. "
-            "The model must match the flowcell and basecaller version used for sequencing. "
-            "Common models: 'r941_min_high_g360' (MinION, Guppy high accuracy), "
-            "'r1041_e82_400bps_sup_g615' (R10.4.1, Dorado, latest Kit14). "
-            "Part of the recommended ONT pipeline: Flye → Racon (x1-2) → Medaka → CheckM2."
-        ),
-        "required_parameters": [
-            {"name": "reads_fastq", "type": "str", "description": "Path to raw ONT reads FASTQ (same reads used for assembly)."},
-            {"name": "assembly_fasta", "type": "str", "description": "Path to Racon-polished assembly FASTA (or Flye assembly if skipping Racon)."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-        ],
-        "optional_parameters": [
-            {"name": "model", "type": "str", "default": "r941_min_high_g360", "description": "Medaka model (must match flowcell + basecaller)."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "batch_size", "type": "int", "default": 100, "description": "Batch size for inference (100 for CPU, 200+ for GPU)."},
-        ],
-        "returns": "dict(polished_fasta, log, output_dir, mean_qv)",
-    },
-
-    # =========================================================================
-    # MAPPING & COVERAGE
-    # =========================================================================
-    {
-        "name": "run_minimap2",
-        "description": (
-            "Align reads to a reference genome or assembly using minimap2. "
-            "Supports short reads (preset='sr'), Nanopore reads ('map-ont'), "
-            "PacBio ('map-pb'), and assembly alignment ('asm5'). "
-            "Optionally produces a sorted and indexed BAM file via samtools."
-        ),
-        "required_parameters": [
-            {"name": "reads", "type": "str", "description": "Path to reads FASTQ/FASTA."},
-            {"name": "reference", "type": "str", "description": "Path to reference genome or assembly FASTA."},
-            {"name": "output_bam", "type": "str", "description": "Output BAM file path."},
-        ],
-        "optional_parameters": [
-            {"name": "preset", "type": "str", "default": "sr", "description": "Minimap2 preset: 'sr', 'map-ont', 'map-pb', 'asm5'."},
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "sort_and_index", "type": "bool", "default": True, "description": "Sort and index BAM output."},
-        ],
-        "returns": "dict(bam_path, index_path, flagstat)",
-    },
-    {
-        "name": "run_bowtie2",
-        "description": (
-            "Align Illumina paired-end or single-end reads to a reference using Bowtie2. "
-            "reference_index: path prefix of Bowtie2 index (without .bt2 extension). "
-            "Use 'bowtie2-build ref.fa ref_index' to build the index first."
-        ),
-        "required_parameters": [
-            {"name": "reads_r1", "type": "str", "description": "Path to R1 reads."},
-            {"name": "reference_index", "type": "str", "description": "Bowtie2 index prefix."},
-            {"name": "output_bam", "type": "str", "description": "Output BAM path."},
-        ],
-        "optional_parameters": [
-            {"name": "reads_r2", "type": "str", "default": None, "description": "Path to R2 reads for paired-end."},
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "sort_and_index", "type": "bool", "default": True, "description": "Sort and index BAM."},
-        ],
-        "returns": "dict(bam_path, index_path, alignment_rate)",
-    },
-    {
-        "name": "compute_coverage_samtools",
-        "description": (
-            "Compute per-contig/chromosome coverage statistics from a sorted BAM file using samtools coverage. "
-            "Produces a TSV with coverage%, mean depth, mean base quality, and mean mapping quality per reference sequence. "
-            "Essential input for MetaBAT2 binning."
-        ),
-        "required_parameters": [
-            {"name": "bam_path", "type": "str", "description": "Path to sorted BAM file."},
-            {"name": "output_tsv", "type": "str", "description": "Output TSV file path."},
-        ],
-        "optional_parameters": [
-            {"name": "min_mapping_quality", "type": "int", "default": 20, "description": "Minimum mapping quality threshold."},
-        ],
-        "returns": "dict(coverage_tsv, mean_coverage_across_contigs, n_contigs)",
-    },
-    {
-        "name": "sort_index_bam",
-        "description": (
-            "Sort and index a BAM file using samtools. "
-            "Required before coverage computation, variant calling, or MetaBAT2 binning."
-        ),
-        "required_parameters": [
-            {"name": "bam_path", "type": "str", "description": "Path to unsorted BAM file."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads for sorting."},
-        ],
-        "returns": "dict(sorted_bam, index_path)",
-    },
-
-    # =========================================================================
-    # TAXONOMIC CLASSIFICATION
-    # =========================================================================
-    {
-        "name": "run_kraken2",
-        "description": (
-            "Run Kraken2 for k-mer based taxonomic classification of metagenomic reads. "
-            "Requires a pre-built Kraken2 database (db_path). "
-            "Use the Kraken2 MiniDB (8 GB) for testing or the Standard DB (60+ GB) for production. "
-            "Produces a per-read classification file and a summary report compatible with Bracken. "
-            "Confidence threshold controls false-positive rate."
-        ),
-        "required_parameters": [
-            {"name": "output_dir", "type": "str", "description": "Directory for Kraken2 output files."},
-            {"name": "reads_r1", "type": "str", "description": "Path to R1 reads (or single-end reads)."},
-            {"name": "db_path", "type": "str", "description": "Path to Kraken2 database directory."},
-        ],
-        "optional_parameters": [
-            {"name": "reads_r2", "type": "str", "default": None, "description": "Path to R2 reads for paired-end."},
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "confidence", "type": "float", "default": 0.1, "description": "Classification confidence threshold (0.0–1.0)."},
-            {"name": "report_minimizer_data", "type": "bool", "default": False, "description": "Include minimizer statistics in report."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra Kraken2 CLI flags."},
-        ],
-        "returns": "dict(report, output, db_used, classification_summary)",
-    },
-    {
-        "name": "run_bracken",
-        "description": (
-            "Run Bracken to re-estimate species or genus level abundances from Kraken2 reports "
-            "using Bayesian re-estimation for improved accuracy. "
-            "level: 'S' (species), 'G' (genus), 'F' (family), 'P' (phylum). "
-            "Requires the same Kraken2 database used for classification."
-        ),
-        "required_parameters": [
-            {"name": "kraken2_report", "type": "str", "description": "Path to Kraken2 report file."},
-            {"name": "db_path", "type": "str", "description": "Path to Kraken2/Bracken database."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-        ],
-        "optional_parameters": [
-            {"name": "level", "type": "str", "default": "S", "description": "Taxonomic level: 'S', 'G', 'F', 'O', 'C', 'P'."},
-            {"name": "read_length", "type": "int", "default": 150, "description": "Average read length."},
-            {"name": "threshold", "type": "int", "default": 10, "description": "Minimum read count threshold."},
-        ],
-        "returns": "dict(bracken_output, bracken_report, level)",
-    },
-    {
-        "name": "run_metaphlan4",
-        "description": (
-            "Run MetaPhlAn4 for marker-gene based taxonomic profiling of metagenomes. "
-            "Uses a curated database of ~1.1M clade-specific marker genes. "
-            "Produces relative abundance profiles at all taxonomic levels. "
-            "More specific than Kraken2 but slower; ideal for relative quantification."
-        ),
-        "required_parameters": [
-            {"name": "input_reads", "type": "str", "description": "Path to FASTQ reads or Bowtie2 output file."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "db_path", "type": "str", "default": None, "description": "Custom MetaPhlAn4 database index path."},
-            {"name": "input_type", "type": "str", "default": "fastq", "description": "Input type: 'fastq', 'fasta', 'bowtie2out', 'sam'."},
-            {"name": "analysis_type", "type": "str", "default": "rel_ab_w_read_stats", "description": "Analysis type: 'rel_ab', 'rel_ab_w_read_stats', 'reads_map', 'clade_profiles'."},
-        ],
-        "returns": "dict(profile_tsv, bowtie2out, output_dir)",
-    },
-    {
-        "name": "run_gtdbtk",
-        "description": (
-            "Run GTDB-Tk to classify metagenome-assembled genomes (MAGs) using "
-            "the Genome Taxonomy Database (GTDB), which provides phylogenomics-based taxonomy. "
-            "bins_dir: directory containing MAG FASTA files (one genome per file). "
-            "Produces species-level classification, placement trees, and ANI distances."
-        ),
-        "required_parameters": [
-            {"name": "bins_dir", "type": "str", "description": "Directory containing MAG FASTA files."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for GTDB-Tk results."},
-            {"name": "db_path", "type": "str", "description": "Path to GTDB-Tk reference database (GTDBTK_DATA_PATH)."},
-        ],
-        "optional_parameters": [
-            {"name": "extension", "type": "str", "default": "fa", "description": "Extension of MAG FASTA files (e.g., 'fa', 'fasta', 'fna')."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "skip_ani_screen", "type": "bool", "default": False, "description": "Skip ANI screening step (faster but less accurate)."},
-        ],
-        "returns": "dict(summary_tsv, ar53_summary, classify_dir)",
-    },
-    {
-        "name": "run_krona",
-        "description": (
-            "Generate an interactive Krona HTML visualization from a Kraken2 or Bracken report. "
-            "Produces a zoomable radial pie chart showing taxonomic composition at all levels."
-        ),
-        "required_parameters": [
-            {"name": "kraken2_report", "type": "str", "description": "Path to Kraken2 or Bracken report file."},
-            {"name": "output_html", "type": "str", "description": "Output HTML file path."},
-        ],
-        "optional_parameters": [
-            {"name": "input_type", "type": "str", "default": "kraken2", "description": "Input type: 'kraken2' or 'text'."},
-        ],
-        "returns": "dict(html_path)",
-    },
-
-    # =========================================================================
-    # BINNING
-    # =========================================================================
-    {
-        "name": "run_metabat2",
-        "description": (
-            "Run MetaBAT2 to bin assembled contigs into metagenome-assembled genomes (MAGs). "
-            "Uses tetranucleotide frequencies and coverage depth (from BAM files) for binning. "
-            "bam_paths: list of sorted+indexed BAM files mapped against the assembly. "
-            "min_contig: minimum contig length to include (recommended: 1500–2500 bp)."
-        ),
-        "required_parameters": [
-            {"name": "assembly_fasta", "type": "str", "description": "Path to assembled contigs FASTA."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for bins."},
-        ],
-        "optional_parameters": [
-            {"name": "bam_paths", "type": "list", "default": None, "description": "List of sorted BAM files for coverage-based binning."},
-            {"name": "min_contig", "type": "int", "default": 2500, "description": "Minimum contig length in bp."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-        ],
-        "returns": "dict(bins_dir, n_bins, bin_files, depth_file)",
-    },
-    {
-        "name": "run_das_tool",
-        "description": (
-            "Run DAS_Tool to dereplicate and refine bins from multiple binning algorithms "
-            "(e.g., MetaBAT2 + CONCOCT + MaxBin2). "
-            "Selects the best non-redundant set of MAGs using a scoring function. "
-            "bins_scaffolds_tsv_list: list of scaffold-to-bin TSV files (one per binner). "
-            "binner_names: corresponding binner name labels."
+            "[CLI Tool][TIMEOUT: 300s] QUAST: Quality Assessment Tool for Genome Assemblies. "
+            "Evaluates assembly quality metrics: N50, L50, total length, misassemblies, "
+            "genome fraction. Works on metagenomic assemblies (--meta flag). "
+            "Use with subprocess.run(['quast.py', contigs_fasta, '-o', output_dir, '--meta', ...])."
         ),
         "required_parameters": [
             {"name": "contigs_fasta", "type": "str", "description": "Path to assembled contigs FASTA."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-            {"name": "bins_scaffolds_tsv_list", "type": "list", "description": "List of scaffold-to-bin TSV files from each binner."},
-            {"name": "binner_names", "type": "list", "description": "Binner name labels matching bins_scaffolds_tsv_list order."},
+            {"name": "output_dir", "type": "str", "description": "Directory for QUAST output."},
         ],
         "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "score_threshold", "type": "float", "default": 0.5, "description": "Minimum DAS_Tool score to retain a bin."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra DAS_Tool CLI flags."},
+            {"name": "reference", "type": "str", "default": None, "description": "Reference genome FASTA (optional)."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "meta", "type": "bool", "default": True, "description": "Enable metagenome mode."},
+            {"name": "min_contig", "type": "int", "default": 500},
         ],
-        "returns": "dict(refined_bins_dir, summary_tsv, n_refined_bins)",
+        "returns": "dict(report_tsv, report_html, N50, L50, total_length, summary)",
     },
+
+    # ── BINNING ───────────────────────────────────────────────────────────────
+    {
+        "name": "run_semibin2",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] SemiBin2: deep-learning metagenomic binning. "
+            "Requires contigs FASTA + sorted BAM files for coverage. "
+            "Command: SemiBin2 single_easy_bin -i contigs.fna -b sorted.bam -o output_dir. "
+            "Produces per-bin FASTA files in output_dir/output_bins/."
+        ),
+        "required_parameters": [
+            {"name": "contigs_fasta", "type": "str", "description": "Assembled contigs FASTA."},
+            {"name": "bam_files", "type": "list", "description": "List of sorted BAM files."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "environment", "type": "str", "default": None,
+             "description": "Built-in model: human_gut, dog_gut, ocean, soil, cat_gut, etc."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "min_len", "type": "int", "default": 1000},
+        ],
+        "returns": "dict(bins_dir, bin_count, summary)",
+    },
+    {
+        "name": "run_concoct",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] CONCOCT: Clustering CONtigs with COverage and ComposiTion. "
+            "Three-step pipeline: cut_up_fasta → concoct_coverage_table → concoct → merge_cutup_clustering. "
+            "Use with subprocess.run(['concoct', '--composition_file', ...])."
+        ),
+        "required_parameters": [
+            {"name": "contigs_fasta", "type": "str"},
+            {"name": "bam_files", "type": "list", "description": "List of sorted indexed BAM files."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "chunk_size", "type": "int", "default": 10000},
+            {"name": "overlap_size", "type": "int", "default": 0},
+            {"name": "clusters", "type": "int", "default": 400},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(clustering_tsv, bins_dir, summary)",
+    },
+    {
+        "name": "run_maxbin2",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] MaxBin2: binning using marker gene sets and EM algorithm. "
+            "Command: run_MaxBin2.pl -contig contigs.fna -out output_prefix -abund coverage.tsv. "
+            "Outputs .fasta files per bin + summary."
+        ),
+        "required_parameters": [
+            {"name": "contigs_fasta", "type": "str"},
+            {"name": "output_prefix", "type": "str", "description": "Prefix path for bin output files."},
+        ],
+        "optional_parameters": [
+            {"name": "abund_list", "type": "str", "default": None,
+             "description": "File listing coverage TSV paths (one per line)."},
+            {"name": "reads", "type": "list", "default": None,
+             "description": "List of reads files (alternative to coverage)."},
+            {"name": "min_contig_length", "type": "int", "default": 1000},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(bins_dir, bin_count, summary_tsv)",
+    },
+
+    # ── BIN QUALITY ───────────────────────────────────────────────────────────
     {
         "name": "run_checkm2",
         "description": (
-            "Run CheckM2 to assess completeness and contamination of MAGs using ML models. "
-            "Much faster than CheckM1 and does not require a marker gene reference database. "
-            "bins_dir: directory of MAG FASTA files to assess."
+            "[CLI Tool][TIMEOUT: 1800s] CheckM2: rapid assessment of genome bin quality using ML. "
+            "Predicts completeness and contamination for each bin. "
+            "Command: checkm2 predict --threads N --input bins_dir/*.fna --output-directory output_dir. "
+            "Produces quality_report.tsv with completeness/contamination per bin."
         ),
         "required_parameters": [
-            {"name": "bins_dir", "type": "str", "description": "Directory containing MAG FASTA files."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for quality report."},
+            {"name": "bins_dir", "type": "str", "description": "Directory containing bin FASTA files."},
+            {"name": "output_dir", "type": "str"},
         ],
         "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "db_path", "type": "str", "default": None, "description": "Path to CheckM2 database (auto-downloads if not provided)."},
-            {"name": "extension", "type": "str", "default": "fa", "description": "Extension of MAG files."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "extension", "type": "str", "default": "fna",
+             "description": "File extension of bin files (fna, fa, fasta)."},
+            {"name": "min_completeness", "type": "float", "default": 50.0,
+             "description": "Filter bins below this completeness threshold."},
         ],
-        "returns": "dict(quality_report_tsv, n_bins_assessed, mean_completeness, mean_contamination, output_dir)",
+        "returns": "dict(quality_report_tsv, high_quality_bins, medium_quality_bins, summary)",
     },
 
-    # =========================================================================
-    # FUNCTIONAL ANNOTATION
-    # =========================================================================
+    # ── TAXONOMIC CLASSIFICATION ──────────────────────────────────────────────
     {
-        "name": "run_prokka",
+        "name": "run_kraken2",
         "description": (
-            "Run Prokka for rapid prokaryotic genome annotation of assembled contigs or MAGs. "
-            "Identifies coding sequences (CDS), rRNAs, tRNAs, and tmRNAs. "
-            "metagenome=True enables metagenome mode with shorter minimum ORF length. "
-            "Outputs GFF, GenBank, protein FASTA, and annotation TSV."
+            "[CLI Tool][TIMEOUT: 3600s] Kraken2: ultrafast taxonomic classification using exact k-mer matches. "
+            "Requires a Kraken2 database (--db). "
+            "Command: kraken2 --db kraken2_db --threads N --output output.kraken "
+            "--report report.txt --gzip-compressed reads.fastq.gz. "
+            "Paired-end: add --paired reads_1.fastq reads_2.fastq."
         ),
         "required_parameters": [
-            {"name": "contigs_fasta", "type": "str", "description": "Path to assembled contigs or MAG FASTA."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
+            {"name": "reads", "type": "list", "description": "Input reads file(s) path(s)."},
+            {"name": "db_path", "type": "str", "description": "Path to Kraken2 database directory."},
+            {"name": "output_prefix", "type": "str"},
         ],
         "optional_parameters": [
-            {"name": "sample_name", "type": "str", "default": "metagenome", "description": "Output file prefix."},
-            {"name": "kingdom", "type": "str", "default": "Bacteria", "description": "Kingdom: 'Bacteria', 'Archaea', 'Viruses'."},
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "metagenome", "type": "bool", "default": True, "description": "Enable Prokka metagenome mode."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra Prokka CLI flags."},
+            {"name": "paired", "type": "bool", "default": False},
+            {"name": "gzip_compressed", "type": "bool", "default": False},
+            {"name": "confidence", "type": "float", "default": 0.0},
+            {"name": "threads", "type": "int", "default": 4},
         ],
-        "returns": "dict(gff, faa, ffn, tsv, gbk, txt_stats, output_dir)",
+        "returns": "dict(kraken_output, report_txt, classified_count, unclassified_count, summary)",
     },
     {
-        "name": "run_prodigal",
+        "name": "run_sylph",
         "description": (
-            "Run Prodigal for ab-initio gene prediction in prokaryotic sequences. "
-            "Recommended for individual MAGs or assembled contigs before DIAMOND/HMMER annotation. "
-            "mode: 'meta' (metagenomics), 'single' (isolated genome), 'anon' (anonymous)."
+            "[CLI Tool][TIMEOUT: 300s] Sylph: ultrafast metagenomic profiling via ANI sketching. "
+            "No database required for sketching reads; use pre-built sylph databases for profiling. "
+            "Workflow: sylph sketch reads.fastq → sylph profile sketches.sylsp -d database.syldb. "
+            "Extremely fast (seconds for profiling). Outputs TSV with ANI, relative abundances."
         ),
         "required_parameters": [
-            {"name": "input_fasta", "type": "str", "description": "Path to contig/MAG FASTA."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
+            {"name": "reads", "type": "list", "description": "Input FASTQ read files."},
+            {"name": "output_prefix", "type": "str"},
         ],
         "optional_parameters": [
-            {"name": "mode", "type": "str", "default": "meta", "description": "Prediction mode: 'meta', 'single', 'anon'."},
-            {"name": "output_format", "type": "str", "default": "gff", "description": "Output format: 'gff' or 'gbk'."},
+            {"name": "db_path", "type": "str", "default": None,
+             "description": "Sylph database (.syldb) for profiling. If None, only sketching is done."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "min_ani", "type": "float", "default": 0.95},
         ],
-        "returns": "dict(coords_file, proteins_faa, genes_fna)",
+        "returns": "dict(profile_tsv, sketches, summary)",
+    },
+    {
+        "name": "run_kaiju",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] Kaiju: fast taxonomic classification using protein-level alignments. "
+            "Better than k-mer methods for divergent sequences. "
+            "Command: kaiju -t nodes.dmp -f kaiju_db.fmi -i reads.fastq -o output.txt. "
+            "Post-process with kaiju2table for abundance summary."
+        ),
+        "required_parameters": [
+            {"name": "reads", "type": "list"},
+            {"name": "db_path", "type": "str", "description": "Directory with nodes.dmp and .fmi database."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "paired", "type": "bool", "default": False},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "taxon_rank", "type": "str", "default": "species",
+             "description": "Rank for kaiju2table: phylum, class, order, family, genus, species."},
+        ],
+        "returns": "dict(classification_txt, summary_tsv, summary)",
+    },
+
+    # ── FUNCTIONAL ANNOTATION ─────────────────────────────────────────────────
+    {
+        "name": "run_hmmer",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] HMMER: profile HMM-based protein family annotation. "
+            "hmmscan (query: protein, target: HMM db) or hmmsearch (query: HMM, target: protein db). "
+            "Command: hmmscan --tblout hits.tsv --cpu N /path/to/db.hmm proteins.faa. "
+            "Common databases: Pfam, TIGRFAMs, Resfams, KEGG."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str", "description": "Input protein FASTA."},
+            {"name": "hmm_db", "type": "str", "description": "Path to pressed HMM database (.h3i/.h3m files)."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "mode", "type": "str", "default": "hmmscan",
+             "description": "hmmscan (protein vs HMM db) or hmmsearch (HMM vs protein db)."},
+            {"name": "evalue", "type": "float", "default": 1e-5},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(tblout_tsv, domtblout_tsv, hit_count, summary)",
+    },
+    {
+        "name": "run_eggnog",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] EggNOG-mapper: functional annotation via orthology. "
+            "Maps proteins to eggNOG OGs → COG categories, GO terms, KEGG pathways, EC numbers. "
+            "Command: emapper.py -i proteins.faa -o output_prefix --cpu N --data_dir eggnog_data/. "
+            "Requires eggnog database (download with download_eggnog_data.py)."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str"},
+            {"name": "output_prefix", "type": "str"},
+            {"name": "data_dir", "type": "str", "description": "Path to eggNOG database directory."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "evalue", "type": "float", "default": 1e-3},
+            {"name": "score", "type": "float", "default": 60.0},
+            {"name": "tax_scope", "type": "str", "default": "auto"},
+        ],
+        "returns": "dict(annotations_tsv, summary_tsv, cog_counts, go_terms, kegg_pathways, summary)",
     },
     {
         "name": "run_diamond",
         "description": (
-            "Run DIAMOND for ultra-fast protein or translated nucleotide sequence alignment "
-            "against a protein database (e.g., NR, UniRef90, UniProt, KEGG). "
-            "mode: 'blastp' (protein vs protein DB) or 'blastx' (nucleotide vs protein DB). "
-            "db_path: pre-built DIAMOND database (.dmnd). Use 'diamond makedb' to create one."
+            "[CLI Tool][TIMEOUT: 1800s] DIAMOND: fast protein alignment (100x faster than BLAST). "
+            "Used for NR/UniRef/custom DB searches. Two modes: blastp (protein vs protein) and "
+            "blastx (translated DNA vs protein). "
+            "Command: diamond blastp -q proteins.faa -d nr.dmnd -o hits.tsv --outfmt 6 -p N."
         ),
         "required_parameters": [
-            {"name": "query_fasta", "type": "str", "description": "Path to query protein or nucleotide FASTA."},
-            {"name": "db_path", "type": "str", "description": "Path to DIAMOND database (.dmnd)."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for hits TSV."},
+            {"name": "query", "type": "str", "description": "Query FASTA (protein for blastp, DNA for blastx)."},
+            {"name": "db_path", "type": "str", "description": "DIAMOND database (.dmnd)."},
+            {"name": "output_file", "type": "str"},
         ],
         "optional_parameters": [
-            {"name": "mode", "type": "str", "default": "blastp", "description": "Alignment mode: 'blastp' or 'blastx'."},
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "max_target_seqs", "type": "int", "default": 5, "description": "Max target sequences per query."},
-            {"name": "evalue", "type": "float", "default": 1e-5, "description": "E-value cutoff."},
-            {"name": "output_format", "type": "str", "default": "6 qseqid sseqid pident length evalue bitscore stitle", "description": "DIAMOND output format string."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra DIAMOND CLI flags."},
+            {"name": "mode", "type": "str", "default": "blastp",
+             "description": "blastp or blastx."},
+            {"name": "evalue", "type": "float", "default": 1e-5},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "top", "type": "int", "default": 1,
+             "description": "Report top N alignments per query."},
+            {"name": "outfmt", "type": "int", "default": 6,
+             "description": "Output format: 6=tabular, 100=DIAMOND binary, 101=SAM."},
         ],
-        "returns": "dict(hits_tsv, n_hits)",
-    },
-    {
-        "name": "run_hmmer",
-        "description": (
-            "Run HMMER for protein family annotation using hidden Markov model profiles. "
-            "Commonly used to annotate proteins against Pfam, TIGRFAM, or COG databases. "
-            "program: 'hmmsearch' (query=HMM profiles, target=protein sequences). "
-            "hmm_db: path to HMM database file (e.g., Pfam-A.hmm)."
-        ),
-        "required_parameters": [
-            {"name": "query_fasta", "type": "str", "description": "Path to protein FASTA for annotation."},
-            {"name": "hmm_db", "type": "str", "description": "Path to HMM profile database file."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
-        ],
-        "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 8, "description": "CPU threads."},
-            {"name": "evalue", "type": "float", "default": 1e-5, "description": "E-value cutoff."},
-            {"name": "program", "type": "str", "default": "hmmsearch", "description": "HMMER program: 'hmmsearch' or 'hmmscan'."},
-        ],
-        "returns": "dict(tblout, domtblout, n_hits)",
+        "returns": "dict(hits_tsv, hit_count, summary)",
     },
     {
         "name": "run_humann3",
         "description": (
-            "Run HUMAnN3 for functional profiling of metagenomes: "
-            "pathway abundance, pathway coverage, and gene family (UniRef90) tables. "
-            "Combines MetaPhlAn4 taxonomic profiling with UniRef/ChocoPhlAn nucleotide and protein searches. "
-            "Input can be raw FASTQ reads or pre-classified MetaPhlAn output."
+            "[CLI Tool][TIMEOUT: 7200s] HUMAnN3: functional profiling of metagenomes and metatranscriptomes. "
+            "Maps reads → gene families → pathways using UniRef + MetaCyc. "
+            "Command: humann --input reads.fastq --output output_dir --threads N. "
+            "Outputs: genefamilies.tsv, pathabundance.tsv, pathcoverage.tsv."
         ),
         "required_parameters": [
-            {"name": "input_reads", "type": "str", "description": "Path to FASTQ reads or MetaPhlAn output."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
+            {"name": "input_reads", "type": "str", "description": "Input FASTQ or merged paired-end file."},
+            {"name": "output_dir", "type": "str"},
         ],
         "optional_parameters": [
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "nucleotide_db", "type": "str", "default": None, "description": "Path to ChocoPhlAn nucleotide database."},
-            {"name": "protein_db", "type": "str", "default": None, "description": "Path to UniRef protein database."},
-            {"name": "bypass_nucleotide_search", "type": "bool", "default": False, "description": "Skip nucleotide search (faster, less sensitive)."},
-            {"name": "extra_args", "type": "str", "default": "", "description": "Extra HUMAnN3 CLI flags."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "nucleotide_db", "type": "str", "default": None,
+             "description": "Path to ChocoPhlAn database."},
+            {"name": "protein_db", "type": "str", "default": None,
+             "description": "Path to UniRef protein database."},
+            {"name": "taxonomic_profile", "type": "str", "default": None,
+             "description": "MetaPhlAn taxonomic profile (speeds up HUMAnN3)."},
         ],
-        "returns": "dict(pathabundance_tsv, pathcoverage_tsv, genefamilies_tsv, output_dir)",
+        "returns": "dict(genefamilies_tsv, pathabundance_tsv, pathcoverage_tsv, summary)",
     },
 
-    # =========================================================================
-    # AMR & VIRULENCE
-    # =========================================================================
+    # ── SPECIALIZED ANNOTATION ────────────────────────────────────────────────
     {
-        "name": "run_amrfinderplus",
+        "name": "run_antismash",
         "description": (
-            "Run NCBI AMRFinderPlus to identify antimicrobial resistance genes (ARGs), "
-            "stress response genes, and virulence factors in protein or nucleotide sequences. "
-            "Uses the NCBI Bacterial Antimicrobial Resistance Reference Gene Database. "
-            "organism: restrict point mutation detection (e.g. 'Escherichia', 'Klebsiella')."
+            "[CLI Tool][TIMEOUT: 3600s] antiSMASH: antibiotic and secondary metabolite biosynthetic "
+            "gene cluster (BGC) detection. Full genome or metagenomic contigs input. "
+            "Command: antismash --taxon bacteria --output-dir output_dir --genefinding-tool prodigal "
+            "--cpus N contigs.fna. "
+            "Outputs HTML report + regions.js with detected BGC types (NRPS, PKS, terpene, etc.)."
         ),
         "required_parameters": [
-            {"name": "input_fasta", "type": "str", "description": "Path to protein FASTA (protein=True) or nucleotide FASTA (protein=False)."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for AMR report."},
+            {"name": "input_fasta", "type": "str", "description": "Genome/contig FASTA or GenBank file."},
+            {"name": "output_dir", "type": "str"},
         ],
         "optional_parameters": [
-            {"name": "organism", "type": "str", "default": None, "description": "Organism name for point mutation detection."},
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "db_path", "type": "str", "default": None, "description": "Path to AMRFinderPlus database."},
-            {"name": "protein", "type": "bool", "default": True, "description": "True if input is protein FASTA, False for nucleotide."},
+            {"name": "taxon", "type": "str", "default": "bacteria",
+             "description": "bacteria or fungi."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "genefinding_tool", "type": "str", "default": "prodigal",
+             "description": "Gene prediction: prodigal, prodigal-m (metagenomes), glimmerhmm."},
+            {"name": "minimal", "type": "bool", "default": False,
+             "description": "Minimal mode: skip most analyses for speed."},
         ],
-        "returns": "dict(amr_report_tsv, n_hits)",
+        "returns": "dict(html_report, bgc_regions, bgc_count, bgc_types, summary)",
     },
     {
-        "name": "run_rgi_card",
+        "name": "run_genomad",
         "description": (
-            "Run RGI (Resistance Gene Identifier) against the CARD database to detect "
-            "antimicrobial resistance genes in assembled contigs or protein sequences. "
-            "Detects perfect matches, strict matches, and loose matches to resistance genes. "
-            "input_type: 'contig', 'protein', or 'read'."
+            "[CLI Tool][TIMEOUT: 1800s] geNomad: identification of viruses and plasmids in metagenomes. "
+            "Uses neural network classifiers. "
+            "Command: genomad end-to-end --cleanup --splits 8 contigs.fna output_dir genomad_db/. "
+            "Outputs virus_summary.tsv and plasmid_summary.tsv with scores and gene annotations."
         ),
         "required_parameters": [
-            {"name": "input_fasta", "type": "str", "description": "Path to contig FASTA or protein FASTA."},
-            {"name": "output_dir", "type": "str", "description": "Output directory."},
+            {"name": "contigs_fasta", "type": "str"},
+            {"name": "output_dir", "type": "str"},
+            {"name": "db_path", "type": "str", "description": "Path to geNomad database directory."},
         ],
         "optional_parameters": [
-            {"name": "input_type", "type": "str", "default": "contig", "description": "Input type: 'contig', 'protein', 'read'."},
-            {"name": "alignment_tool", "type": "str", "default": "BLAST", "description": "Alignment tool: 'BLAST' or 'DIAMOND'."},
-            {"name": "db_path", "type": "str", "default": None, "description": "Path to CARD database JSON."},
-            {"name": "threads", "type": "int", "default": 4, "description": "CPU threads."},
-            {"name": "low_quality", "type": "bool", "default": False, "description": "Enable low quality/coverage reporting."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "splits", "type": "int", "default": 8,
+             "description": "Number of data splits (reduce for low-memory machines)."},
+            {"name": "min_score", "type": "float", "default": 0.7},
         ],
-        "returns": "dict(rgi_tsv, json_report, n_hits)",
+        "returns": "dict(virus_summary_tsv, plasmid_summary_tsv, virus_count, plasmid_count, summary)",
+    },
+    {
+        "name": "run_abricate",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] ABRicate: mass screening of contigs for antimicrobial resistance "
+            "and virulence genes. Databases: resfinder, card, ncbi, argannot, vfdb, plasmidfinder, ecoh. "
+            "Command: abricate --db resfinder --minid 80 --mincov 80 contigs.fna > results.tsv. "
+            "Multi-database: run abricate multiple times and merge with abricate --summary."
+        ),
+        "required_parameters": [
+            {"name": "contigs_fasta", "type": "str"},
+            {"name": "output_file", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "db", "type": "str", "default": "resfinder",
+             "description": "Database: resfinder, card, ncbi, argannot, vfdb, plasmidfinder, ecoh."},
+            {"name": "minid", "type": "float", "default": 80.0,
+             "description": "Minimum DNA identity %."},
+            {"name": "mincov", "type": "float", "default": 80.0,
+             "description": "Minimum coverage %."},
+        ],
+        "returns": "dict(results_tsv, gene_count, resistance_genes, summary)",
     },
 
-    # =========================================================================
-    # STATISTICS & VISUALIZATION
-    # =========================================================================
+    # ── SEQUENCE MANIPULATION ─────────────────────────────────────────────────
     {
-        "name": "run_microbiome_diversity",
+        "name": "run_seqkit",
         "description": (
-            "Compute alpha diversity (Shannon index, observed OTUs) and beta diversity "
-            "(Bray-Curtis dissimilarity matrix) from a microbial abundance table. "
-            "Produces a TSV of alpha metrics, a Bray-Curtis distance matrix, and "
-            "publication-quality PNG plots (bar chart and heatmap). "
-            "abundance_table: TSV/CSV with taxa as rows and samples as columns."
+            "[CLI Tool][TIMEOUT: 120s] SeqKit: ultrafast toolkit for FASTA/FASTQ manipulation. "
+            "Key subcommands: stats (QC summary), seq (filter/transform), grep (search by ID/pattern), "
+            "split2 (split by size/count), sample (subsample), fx2tab (to TSV), rmdup (deduplicate). "
+            "Command: seqkit stats -a *.fna → per-file stats with N50, GC%, etc."
         ),
         "required_parameters": [
-            {"name": "abundance_table", "type": "str", "description": "Path to abundance TSV/CSV (taxa x samples)."},
-            {"name": "output_dir", "type": "str", "description": "Output directory for diversity results and plots."},
+            {"name": "subcommand", "type": "str",
+             "description": "SeqKit subcommand: stats, seq, grep, split2, sample, fx2tab, rmdup, translate."},
+            {"name": "input_files", "type": "list"},
         ],
         "optional_parameters": [
-            {"name": "sample_metadata", "type": "str", "default": None, "description": "Optional metadata TSV for group comparisons."},
-            {"name": "grouping_column", "type": "str", "default": None, "description": "Column in metadata for group-level comparisons."},
-            {"name": "metrics", "type": "list", "default": ["shannon", "observed_otus", "bray_curtis"], "description": "List of diversity metrics to compute."},
+            {"name": "output_file", "type": "str", "default": None},
+            {"name": "extra_args", "type": "list", "default": None,
+             "description": "Extra CLI arguments e.g. ['-a'] for all-stats, ['-m', '500'] for min-len."},
+            {"name": "threads", "type": "int", "default": 4},
         ],
-        "returns": "dict(files[alpha_tsv, beta_tsv, alpha_plot, beta_heatmap], output_dir)",
+        "returns": "dict(output, summary)",
+    },
+    {
+        "name": "run_bbduk",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] BBDuk (BBTools): adapter trimming, quality filtering, "
+            "contamination removal. "
+            "Command: bbduk.sh in=reads.fastq.gz out=clean.fastq.gz ref=adapters.fa "
+            "ktrim=r k=23 mink=11 hdist=1 tpe tbo qtrim=r trimq=20 minlen=50. "
+            "Paired-end: use in1/in2 and out1/out2."
+        ),
+        "required_parameters": [
+            {"name": "input_reads", "type": "list", "description": "Input reads (1 or 2 files for PE)."},
+            {"name": "output_reads", "type": "list", "description": "Output reads (1 or 2 files for PE)."},
+        ],
+        "optional_parameters": [
+            {"name": "ref", "type": "str", "default": "adapters",
+             "description": "Adapter reference: 'adapters' (BBTools built-in), or path to FASTA."},
+            {"name": "ktrim", "type": "str", "default": "r",
+             "description": "r=right trim, l=left trim, f=no trim."},
+            {"name": "qtrim", "type": "str", "default": "r"},
+            {"name": "trimq", "type": "int", "default": 20},
+            {"name": "minlen", "type": "int", "default": 50},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(stats, reads_in, reads_out, bases_removed, summary)",
+    },
+
+    # ── FUNCTIONAL SPECIALISED ────────────────────────────────────────────────
+    {
+        "name": "run_dbcan",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] dbCAN: Carbohydrate-Active enZyme (CAZyme) annotation. "
+            "Three tools in one: HMMER (dbCAN HMM db), DIAMOND (CAZy db), Hotpep. "
+            "Command: run_dbcan.py proteins.faa protein --out_dir output_dir --db_dir db/ --tools hmmer diamond. "
+            "Outputs: overview.txt with CAZyme family assignments and confidence."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str"},
+            {"name": "output_dir", "type": "str"},
+            {"name": "db_dir", "type": "str", "description": "dbCAN database directory."},
+        ],
+        "optional_parameters": [
+            {"name": "input_type", "type": "str", "default": "protein",
+             "description": "protein or meta (metagenome, auto-calls prodigal)."},
+            {"name": "tools", "type": "list", "default": ["hmmer", "diamond"],
+             "description": "Tools to run: hmmer, diamond, hotpep."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(overview_tsv, cazyme_count, families, summary)",
+    },
+    {
+        "name": "run_pharokka",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] Pharokka: fast phage annotation pipeline. "
+            "Combines Phanotate/Prodigal (gene prediction) + CARD/VFDB/PHROGs (annotation). "
+            "Command: pharokka.py -i phage_contigs.fna -o output_dir -d pharokka_db/ -t N. "
+            "Outputs GFF, GenBank, functional summary."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str", "description": "Phage genome/contigs FASTA."},
+            {"name": "output_dir", "type": "str"},
+            {"name": "db_dir", "type": "str", "description": "Pharokka database directory."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "gene_predictor", "type": "str", "default": "phanotate",
+             "description": "phanotate or prodigal."},
+            {"name": "force", "type": "bool", "default": False},
+        ],
+        "returns": "dict(gff, gbk, phrog_summary, cds_count, summary)",
+    },
+
+    # ── COMMUNITY ANALYSIS ────────────────────────────────────────────────────
+    {
+        "name": "run_phyloseq",
+        "description": (
+            "[R Package][TIMEOUT: 300s] Phyloseq: R package for microbiome data analysis. "
+            "Alpha diversity (Shannon, Simpson, Chao1), beta diversity (Bray-Curtis, UniFrac), "
+            "ordination (PCoA, NMDS), differential abundance, visualization. "
+            "Use with subprocess.run(['Rscript', '-e', '...R code...']). "
+            "Input: OTU/ASV table TSV + taxonomy TSV + optional metadata TSV."
+        ),
+        "required_parameters": [
+            {"name": "otu_table", "type": "str", "description": "OTU/ASV count table TSV (features x samples)."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "tax_table", "type": "str", "default": None,
+             "description": "Taxonomy table TSV."},
+            {"name": "metadata", "type": "str", "default": None,
+             "description": "Sample metadata TSV."},
+            {"name": "analysis", "type": "list",
+             "default": ["alpha_diversity", "beta_diversity", "ordination"],
+             "description": "Analyses to run."},
+        ],
+        "returns": "dict(alpha_div_tsv, beta_div_tsv, ordination_plot, summary)",
+    },
+    {
+        "name": "run_lefse",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] LEfSe (Linear discriminant analysis Effect Size): "
+            "biomarker discovery between two or more groups. "
+            "Three-step pipeline: lefse_format_input.py → lefse_run.py → lefse_plot_res.py. "
+            "Input: feature table TSV with class/subclass rows. LDA threshold typically 2.0."
+        ),
+        "required_parameters": [
+            {"name": "input_tsv", "type": "str",
+             "description": "Input feature table with class row (samples as columns)."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "class_row", "type": "int", "default": 0,
+             "description": "Row index for class labels (0-based)."},
+            {"name": "lda_threshold", "type": "float", "default": 2.0},
+            {"name": "pvalue", "type": "float", "default": 0.05},
+        ],
+        "returns": "dict(results_tsv, significant_features, plot_png, summary)",
+    },
+
+    # ── COVERAGE ESTIMATION ───────────────────────────────────────────────────
+    {
+        "name": "run_nonpareil",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] Nonpareil: metagenome coverage and sequencing effort estimation. "
+            "Estimates redundancy, predicts reads needed for N% coverage. "
+            "Command: nonpareil -s reads.fastq -T kmer -f fastq -b output_prefix -t N. "
+            "Outputs R object (.npo) → plot with nonpareil_plot.R or Nonpareil::Nonpareil.curve()."
+        ),
+        "required_parameters": [
+            {"name": "reads_file", "type": "str", "description": "Input FASTQ reads file."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "method", "type": "str", "default": "kmer",
+             "description": "kmer (fast) or alignment (accurate)."},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "subsample_n", "type": "int", "default": 1000,
+             "description": "Number of query reads for estimation."},
+        ],
+        "returns": "dict(npo_file, coverage_estimate, redundancy, summary)",
     },
 ]

@@ -129,22 +129,11 @@ def _score_match(env: EnvSpec, tool_name: str, kind: Kind, req_version: str | No
 def _tiebreak(a: EnvSpec, b: EnvSpec, kind: Kind) -> int:
     """
     Deterministic tiebreak:
-      1) BUG-39: for binary tools, prefer meta-env1 over bio-agent-env1 — metagenomics
-         CLI tools belong in meta-env1 even when accidentally also listed in bio-agent-env1.
-      2) Prefer env with fewer total provides (more specific)
-      3) Prefer higher python version (if both have numeric python)
-      4) Lexicographic by env name
-    Return -1 if a wins, 1 if b wins, 0 if equal.
+      1) Prefer env with fewer total provides (more specific)
+      2) Prefer higher python version (if both have numeric python)
+      3) Lexicographic by env name
+    Return -1 if a<b (a wins), 1 if a>b (b wins), 0 if equal.
     """
-    # Rule 1: for bin kind, explicit meta-env1 preference
-    if kind == "bin":
-        _META = "meta-env1"
-        _BIO  = "bio-agent-env1"
-        if a.name == _META and b.name == _BIO:
-            return -1   # a (meta-env1) wins
-        if b.name == _META and a.name == _BIO:
-            return 1    # b (meta-env1) wins
-
     def size(e: EnvSpec) -> int:
         return len(e.provides_bins) + len(e.provides_py) + len(e.provides_r)
 
@@ -160,6 +149,7 @@ def _tiebreak(a: EnvSpec, b: EnvSpec, kind: Kind) -> int:
 
     va, vb = pyv(a), pyv(b)
     if va != vb:
+        # prefer higher
         return -1 if va > vb else 1
 
     return -1 if a.name < b.name else (1 if a.name > b.name else 0)
@@ -244,79 +234,3 @@ if __name__ == "__main__":
     kind = sys.argv[2]
     reg = sys.argv[3] if len(sys.argv) > 3 else REGISTRY_PATH
     print(resolve_env(tool, kind, reg))
-
-
-# ---------------------------------------------------------------------------
-# FIX G_ENV1: resolve_env_for_code — imported by BioAgent.py (line 46)
-# Determines correct micromamba env for a generated code block.
-# Priority: env_hint > meta-env1 tool scan > R lang > keep current_env
-# ---------------------------------------------------------------------------
-# Meta-env signals (used for code-to-env routing)
-_WRAPPERS_SIGNALS = {
-    "run_fastp", "run_fastqc", "run_kraken2", "run_metaphlan4",
-    "run_metaspades", "run_megahit", "run_flye", "run_minimap2",
-    "run_bowtie2", "run_bwa_mem", "run_metabat2", "run_das_tool",
-    "run_checkm2", "run_prokka", "run_prodigal", "run_diamond",
-    "run_hmmer", "run_humann3", "run_amrfinderplus", "run_rgi_card",
-    "run_bracken", "run_gtdbtk", "run_krona", "run_nanostat",
-    "run_multiqc", "compute_coverage_samtools",
-    "run_virsorter2", "run_checkv", "run_deepvirfinder",
-    "run_medaka", "run_racon",
-    "from genomeer.tools.function.metagenomics",
-    "from genomeer.tools.function.viromics",
-}
-
-def get_meta_env_signals() -> set[str]:
-    """Dynamically merges hardcoded wrappers with registry binaries for meta-env1."""
-    signals = set(_WRAPPERS_SIGNALS)
-    try:
-        envs = _load_registry(REGISTRY_PATH)
-        for e in envs:
-            if e.name == "meta-env1":
-                signals.update(e._bins_norm)
-                break
-    except Exception:
-        pass
-    return signals
-
-def _get_meta_env_signals_cached() -> set:
-    """Get meta env signals, refreshing if the registry file was modified."""
-    return get_meta_env_signals()
-
-# Keep META_ENV_SIGNALS as a property for backward compat, but refresh on each access
-META_ENV_SIGNALS = _WRAPPERS_SIGNALS  # fallback; real value fetched per-call in resolve_env_for_code
-
-
-def resolve_env_for_code(
-    code: str,
-    lang: str | None,
-    env_hint: str | None,
-    current_env: str,
-) -> str:
-    """
-    Determine the correct micromamba environment for a generated code block.
-
-    Priority order:
-      1. Explicit env="..." attribute in <EXECUTE> tag  → use as-is
-      2. Code mentions meta-env1 CLI tools             → return "meta-env1"
-      3. Code is R                                     → return "bio-agent-env1"
-      4. Keep current_env                              → no change needed
-    """
-    # 1. LLM explicitly declared the env in the tag
-    if env_hint:
-        return env_hint
-
-    # 2. Scan code for metagenomics tool usage (dynamic registry check)
-    if code:
-        code_lower = code.lower()
-        signals = get_meta_env_signals()
-        for tool in signals:
-            if re.search(rf"\b{re.escape(tool.lower())}\b", code_lower):
-                return "meta-env1"
-
-    # 3. R code always runs in bio-agent-env1 (has Rscript + R packages)
-    if lang and lang.upper() == "R":
-        return "bio-agent-env1"
-
-    # 4. No change needed
-    return current_env

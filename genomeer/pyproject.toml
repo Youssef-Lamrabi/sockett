@@ -19,16 +19,16 @@ classifiers = [
 ]
 dependencies = [
     "numpy==2.1",
-    "pandas>=2.0.0,<3.0.0",
-    "matplotlib>=3.7.0,<4.0.0",
-    "scipy>=1.11.0,<2.0.0",
+    "pandas",
+    "matplotlib",
+    "scipy",
     "statsmodels",
     "scikit-learn",
-    # gradio removed — replaced by FastAPI SSE interface
-    "langchain>=0.2.0,<2.0.0",
+    "gradio", #tobedelete
+    "langchain",
     "langgraph==0.3.18",
-    "langchain-openai>=0.1.0,<2.0.0",
-    "langchain-anthropic>=0.1.0,<2.0.0",
+    "langchain-openai",
+    "langchain-anthropic",
     "langchain-ollama",
     "langchain-community",
     "openai",
@@ -37,22 +37,19 @@ dependencies = [
     "tqdm",
     "seaborn",
     "networkx",
-    "requests>=2.31.0,<3.0.0",
+    "requests",
     "pyyaml",
+    "jupyter",
+    "notebook",
+    "ipykernel",
+    "pytest",
     "transformers",
     "sentencepiece",
     "mcp",
     "tooluniverse",
     "python-dotenv",
-    "pydantic",
-    "ipython",
-    # ── Phase 1: FAISS semantic retriever ──
-    "faiss-cpu",
-    "sentence-transformers>=2.6.0,<3.0",
-    "biopython",
-    "fastapi",
-    "uvicorn[standard]",
-    "sse-starlette",
+    "pydantic", 
+    "ipython"
 ]
 
 [project.urls]
@@ -82,8 +79,7 @@ line-length = 120
 
 [project.optional-dependencies]
 r = ["rpy2"]
-dev = ["pytest", "pytest-cov", "ruff", "mypy", "jupyter", "notebook", "ipykernel"]
-# server dependencies moved to main dependencies
+dev = ["pytest", "pytest-cov", "ruff", "mypy"]
 
 [tool.ruff.lint]
 select = [

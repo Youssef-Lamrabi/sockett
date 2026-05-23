@@ -1,260 +1,120 @@
-"""
-genomeer/model/retriever.py
-============================
-ToolRetriever — Semantic tool selection using FAISS embeddings.
+import re, contextlib, concurrent.futures, threading, shutil
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 
-Strategy:
-  1. At agent init, build a FAISS index over all tool/data/library descriptions (once).
-  2. At every step, run cosine-similarity search (sub-millisecond, zero LLM tokens).
-  3. Graceful fallback to LLM-based retrieval if FAISS or embeddings unavailable.
+_RETRIEVAL_TIMEOUT_SEC = 60
 
-This replaces the original prompt_based_retrieval() which called an LLM for every
-single tool selection query (~2000 tokens × N steps per run = expensive).
-"""
+# Keywords that mark a tool as a stub/toy/deprecated — excluded from retrieval
+_STUB_KEYWORDS = re.compile(
+    r"\[STUB\]|\[DEPRECATED\]|\bToy\b|\bstub\b|\bplaceholder\b|\bDO NOT USE\b",
+    re.IGNORECASE,
+)
 
-from __future__ import annotations
+# CLI tools that must be present on PATH to be offered to the generator
+# key = tool name in description, value = CLI executable to check
+_CLI_TOOL_BINARIES = {
+    # ── Core alignment / manipulation ─────────────────────────────────────────
+    "samtools": "samtools",
+    "bowtie2": "bowtie2",
+    "bwa": "bwa",
+    "minimap2": "minimap2",
+    "blast": "blastn",
+    "bedtools": "bedtools",
+    "fastp": "fastp",
+    "seqkit": "seqkit",
+    "bbduk": "bbduk.sh",
+    "diamond": "diamond",
+    # ── Assembly / scaffolding ────────────────────────────────────────────────
+    "megahit": "megahit",
+    "spades": "spades.py",
+    "quast": "quast.py",
+    # ── Binning ───────────────────────────────────────────────────────────────
+    "semibin2": "SemiBin2",
+    "concoct": "concoct",
+    "maxbin2": "run_MaxBin2.pl",
+    # ── Bin quality ───────────────────────────────────────────────────────────
+    "checkm2": "checkm2",
+    # ── Taxonomic classification ──────────────────────────────────────────────
+    "kraken2": "kraken2",
+    "kaiju": "kaiju",
+    "sylph": "sylph",
+    # ── Gene prediction / annotation ──────────────────────────────────────────
+    "prodigal": "prodigal",
+    "prokka": "prokka",
+    "hmmer": "hmmscan",
+    "eggnog-mapper": "emapper.py",
+    "humann3": "humann",
+    # ── Specialized annotation ────────────────────────────────────────────────
+    "antismash": "antismash",
+    "genomad": "genomad",
+    "abricate": "abricate",
+    "dbcan": "run_dbcan.py",
+    "pharokka": "pharokka.py",
+    # ── Community / stats ─────────────────────────────────────────────────────
+    "lefse": "lefse_run.py",
+    "nonpareil": "nonpareil",
+}
 
-import contextlib
-import os
-import logging
-import re
-import warnings
-from typing import Any, Dict, List, Optional, Tuple
+def _available_cli_tools() -> set:
+    """Return the set of CLI tool names that are actually on PATH."""
+    return {name for name, exe in _CLI_TOOL_BINARIES.items() if shutil.which(exe)}
 
-logger = logging.getLogger("genomeer.retriever")
+_AVAILABLE_CLI = _available_cli_tools()  # computed once at import time
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional FAISS + embeddings imports (graceful fallback if not installed)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    import numpy as np
-
-    _NUMPY_OK = True
-except ImportError:
-    _NUMPY_OK = False
-
-_FAISS_OK = False
-_faiss = None
-try:
-    import faiss as _faiss  # type: ignore
-
-    _FAISS_OK = True
-except ImportError:
-    pass
-
-# We support two embedding backends (priority order):
-#   1. sentence-transformers (local, free, fast on CPU)
-#   2. OpenAI text-embedding-3-small (cloud, requires OPENAI_API_KEY)
-_EMBED_BACKEND: Optional[str] = None
-_embed_model: Any = None
-
-def _lazy_init_embedder() -> None:
-    """Try to load a local sentence-transformer first, then fall back to OpenAI."""
-    global _EMBED_BACKEND, _embed_model
-    if _EMBED_BACKEND is not None:
-        return  # already initialised
-
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-        # P3-B.3: Handle download failures/timeouts
-        _model_name = os.environ.get("GENOMEER_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-        _device = os.environ.get("GENOMEER_EMBEDDING_DEVICE", "cpu")
-        _embed_model = SentenceTransformer(_model_name, device=_device)
-        _EMBED_BACKEND = "sentence_transformers"
-        return
-    except Exception as e:
-        logger.warning(f"[ToolRetriever] Failed to load local embedder ({e}). Falling back to OpenAI if available.")
-        pass
-
-    try:
-        from langchain_openai import OpenAIEmbeddings  # type: ignore
-        _embed_model = OpenAIEmbeddings(model="text-embedding-3-small")
-        _EMBED_BACKEND = "openai"
-        return
-    except Exception:
-        pass
-
-    warnings.warn(
-        "[ToolRetriever] No embedding backend found (sentence-transformers or OpenAI). "
-        "Falling back to LLM-based retrieval.",
-        stacklevel=3,
-    )
-    _EMBED_BACKEND = "none"
-
-
-def _embed(texts: List[str]) -> "np.ndarray":
-    """Return an (N, D) float32 numpy array of embeddings for the given texts."""
-    assert _NUMPY_OK, "numpy required for FAISS retrieval"
-    if _EMBED_BACKEND == "sentence_transformers":
-        return _embed_model.encode(texts, normalize_embeddings=True).astype("float32")
-    elif _EMBED_BACKEND == "openai":
-        raw = _embed_model.embed_documents(texts)
-        arr = np.array(raw, dtype="float32")
-        # normalise for cosine similarity
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        arr = arr / (norms + 1e-10)
-        return arr
-    else:
-        raise RuntimeError("No embedding backend available")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ToolRetriever
-# ──────────────────────────────────────────────────────────────────────────────
 
 class ToolRetriever:
-    """
-    Retrieve the most relevant tools, data-lake items, and libraries for a query.
+    """Retrieve tools from the tool registry, filtering stubs and unavailable CLIs."""
 
-    Usage
-    -----
-    retriever = ToolRetriever()
-    retriever.build_index(tools_list, data_lake_list, libraries_list)
-    results = retriever.semantic_retrieval(query, k=12)
-    # → {"tools": [...], "data_lake": [...], "libraries": [...]}
-    """
+    def __init__(self):
+        pass
 
-    def __init__(self) -> None:
-        self._index: Any = None            # FAISS IndexFlatIP
-        self._items: List[Tuple[str, str, int]] = []  # (category, name, orig_idx)
-        self._raw_resources: Dict[str, List] = {}     # original resource lists
-        self._faiss_available = _FAISS_OK and _NUMPY_OK
-        self._index_fingerprint: Optional[str] = None
-
-    # ── Public: build index (call once at agent startup) ─────────────────────
-
-    def build_index(
-        self,
-        tools: List[Any],
-        data_lake: Optional[List[Any]] = None,
-        libraries: Optional[List[Any]] = None,
-        force: bool = False
-    ) -> None:
+    @staticmethod
+    def filter_tools(tools: list) -> list:
         """
-        Vectorise all resources and build a FAISS inner-product index.
-        P3-B.2: Added simple fingerprinting to avoid expensive rebuilds.
+        Remove tools that are:
+        1. Marked as stub/toy/deprecated in their description.
+        2. Require a CLI backend that is not installed on the current machine.
         """
-        data_lake = data_lake or []
-        libraries = libraries or []
-        
-        # Simple fingerprint: count + first item + last item hash
-        fingerprint = f"{len(tools)}_{len(data_lake)}_{len(libraries)}_{hash(str(tools[0]) if tools else 0)}_{hash(str(libraries[-1]) if libraries else 0)}"
-        if not force and self._index_fingerprint == fingerprint:
-            return
+        kept = []
+        for tool in tools:
+            desc = ""
+            if isinstance(tool, dict):
+                desc = tool.get("description", "")
+            elif hasattr(tool, "description"):
+                desc = tool.description or ""
 
-        self._raw_resources = {
-            "tools": list(tools),
-            "data_lake": list(data_lake),
-            "libraries": list(libraries),
-        }
+            # Skip stubs / deprecated
+            if _STUB_KEYWORDS.search(desc):
+                continue
 
-        if not self._faiss_available:
-            warnings.warn(
-                "[ToolRetriever.build_index] FAISS not available — index not built. "
-                "Will use LLM-based fallback.",
-                stacklevel=2,
-            )
-            return
+            # Skip CLI tools whose binary is absent
+            skip = False
+            for cli_name, exe in _CLI_TOOL_BINARIES.items():
+                if cli_name.lower() in desc.lower() and shutil.which(exe) is None:
+                    skip = True
+                    break
+            if skip:
+                continue
 
-        _lazy_init_embedder()
-        if _EMBED_BACKEND == "none":
-            return  # no embedder, keep fallback
-
-        texts: List[str] = []
-        meta: List[Tuple[str, str, int]] = []
-
-        for cat, items in [("tools", tools), ("data_lake", data_lake), ("libraries", libraries)]:
-            for i, item in enumerate(items):
-                text = self._item_to_text(item)
-                texts.append(text)
-                name = item.get("name", f"item_{i}") if isinstance(item, dict) else str(item)[:60]
-                meta.append((cat, name, i))
-
-        if not texts:
-            return
-
-        try:
-            embeddings = _embed(texts)          # (N, D) float32
-            D = embeddings.shape[1]
-            index = _faiss.IndexFlatIP(D)       # inner product = cosine (for normalised vecs)
-            index.add(embeddings)               # type: ignore[arg-type]
-            self._index = index
-            self._items = meta
-            self._index_fingerprint = fingerprint
-        except Exception as e:
-            warnings.warn(f"[ToolRetriever.build_index] Failed to build FAISS index: {e}", stacklevel=2)
-            self._index = None
-
-    # ── Public: semantic retrieval ────────────────────────────────────────────
-
-    def semantic_retrieval(
-        self,
-        query: str,
-        k: int = 12,
-        min_score: float = 0.45,  # T13: raised from 0.30 for better precision
-    ) -> Dict[str, List]:
-        """
-        Find the top-k most relevant resources for `query` using FAISS cosine search.
-
-        Falls back to `prompt_based_retrieval()` if FAISS index is unavailable.
-
-        Returns
-        -------
-        {"tools": [...], "data_lake": [...], "libraries": [...]}
-        """
-        if self._index is None or not self._faiss_available or _EMBED_BACKEND == "none":
-            # Graceful fallback: use LLM
-            return self.prompt_based_retrieval(query, self._raw_resources)
-
-        try:
-            q_vec = _embed([query])             # (1, D)
-            k_search = min(k * 2, len(self._items))  # over-fetch then filter
-            scores, indices = self._index.search(q_vec, k_search)  # type: ignore
-            scores = scores[0]
-            indices = indices[0]
-
-            selected: Dict[str, List] = {"tools": [], "data_lake": [], "libraries": []}
-            seen: Dict[str, set] = {"tools": set(), "data_lake": set(), "libraries": set()}
-
-            for score, idx in zip(scores, indices):
-                if idx < 0 or float(score) < min_score:
-                    continue
-                cat, name, orig_idx = self._items[idx]
-                if orig_idx not in seen[cat]:
-                    seen[cat].add(orig_idx)
-                    raw = self._raw_resources[cat]
-                    if orig_idx < len(raw):
-                        selected[cat].append(raw[orig_idx])
-
-            # T13: Fallback if no results above min_score
-            if not any(selected.values()):
-                logger.debug(f"[Retriever] No results above min_score={min_score}, using top-k fallback")
-                # Return the best k_search results regardless of score
-                for i in range(min(k, len(self._items))):
-                    score, idx = scores[i], indices[i]
-                    if idx < 0: continue
-                    cat, name, orig_idx = self._items[idx]
-                    if orig_idx not in seen[cat]:
-                        seen[cat].add(orig_idx)
-                        raw = self._raw_resources[cat]
-                        if orig_idx < len(raw):
-                            selected[cat].append(raw[orig_idx])
-
-            return selected
-
-        except Exception as e:
-            warnings.warn(f"[ToolRetriever.semantic_retrieval] FAISS search failed: {e}. Using LLM fallback.", stacklevel=2)
-            return self.prompt_based_retrieval(query, self._raw_resources)
-
-    # ── Public: LLM-based fallback (original logic, kept intact) ─────────────
+            kept.append(tool)
+        return kept
 
     def prompt_based_retrieval(self, query: str, resources: dict, llm=None) -> dict:
+        """Use a prompt-based approach to retrieve the most relevant resources for a query.
+        Args:
+            query: The user's query
+            resources: A dictionary with keys 'tools', 'data_lake', and 'libraries',
+                      each containing a list of available resources
+            llm: Optional LLM instance to use for retrieval (if None, will create a new one)
+        Returns:
+            A dictionary with the same keys, but containing only the most relevant resources
         """
-        LLM-based resource selection — used as fallback when FAISS unavailable.
-        Original implementation preserved for compatibility.
-        """
-        from langchain_core.messages import HumanMessage
         
+        # Pre-filter: remove stubs, deprecated tools, and unavailable CLI backends
+        resources = dict(resources)
+        resources["tools"] = self.filter_tools(resources.get("tools", []))
+
+        # Create a prompt for the LLM to select relevant resources
         prompt = f"""
             You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.
 
@@ -262,6 +122,7 @@ class ToolRetriever:
 
             Below are the available resources. For each category, select items that are directly or indirectly relevant to answering the query.
             Be generous in your selection - include resources that might be useful for the task, even if they're not explicitly mentioned in the query.
+            It's better to include slightly more resources than to miss potentially useful ones.
 
             AVAILABLE TOOLS:
             {self._format_resources_for_prompt(resources.get("tools", []))}
@@ -277,129 +138,109 @@ class ToolRetriever:
             DATA_LAKE: [list of indices]
             LIBRARIES: [list of indices]
 
+            For example:
+            TOOLS: [0, 3, 5, 7, 9]
+            DATA_LAKE: [1, 2, 4]
+            LIBRARIES: [0, 2, 4, 5, 8]
+
+            If a category has no relevant items, use an empty list, e.g., DATA_LAKE: []
+
             IMPORTANT GUIDELINES:
-            1. Be generous but not excessive
-            2. ALWAYS prioritize database tools for general queries
+            1. Be generous but not excessive - aim to include all potentially relevant resources
+            2. ALWAYS prioritize database tools for general queries - include as many database tools as possible
             3. Include all literature search tools
-            4. For wet lab sequence queries, ALWAYS include molecular biology tools
+            4. For wet lab sequence type of queries, ALWAYS include molecular biology tools
+            5. For data lake items, include datasets that could provide useful information
+            6. For libraries, include those that provide functions needed for analysis
+            7. Don't exclude resources just because they're not explicitly mentioned in the query
+            8. When in doubt about a database tool or molecular biology tool, include it rather than exclude it
         """
 
-        # FIX G14: removed hardcoded ChatOpenAI(gpt-4o) fallback — callers must pass llm=
+        # Use the provided LLM or create a new one
         if llm is None:
-            warnings.warn(
-                "[ToolRetriever] prompt_based_retrieval called without an LLM. "
-                "Pass llm= argument. Returning empty resource selection.",
-                stacklevel=2,
-            )
-            return {"tools": [], "data_lake": [], "libraries": []}
+            llm = ChatOpenAI(model="gpt-4o")
 
-        # BUG-46: wrap the LLM call with a timeout and catch all exceptions.
-        # On failure we return empty selections so the agent falls back to using
-        # the full tool set rather than blocking indefinitely or crashing.
-        _llm_timeout = int(os.environ.get("GENOMEER_RETRIEVER_LLM_TIMEOUT", "30"))
-        response_content = ""
+        # Invoke the LLM with a hard timeout to prevent indefinite blocking
+        def _call_llm():
+            if hasattr(llm, "invoke"):
+                return llm.invoke([HumanMessage(content=prompt)]).content
+            return str(llm(prompt))
+
         try:
-            import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                if hasattr(llm, "invoke"):
-                    _fut = _ex.submit(llm.invoke, [HumanMessage(content=prompt)])
-                else:
-                    _fut = _ex.submit(llm, prompt)
-                try:
-                    _resp = _fut.result(timeout=_llm_timeout)
-                    response_content = _resp.content if hasattr(_resp, "content") else str(_resp)
-                except _cf.TimeoutError:
-                    logger.warning(
-                        f"[ToolRetriever] LLM timed out after {_llm_timeout}s — "
-                        "returning empty tool selection."
-                    )
-                    _fut.cancel()
-        except Exception as exc:
-            logger.warning(
-                f"[ToolRetriever] LLM invocation failed ({exc}) — "
-                "returning empty tool selection."
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_call_llm)
+                response_content = fut.result(timeout=_RETRIEVAL_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            # Retrieval timed out: fall back to returning all resources unfiltered
+            return {k: list(v) for k, v in resources.items()}
+        except Exception:
+            # Any LLM error: same safe fallback
+            return {k: list(v) for k, v in resources.items()}
 
-        if not response_content:
-            return {"tools": [], "data_lake": [], "libraries": []}
-
+        # Parse the response to extract the selected indices
         selected_indices = self._parse_llm_response(response_content)
 
-        return {
+        # Get the selected resources
+        selected_resources = {
             "tools": [
-                resources["tools"][i] for i in selected_indices.get("tools", [])
-                if i < len(resources.get("tools", []))
+                resources["tools"][i] for i in selected_indices.get("tools", []) if i < len(resources.get("tools", []))
             ],
             "data_lake": [
-                resources["data_lake"][i] for i in selected_indices.get("data_lake", [])
+                resources["data_lake"][i]
+                for i in selected_indices.get("data_lake", [])
                 if i < len(resources.get("data_lake", []))
             ],
             "libraries": [
-                resources["libraries"][i] for i in selected_indices.get("libraries", [])
+                resources["libraries"][i]
+                for i in selected_indices.get("libraries", [])
                 if i < len(resources.get("libraries", []))
             ],
         }
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _item_to_text(self, item: Any) -> str:
-        if isinstance(item, str):
-            return item
-        if isinstance(item, dict):
-            name = item.get("name") or item.get("title") or ""
-            desc = item.get("description") or item.get("summary") or ""
-            return f"{name}: {desc}"
-        
-        # P3-B.4: Handle objects with attributes (BioAgent tools)
-        try:
-            name = getattr(item, "name", "") or getattr(item, "title", "")
-            desc = getattr(item, "description", "") or getattr(item, "summary", "")
-            if name or desc:
-                return f"{name}: {desc}"
-        except Exception:
-            pass
-            
-        return str(item)
+        return selected_resources
 
     def _format_resources_for_prompt(self, resources: list) -> str:
+        """Format resources for inclusion in the prompt."""
         formatted = []
         for i, resource in enumerate(resources):
             if isinstance(resource, dict):
+                # Handle dictionary format (from tool registry or data lake/libraries with descriptions)
                 name = resource.get("name", f"Resource {i}")
                 description = resource.get("description", "")
                 formatted.append(f"{i}. {name}: {description}")
             elif isinstance(resource, str):
+                # Handle string format (simple strings)
                 formatted.append(f"{i}. {resource}")
             else:
+                # Try to extract name and description from tool objects
                 name = getattr(resource, "name", str(resource))
                 desc = getattr(resource, "description", "")
                 formatted.append(f"{i}. {name}: {desc}")
+
         return "\n".join(formatted) if formatted else "None available"
 
     def _parse_llm_response(self, response: str) -> dict:
-        selected_indices: Dict[str, List[int]] = {"tools": [], "data_lake": [], "libraries": []}
+        """Parse the LLM response to extract the selected indices."""
+        selected_indices = {"tools": [], "data_lake": [], "libraries": []}
+
+        # Extract indices for each category
         tools_match = re.search(r"TOOLS:\s*\[(.*?)\]", response, re.IGNORECASE)
         if tools_match and tools_match.group(1).strip():
             with contextlib.suppress(ValueError):
-                selected_indices["tools"] = [int(x.strip()) for x in tools_match.group(1).split(",") if x.strip()]
+                selected_indices["tools"] = [int(idx.strip()) for idx in tools_match.group(1).split(",") if idx.strip()]
+
         data_lake_match = re.search(r"DATA_LAKE:\s*\[(.*?)\]", response, re.IGNORECASE)
         if data_lake_match and data_lake_match.group(1).strip():
             with contextlib.suppress(ValueError):
-                selected_indices["data_lake"] = [int(x.strip()) for x in data_lake_match.group(1).split(",") if x.strip()]
+                selected_indices["data_lake"] = [
+                    int(idx.strip()) for idx in data_lake_match.group(1).split(",") if idx.strip()
+                ]
+
         libraries_match = re.search(r"LIBRARIES:\s*\[(.*?)\]", response, re.IGNORECASE)
         if libraries_match and libraries_match.group(1).strip():
             with contextlib.suppress(ValueError):
-                selected_indices["libraries"] = [int(x.strip()) for x in libraries_match.group(1).split(",") if x.strip()]
-        return selected_indices
+                selected_indices["libraries"] = [
+                    int(idx.strip()) for idx in libraries_match.group(1).split(",") if idx.strip()
+                ]
 
-    # ── Convenience: names only (used by BioAgent) ────────────────────────────
-    def get_resource_names(self, resources: Dict[str, List]) -> List[str]:
-        """Flatten retrieved resources to a list of names."""
-        names = []
-        for items in resources.values():
-            for item in items:
-                if isinstance(item, dict):
-                    names.append(item.get("name", str(item)))
-                else:
-                    names.append(str(item))
-        return names
+        return selected_indices

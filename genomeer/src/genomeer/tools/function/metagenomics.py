@@ -1,1769 +1,840 @@
 """
-Genomeer — Metagenomics Tool Functions
-=======================================
-Real CLI wrappers for the `meta-env1` micromamba environment.
-Every function follows the same contract as genomeer/src/genomeer/tools/function/basic.py:
-  - Pure Python callable importable by the agent
-  - Returns a dict with meaningful keys for downstream use
-  - Writes all output files into `output_dir`
-  - Raises RuntimeError with formatted message on failure
+metagenomics.py — CLI wrapper functions for metagenomics tools.
 
-Coverage (30 tools):
-  QC          : run_fastp, run_multiqc, run_nanostat, run_fastqc
-  Assembly    : run_metaspades, run_megahit, run_flye, run_medaka, run_racon
-  Mapping     : run_minimap2, run_bowtie2, run_bwa_mem, compute_coverage_samtools, sort_index_bam
-  Taxonomy    : run_kraken2, run_bracken, run_metaphlan4, run_gtdbtk, run_krona
-  Binning     : run_metabat2, run_das_tool, run_checkm2
-  Annotation  : run_prokka, run_prodigal, run_diamond, run_hmmer, run_humann3
-  AMR/Virulence: run_amrfinderplus, run_rgi_card
-  Stats/Viz   : run_microbiome_diversity (Python, via scikit-bio + matplotlib)
+Each function builds a subprocess command, runs it with a timeout,
+and returns a structured dict so the LLM agent can consume the result.
+All heavy lifting (parsing, filtering) is left to the caller.
 """
-
 from __future__ import annotations
 
-import json
+import glob
 import os
-import shlex
-import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-
-# ---------------------------------------------------------------------------
-# Internal helpers — same pattern as helper.py _run_in_env
-# ---------------------------------------------------------------------------
-
-_META_ENV = "meta-env1"
-_BIO_ENV  = "bio-agent-env1"
+from typing import Any, Dict, List, Optional, Union
 
 
-def _micromamba_bin() -> str:
-    """Return micromamba executable path (mirrors env_manager.ensure_micromamba logic)."""
-    from genomeer.runtime.env_manager import ensure_micromamba
-    return str(ensure_micromamba())
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-
-def _env_prefix(env_name: str) -> Path:
-    from genomeer.runtime.env_manager import ENVS_DIR
-    return ENVS_DIR / env_name
-
-
-def _run(argv: List[str], env_name: str = _META_ENV, timeout: int = 21600,
-         extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
-    """Run argv inside micromamba env and return CompletedProcess.
-    Applies RLIMIT_AS/CPU resource limits on Linux/macOS (BUG-5)."""
-    import platform as _platform
-    mm = _micromamba_bin()
-    prefix = _env_prefix(env_name)
-    cmd = [mm, "run", "-p", str(prefix), *argv]
-    env = dict(os.environ)
-    env.pop("CONDA_PREFIX", None)
-    if extra_env:
-        env.update(extra_env)
-
-    preexec_fn = None
-    if _platform.system() != "Windows":
-        try:
-            import resource as _res
-            _max_ram_gb = float(os.environ.get("GENOMEER_MAX_RAM_GB", "32"))
-            _max_cpu    = int(os.environ.get("GENOMEER_MAX_CPU_SECONDS", str(timeout)))
-
-            def _limit():
-                try:
-                    _ram = int(_max_ram_gb * 1024 ** 3)
-                    _res.setrlimit(_res.RLIMIT_AS, (_ram, _ram))
-                    _res.setrlimit(_res.RLIMIT_CPU, (_max_cpu, _max_cpu))
-                    _res.setrlimit(_res.RLIMIT_NPROC, (512, 512))
-                except Exception:
-                    pass
-
-            preexec_fn = _limit
-        except ImportError:
-            pass
-
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout,
-        env=env, preexec_fn=preexec_fn,
-    )
-
-
-def _assert_ok(proc: subprocess.CompletedProcess, label: str) -> None:
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"{label} failed (exit {proc.returncode})\n"
-            f"--- STDOUT ---\n{proc.stdout[-4000:]}\n"
-            f"--- STDERR ---\n{proc.stderr[-4000:]}"
-        )
-
-
-def _ensure_dir(path: str | Path) -> Path:
-    p = Path(path)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-# ===========================================================================
-# QC & PREPROCESSING
-# ===========================================================================
-
-def validate_fastq_input(
-    fastq_path: str,
-    min_reads: int = 1000,
-) -> Dict[str, Any]:
-    """
-    Quick validation of a FASTQ file before running the pipeline.
-    Checks: file exists, non-empty, valid FASTQ format (first 4 lines),
-    and estimates read count.
-    Returns dict(valid, n_reads_estimated, format_ok, file_size_mb, message).
-    """
-    p = Path(fastq_path)
-    if not p.exists():
-        return {"valid": False, "message": f"File not found: {fastq_path}"}
-    size_mb = p.stat().st_size / (1024 ** 2)
-    if size_mb == 0:
-        return {"valid": False, "message": f"File is empty: {fastq_path}"}
-
-    import gzip
-    try:
-        opener = gzip.open if fastq_path.endswith(".gz") else open
-        with opener(fastq_path, "rt", errors="replace") as fh:
-            lines = [fh.readline() for _ in range(8)]
-        if not lines[0].startswith("@"):
-            return {"valid": False, "message": "Not a valid FASTQ: first line must start with '@'"}
-        if not lines[2].startswith("+"):
-            return {"valid": False, "message": "Not a valid FASTQ: third line must start with '+'"}
-    except Exception as e:
-        return {"valid": False, "message": f"Could not read file: {e}"}
-
-    # Estimate read count from file size (rough: ~250 bytes per read compressed)
-    n_reads_est = int(size_mb * 1024 * 1024 / 250)
-    warn = n_reads_est < min_reads
-
+def _run(cmd: List[str], timeout: int, cwd: Optional[str] = None) -> Dict[str, Any]:
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
     return {
-        "valid": True,
-        "format_ok": True,
-        "file_size_mb": round(size_mb, 2),
-        "n_reads_estimated": n_reads_est,
-        "message": (
-            f"Valid FASTQ. ~{n_reads_est:,} reads estimated. "
-            + (f"WARNING: fewer than {min_reads} reads, may be insufficient for assembly." if warn else "")
-        ),
+        "ok": res.returncode == 0,
+        "returncode": res.returncode,
+        "stdout": res.stdout,
+        "stderr": res.stderr,
+        "cmd": cmd,
     }
 
 
-def run_host_decontamination(
-    input_r1: str,
-    input_r2: str,
-    output_dir: str,
-    host_index: str,      # path to bowtie2 index prefix (e.g. /db/hg38/hg38)
-    threads: int = 8,
-) -> Dict[str, Any]:
-    """
-    Remove host reads using Bowtie2.
-    Outputs only unaligned reads (non-host = microbial) for downstream analysis.
-    Returns dict with clean_r1, clean_r2, host_reads_pct, n_reads_after.
-    """
-    import re
-    validate_fastq_input(input_r1)
-    if input_r2:
-        validate_fastq_input(input_r2)
-    # Validate host_index path
-    _host_path = Path(host_index).resolve()
-    _bt2_check = Path(str(_host_path) + ".1.bt2")
-    _bt2l_check = Path(str(_host_path) + ".1.bt2l")
-    if not (_bt2_check.exists() or _bt2l_check.exists()):
+def _which(name: str) -> str:
+    import shutil
+    path = shutil.which(name)
+    if not path:
         raise FileNotFoundError(
-            f"[run_host_decontamination] Bowtie2 index not found: {host_index!r} "
-            f"(expected {_bt2_check} or {_bt2l_check})"
+            f"'{name}' not found on PATH. Install it in the active conda env."
         )
-    out = _ensure_dir(output_dir)
-    clean_r1 = str(out / "host_removed_R1.fastq.gz")
-    clean_r2 = str(out / "host_removed_R2.fastq.gz")
-    sam_out = "/dev/null"
+    return path
 
-    cmd = [
-        "bowtie2", "-x", host_index,
-        "-1", input_r1, "-2", input_r2,
-        "--un-conc-gz", str(out / "host_removed_R%.fastq.gz"),
-        "-S", sam_out,
-        "--threads", str(threads),
-        "--very-sensitive"
-    ]
-    proc = _run(cmd, timeout=7200)
-    _assert_ok(proc, "bowtie2_host_decontam")
 
-    host_pct = 0.0
-    m = re.search(r"(\d+\.\d+)%\s+overall alignment rate", proc.stderr)
-    if m:
-        host_pct = float(m.group(1))
+def _mkdir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
 
-    return {
-        "clean_r1": clean_r1,
-        "clean_r2": clean_r2,
-        "host_alignment_pct": host_pct,
-        "microbial_pct": round(100.0 - host_pct, 2),
-        "stdout": proc.stdout[-1000:],
-    }
 
+# ── Assembly QC ───────────────────────────────────────────────────────────────
 
-def run_fastp(
-    input_r1: str,
-    output_dir: str,
-    input_r2: Optional[str] = None,
-    threads: int = 4,
-    min_quality: int = 20,
-    min_length: int = 50,
-    detect_adapter_for_pe: bool = True,
-    json_report: bool = True,
-    html_report: bool = True,
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Run fastp for adapter trimming and quality control on Illumina reads.
-    Supports both single-end and paired-end FASTQ (optionally gzipped).
-    Returns a dict with paths to trimmed reads, JSON stats, and HTML report.
-    """
-    validate_fastq_input(input_r1)
-    if input_r2:
-        validate_fastq_input(input_r2)
-    out = _ensure_dir(output_dir)
-    stem = Path(input_r1).stem.replace(".fastq", "").replace(".fq", "")
-
-    out_r1 = str(out / f"{stem}_R1_clean.fastq.gz")
-    cmd = ["fastp", "-i", input_r1, "-o", out_r1, "-w", str(threads),
-           "-q", str(min_quality), "-l", str(min_length)]
-
-    out_r2 = None
-    if input_r2:
-        out_r2 = str(out / f"{stem}_R2_clean.fastq.gz")
-        cmd += ["-I", input_r2, "-O", out_r2]
-        if detect_adapter_for_pe:
-            cmd += ["--detect_adapter_for_pe"]
-
-    json_path = str(out / f"{stem}_fastp.json") if json_report else None
-    html_path = str(out / f"{stem}_fastp.html") if html_report else None
-    if json_path:
-        cmd += ["-j", json_path]
-    if html_path:
-        cmd += ["-h", html_path]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd)
-    _assert_ok(proc, "fastp")
-
-    stats = {}
-    if json_path and Path(json_path).exists():
-        with open(json_path) as f:
-            stats = json.load(f)
-
-    # FIX G8: expose q30_rate at top-level so quality_gate can read it directly
-    # fastp JSON structure: stats["summary"]["before_filtering"]["q30_rate"]
-    q30_before = 0.0
-    q30_after  = 0.0
-    try:
-        q30_before = float(stats["summary"]["before_filtering"]["q30_rate"])
-        q30_after  = float(stats["summary"]["after_filtering"]["q30_rate"])
-    except (KeyError, TypeError, ValueError):
-        pass
-
-    return {
-        "out_r1": out_r1,
-        "out_r2": out_r2,
-        "json_report": json_path,
-        "html_report": html_path,
-        "summary": stats.get("summary", {}),
-        "q30_rate": q30_after if q30_after > 0 else q30_before,  # quality gate reads this key
-        "q30_rate_before": q30_before,
-        "q30_rate_after":  q30_after,
-    }
-
-
-def run_fastqc(
-    input_files: List[str],
-    output_dir: str,
-    threads: int = 4,
-) -> Dict[str, Any]:
-    """
-    Run FastQC quality assessment on one or more FASTQ files.
-    Returns dict with output_dir and list of generated HTML report paths.
-    """
-    out = _ensure_dir(output_dir)
-    cmd = ["fastqc", "--outdir", str(out), "--threads", str(threads)] + input_files
-    proc = _run(cmd)
-    _assert_ok(proc, "fastqc")
-    html_reports = sorted(str(p) for p in out.glob("*_fastqc.html"))
-    return {"output_dir": str(out), "html_reports": html_reports, "stdout": proc.stdout}
-
-
-def run_multiqc(
-    input_dir: str,
-    output_dir: str,
-    report_name: str = "multiqc_report",
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Run MultiQC to aggregate QC reports from fastp, FastQC, Kraken2, etc.
-    Scans input_dir recursively and produces an interactive HTML summary.
-    Returns dict with html_report path and data_dir.
-    """
-    out = _ensure_dir(output_dir)
-    cmd = ["multiqc", input_dir, "--outdir", str(out), "--filename", report_name, "--force"]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-    proc = _run(cmd)
-    _assert_ok(proc, "multiqc")
-    html = str(out / f"{report_name}.html")
-    return {"html_report": html, "data_dir": str(out / f"{report_name}_data"), "stdout": proc.stdout}
-
-
-def run_nanostat(
-    input_fastq: str,
-    output_dir: str,
-    threads: int = 4,
-) -> Dict[str, Any]:
-    """
-    Run NanoStat to compute quality statistics on Oxford Nanopore long reads.
-    Returns dict with stats_file path and parsed key metrics (N50, mean quality, etc.).
-    """
-    out = _ensure_dir(output_dir)
-    stats_file = str(out / "nanostat_report.txt")
-    cmd = ["NanoStat", "--fastq", input_fastq, "--outdir", str(out),
-           "--name", "nanostat_report.txt", "--threads", str(threads)]
-    proc = _run(cmd)
-    _assert_ok(proc, "NanoStat")
-    return {"stats_file": stats_file, "stdout": proc.stdout}
-
-
-# ===========================================================================
-# ASSEMBLY
-# ===========================================================================
-
-def run_metaspades(
-    output_dir: str,
-    reads_r1: Optional[str] = None,
-    reads_r2: Optional[str] = None,
-    reads_single: Optional[str] = None,
-    threads: int = 8,
-    memory_gb: int = 16,
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Run metaSPAdes for metagenome de-novo assembly from Illumina short reads.
-    Supports paired-end (reads_r1 + reads_r2) or single-end (reads_single).
-    Returns dict with contigs_fasta, scaffolds_fasta, assembly_graph, and log.
-    """
-    if reads_r1:
-        validate_fastq_input(reads_r1)
-    if reads_r2:
-        validate_fastq_input(reads_r2)
-    out = _ensure_dir(output_dir)
-    # FIX G11: --meta flag is required for metagenome mode in metaSPAdes
-    cmd = ["metaspades.py", "--meta", "-o", str(out), "-t", str(threads), "-m", str(memory_gb)]
-    if reads_r1:
-        cmd += ["-1", reads_r1]
-    if reads_r2:
-        cmd += ["-2", reads_r2]
-    if reads_single:
-        cmd += ["-s", reads_single]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd, timeout=21600)
-    _assert_ok(proc, "metaSPAdes")
-
-    contigs   = out / "contigs.fasta"
-    scaffolds = out / "scaffolds.fasta"
-
-    # BUG-6: metaSPAdes can exit 0 with a missing/empty FASTA on partial failures.
-    primary = scaffolds if scaffolds.exists() and scaffolds.stat().st_size > 0 else contigs
-    if not primary.exists() or primary.stat().st_size == 0:
-        raise RuntimeError(
-            f"metaSPAdes returned exit 0 but primary assembly FASTA is absent or empty "
-            f"(checked {scaffolds}, {contigs}). "
-            f"Check spades.log: {out / 'spades.log'}"
-        )
-
-    return {
-        "contigs_fasta":  str(contigs)   if contigs.exists()   and contigs.stat().st_size   > 0 else None,
-        "scaffolds_fasta": str(scaffolds) if scaffolds.exists() and scaffolds.stat().st_size > 0 else None,
-        "assembly_graph": str(out / "assembly_graph.fastg"),
-        "log": str(out / "spades.log"),
-        "output_dir": str(out),
-    }
-
-
-def run_megahit(
-    output_dir: str,
-    reads_r1: Optional[str] = None,
-    reads_r2: Optional[str] = None,
-    reads_single: Optional[str] = None,
-    threads: int = 8,
-    memory_fraction: float = 0.5,
-    min_contig_len: int = 500,
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Run MEGAHIT for fast and memory-efficient metagenome assembly.
-    More suitable than metaSPAdes for very large datasets or low-memory systems.
-    Returns dict with contigs_fasta path.
-    """
-    out = _ensure_dir(output_dir)
-    final_out = out / "megahit_out"
-    if final_out.exists():
-        shutil.rmtree(final_out)
-
-    cmd = ["megahit", "-o", str(final_out), "-t", str(threads),
-           "--memory", str(memory_fraction), "--min-contig-len", str(min_contig_len)]
-    if reads_r1:
-        cmd += ["-1", reads_r1]
-    if reads_r2:
-        cmd += ["-2", reads_r2]
-    if reads_single:
-        cmd += ["-r", reads_single]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd, timeout=21600)
-    _assert_ok(proc, "MEGAHIT")
-
-    contigs_path = final_out / "final.contigs.fa"
-
-    # BUG-6: MEGAHIT can exit 0 with an absent/empty FASTA when input depth is too low.
-    if not contigs_path.exists() or contigs_path.stat().st_size == 0:
-        raise RuntimeError(
-            f"MEGAHIT returned exit 0 but final.contigs.fa is absent or empty in {final_out}. "
-            f"Check log: {final_out / 'log'}"
-        )
-
-    return {
-        "contigs_fasta": str(contigs_path),
-        "output_dir": str(final_out),
-        "log": str(final_out / "log"),
-    }
-
-
-def run_flye(
-    input_reads: str,
-    output_dir: str,
-    read_type: str = "nano-raw",
-    genome_size: str = "5m",
-    threads: int = 8,
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Run Flye assembler optimized for Oxford Nanopore or PacBio long reads.
-    read_type options: 'nano-raw', 'nano-hq', 'nano-corr', 'pacbio-raw', 'pacbio-hifi'.
-    genome_size: estimated metagenome size (e.g. '5m', '100m', '1g').
-    Returns dict with assembly_fasta, assembly_info, and log.
-    """
-    out = _ensure_dir(output_dir)
-    cmd = ["flye", f"--{read_type}", input_reads, "--out-dir", str(out),
-           "--threads", str(threads), "--meta"]
-    if genome_size:
-        cmd += ["--genome-size", genome_size]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd, timeout=21600)
-    _assert_ok(proc, "Flye")
-
-    assembly = str(out / "assembly.fasta")
-    return {
-        "assembly_fasta": assembly if Path(assembly).exists() else None,
-        "assembly_info": str(out / "assembly_info.txt"),
-        "log": str(out / "flye.log"),
-        "output_dir": str(out),
-    }
-
-
-def run_medaka(
-    reads_fastq: str,
-    assembly_fasta: str,
-    output_dir: str,
-    model: str = "r941_min_high_g360",
-    threads: int = 8,
-    batch_size: int = 100,
-) -> Dict[str, Any]:
-    """
-    Polish an ONT assembly using Medaka.
-
-    Medaka is the recommended post-assembly polishing tool for Oxford Nanopore
-    reads. It uses a neural network trained on specific flowcell/basecaller
-    models to correct systematic errors left by assemblers like Flye.
-
-    Recommended pipeline: Flye → Racon (1-2 rounds) → Medaka → CheckM2.
-
-    Parameters
-    ----------
-    reads_fastq    : Path to raw ONT reads FASTQ (the same reads used for assembly).
-    assembly_fasta : Path to the draft assembly FASTA produced by Flye (or Racon-polished).
-    output_dir     : Output directory where medaka_out/ will be created.
-    model          : Medaka model matching flowcell + basecaller version.
-                     Examples: 'r941_min_high_g360', 'r941_prom_high_g360',
-                               'r1041_e82_400bps_sup_g615' (latest Kit14/Dorado).
-    threads        : CPU threads (-t).
-    batch_size     : Batch size for GPU inference (-b). Use 100 for CPU.
-
-    Returns
-    -------
-    dict(polished_fasta, log, output_dir, mean_qv)
-        polished_fasta : Path to consensus.fasta produced by Medaka.
-        log            : Path to medaka log file.
-        output_dir     : The medaka output directory.
-        mean_qv        : Mean Quality Value parsed from medaka output (float or None).
-    """
-    import re as _re
-    out = _ensure_dir(output_dir)
-    medaka_out = str(out / "medaka_out")
-
-    cmd = [
-        "medaka_consensus",
-        "-i", reads_fastq,
-        "-d", assembly_fasta,
-        "-o", medaka_out,
-        "-t", str(threads),
-        "-m", model,
-        "-b", str(batch_size),
-    ]
-
-    proc = _run(cmd, timeout=21600)
-    _assert_ok(proc, "medaka_consensus")
-
-    polished = str(Path(medaka_out) / "consensus.fasta")
-    log_path = str(out / "medaka.log")
-
-    # Write combined stdout+stderr to a log file
-    try:
-        with open(log_path, "w") as lf:
-            lf.write(proc.stdout or "")
-            lf.write(proc.stderr or "")
-    except Exception:
-        pass
-
-    # Parse mean QV from medaka output
-    # Medaka prints: "[M::pyabpoa] INFO mean qv: 28.35" or similar
-    mean_qv: Optional[float] = None
-    combined_output = (proc.stdout or "") + (proc.stderr or "")
-    m = _re.search(
-        r"(?:mean\s*qv|consensus\s*qv)[:\s]+([0-9]+(?:\.[0-9]+)?)",
-        combined_output,
-        _re.IGNORECASE,
-    )
-    if m:
-        try:
-            mean_qv = float(m.group(1))
-        except ValueError:
-            pass
-
-    return {
-        "polished_fasta": polished if Path(polished).exists() else None,
-        "log": log_path,
-        "output_dir": medaka_out,
-        "mean_qv": mean_qv,
-    }
-
-
-def run_racon(
-    reads_fastq: str,
-    overlaps_paf: str,
-    assembly_fasta: str,
-    output_dir: str,
-    threads: int = 8,
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Polish an assembly using Racon (fast consensus from long-read overlaps).
-
-    Racon is a fast, error-correction tool that uses raw read overlaps (PAF
-    format, produced by minimap2) to improve assembly accuracy before the
-    more accurate (but slower) Medaka polishing step.
-
-    Recommended pipeline: Flye → Racon (1-2 rounds) → Medaka → CheckM2.
-    For each Racon round, re-run minimap2 on the latest polished FASTA.
-
-    Parameters
-    ----------
-    reads_fastq    : Path to raw ONT reads FASTQ.
-    overlaps_paf   : Path to minimap2 PAF overlap file.
-                     Generate with: minimap2 -x map-ont assembly.fasta reads.fastq > overlaps.paf
-    assembly_fasta : Path to the draft assembly FASTA (Flye output or previous Racon round).
-    output_dir     : Output directory. The polished FASTA is written here.
-    threads        : CPU threads.
-    extra_args     : Extra Racon CLI flags as a string.
-
-    Returns
-    -------
-    dict(polished_fasta, output_dir)
-        polished_fasta : Path to racon_polished.fasta.
-        output_dir     : The output directory.
-    """
-    out = _ensure_dir(output_dir)
-    polished_fasta = str(out / "racon_polished.fasta")
-
-    cmd = ["racon", "-t", str(threads)]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-    cmd += [reads_fastq, overlaps_paf, assembly_fasta]
-
-    # Racon writes polished FASTA to stdout
-    import subprocess as _sp
-    mm = _micromamba_bin()
-    prefix = _env_prefix(_META_ENV)
-    full_cmd = [mm, "run", "-p", str(prefix)] + cmd
-    print("CMD:", " ".join(full_cmd))
-
-    import os as _os
-    env = dict(_os.environ)
-    env.pop("CONDA_PREFIX", None)
-
-    with open(polished_fasta, "w") as out_fh:
-        proc = _sp.run(
-            full_cmd,
-            stdout=out_fh,
-            stderr=_sp.PIPE,
-            text=True,
-            timeout=14400,
-            env=env,
-        )
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"racon failed (exit {proc.returncode})\n"
-            f"--- STDERR ---\n{proc.stderr[-4000:]}"
-        )
-
-    return {
-        "polished_fasta": polished_fasta if Path(polished_fasta).exists() else None,
-        "output_dir": str(out),
-    }
-
-
-# ===========================================================================
-# MAPPING & COVERAGE
-# ===========================================================================
-
-def run_minimap2(
-    reads: str,
-    reference: str,
-    output_bam: str,
-    preset: str = "sr",
-    threads: int = 4,
-    sort_and_index: bool = True,
-) -> Dict[str, Any]:
-    """
-    Align reads to a reference genome/assembly using minimap2.
-    preset: 'sr' (short reads), 'map-ont' (Nanopore), 'map-pb' (PacBio), 'asm5' (assembly).
-    If sort_and_index=True, produces a sorted BAM with .bai index.
-    Returns dict with bam_path, index_path, and alignment stats.
-    """
-    out_dir = _ensure_dir(Path(output_bam).parent)
-    sam_path = str(out_dir / Path(output_bam).stem) + ".sam"
-
-    cmd_map = ["minimap2", "-ax", preset, "-t", str(threads), reference, reads]
-    with open(sam_path, "w") as sam_f:
-        proc_map = subprocess.run(
-            [_micromamba_bin(), "run", "-p", str(_env_prefix(_META_ENV))] + cmd_map,
-            stdout=sam_f, stderr=subprocess.PIPE, text=True, timeout=7200
-        )
-    _assert_ok(proc_map, "minimap2")
-
-    if sort_and_index:
-        proc_sort = _run(["samtools", "sort", "-@", str(threads), "-o", output_bam, sam_path])
-        _assert_ok(proc_sort, "samtools sort")
-        proc_idx = _run(["samtools", "index", output_bam])
-        _assert_ok(proc_idx, "samtools index")
-        Path(sam_path).unlink(missing_ok=True)
-        index_path = output_bam + ".bai"
-    else:
-        shutil.move(sam_path, output_bam)
-        index_path = None
-
-    flagstat = _run(["samtools", "flagstat", output_bam])
-    return {"bam_path": output_bam, "index_path": index_path, "flagstat": flagstat.stdout}
-
-
-def run_bowtie2(
-    reads_r1: str,
-    reference_index: str,
-    output_bam: str,
-    reads_r2: Optional[str] = None,
-    threads: int = 4,
-    sort_and_index: bool = True,
-) -> Dict[str, Any]:
-    """
-    Align Illumina reads to a reference using Bowtie2. 
-    reference_index: path prefix (without .bt2 extension) — use bowtie2-build if needed.
-    Returns dict with bam_path, index_path, alignment_rate.
-    """
-    out_dir = _ensure_dir(Path(output_bam).parent)
-    sam_path = str(out_dir / Path(output_bam).stem) + ".sam"
-
-    cmd = ["bowtie2", "-x", reference_index, "-1", reads_r1, "-p", str(threads),
-           "--no-unal", "-S", sam_path]
-    if reads_r2:
-        cmd += ["-2", reads_r2]
-
-    proc = _run(cmd)
-    _assert_ok(proc, "bowtie2")
-    alignment_rate = [l for l in proc.stderr.splitlines() if "overall alignment rate" in l]
-
-    if sort_and_index:
-        _assert_ok(_run(["samtools", "sort", "-@", str(threads), "-o", output_bam, sam_path]), "samtools sort")
-        _assert_ok(_run(["samtools", "index", output_bam]), "samtools index")
-        Path(sam_path).unlink(missing_ok=True)
-
-    return {
-        "bam_path": output_bam,
-        "index_path": output_bam + ".bai" if sort_and_index else None,
-        "alignment_rate": alignment_rate[0].strip() if alignment_rate else "unknown",
-    }
-
-
-def compute_coverage_samtools(
-    bam_path: str,
-    output_tsv: str,
-    min_mapping_quality: int = 20,
-) -> Dict[str, Any]:
-    """
-    Compute per-contig/chromosome coverage statistics using samtools coverage.
-    Produces a TSV with columns: rname, startpos, endpos, numreads, covbases,
-    coverage, meandepth, meanbaseq, meanmapq.
-    Returns dict with coverage_tsv path and summary stats.
-    """
-    _ensure_dir(Path(output_tsv).parent)
-    cmd = ["samtools", "coverage", "-q", str(min_mapping_quality), bam_path, "-o", output_tsv]
-    proc = _run(cmd)
-    _assert_ok(proc, "samtools coverage")
-
-    total_cov = 0.0
-    n_contigs = 0
-    try:
-        with open(output_tsv) as f:
-            next(f)
-            for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) >= 6:
-                    total_cov += float(parts[5])
-                    n_contigs += 1
-    except Exception:
-        pass
-
-    return {
-        "coverage_tsv": output_tsv,
-        "mean_coverage_across_contigs": round(total_cov / n_contigs, 2) if n_contigs else 0,
-        "n_contigs": n_contigs,
-    }
-
-
-def sort_index_bam(bam_path: str, threads: int = 4) -> Dict[str, Any]:
-    """
-    Sort and index a BAM file using samtools. Produces sorted BAM and .bai index.
-    Returns dict with sorted_bam and index_path.
-    """
-    sorted_bam = bam_path.replace(".bam", ".sorted.bam")
-    _assert_ok(_run(["samtools", "sort", "-@", str(threads), "-o", sorted_bam, bam_path]), "samtools sort")
-    _assert_ok(_run(["samtools", "index", sorted_bam]), "samtools index")
-    return {"sorted_bam": sorted_bam, "index_path": sorted_bam + ".bai"}
-
-
-# ===========================================================================
-# TAXONOMIC CLASSIFICATION
-# ===========================================================================
-
-def run_kraken2(
-    output_dir: str,
-    reads_r1: str,
-    db_path: str,
-    reads_r2: Optional[str] = None,
-    threads: int = 4,
-    confidence: float = 0.1,
-    report_minimizer_data: bool = False,
-    extra_args: str = "",
-) -> Dict[str, Any]:
-    """
-    Run Kraken2 for k-mer based taxonomic classification of metagenomic reads.
-    Requires a pre-built Kraken2 database (db_path). Use MiniKraken2 for testing.
-    Returns dict with report, output, and classified/unclassified counts.
-    """
-    validate_fastq_input(reads_r1)
-    if reads_r2:
-        validate_fastq_input(reads_r2)
-    out = _ensure_dir(output_dir)
-    report = str(out / "kraken2_report.txt")
-    output_file = str(out / "kraken2_output.txt")
-
-    cmd = ["kraken2", "--db", db_path, "--threads", str(threads),
-           "--confidence", str(confidence),
-           "--report", report, "--output", output_file]
-    if reads_r2:
-        cmd += ["--paired", reads_r1, reads_r2]
-    else:
-        cmd += [reads_r1]
-    if report_minimizer_data:
-        cmd += ["--report-minimizer-data"]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd)
-    _assert_ok(proc, "Kraken2")
-
-    # FIX G9: parse classified_pct as float so quality_gate can apply threshold
-    classified_pct: Optional[float] = None
-    classification_summary_str = ""
-    for line in proc.stderr.splitlines():
-        if "classified" in line.lower():
-            classification_summary_str = line.strip()
-            import re as _re
-            # BUG-7: decimal part optional so "100%" (no decimal) also matches
-            m = _re.search(r"([0-9]+(?:\.[0-9]+)?)%\s+of\s+sequences\s+classified", line, _re.IGNORECASE)
-            if m:
-                try:
-                    classified_pct = float(m.group(1))
-                except ValueError:
-                    pass
-
-
-
-    return {
-        "report": report,
-        "output": output_file,
-        "db_used": db_path,
-        "classified_pct": classified_pct,            # FIX G9: float for quality gate
-        "classification_summary": classification_summary_str or proc.stderr[:500],
-    }
-
-
-def run_bracken(
-    kraken2_report: str,
-    db_path: str,
-    output_dir: str,
-    level: str = "S",
-    read_length: int = 150,
-    threshold: int = 10,
-) -> Dict[str, Any]:
-    """
-    Run Bracken to re-estimate species/genus abundances from Kraken2 reports.
-    level: 'S' (species), 'G' (genus), 'F' (family), 'O' (order), 'C' (class), 'P' (phylum).
-    Returns dict with bracken_output and bracken_report paths.
-    """
-    out = _ensure_dir(output_dir)
-    bracken_out = str(out / f"bracken_{level}.txt")
-    bracken_report = str(out / f"bracken_{level}_report.txt")
-
-    cmd = ["bracken", "-d", db_path, "-i", kraken2_report,
-           "-o", bracken_out, "-r", str(read_length),
-           "-l", level, "-t", str(threshold),
-           "-w", bracken_report]
-    proc = _run(cmd)
-    _assert_ok(proc, "Bracken")
-
-    # ISSUE-3: quality_gate uses "n_species_estimated" — count from bracken_report
-    n_species = 0
-    try:
-        with open(bracken_report) as _f:
-            n_species = sum(1 for _l in _f if _l.strip() and not _l.startswith("#"))
-    except Exception:
-        pass
-
-    return {
-        "bracken_output": bracken_out,
-        "bracken_report": bracken_report,
-        "level": level,
-        "n_species_estimated": n_species,   # consumed by quality_gate run_bracken gate
-        "stdout": proc.stdout,
-    }
-
-
-def run_metaphlan4(
-    input_reads: str,
-    output_dir: str,
-    threads: int = 4,
-    db_path: Optional[str] = None,
-    input_type: str = "fastq",
-    analysis_type: str = "rel_ab_w_read_stats",
-    bowtie2out: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Run MetaPhlAn4 for marker-gene based taxonomic and functional profiling.
-    Uses a curated database of clade-specific marker genes (auto-downloads on first run).
-    input_type: 'fastq', 'fasta', 'bowtie2out', 'sam'.
-    Returns dict with profile_tsv and bowtie2out paths.
-    """
-    out = _ensure_dir(output_dir)
-    profile_tsv = str(out / "metaphlan4_profile.tsv")
-    bt2_out = bowtie2out or str(out / "metaphlan4_bowtie2.bz2")
-
-    cmd = ["metaphlan", input_reads, "--input_type", input_type,
-           "--nproc", str(threads), "--output_file", profile_tsv,
-           "-t", analysis_type, "--bowtie2out", bt2_out]
-    if db_path:
-        cmd += ["--index", db_path]
-
-    proc = _run(cmd, timeout=14400)
-    _assert_ok(proc, "MetaPhlAn4")
-
-    return {
-        "profile_tsv": profile_tsv,
-        "bowtie2out": bt2_out,
-        "output_dir": str(out),
-        "stdout": proc.stdout,
-    }
-
-
-def run_gtdbtk(
-    bins_dir: str,
-    output_dir: str,
-    db_path: str,
-    extension: str = "fa",
-    threads: int = 8,
-    skip_ani_screen: bool = False,
-) -> Dict[str, Any]:
-    """
-    Run GTDB-Tk to classify metagenome-assembled genomes (MAGs) with GTDB taxonomy.
-    bins_dir: directory containing MAG FASTA files (one genome per file).
-    db_path: path to GTDB-Tk reference database (GTDBTK_DATA_PATH).
-    Returns dict with summary_tsv, classify_dir, and failed_genomes.
-    """
-    out = _ensure_dir(output_dir)
-    cmd = ["gtdbtk", "classify_wf",
-           "--genome_dir", bins_dir,
-           "--out_dir", str(out),
-           "--extension", extension,
-           "--cpus", str(threads),
-           "--prefix", "gtdbtk"]
-    if skip_ani_screen:
-        cmd += ["--skip_ani_screen"]
-
-    extra = {"GTDBTK_DATA_PATH": db_path}
-    proc = _run(cmd, extra_env=extra, timeout=21600)
-    _assert_ok(proc, "GTDB-Tk")
-
-    summary = str(out / "gtdbtk.bac120.summary.tsv")
-
-    # ISSUE-7: quality_gate uses "n_classified" — count rows in summary TSV
-    n_classified = 0
-    if Path(summary).exists():
-        try:
-            with open(summary) as _f:
-                n_classified = sum(1 for _l in _f if _l.strip() and not _l.startswith("user_genome"))
-        except Exception:
-            pass
-
-    return {
-        "summary_tsv": summary if Path(summary).exists() else None,
-        "ar53_summary": str(out / "gtdbtk.ar53.summary.tsv"),
-        "classify_dir": str(out),
-        "n_classified": n_classified,       # consumed by quality_gate run_gtdbtk gate
-        "stdout": proc.stdout[-2000:],
-    }
-
-
-def run_krona(
-    kraken2_report: str,
-    output_html: str,
-    input_type: str = "kraken2",
-) -> Dict[str, Any]:
-    """
-    Generate an interactive Krona pie chart from a Kraken2 or Bracken report.
-    input_type: 'kraken2' or 'text' (tab-separated count+taxonomy).
-    Returns dict with html_path.
-    """
-    _ensure_dir(Path(output_html).parent)
-    if input_type == "kraken2":
-        cmd = ["ktImportTaxonomy", "-t", "5", "-m", "3", "-o", output_html, kraken2_report]
-    else:
-        cmd = ["ktImportText", "-o", output_html, kraken2_report]
-    proc = _run(cmd)
-    _assert_ok(proc, "Krona")
-    return {"html_path": output_html}
-
-
-# ===========================================================================
-# BINNING
-# ===========================================================================
-
-def run_metabat2(
-    assembly_fasta: str,
-    output_dir: str,
-    bam_paths: Optional[List[str]] = None,
-    min_contig: int = 2500,
-    threads: int = 8,
-) -> Dict[str, Any]:
-    """
-    Run MetaBAT2 to bin assembled contigs into metagenome-assembled genomes (MAGs).
-    bam_paths: list of BAM files (sorted+indexed) for coverage information.
-    If bam_paths is None, binning is done by composition only (less accurate).
-    Returns dict with bins_dir, n_bins, and depth_file.
-    """
-    out = _ensure_dir(output_dir)
-    depth_file = str(out / "depth.txt")
-
-    if bam_paths:
-        proc_depth = _run(
-            ["jgi_summarize_bam_contig_depths", "--outputDepth", depth_file] + bam_paths
-        )
-        _assert_ok(proc_depth, "jgi_summarize_bam_contig_depths")
-
-    bins_prefix = str(out / "bin")
-    cmd = ["metabat2", "-i", assembly_fasta, "-o", bins_prefix,
-           "-m", str(min_contig), "-t", str(threads), "--unbinned"]
-    if bam_paths and Path(depth_file).exists():
-        cmd += ["-a", depth_file]
-
-    proc = _run(cmd)
-    _assert_ok(proc, "MetaBAT2")
-
-    bins = sorted(Path(out).glob("bin.*.fa"))
-    return {
-        "bins_dir": str(out),
-        "n_bins": len(bins),
-        "bin_files": [str(b) for b in bins],
-        "depth_file": depth_file if Path(depth_file).exists() else None,
-    }
-
-
-def run_das_tool(
+def run_quast(
     contigs_fasta: str,
     output_dir: str,
-    bins_scaffolds_tsv_list: List[str],
-    binner_names: List[str],
-    threads: int = 8,
-    score_threshold: float = 0.5,
-    extra_args: str = "",
+    *,
+    reference: Optional[str] = None,
+    threads: int = 4,
+    meta: bool = True,
+    min_contig: int = 500,
+    timeout: int = 300,
 ) -> Dict[str, Any]:
-    """
-    Run DAS_Tool to dereplicate and refine bins from multiple binning algorithms.
-    bins_scaffolds_tsv_list: list of scaffold-to-bin TSV files (one per binner).
-    binner_names: list of binner names matching bins_scaffolds_tsv_list order.
-    Returns dict with refined_bins_dir, summary_tsv, and n_refined_bins.
-    """
-    out = _ensure_dir(output_dir)
-    prefix = str(out / "dastool")
-    bins_str = ",".join(bins_scaffolds_tsv_list)
-    names_str = ",".join(binner_names)
+    """QUAST assembly quality assessment."""
+    _mkdir(output_dir)
+    cmd = [_which("quast.py"), contigs_fasta, "-o", output_dir,
+           "-t", str(threads), "--min-contig", str(min_contig)]
+    if meta:
+        cmd.append("--meta")
+    if reference:
+        cmd += ["-r", reference]
+    result = _run(cmd, timeout)
+    report = os.path.join(output_dir, "report.tsv")
+    result.update({"report_tsv": report if os.path.exists(report) else None,
+                   "report_html": os.path.join(output_dir, "report.html"),
+                   "output_dir": output_dir})
+    return result
 
-    cmd = ["DAS_Tool", "-i", bins_str, "-l", names_str, "-c", contigs_fasta,
-           "-o", prefix, "--threads", str(threads),
-           "--score_threshold", str(score_threshold), "--write_bins"]
-    if extra_args:
-        cmd += shlex.split(extra_args)
 
-    proc = _run(cmd, timeout=14400)
-    _assert_ok(proc, "DAS_Tool")
+# ── Binning ───────────────────────────────────────────────────────────────────
 
-    bins_dir = prefix + "_DASTool_bins"
-    summary = prefix + "_DASTool_summary.tsv"
-    n_bins = len(list(Path(bins_dir).glob("*.fa"))) if Path(bins_dir).exists() else 0
+def run_semibin2(
+    contigs_fasta: str,
+    output_dir: str,
+    *,
+    bam_files: Optional[List[str]] = None,
+    environment: Optional[str] = None,
+    threads: int = 4,
+    min_len: int = 1000,
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """SemiBin2 deep-learning metagenomic binning."""
+    _mkdir(output_dir)
+    cmd = [_which("SemiBin2"), "single_easy_bin",
+           "-i", contigs_fasta, "-o", output_dir,
+           "--threads", str(threads), "--min-len", str(min_len)]
+    if environment:
+        cmd += ["--environment", environment]
+    elif bam_files:
+        for b in bam_files:
+            cmd += ["-b", b]
+    result = _run(cmd, timeout)
+    bins_dir = os.path.join(output_dir, "output_bins")
+    bins = glob.glob(os.path.join(bins_dir, "*.fa")) + glob.glob(os.path.join(bins_dir, "*.fna"))
+    result.update({"bins_dir": bins_dir, "bin_count": len(bins), "output_dir": output_dir})
+    return result
 
-    return {
-        "refined_bins_dir": bins_dir if Path(bins_dir).exists() else str(out),
-        "summary_tsv": summary if Path(summary).exists() else None,
-        "n_refined_bins": n_bins,
-        "stdout": proc.stdout[-2000:],
-    }
 
+def run_concoct(
+    contigs_fasta: str,
+    output_dir: str,
+    *,
+    bam_files: Optional[List[str]] = None,
+    chunk_size: int = 10000,
+    overlap_size: int = 0,
+    clusters: int = 400,
+    threads: int = 4,
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """CONCOCT composition+coverage binning (4-step pipeline)."""
+    _mkdir(output_dir)
+    chunks_fa  = os.path.join(output_dir, "contigs_10k.fna")
+    chunks_bed = os.path.join(output_dir, "contigs_10k.bed")
+    cov_table  = os.path.join(output_dir, "coverage_table.tsv")
+    bins_dir   = os.path.join(output_dir, "bins")
+
+    # step 1 – cut up
+    with open(chunks_fa, "w") as fh:
+        r1 = subprocess.run(
+            [_which("cut_up_fasta.py"), contigs_fasta,
+             "-c", str(chunk_size), "-o", str(overlap_size),
+             "--merge_last", "-b", chunks_bed],
+            capture_output=True, text=True, timeout=120, stdout=fh)
+
+    # step 2 – coverage table
+    if bam_files:
+        with open(cov_table, "w") as fh:
+            subprocess.run(
+                [_which("concoct_coverage_table.py"), chunks_bed] + bam_files,
+                capture_output=True, text=True, timeout=300, stdout=fh)
+
+    # step 3 – cluster
+    r3 = _run([_which("concoct"),
+               "--composition_file", chunks_fa,
+               "--coverage_file", cov_table,
+               "-b", output_dir, "-t", str(threads),
+               "-c", str(clusters)], timeout)
+
+    # step 4 – merge + extract
+    merged = os.path.join(output_dir, "clustering_merged.csv")
+    with open(merged, "w") as fh:
+        subprocess.run(
+            [_which("merge_cutup_clustering.py"),
+             os.path.join(output_dir, "clustering_gt1000.csv")],
+            capture_output=True, text=True, timeout=60, stdout=fh)
+
+    _mkdir(bins_dir)
+    subprocess.run(
+        [_which("extract_fasta_bins.py"), contigs_fasta, merged,
+         "--output_path", bins_dir],
+        capture_output=True, text=True, timeout=120)
+
+    bins = glob.glob(os.path.join(bins_dir, "*.fa"))
+    r3.update({"clustering_tsv": merged, "bins_dir": bins_dir, "bin_count": len(bins)})
+    return r3
+
+
+def run_maxbin2(
+    contigs_fasta: str,
+    output_prefix: str,
+    *,
+    abund_list: Optional[str] = None,
+    reads: Optional[List[str]] = None,
+    min_contig_length: int = 1000,
+    threads: int = 4,
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """MaxBin2 marker-gene EM binning."""
+    _mkdir(os.path.dirname(output_prefix) or ".")
+    cmd = [_which("run_MaxBin2.pl"), "-contig", contigs_fasta,
+           "-out", output_prefix, "-thread", str(threads),
+           "-min_contig_length", str(min_contig_length)]
+    if abund_list:
+        cmd += ["-abund_list", abund_list]
+    elif reads:
+        for r in reads:
+            cmd += ["-reads", r]
+    result = _run(cmd, timeout)
+    bins = glob.glob(f"{output_prefix}.*.fasta")
+    summary = f"{output_prefix}.summary"
+    result.update({"bins_dir": os.path.dirname(output_prefix),
+                   "bin_count": len(bins),
+                   "summary_tsv": summary if os.path.exists(summary) else None})
+    return result
+
+
+# ── Bin quality ───────────────────────────────────────────────────────────────
 
 def run_checkm2(
     bins_dir: str,
     output_dir: str,
-    threads: int = 8,
-    db_path: Optional[str] = None,
-    extension: str = "fa",
-) -> Dict[str, Any]:
-    """
-    Run CheckM2 to assess completeness and contamination of MAGs using machine learning.
-    Much faster than CheckM1 and does not require a reference database download.
-    Returns dict with quality_report_tsv and summary statistics.
-    """
-    out = _ensure_dir(output_dir)
-    cmd = ["checkm2", "predict", "--input", bins_dir, "--output-directory", str(out),
-           "--threads", str(threads), "--extension", extension, "--force"]
-    if db_path:
-        cmd += ["--database_path", db_path]
-
-    proc = _run(cmd, timeout=14400)
-    _assert_ok(proc, "CheckM2")
-
-    report = str(out / "quality_report.tsv")
-    stats = {"completeness": [], "contamination": []}
-    try:
-        with open(report) as f:
-            next(f)
-            for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) >= 3:
-                    stats["completeness"].append(float(parts[1]))
-                    stats["contamination"].append(float(parts[2]))
-    except Exception:
-        pass
-
-    n = len(stats["completeness"])
-    return {
-        "quality_report_tsv": report if Path(report).exists() else None,
-        "n_bins_assessed": n,
-        "mean_completeness": round(sum(stats["completeness"]) / n, 1) if n else None,
-        "mean_contamination": round(sum(stats["contamination"]) / n, 1) if n else None,
-        "output_dir": str(out),
-    }
-
-
-# ===========================================================================
-# FUNCTIONAL ANNOTATION
-# ===========================================================================
-
-def run_prokka(
-    contigs_fasta: str,
-    output_dir: str,
-    sample_name: str = "metagenome",
-    kingdom: str = "Bacteria",
+    *,
     threads: int = 4,
-    metagenome: bool = True,
-    extra_args: str = "",
+    extension: str = "fna",
+    min_completeness: float = 0.0,
+    timeout: int = 1800,
 ) -> Dict[str, Any]:
-    """
-    Run Prokka for rapid prokaryotic genome annotation of assembled contigs or MAGs.
-    metagenome=True enables Prokka's metagenome mode (shorter minimum ORF length).
-    Returns dict with gff, faa (proteins), ffn (CDS nucleotides), and tsv annotation table.
-    """
-    out = _ensure_dir(output_dir)
-    prefix = str(out / sample_name)
-    cmd = ["prokka", "--outdir", str(out), "--prefix", sample_name,
-           "--kingdom", kingdom, "--cpus", str(threads), "--force"]
-    if metagenome:
-        cmd += ["--metagenome"]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-    cmd += [contigs_fasta]
-
-    proc = _run(cmd, timeout=14400)
-    _assert_ok(proc, "Prokka")
-
-    # ISSUE-4: quality_gate uses "n_genes_predicted" — parse from Prokka .txt stats
-    n_genes = 0
-    txt_path = Path(f"{prefix}.txt")
-    if txt_path.exists():
-        import re as _re
-        try:
-            for _line in txt_path.read_text(encoding="utf-8").splitlines():
-                _m = _re.search(r"CDS\s*:\s*(\d+)", _line)
-                if _m:
-                    n_genes = int(_m.group(1))
-                    break
-        except Exception:
-            pass
-
-    return {
-        "gff": f"{prefix}.gff",
-        "faa": f"{prefix}.faa",
-        "ffn": f"{prefix}.ffn",
-        "tsv": f"{prefix}.tsv",
-        "gbk": f"{prefix}.gbk",
-        "txt_stats": str(txt_path),
-        "n_genes_predicted": n_genes,       # consumed by quality_gate run_prokka gate
-        "output_dir": str(out),
-    }
+    """CheckM2 ML-based bin quality assessment."""
+    _mkdir(output_dir)
+    bin_glob = os.path.join(bins_dir, f"*.{extension}")
+    cmd = [_which("checkm2"), "predict",
+           "--threads", str(threads),
+           "--input", bin_glob,
+           "--output-directory", output_dir,
+           "--extension", extension]
+    result = _run(cmd, timeout)
+    report = os.path.join(output_dir, "quality_report.tsv")
+    hq, mq = [], []
+    if os.path.exists(report):
+        import csv
+        with open(report) as f:
+            for row in csv.DictReader(f, delimiter="\t"):
+                try:
+                    comp = float(row.get("Completeness", 0))
+                    cont = float(row.get("Contamination", 100))
+                except ValueError:
+                    continue
+                if comp >= 90 and cont <= 5:
+                    hq.append(row["Name"])
+                elif comp >= 50 and cont <= 10:
+                    mq.append(row["Name"])
+    result.update({"quality_report_tsv": report,
+                   "high_quality_bins": hq,
+                   "medium_quality_bins": mq,
+                   "output_dir": output_dir})
+    return result
 
 
-def run_prodigal(
-    input_fasta: str,
-    output_dir: str,
-    mode: str = "meta",
-    output_format: str = "gff",
+# ── Taxonomic classification ──────────────────────────────────────────────────
+
+def run_kraken2(
+    reads: List[str],
+    db_path: str,
+    output_prefix: str,
+    *,
+    paired: bool = False,
+    gzip_compressed: bool = False,
+    confidence: float = 0.0,
+    threads: int = 4,
+    timeout: int = 3600,
 ) -> Dict[str, Any]:
-    """
-    Run Prodigal for ab-initio gene prediction in prokaryotic sequences.
-    mode: 'meta' (metagenomics), 'single' (isolated genome), 'anon' (anonymous sequences).
-    Returns dict with gene predictions GFF/GBK, protein FASTA, and nucleotide FASTA.
-    """
-    out = _ensure_dir(output_dir)
-    stem = Path(input_fasta).stem
-    coords_file = str(out / f"{stem}.{output_format}")
-    proteins_faa = str(out / f"{stem}_proteins.faa")
-    genes_fna = str(out / f"{stem}_genes.fna")
+    """Kraken2 k-mer taxonomic classification."""
+    out_dir = os.path.dirname(output_prefix) or "."
+    _mkdir(out_dir)
+    kraken_out = f"{output_prefix}.kraken"
+    report     = f"{output_prefix}_report.txt"
+    cmd = [_which("kraken2"), "--db", db_path,
+           "--threads", str(threads),
+           "--output", kraken_out,
+           "--report", report,
+           "--confidence", str(confidence)]
+    if gzip_compressed:
+        cmd.append("--gzip-compressed")
+    if paired:
+        cmd.append("--paired")
+    cmd += reads
+    result = _run(cmd, timeout)
+    # parse classified count from stderr
+    classified = unclassified = 0
+    for line in result["stderr"].splitlines():
+        if "sequences classified" in line:
+            classified = int(line.split()[0].replace(",", ""))
+        elif "sequences unclassified" in line:
+            unclassified = int(line.split()[0].replace(",", ""))
+    result.update({"kraken_output": kraken_out, "report_txt": report,
+                   "classified_count": classified,
+                   "unclassified_count": unclassified})
+    return result
 
-    cmd = ["prodigal", "-i", input_fasta, "-p", mode,
-           "-f", output_format, "-o", coords_file,
-           "-a", proteins_faa, "-d", genes_fna]
 
-    proc = _run(cmd)
-    _assert_ok(proc, "Prodigal")
+def run_sylph(
+    reads: List[str],
+    output_prefix: str,
+    *,
+    db_path: Optional[str] = None,
+    threads: int = 4,
+    min_ani: float = 0.95,
+    timeout: int = 300,
+) -> Dict[str, Any]:
+    """Sylph sketch-based metagenomic profiling."""
+    sketch = f"{output_prefix}.sylsp"
+    r1 = _run([_which("sylph"), "sketch"] + reads + ["-o", sketch], 120)
+    result = {"sketch": sketch, "sketch_ok": r1["ok"]}
+    if db_path and r1["ok"]:
+        profile = f"{output_prefix}_profile.tsv"
+        r2 = _run([_which("sylph"), "profile", sketch,
+                   "-d", db_path, "-t", str(threads),
+                   "--min-ani", str(min_ani), "-o", profile], timeout)
+        result.update({"profile_tsv": profile, **r2})
+    return result
 
-    return {
-        "coords_file": coords_file,
-        "proteins_faa": proteins_faa,
-        "genes_fna": genes_fna,
-        "stdout": proc.stdout,
-    }
+
+def run_kaiju(
+    reads: List[str],
+    db_path: str,
+    output_prefix: str,
+    *,
+    paired: bool = False,
+    threads: int = 4,
+    taxon_rank: str = "species",
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    """Kaiju protein-level taxonomic classification."""
+    nodes_dmp = os.path.join(db_path, "nodes.dmp")
+    names_dmp = os.path.join(db_path, "names.dmp")
+    fmi_files = glob.glob(os.path.join(db_path, "*.fmi"))
+    if not fmi_files:
+        raise FileNotFoundError(f"No .fmi database found in {db_path}")
+    fmi = fmi_files[0]
+    out_txt = f"{output_prefix}.txt"
+    summary = f"{output_prefix}_summary.tsv"
+
+    cmd = [_which("kaiju"), "-t", nodes_dmp, "-f", fmi,
+           "-z", str(threads), "-o", out_txt]
+    if paired and len(reads) == 2:
+        cmd += ["-i", reads[0], "-j", reads[1]]
+    else:
+        cmd += ["-i", reads[0]]
+    result = _run(cmd, timeout)
+
+    if result["ok"]:
+        _run([_which("kaiju2table"),
+              "-t", nodes_dmp, "-n", names_dmp,
+              "-r", taxon_rank, "-o", summary, out_txt], 120)
+
+    result.update({"classification_txt": out_txt, "summary_tsv": summary})
+    return result
+
+
+# ── Functional annotation ─────────────────────────────────────────────────────
+
+def run_hmmer(
+    proteins_faa: str,
+    hmm_db: str,
+    output_prefix: str,
+    *,
+    mode: str = "hmmscan",
+    evalue: float = 1e-5,
+    threads: int = 4,
+    timeout: int = 600,
+) -> Dict[str, Any]:
+    """HMMER profile HMM protein family annotation."""
+    tblout   = f"{output_prefix}_tblout.tsv"
+    domtblout = f"{output_prefix}_domtblout.tsv"
+    out_dir = os.path.dirname(output_prefix) or "."
+    _mkdir(out_dir)
+
+    if mode not in ("hmmscan", "hmmsearch"):
+        raise ValueError("mode must be 'hmmscan' or 'hmmsearch'")
+    # hmmscan: protein vs HMM db  |  hmmsearch: HMM vs protein db
+    if mode == "hmmscan":
+        cmd = [_which("hmmscan"), "--tblout", tblout, "--domtblout", domtblout,
+               "--cpu", str(threads), "-E", str(evalue), hmm_db, proteins_faa]
+    else:
+        cmd = [_which("hmmsearch"), "--tblout", tblout, "--domtblout", domtblout,
+               "--cpu", str(threads), "-E", str(evalue), hmm_db, proteins_faa]
+    result = _run(cmd, timeout)
+    # count non-comment lines in tblout
+    hit_count = 0
+    if os.path.exists(tblout):
+        with open(tblout) as f:
+            hit_count = sum(1 for l in f if not l.startswith("#") and l.strip())
+    result.update({"tblout_tsv": tblout, "domtblout_tsv": domtblout, "hit_count": hit_count})
+    return result
+
+
+def run_eggnog(
+    proteins_faa: str,
+    output_prefix: str,
+    data_dir: str,
+    *,
+    threads: int = 4,
+    evalue: float = 1e-3,
+    score: float = 60.0,
+    tax_scope: str = "auto",
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    """EggNOG-mapper orthology-based functional annotation."""
+    out_dir = os.path.dirname(output_prefix) or "."
+    _mkdir(out_dir)
+    cmd = [_which("emapper.py"),
+           "-i", proteins_faa,
+           "-o", os.path.basename(output_prefix),
+           "--output_dir", out_dir,
+           "--cpu", str(threads),
+           "--data_dir", data_dir,
+           "--evalue", str(evalue),
+           "--score", str(score),
+           "--tax_scope", tax_scope,
+           "--override"]
+    result = _run(cmd, timeout)
+    ann = f"{output_prefix}.emapper.annotations"
+    result.update({"annotations_tsv": ann,
+                   "exists": os.path.exists(ann),
+                   "output_dir": out_dir})
+    return result
 
 
 def run_diamond(
-    query_fasta: str,
+    query: str,
     db_path: str,
-    output_dir: str,
+    output_file: str,
+    *,
     mode: str = "blastp",
-    threads: int = 8,
-    max_target_seqs: int = 5,
     evalue: float = 1e-5,
-    output_format: str = "6 qseqid sseqid pident length evalue bitscore stitle",
-    extra_args: str = "",
+    threads: int = 4,
+    top: int = 1,
+    outfmt: int = 6,
+    timeout: int = 1800,
 ) -> Dict[str, Any]:
-    """
-    Run DIAMOND for ultra-fast protein/translated nucleotide sequence alignment.
-    mode: 'blastp' (protein vs protein DB) or 'blastx' (nucleotide vs protein DB).
-    db_path: pre-built DIAMOND database (.dmnd). Use 'diamond makedb' to create.
-    Returns dict with hits_tsv and summary statistics.
-    """
-    out = _ensure_dir(output_dir)
-    hits_tsv = str(out / "diamond_hits.tsv")
-
-    cmd = ["diamond", mode, "-d", db_path, "-q", query_fasta,
-           "-o", hits_tsv, "-p", str(threads),
-           "-k", str(max_target_seqs), "-e", str(evalue),
-           "--outfmt"] + output_format.split()
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd, timeout=14400)
-    _assert_ok(proc, "DIAMOND")
-
-    n_hits = 0
-    try:
-        with open(hits_tsv) as f:
-            n_hits = sum(1 for _ in f)
-    except Exception:
-        pass
-
-    # ISSUE-5: quality_gate uses "hit_rate_pct" — derive from DIAMOND stdout
-    # DIAMOND reports "X queries aligned" in its output
-    import re as _re
-    hit_rate_pct: Optional[float] = None
-    _m = _re.search(r"(\d+)\s+queries\s+aligned", proc.stdout or "", _re.IGNORECASE)
-    _total = _re.search(r"(\d+)\s+queries\s+(?:total|processed)", proc.stdout or "", _re.IGNORECASE)
-    if _m and _total:
-        try:
-            _aligned = int(_m.group(1))
-            _tot = int(_total.group(1))
-            hit_rate_pct = round(100.0 * _aligned / _tot, 2) if _tot > 0 else 0.0
-        except (ValueError, ZeroDivisionError):
-            pass
-
-    return {
-        "hits_tsv": hits_tsv,
-        "n_hits": n_hits,
-        "hit_rate_pct": hit_rate_pct,       # consumed by quality_gate run_diamond gate
-        "stdout": proc.stdout,
-    }
-
-
-def run_hmmer(
-    query_fasta: str,
-    hmm_db: str,
-    output_dir: str,
-    threads: int = 8,
-    evalue: float = 1e-5,
-    program: str = "hmmsearch",
-) -> Dict[str, Any]:
-    """
-    Run HMMER for protein family annotation using hidden Markov model profiles.
-    program: 'hmmsearch' (query=HMM, target=sequences) or 'hmmscan' (reverse).
-    hmm_db: path to HMM profile database (e.g. Pfam-A.hmm, TIGRFAM).
-    Returns dict with domtblout, tblout, and n_hits.
-    """
-    out = _ensure_dir(output_dir)
-    tblout = str(out / "hmmer_tblout.txt")
-    domtblout = str(out / "hmmer_domtblout.txt")
-    stdout_file = str(out / "hmmer_stdout.txt")
-
-    cmd = [program, "--cpu", str(threads), "-E", str(evalue),
-           "--tblout", tblout, "--domtblout", domtblout,
-           hmm_db, query_fasta]
-
-    proc = _run(cmd, timeout=14400)
-    _assert_ok(proc, f"HMMER/{program}")
-
-    with open(stdout_file, "w") as f:
-        f.write(proc.stdout)
-
-    n_hits = 0
-    try:
-        with open(tblout) as f:
-            n_hits = sum(1 for l in f if not l.startswith("#"))
-    except Exception:
-        pass
-
-    return {"tblout": tblout, "domtblout": domtblout, "n_hits": n_hits}
+    """DIAMOND fast protein alignment."""
+    if mode not in ("blastp", "blastx"):
+        raise ValueError("mode must be 'blastp' or 'blastx'")
+    _mkdir(os.path.dirname(output_file) or ".")
+    cmd = [_which("diamond"), mode,
+           "-q", query, "-d", db_path, "-o", output_file,
+           "--outfmt", str(outfmt),
+           "-p", str(threads),
+           "--evalue", str(evalue),
+           "--top", str(top)]
+    result = _run(cmd, timeout)
+    hit_count = 0
+    if os.path.exists(output_file):
+        with open(output_file) as f:
+            hit_count = sum(1 for l in f if l.strip())
+    result.update({"hits_tsv": output_file, "hit_count": hit_count})
+    return result
 
 
 def run_humann3(
     input_reads: str,
     output_dir: str,
+    *,
     threads: int = 4,
     nucleotide_db: Optional[str] = None,
     protein_db: Optional[str] = None,
-    bypass_nucleotide_search: bool = False,
-    extra_args: str = "",
+    taxonomic_profile: Optional[str] = None,
+    timeout: int = 7200,
 ) -> Dict[str, Any]:
-    """
-    Run HUMAnN3 for functional profiling of metagenomes (gene families, pathways).
-    Produces pathway abundance, pathway coverage, and gene family tables.
-    Input can be FASTQ reads or pre-classified sequences from MetaPhlAn.
-    Returns dict with pathabundance, pathcoverage, genefamilies TSV paths.
-    """
-    out = _ensure_dir(output_dir)
-    cmd = ["humann", "--input", input_reads, "--output", str(out),
+    """HUMAnN3 functional profiling of metagenomes."""
+    _mkdir(output_dir)
+    cmd = [_which("humann"),
+           "--input", input_reads,
+           "--output", output_dir,
            "--threads", str(threads)]
     if nucleotide_db:
         cmd += ["--nucleotide-database", nucleotide_db]
     if protein_db:
         cmd += ["--protein-database", protein_db]
-    if bypass_nucleotide_search:
-        cmd += ["--bypass-nucleotide-search"]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    proc = _run(cmd, timeout=21600)
-    _assert_ok(proc, "HUMAnN3")
-
-    stem = Path(input_reads).stem.replace(".fastq", "").replace(".fq", "")
-
-    # ISSUE-6: quality_gate uses "mapped_reads_pct" — parse from HUMAnN3 stdout
-    import re as _re
-    mapped_reads_pct: Optional[float] = None
-    _m = _re.search(
-        r"(\d+(?:\.\d+)?)\s*%.*reads.*(?:mapped|aligned|classified)",
-        proc.stdout or "", _re.IGNORECASE
-    )
-    if not _m:
-        _m = _re.search(
-            r"Total reads mapped\s*:\s*(\d+(?:\.\d+)?)\s*%",
-            proc.stdout or "", _re.IGNORECASE
-        )
-    if _m:
-        try:
-            mapped_reads_pct = float(_m.group(1))
-        except ValueError:
-            pass
-
-    return {
-        "pathabundance_tsv": str(out / f"{stem}_pathabundance.tsv"),
-        "pathcoverage_tsv": str(out / f"{stem}_pathcoverage.tsv"),
-        "genefamilies_tsv": str(out / f"{stem}_genefamilies.tsv"),
-        "output_dir": str(out),
-        "mapped_reads_pct": mapped_reads_pct,   # consumed by quality_gate run_humann3 gate
-        "stdout": proc.stdout[-2000:],
-    }
-
-
-# ===========================================================================
-# AMR & VIRULENCE
-# ===========================================================================
-
-def run_amrfinderplus(
-    input_fasta: str,
-    output_dir: str,
-    organism: Optional[str] = None,
-    threads: int = 4,
-    db_path: Optional[str] = None,
-    protein: bool = True,
-) -> Dict[str, Any]:
-    """
-    Run NCBI AMRFinderPlus to identify antimicrobial resistance genes (ARGs),
-    stress response genes, and virulence factors in genomic sequences.
-    organism: restrict to organism-specific point mutations (e.g. 'Escherichia', 'Klebsiella').
-    protein=True: input is protein FASTA; False: nucleotide.
-    Returns dict with amr_report_tsv and n_hits.
-    """
-    out = _ensure_dir(output_dir)
-    report = str(out / "amrfinderplus_report.tsv")
-
-    flag = "-p" if protein else "-n"
-    cmd = ["amrfinder", flag, input_fasta, "-o", report,
-           "--threads", str(threads), "--plus"]
-    if organism:
-        cmd += ["--organism", organism]
-    if db_path:
-        cmd += ["--database", db_path]
-
-    proc = _run(cmd, timeout=7200)
-    _assert_ok(proc, "AMRFinderPlus")
-
-    n_hits = 0
-    try:
-        with open(report) as f:
-            n_hits = sum(1 for l in f if not l.startswith("Protein")) - 1
-    except Exception:
-        pass
-
-
-
-    return {"amr_report_tsv": report, "n_hits": max(0, n_hits), "stdout": proc.stdout}
-
-
-def run_rgi_card(
-    input_fasta: str,
-    output_dir: str,
-    input_type: str = "contig",
-    alignment_tool: str = "BLAST",
-    db_path: Optional[str] = None,
-    threads: int = 4,
-    low_quality: bool = False,
-) -> Dict[str, Any]:
-    """
-    Run RGI (Resistance Gene Identifier) against the CARD (Comprehensive Antibiotic
-    Resistance Database) to detect ARGs in assembled contigs or protein sequences.
-    input_type: 'contig', 'protein', 'read'.
-    Returns dict with rgi_tsv, json_report, and n_hits.
-    """
-    out = _ensure_dir(output_dir)
-    prefix = str(out / "rgi_output")
-
-    cmd = ["rgi", "main", "-i", input_fasta, "-o", prefix,
-           "-t", input_type, "-a", alignment_tool,
-           "-n", str(threads), "--clean"]
-    if db_path:
-        cmd = ["rgi", "load", "--card_json", db_path] + cmd[1:]
-    if low_quality:
-        cmd += ["--low_quality"]
-
-    proc = _run(cmd, timeout=7200)
-    _assert_ok(proc, "RGI/CARD")
-
-    tsv = prefix + ".txt"
-    json_r = prefix + ".json"
-    n_hits = 0
-    try:
-        with open(tsv) as f:
-            n_hits = sum(1 for l in f if not l.startswith("ORF_ID")) - 1
-    except Exception:
-        pass
-
-
-
-    return {
-        "rgi_tsv": tsv if Path(tsv).exists() else None,
-        "json_report": json_r if Path(json_r).exists() else None,
-        "n_hits": max(0, n_hits),
-    }
-
-
-# ===========================================================================
-# MICROBIOME STATISTICS & VISUALIZATION
-# ===========================================================================
-
-def run_microbiome_diversity(
-    abundance_table: str,
-    output_dir: str,
-    sample_metadata: Optional[str] = None,
-    grouping_column: Optional[str] = None,
-    metrics: List[str] = None,
-) -> Dict[str, Any]:
-    """
-    Compute alpha and beta diversity metrics for microbiome community data.
-    Requires scikit-bio, pandas, matplotlib (available in bio-agent-env1).
-    abundance_table: TSV/CSV with taxa as rows, samples as columns (or transposed).
-    sample_metadata: optional TSV with sample metadata for group comparisons.
-    metrics: list from ['shannon', 'observed_otus', 'faith_pd', 'bray_curtis', 'jaccard'].
-    Returns dict with alpha_tsv, beta_tsv, and diversity plots.
-    """
-    if metrics is None:
-        metrics = ["shannon", "observed_otus", "bray_curtis"]
-
-    out = _ensure_dir(output_dir)
-
-    script = f"""
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import json, os, warnings
-warnings.filterwarnings('ignore')
-
-out_dir = "{str(out)}"
-os.makedirs(out_dir, exist_ok=True)
-
-df = pd.read_csv("{abundance_table}", sep='\\t', index_col=0)
-if df.shape[1] > df.shape[0]:
-    df = df.T
-
-results = {{"alpha": {{}}, "files": {{}}, "metrics_computed": {list(metrics)}}}
-
-# ---- Alpha diversity ----
-from scipy.stats import entropy as sp_entropy
-
-alpha_rows = []
-for sample in df.columns:
-    counts = df[sample].values.astype(float)
-    counts = counts[counts > 0]
-    row = {{"sample": sample}}
-    if "shannon" in {list(metrics)}:
-        props = counts / counts.sum()
-        row["shannon"] = float(-np.sum(props * np.log(props)))
-    if "observed_otus" in {list(metrics)}:
-        row["observed_otus"] = int((counts > 0).sum())
-    alpha_rows.append(row)
-
-alpha_df = pd.DataFrame(alpha_rows).set_index("sample")
-alpha_tsv = os.path.join(out_dir, "alpha_diversity.tsv")
-alpha_df.to_csv(alpha_tsv, sep='\\t')
-results["files"]["alpha_tsv"] = alpha_tsv
-
-# ---- Alpha boxplot ----
-if "shannon" in alpha_df.columns:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(range(len(alpha_df)), alpha_df["shannon"].values)
-    ax.set_xticks(range(len(alpha_df)))
-    ax.set_xticklabels(alpha_df.index.tolist(), rotation=45, ha='right')
-    ax.set_ylabel("Shannon Index")
-    ax.set_title("Alpha Diversity (Shannon)")
-    plt.tight_layout()
-    plot_alpha = os.path.join(out_dir, "alpha_diversity_shannon.png")
-    plt.savefig(plot_alpha, dpi=150)
-    plt.close()
-    results["files"]["alpha_plot"] = plot_alpha
-
-# ---- Beta diversity (Bray-Curtis) ----
-if "bray_curtis" in {list(metrics)}:
-    from scipy.spatial.distance import braycurtis
-    samples = df.columns.tolist()
-    n = len(samples)
-    bc_matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i+1, n):
-            d = braycurtis(df.iloc[:, i].values, df.iloc[:, j].values)
-            bc_matrix[i, j] = d
-            bc_matrix[j, i] = d
-    bc_df = pd.DataFrame(bc_matrix, index=samples, columns=samples)
-    beta_tsv = os.path.join(out_dir, "beta_bray_curtis.tsv")
-    bc_df.to_csv(beta_tsv, sep='\\t')
-    results["files"]["beta_tsv"] = beta_tsv
-
-    # Heatmap
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(bc_matrix, cmap='Blues', aspect='auto')
-    ax.set_xticks(range(n))
-    ax.set_yticks(range(n))
-    ax.set_xticklabels(samples, rotation=45, ha='right')
-    ax.set_yticklabels(samples)
-    plt.colorbar(im, ax=ax, label='Bray-Curtis Distance')
-    ax.set_title("Beta Diversity (Bray-Curtis)")
-    plt.tight_layout()
-    heatmap_path = os.path.join(out_dir, "beta_bray_curtis_heatmap.png")
-    plt.savefig(heatmap_path, dpi=150)
-    plt.close()
-    results["files"]["beta_heatmap"] = heatmap_path
-
-with open(os.path.join(out_dir, "diversity_results.json"), "w") as f:
-    json.dump(results, f, indent=2)
-print(json.dumps(results))
-"""
-    script_path = str(out / "_diversity_script.py")
-    with open(script_path, "w") as f:
-        f.write(script)
-
-    proc = _run(["python", script_path], env_name=_BIO_ENV)
-    _assert_ok(proc, "microbiome_diversity")
-    Path(script_path).unlink(missing_ok=True)
-
-    try:
-        result = json.loads(proc.stdout)
-    except Exception:
-        result = {"output_dir": str(out), "stdout": proc.stdout}
-
-    result["output_dir"] = str(out)
+    if taxonomic_profile:
+        cmd += ["--taxonomic-profile", taxonomic_profile]
+    result = _run(cmd, timeout)
+    base = os.path.splitext(os.path.basename(input_reads))[0].replace(".fastq", "").replace(".gz", "")
+    result.update({
+        "genefamilies_tsv": os.path.join(output_dir, f"{base}_genefamilies.tsv"),
+        "pathabundance_tsv": os.path.join(output_dir, f"{base}_pathabundance.tsv"),
+        "pathcoverage_tsv": os.path.join(output_dir, f"{base}_pathcoverage.tsv"),
+        "output_dir": output_dir,
+    })
     return result
 
 
-# =============================================================================
-# Phase 5: Advanced Statistical Methods (Publication-Grade)
-# =============================================================================
+# ── Specialized annotation ────────────────────────────────────────────────────
 
-def run_permanova(
-    distance_matrix_tsv: str,
-    metadata_tsv: str,
-    group_column: str,
+def run_antismash(
+    input_fasta: str,
     output_dir: str,
-    permutations: int = 9999,
-    strata_column: Optional[str] = None,
-) -> dict:
-    """
-    Run PERMANOVA via R vegan::adonis2() to test if communities differ between groups.
+    *,
+    taxon: str = "bacteria",
+    threads: int = 4,
+    genefinding_tool: str = "prodigal-m",
+    minimal: bool = False,
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """antiSMASH biosynthetic gene cluster detection."""
+    _mkdir(output_dir)
+    cmd = [_which("antismash"),
+           "--taxon", taxon,
+           "--output-dir", output_dir,
+           "--genefinding-tool", genefinding_tool,
+           "--cpus", str(threads)]
+    if minimal:
+        cmd.append("--minimal")
+    cmd.append(input_fasta)
+    result = _run(cmd, timeout)
+    # count regions from region files
+    regions = glob.glob(os.path.join(output_dir, "*.region*.gbk"))
+    bgc_types: List[str] = []
+    for r in regions:
+        name = os.path.basename(r)
+        if "." in name:
+            bgc_types.append(name.split(".")[-2] if len(name.split(".")) > 2 else "unknown")
+    result.update({"html_report": os.path.join(output_dir, "index.html"),
+                   "bgc_count": len(regions),
+                   "bgc_types": list(set(bgc_types)),
+                   "output_dir": output_dir})
+    return result
 
-    Parameters
-    ----------
-    distance_matrix_tsv : Path to symmetric TSV distance matrix (sample x sample)
-    metadata_tsv        : Sample metadata TSV (sample IDs as first column)
-    group_column        : Column in metadata to test (e.g. "treatment")
-    output_dir          : Directory to write results
-    permutations        : Number of permutations (default 9999)
-    strata_column       : Optional stratification column (e.g. "patient_id")
 
-    Returns dict with: permanova_tsv, r2, p_value, f_statistic, output_dir
-    """
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def run_genomad(
+    contigs_fasta: str,
+    output_dir: str,
+    db_path: str,
+    *,
+    threads: int = 4,
+    splits: int = 8,
+    min_score: float = 0.7,
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    """geNomad virus/plasmid identification."""
+    _mkdir(output_dir)
+    cmd = [_which("genomad"), "end-to-end", "--cleanup",
+           "--splits", str(splits),
+           "--threads", str(threads),
+           contigs_fasta, output_dir, db_path]
+    result = _run(cmd, timeout)
+    base = os.path.splitext(os.path.basename(contigs_fasta))[0]
+    sub = os.path.join(output_dir, f"{base}_summary")
+    virus_tsv   = os.path.join(sub, f"{base}_virus_summary.tsv")
+    plasmid_tsv = os.path.join(sub, f"{base}_plasmid_summary.tsv")
+    def _count(tsv: str) -> int:
+        if not os.path.exists(tsv):
+            return 0
+        with open(tsv) as f:
+            return sum(1 for l in f if not l.startswith("seq_name") and l.strip())
+    result.update({"virus_summary_tsv": virus_tsv,
+                   "plasmid_summary_tsv": plasmid_tsv,
+                   "virus_count": _count(virus_tsv),
+                   "plasmid_count": _count(plasmid_tsv)})
+    return result
 
-    strata_line = f"strata = metadata${strata_column}," if strata_column else ""
-    r_script = f"""
-library(vegan); library(data.table)
-dist_mat <- as.dist(as.matrix(fread("{distance_matrix_tsv}", header=TRUE, row.names=1)))
-metadata <- as.data.frame(fread("{metadata_tsv}", header=TRUE))
-rownames(metadata) <- metadata[,1]
-result <- adonis2(dist_mat ~ {group_column}, data=metadata, permutations={permutations}, {strata_line}method="bray")
-out_df <- as.data.frame(result); out_df$Statistic <- rownames(out_df)
-write.table(out_df, "{out}/permanova_results.tsv", sep="\\t", quote=FALSE, row.names=FALSE)
-cat(sprintf('{{"r2":%f,"f_statistic":%f,"p_value":%f}}',
-    result["Model","R2"], result["Model","F"], result["Model","Pr(>F)"]))
-"""
-    s = str(out / "_permanova.R")
-    Path(s).write_text(r_script)
-    proc = _run(["Rscript", s], env_name=_META_ENV)
-    _assert_ok(proc, "permanova")
-    Path(s).unlink(missing_ok=True)
-    try:
-        stats = json.loads(proc.stdout.strip().split("\n")[-1])
-    except Exception:
-        stats = {}
-    return {
-        "permanova_tsv": str(out / "permanova_results.tsv"),
-        "r2": stats.get("r2"), "p_value": stats.get("p_value"),
-        "f_statistic": stats.get("f_statistic"),
-        "group_column": group_column, "permutations": permutations,
-        "output_dir": str(out),
-    }
+
+def run_abricate(
+    contigs_fasta: str,
+    output_file: str,
+    *,
+    db: str = "resfinder",
+    minid: float = 80.0,
+    mincov: float = 80.0,
+    timeout: int = 300,
+) -> Dict[str, Any]:
+    """ABRicate AMR/virulence gene screening."""
+    _mkdir(os.path.dirname(output_file) or ".")
+    valid_dbs = {"resfinder", "card", "ncbi", "argannot", "vfdb", "plasmidfinder", "ecoh"}
+    if db not in valid_dbs:
+        raise ValueError(f"db must be one of {valid_dbs}")
+    cmd = [_which("abricate"), "--db", db,
+           "--minid", str(minid), "--mincov", str(mincov),
+           contigs_fasta]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    with open(output_file, "w") as f:
+        f.write(res.stdout)
+    gene_count = sum(1 for l in res.stdout.splitlines()
+                     if l.strip() and not l.startswith("#FILE"))
+    genes = [l.split("\t")[4] for l in res.stdout.splitlines()
+             if l.strip() and not l.startswith("#") and len(l.split("\t")) > 4]
+    return {"ok": res.returncode == 0, "returncode": res.returncode,
+            "results_tsv": output_file, "gene_count": gene_count,
+            "resistance_genes": list(set(genes)),
+            "stdout": res.stdout, "stderr": res.stderr}
+
+
+# ── Sequence manipulation ─────────────────────────────────────────────────────
+
+def run_seqkit(
+    subcommand: str,
+    input_files: List[str],
+    *,
+    output_file: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
+    threads: int = 4,
+    timeout: int = 120,
+) -> Dict[str, Any]:
+    """SeqKit FASTA/FASTQ manipulation toolkit."""
+    cmd = [_which("seqkit"), subcommand, "--threads", str(threads)]
+    if extra_args:
+        cmd += extra_args
+    cmd += input_files
+    if output_file:
+        cmd += ["-o", output_file]
+    result = _run(cmd, timeout)
+    if output_file:
+        result["output_file"] = output_file
+    return result
+
+
+def run_bbduk(
+    input_reads: List[str],
+    output_reads: List[str],
+    *,
+    ref: str = "adapters",
+    ktrim: str = "r",
+    qtrim: str = "r",
+    trimq: int = 20,
+    minlen: int = 50,
+    threads: int = 4,
+    timeout: int = 300,
+) -> Dict[str, Any]:
+    """BBDuk adapter trimming and quality filtering."""
+    cmd = [_which("bbduk.sh")]
+    if len(input_reads) == 2:
+        cmd += [f"in1={input_reads[0]}", f"in2={input_reads[1]}",
+                f"out1={output_reads[0]}", f"out2={output_reads[1]}",
+                "tpe", "tbo"]
+    else:
+        cmd += [f"in={input_reads[0]}", f"out={output_reads[0]}"]
+    cmd += [f"ref={ref}", f"ktrim={ktrim}", "k=23", "mink=11", "hdist=1",
+            f"qtrim={qtrim}", f"trimq={trimq}", f"minlen={minlen}",
+            f"threads={threads}"]
+    result = _run(cmd, timeout)
+    # parse stats from stderr
+    stats: Dict[str, str] = {}
+    for line in result["stderr"].splitlines():
+        if "Input:" in line or "Output:" in line or "Result:" in line:
+            stats[line.split(":")[0].strip()] = line.split(":", 1)[-1].strip()
+    result["stats"] = stats
+    return result
+
+
+# ── CAZyme annotation ─────────────────────────────────────────────────────────
+
+def run_dbcan(
+    proteins_faa: str,
+    output_dir: str,
+    db_dir: str,
+    *,
+    input_type: str = "protein",
+    tools: Optional[List[str]] = None,
+    threads: int = 4,
+    timeout: int = 600,
+) -> Dict[str, Any]:
+    """dbCAN CAZyme annotation pipeline."""
+    _mkdir(output_dir)
+    if tools is None:
+        tools = ["hmmer", "diamond"]
+    cmd = [_which("run_dbcan.py"), proteins_faa, input_type,
+           "--out_dir", output_dir, "--db_dir", db_dir,
+           "--tools"] + tools + ["-t", str(threads)]
+    result = _run(cmd, timeout)
+    overview = os.path.join(output_dir, "overview.txt")
+    cazymes: Dict[str, int] = {}
+    if os.path.exists(overview):
+        with open(overview) as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 3 and not line.startswith("Gene"):
+                    fam = parts[2]
+                    cazymes[fam] = cazymes.get(fam, 0) + 1
+    result.update({"overview_tsv": overview,
+                   "cazyme_count": sum(cazymes.values()),
+                   "families": cazymes})
+    return result
+
+
+# ── Phage annotation ──────────────────────────────────────────────────────────
+
+def run_pharokka(
+    input_fasta: str,
+    output_dir: str,
+    db_dir: str,
+    *,
+    threads: int = 4,
+    gene_predictor: str = "phanotate",
+    force: bool = True,
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    """Pharokka phage genome annotation."""
+    _mkdir(output_dir)
+    cmd = [_which("pharokka.py"),
+           "-i", input_fasta,
+           "-o", output_dir,
+           "-d", db_dir,
+           "-t", str(threads),
+           "-g", gene_predictor]
+    if force:
+        cmd.append("-f")
+    result = _run(cmd, timeout)
+    base = "pharokka"
+    result.update({
+        "gff": os.path.join(output_dir, f"{base}.gff"),
+        "gbk": os.path.join(output_dir, f"{base}.gbk"),
+        "phrog_summary": os.path.join(output_dir, f"{base}_top_hits_card.tsv"),
+        "output_dir": output_dir,
+    })
+    return result
+
+
+# ── Community analysis ────────────────────────────────────────────────────────
+
+def run_phyloseq(
+    otu_table: str,
+    output_dir: str,
+    *,
+    tax_table: Optional[str] = None,
+    metadata: Optional[str] = None,
+    analysis: Optional[List[str]] = None,
+    timeout: int = 300,
+) -> Dict[str, Any]:
+    """Phyloseq R microbiome analysis (alpha/beta diversity, ordination)."""
+    import shutil
+    if not shutil.which("Rscript"):
+        raise FileNotFoundError("Rscript not found on PATH.")
+    _mkdir(output_dir)
+    if analysis is None:
+        analysis = ["alpha_diversity", "beta_diversity", "ordination"]
+
+    alpha_tsv = os.path.join(output_dir, "alpha_diversity.tsv")
+    beta_tsv  = os.path.join(output_dir, "beta_diversity.tsv")
+    ord_plot  = os.path.join(output_dir, "ordination.png")
+
+    r_lines = [
+        "library(phyloseq)",
+        "library(ggplot2)",
+        f'otu <- read.table("{otu_table}", sep="\\t", header=TRUE, row.names=1)',
+        "OTU <- otu_table(as.matrix(otu), taxa_are_rows=TRUE)",
+        "ps <- phyloseq(OTU)",
+    ]
+    if tax_table:
+        r_lines += [
+            f'tax <- read.table("{tax_table}", sep="\\t", header=TRUE, row.names=1)',
+            "TAX <- tax_table(as.matrix(tax))",
+            "ps <- phyloseq(OTU, TAX)",
+        ]
+    if metadata:
+        r_lines += [
+            f'meta <- read.table("{metadata}", sep="\\t", header=TRUE, row.names=1)',
+            "SAMP <- sample_data(meta)",
+            "ps <- merge_phyloseq(ps, SAMP)",
+        ]
+    if "alpha_diversity" in analysis:
+        r_lines += [
+            "alpha <- estimate_richness(ps, measures=c('Observed','Shannon','Simpson','Chao1'))",
+            f'write.table(alpha, "{alpha_tsv}", sep="\\t", quote=FALSE)',
+        ]
+    if "beta_diversity" in analysis:
+        r_lines += [
+            "bc <- distance(ps, method='bray')",
+            f'write.table(as.matrix(bc), "{beta_tsv}", sep="\\t", quote=FALSE)',
+        ]
+    if "ordination" in analysis:
+        r_lines += [
+            "ord <- ordinate(ps, method='PCoA', distance='bray')",
+            "p <- plot_ordination(ps, ord)",
+            f'ggsave("{ord_plot}", p, width=8, height=6)',
+        ]
+
+    r_script = "\n".join(r_lines)
+    res = subprocess.run(
+        ["Rscript", "-e", r_script],
+        capture_output=True, text=True, timeout=timeout)
+    return {"ok": res.returncode == 0, "returncode": res.returncode,
+            "alpha_div_tsv": alpha_tsv if os.path.exists(alpha_tsv) else None,
+            "beta_div_tsv": beta_tsv if os.path.exists(beta_tsv) else None,
+            "ordination_plot": ord_plot if os.path.exists(ord_plot) else None,
+            "stdout": res.stdout, "stderr": res.stderr}
 
 
 def run_lefse(
-    otu_table_tsv: str,
-    metadata_tsv: str,
-    class_column: str,
-    output_dir: str,
-    subject_column: Optional[str] = None,
+    input_tsv: str,
+    output_prefix: str,
+    *,
+    class_row: int = 0,
     lda_threshold: float = 2.0,
-    alpha: float = 0.05,
-) -> dict:
-    """
-    Run LEfSe for microbial biomarker discovery (LDA + Kruskal-Wallis).
+    pvalue: float = 0.05,
+    timeout: int = 300,
+) -> Dict[str, Any]:
+    """LEfSe linear discriminant analysis for biomarker discovery."""
+    _mkdir(os.path.dirname(output_prefix) or ".")
+    formatted = f"{output_prefix}.in"
+    results   = f"{output_prefix}.res"
+    plot      = f"{output_prefix}_barplot.png"
 
-    Parameters
-    ----------
-    otu_table_tsv  : OTU/taxa table (features x samples) TSV
-    metadata_tsv   : Sample metadata TSV
-    class_column   : Column defining the class grouping
-    output_dir     : Directory to write results
-    lda_threshold  : Minimum LDA score threshold (default 2.0)
-    alpha          : Statistical significance threshold (default 0.05)
+    r1 = _run([_which("lefse_format_input.py"), input_tsv, formatted,
+               "-c", str(class_row + 1), "-s", "-1", "-u", "2",
+               "-o", "1000000"], 60)
+    if not r1["ok"]:
+        r1.update({"results_tsv": None, "significant_features": [], "plot_png": None})
+        return r1
 
-    Returns dict with: biomarkers_tsv, n_biomarkers, plot_png, output_dir
-    """
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    r2 = _run([_which("lefse_run.py"), formatted, results,
+               "-l", str(lda_threshold),
+               "--alpha", str(pvalue)], 120)
 
-    input_lefse = str(out / "lefse_input.txt")
-    result_file = str(out / "lefse_results.txt")
-    plot_file   = str(out / "lefse_biomarkers.png")
+    _run([_which("lefse_plot_res.py"), results, plot, "--format", "png"], 60)
 
-    prep = f"""
-import pandas as pd
-meta = pd.read_csv("{metadata_tsv}", sep="\\t", index_col=0)
-otu = pd.read_csv("{otu_table_tsv}", sep="\\t", index_col=0)
-common = meta.index.intersection(otu.columns)
-rows = [meta["{class_column}"].rename("class")]
-{"rows.append(meta['" + subject_column + "'].rename('subject'))" if subject_column else ""}
-rows += [otu[f] for f in otu.index if f in common]
-pd.DataFrame(rows, columns=common).to_csv("{input_lefse}", sep="\\t", header=False)
-"""
-    pp = str(out / "_lefse_prep.py"); Path(pp).write_text(prep)
-    _run(["python", pp], env_name=_META_ENV); Path(pp).unlink(missing_ok=True)
-
-    proc = _run(["lefse-run.py", input_lefse, result_file,
-                 "--lefse_alpha", str(alpha), "--lda_abs_th", str(lda_threshold)], env_name=_META_ENV)
-    _assert_ok(proc, "lefse")
-    _run(["lefse-plot_res.py", result_file, plot_file, "--format", "png"], env_name=_META_ENV)
-
-    n = 0
-    try:
-        with open(result_file) as f:
-            n = sum(1 for l in f if l.strip() and len(l.split("\t")) > 2 and l.split("\t")[2])
-    except Exception:
-        pass
-
-    return {
-        "biomarkers_tsv": result_file, "n_biomarkers": n,
-        "plot_png": plot_file if Path(plot_file).exists() else None,
-        "lda_threshold": lda_threshold, "output_dir": str(out),
-    }
+    features = []
+    if os.path.exists(results):
+        with open(results) as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 3 and parts[2]:
+                    features.append(parts[0])
+    r2.update({"results_tsv": results,
+               "significant_features": features,
+               "plot_png": plot if os.path.exists(plot) else None})
+    return r2
 
 
-def run_ancom_bc(
-    count_table_tsv: str,
-    metadata_tsv: str,
-    group_column: str,
-    output_dir: str,
-    formula: Optional[str] = None,
-    p_adj_method: str = "BH",
-    alpha: float = 0.05,
-) -> dict:
-    """
-    Run ANCOM-BC (compositional differential abundance) via R.
+# ── Coverage estimation ───────────────────────────────────────────────────────
 
-    The most rigorous library-size-corrected test for compositional microbiome data.
-    No rarefaction required.
-
-    Parameters
-    ----------
-    count_table_tsv : Raw count table (features x samples) TSV
-    metadata_tsv    : Sample metadata TSV
-    group_column    : Column defining the comparison group
-    output_dir      : Directory to write results
-    formula         : R formula string (default: group_column only)
-    p_adj_method    : P-value adjustment ("BH", "bonferroni", "holm")
-    alpha           : Significance threshold (default 0.05)
-
-    Returns dict with: results_tsv, n_significant, volcano_plot_png, output_dir
-    """
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    formula_str = formula or group_column
-
-    r_script = f"""
-suppressPackageStartupMessages({{library(ANCOMBC);library(phyloseq);library(data.table);library(ggplot2)}})
-counts <- as.matrix(fread("{count_table_tsv}", header=TRUE, row.names=1))
-meta   <- as.data.frame(fread("{metadata_tsv}", header=TRUE)); rownames(meta) <- meta[,1]; meta <- meta[,-1]
-common <- intersect(colnames(counts), rownames(meta))
-ps <- phyloseq(otu_table(counts[,common], taxa_are_rows=TRUE), sample_data(meta[common,,drop=FALSE]))
-meta(sample_data(ps))${group_column} <- as.factor(sample_data(ps)${group_column})
-out_ancom <- ancombc(phyloseq=ps, formula="{formula_str}", p_adj_method="{p_adj_method}", alpha={alpha}, verbose=FALSE)
-res <- out_ancom$res
-df <- data.frame(feature=rownames(res$lfc), lfc=res$lfc[,1], se=res$se[,1],
-                 W=res$W[,1], p_value=res$p_val[,1], p_adj=res$q_val[,1], diff_abund=res$diff_abn[,1])
-df <- df[order(df$p_adj),]
-write.table(df, "{out}/ancombc_results.tsv", sep="\\t", quote=FALSE, row.names=FALSE)
-n_sig <- sum(df$diff_abund, na.rm=TRUE)
-cat(sprintf('{{"n_significant":%d}}', n_sig))
-df$log10_padj <- -log10(df$p_adj+1e-300)
-df$sig <- ifelse(df$diff_abund, "Significant", "Not significant")
-p <- ggplot(df,aes(lfc,log10_padj,color=sig))+geom_point(size=2,alpha=0.8)+
-     scale_color_manual(values=c("Significant"="#e74c3c","Not significant"="#95a5a6"))+
-     geom_hline(yintercept=-log10({alpha}),linetype="dashed")+
-     labs(title="ANCOM-BC",x="Log Fold Change",y="-log10(adj.p)")+theme_bw()
-ggsave("{out}/ancombc_volcano.png",p,width=8,height=6,dpi=150)
-"""
-    s = str(out / "_ancombc.R"); Path(s).write_text(r_script)
-    proc = _run(["Rscript", s], env_name=_META_ENV)
-    _assert_ok(proc, "ancom_bc")
-    Path(s).unlink(missing_ok=True)
-    try:
-        n_sig = json.loads(proc.stdout.strip().split("\n")[-1]).get("n_significant", 0)
-    except Exception:
-        n_sig = 0
-    return {
-        "results_tsv": str(out / "ancombc_results.tsv"),
-        "n_significant": n_sig,
-        "volcano_plot_png": str(out / "ancombc_volcano.png"),
-        "group_column": group_column, "formula": formula_str,
-        "p_adj_method": p_adj_method, "alpha": alpha,
-        "output_dir": str(out),
-    }
+def run_nonpareil(
+    reads_file: str,
+    output_prefix: str,
+    *,
+    method: str = "kmer",
+    threads: int = 4,
+    subsample_n: int = 1000,
+    timeout: int = 600,
+) -> Dict[str, Any]:
+    """Nonpareil metagenome coverage and sequencing effort estimation."""
+    _mkdir(os.path.dirname(output_prefix) or ".")
+    fmt = "fastq" if reads_file.endswith((".fastq", ".fastq.gz", ".fq", ".fq.gz")) else "fasta"
+    cmd = [_which("nonpareil"),
+           "-s", reads_file,
+           "-T", method,
+           "-f", fmt,
+           "-b", output_prefix,
+           "-t", str(threads),
+           "-n", str(subsample_n)]
+    result = _run(cmd, timeout)
+    npo = f"{output_prefix}.npo"
+    # parse coverage from .npo if exists
+    coverage = None
+    if os.path.exists(npo):
+        with open(npo) as f:
+            for line in f:
+                if line.startswith("C\t"):
+                    try:
+                        coverage = float(line.split("\t")[1])
+                    except (IndexError, ValueError):
+                        pass
+    result.update({"npo_file": npo,
+                   "coverage_estimate": coverage,
+                   "output_prefix": output_prefix})
+    return result

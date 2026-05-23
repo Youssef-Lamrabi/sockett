@@ -1,6 +1,6 @@
 envs:
   - name: bio-agent-env1
-    description: "General-purpose Python 3.11 agent environment (LLM + analytics + notebooks). Default env for Python/R scripts, data processing, visualization, and NCBI downloads."
+    description: "General-purpose Python 3.11 agent environment (LLM + analytics + notebooks)."
     spec: "default-agent.yaml"
     python: "3.11"
     provides_bins:
@@ -8,8 +8,6 @@ envs:
       - pip
       - jupyter
       - jupyter-notebook
-      - ncbi-genome-download
-      - Rscript
     provides_py:
       - numpy==2.1
       - pandas
@@ -17,6 +15,7 @@ envs:
       - scipy
       - statsmodels
       - scikit-learn
+      - gradio
       - langchain
       - langgraph==0.3.18
       - langchain-openai
@@ -40,92 +39,58 @@ envs:
       - mcp
       - tooluniverse
       - python-dotenv
-      - biopython
-      - faiss-cpu
-      - sentence-transformers
-    provides_r:
-      - ggplot2
-      - vegan
-      - phyloseq
-      - DESeq2
-      - edgeR
+    provides_r: []
 
   - name: meta-env1
-    description: "Metagenomics specialized environment. Contains ALL metagenomics CLI tools: fastp, FastQC, MultiQC, NanoStat, metaSPAdes, MEGAHIT, Flye, Racon, Medaka, Unicycler, minimap2, Bowtie2, samtools, Kraken2, Bracken, MetaPhlAn4, GTDB-Tk, Krona, MetaBAT2, DAS_Tool, CheckM2, Prokka, Prodigal, DIAMOND, HMMER, HUMAnN3, AMRFinderPlus, RGI. Use for any metagenomics pipeline step including long-read (ONT) pipelines: Flye → Racon → Medaka → CheckM2."
-    spec: "metagenomics-env.yaml"
-    python: "3.11"
+    description: "Metagenomics CLI stack: binning, taxonomy, functional annotation, QC."
+    spec: "meta-env1.yaml"
+    python: "3.10"
     provides_bins:
-      # QC
-      - fastp
-      - fastqc
-      - multiqc
-      - NanoStat
-      - NanoPlot
-      - trim_galore
-      # Assembly
-      - metaspades.py
-      - spades.py
-      - megahit
-      - flye
-      - racon
-      - medaka_consensus
-      - unicycler
-      # Mapping
-      - minimap2
-      - bowtie2
-      - bowtie2-build
-      - bwa
-      - bwa-mem2
-      - samtools
-      - bedtools
-      # Taxonomic classification
-      - kraken2
-      - kraken2-build
-      - bracken
-      - metaphlan
-      - gtdbtk
-      - ktImportTaxonomy
-      - ktImportText
-      # Binning
-      - metabat2
-      - jgi_summarize_bam_contig_depths
-      - DAS_Tool
-      - das_tool
+      - quast.py
+      - SemiBin2
+      - concoct
+      - cut_up_fasta.py
+      - concoct_coverage_table.py
+      - merge_cutup_clustering.py
+      - extract_fasta_bins.py
+      - run_MaxBin2.pl
       - checkm2
-      # Annotation
-      - prokka
-      - prodigal
-      - diamond
-      - hmmsearch
+      - kraken2
+      - sylph
+      - kaiju
+      - kaiju2table
       - hmmscan
+      - hmmsearch
       - hmmpress
+      - emapper.py
+      - diamond
       - humann
       - humann_renorm_table
-      - humann_join_tables
-      # AMR / Virulence
-      - amrfinder
-      - amrfinderplus
-      - rgi
-      # SRA tools
-      - prefetch
-      - fasterq-dump
-      - fastq-dump
-      # Utils
-      - seqtk
-      - pigz
-      - parallel
+      - antismash
+      - genomad
+      - abricate
+      - seqkit
+      - bbduk.sh
+      - run_dbcan.py
+      - pharokka.py
+      - lefse_format_input.py
+      - lefse_run.py
+      - lefse_plot_res.py
+      - nonpareil
+      - Rscript
     provides_py:
+      - biopython
       - numpy
       - pandas
       - matplotlib
       - scipy
-      - seaborn
-      - biopython
-      - pysam
-    provides_r: []
+    provides_r:
+      - phyloseq
+      - ggplot2
+      - vegan
 
   - name: btools_env_py310
-    description: "Clinical genomics / HLA typing environment (Python 3.10). Contains CNVkit, BWA, samtools, bedtools, and OptiType. Use for HLA typing and CNV analysis."
+    description: "Bioinformatics CLI stack with CNVkit, BWA, samtools, bedtools, and OptiType (Python 3.10)."
     spec: "hla-tools.yaml"
     python: "3.10"
     provides_bins:
@@ -140,17 +105,4 @@ envs:
     provides_py:
       - cnvkit
       - rich
-    provides_r: []
-
-  - name: panhumanpy_env
-    description: "Environment for single cell hierarchical cell type annotation using panhumanpy and Azimuth Neural Network."
-    spec: "panhumanpy-env.yaml"
-    python: "3.10"
-    provides_bins:
-      - python
-    provides_py:
-      - scanpy
-      - pandas
-      - numpy
-      - panhumanpy
     provides_r: []

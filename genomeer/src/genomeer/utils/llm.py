@@ -4,33 +4,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 if TYPE_CHECKING:
     from genomeer.config import GenomeerConfig
 
-
-class _SecretStr:
-    """Wrapper that prevents API key from appearing in logs or tracebacks."""
-    __slots__ = ('_value',)
-    def __init__(self, value: str): self._value = value
-    def __repr__(self): return '***REDACTED***'
-    def __str__(self): return '***REDACTED***'
-    def get_secret_value(self) -> str: return self._value
-
 SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "Custom"]
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
-
-_MODEL_MAX_OUTPUT: dict[str, int] = {
-    # BUG-32: "claude-opus-4-7" was a typo; correct name is "claude-opus-4-6"
-    "claude-opus-4-6": 8192,
-    "claude-sonnet-4-6": 8192,
-    "claude-haiku-4-5": 4096,
-    "claude-haiku-4-5-20251001": 4096,
-    "claude-3-opus-20240229": 4096,
-    "claude-3-sonnet-20240229": 4096,
-    "claude-3-haiku-20240307": 4096,
-    "gpt-4o": 4096,
-    "gpt-4-turbo": 4096,
-    "gpt-4": 4096,
-    "gpt-3.5-turbo": 4096,
-}
-_DEFAULT_MAX_OUTPUT = 4096
 
 def get_llm(
     model: str | None = None,
@@ -65,8 +40,7 @@ def get_llm(
         if base_url is None:
             base_url = config.base_url
         if api_key is None:
-            _raw_key = getattr(config, 'api_key', None) or "EMPTY"
-            api_key = _SecretStr(_raw_key)
+            api_key = config.api_key or "EMPTY"
 
     # Use defaults if still not specified
     if model is None:
@@ -74,17 +48,8 @@ def get_llm(
     if temperature is None:
         temperature = 0.7
     if api_key is None:
-        api_key = _SecretStr("EMPTY")
+        api_key = "EMPTY"
         
-    # BUG-31: validate model name before slicing — an empty string or a name
-    # shorter than the prefix being tested gives a misleading ValueError.
-    if not model or not model.strip():
-        raise ValueError(
-            "model name must be a non-empty string. "
-            "Set GENOMEER_LLM (env var) or pass model= explicitly."
-        )
-    model = model.strip()
-
     # Auto-detect source from model name if not specified
     if source is None:
         env_source = os.getenv("GENOMEER_MODEL_SOURCE")
@@ -125,11 +90,7 @@ def get_llm(
             ):
                 source = "Bedrock"
             else:
-                raise ValueError(
-                    f"Unable to determine provider for model {model!r}. "
-                    "Pass source='Anthropic'|'OpenAI'|'Ollama'|'AzureOpenAI'|'Gemini'|'Groq'|'Bedrock'|'Custom' "
-                    "or set GENOMEER_MODEL_SOURCE env var."
-                )
+                raise ValueError("Unable to determine model source. Please specify 'source' parameter.")
 
     # INternal helper
     def _mk_openai_like(source, model, temperature, stop_sequences, api_key=None, base_url=None):
@@ -151,15 +112,13 @@ def get_llm(
             },
         )
         if api_key is not None:
-            kwargs["api_key"] = api_key.get_secret_value() if isinstance(api_key, _SecretStr) else api_key
+            kwargs["api_key"] = api_key
         if base_url is not None:
             kwargs["base_url"] = base_url
         return ChatOpenAI(**kwargs)
 
     # Create appropriate model based on source
     if source == "OpenAI":
-        if not os.getenv("OPENAI_API_KEY"):
-            raise ValueError("OPENAI_API_KEY environment variable is required for OpenAI models.")
         return _mk_openai_like("OpenAI", model, temperature, stop_sequences)
     
     elif source == "AzureOpenAI":
@@ -169,16 +128,11 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-openai package is required for Azure OpenAI models. Install with: pip install langchain-openai"
             )
-        if not os.getenv("AZURE_OPENAI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-            raise ValueError("AZURE_OPENAI_API_KEY (or OPENAI_API_KEY) is required for AzureOpenAI models.")
-        if not os.getenv("AZURE_OPENAI_ENDPOINT"):
-            raise ValueError("AZURE_OPENAI_ENDPOINT is required for AzureOpenAI models.")
-            
         API_VERSION = "2024-12-01-preview"
         model = model.replace("azure-", "")
         return AzureChatOpenAI(
-            openai_api_key=os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("OPENAI_ENDPOINT"),
             azure_deployment=model,
             openai_api_version=API_VERSION,
             temperature=temperature,
@@ -191,23 +145,14 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-anthropic package is required for Anthropic models. Install with: pip install langchain-anthropic"
             )
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            raise ValueError("ANTHROPIC_API_KEY environment variable is required for Anthropic models.")
-        llm = ChatAnthropic(
+        return ChatAnthropic(
             model=model,
             temperature=temperature,
-            max_tokens=_MODEL_MAX_OUTPUT.get(model, _DEFAULT_MAX_OUTPUT),
+            max_tokens=8192,
             stop_sequences=stop_sequences,
         )
-        try:
-            llm = llm.with_retry(stop_after_attempt=3)
-        except AttributeError:
-            pass  # older langchain version without with_retry
-        return llm
 
     elif source == "Gemini":
-        if not os.getenv("GEMINI_API_KEY"):
-            raise ValueError("GEMINI_API_KEY environment variable is required for Gemini models.")
         return _mk_openai_like(
             "Gemini",
             model, temperature, stop_sequences,
@@ -216,8 +161,6 @@ def get_llm(
         )
 
     elif source == "Groq":
-        if not os.getenv("GROQ_API_KEY"):
-            raise ValueError("GROQ_API_KEY environment variable is required for Groq models.")
         return _mk_openai_like(
             "Groq",
             model, temperature, stop_sequences,
@@ -232,11 +175,10 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-ollama package is required for Ollama models. Install with: pip install langchain-ollama"
             )
-        # BUG-33: pass stop sequences so structured output delimiters are respected
-        ollama_kwargs: dict = dict(model=model, temperature=temperature)
-        if stop_sequences:
-            ollama_kwargs["stop"] = stop_sequences
-        return ChatOllama(**ollama_kwargs)
+        return ChatOllama(
+            model=model,
+            temperature=temperature,
+        )
 
     elif source == "Bedrock":
         try:
@@ -264,23 +206,19 @@ def get_llm(
         llm = ChatOpenAI(
             model=model,
             temperature=temperature,
-            max_tokens=_MODEL_MAX_OUTPUT.get(model, _DEFAULT_MAX_OUTPUT),
+            max_tokens=8192,
             stop=stop_sequences,
             base_url=base_url,
-            api_key=api_key.get_secret_value() if isinstance(api_key, _SecretStr) else api_key,
+            api_key=api_key,
             # Fixed: To avoid automatic tools call by ChatOpenAI->we want it as plain text in <execute></execute>
             model_kwargs={
                 "tool_choice": "none",
                 "response_format": {"type": "text"},
             },
         )
-        try:
-            llm = llm.with_retry(stop_after_attempt=3)
-        except AttributeError:
-            pass  # older langchain version without with_retry
         return llm
 
     else:
         raise ValueError(
-            f"Invalid source: {source}. Valid options are 'OpenAI', 'AzureOpenAI', 'Anthropic', 'Gemini', 'Groq', 'Bedrock', 'Ollama', or 'Custom'"
+            f"Invalid source: {source}. Valid options are 'OpenAI', 'AzureOpenAI', 'Anthropic', 'Gemini', 'Groq', 'Bedrock', or 'Ollama'"
         )

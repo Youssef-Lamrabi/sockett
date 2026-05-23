@@ -1,0 +1,8 @@
+Total length
+4215606
+Number of contigs
+1
+GC content
+43.51%
+N50
+4215606

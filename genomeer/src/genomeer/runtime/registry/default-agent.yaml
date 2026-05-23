@@ -5,19 +5,16 @@ channels:
   - bioconda
 dependencies:
   - python=3.11
-  - ncbi-genome-download
+  - ncbi-genome-download  
   - pip
   - pip:
-      # Install genomeer from the package (use -e . for local dev or 'genomeer' for PyPI)
-      # For local development: set GENOMEER_SRC env var or uncomment the -e line below
-      # - -e ${GENOMEER_SRC:-.}
-      - genomeer           # Install from PyPI (use -e . for local dev override)
       - numpy==2.1
       - pandas
       - matplotlib
       - scipy
       - statsmodels
       - scikit-learn
+      - gradio
       - langchain
       - langgraph==0.3.18
       - langchain-openai
@@ -41,7 +38,3 @@ dependencies:
       - mcp
       - tooluniverse
       - python-dotenv
-      - biopython
-      - faiss-cpu          # For FAISS-based tool retrieval (GAP8)
-      - langchain-community
-      # gradio removed (#tobedelete — replaced by FastAPI SSE)

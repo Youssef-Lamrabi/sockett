@@ -2,12 +2,15 @@
 bioagent_tools.py
 ------------------
 A lightweight, dependency-minimal toolbox for agentic workflows in bioinformatics & metagenomics.
+These implementations are intentionally simple "baselines" or "stubs" that produce usable artifacts
+(TSV/FASTA/FASTQ/PNG placeholders, simple text reports) without requiring heavy third-party tools.
 
-This module contains TWO categories of functions:
+All functions return small JSON-like dicts or strings designed to be easy for LLM agents to consume.
 
-[SAFE — Use freely]
-  Sequence I/O and parsing, FASTA/FASTQ readers/writers, k-mer profiling, GC content,
-  ORF translation, deduplication, interval/BED operations, overlap analysis, reporting.
+NOTE:
+- FASTA/FASTQ parsing here is basic and assumes reasonably well-formed files.
+- Alignment, variant calling, binning, assembly, and annotation are toy approximations to support demos.
+- Wherever performance matters, replace with domain tools. These functions aim for clarity + zero deps.
 """
 
 from __future__ import annotations
@@ -151,8 +154,6 @@ def load_sequences(paths: List[str], format: Optional[str] = None, max_records: 
                 if max_records and count >= max_records:
                     break
         _write_tsv(rows, out)
-        if not Path(out).exists() or Path(out).stat().st_size == 0:
-            raise RuntimeError(f"[load_sequences] TSV write failed or produced empty file: {out}")
         artifacts.append(out)
     return {"records_count": total, "format": detected or "auto", "temp_paths": artifacts}
 
@@ -409,7 +410,64 @@ def deduplicate_sequences(input_path: str, output_path: str, min_count: int = 1)
 # Mapping, Coverage & Variants (toy)
 # -----------------------------
 
-    return {"diversity_tsv": out, "summary": f"{metric}={round(val,3)}", "plots": []}
+def align_reads_minimap2_like(reads: List[str], reference_fasta: str, output_bam: str,
+                              preset: str = "sr", threads: int = 2):
+    # Toy: produce a fake BAM placeholder and a tiny summary.
+    bam_path = output_bam
+    Path(bam_path).write_text("@FAKE\tThis is a placeholder BAM. Replace with a real aligner.\n")
+    return {"bam_path": bam_path, "index_created": False, "summary": "Toy aligner wrote a placeholder BAM."}
+
+
+def compute_coverage(bam_path: str, reference_fasta: str, window: Optional[int] = None,
+                     bed_regions: Optional[str] = None):
+    # Toy: uniform coverage = 0 across reference
+    rows = []
+    for h, s in _iter_fasta(reference_fasta):
+        if window:
+            for i, wseq in _sliding_windows(s, window, window):
+                rows.append({"contig": h, "start": i, "end": i+len(wseq), "cov": 0})
+        else:
+            rows.append({"contig": h, "start": 0, "end": len(s), "cov": 0})
+    out = str(Path(bam_path).with_suffix(".cov.tsv"))
+    _write_tsv(rows, out)
+    return {"coverage_tsv": out, "plots": []}
+
+
+def call_variants_simple(bam_path: str, reference_fasta: str, output_vcf: str,
+                         min_depth: int = 5, min_alt_frac: float = 0.2):
+    # Toy: emit empty VCF header
+    with open(output_vcf, "w") as out:
+        out.write("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+    return {"vcf_path": output_vcf, "summary": "Toy variant caller emitted empty VCF."}
+
+
+# -----------------------------
+# Metagenomics Essentials (toy)
+# -----------------------------
+
+def classify_reads_kmer(reads: List[str], db_path: str, k: int = 31, min_hits: int = 3, top_n: int = 1):
+    # Toy: assign all reads to 'unknown'
+    out = str(Path(reads[0]).with_suffix(".assign.tsv"))
+    _write_tsv([{"read": Path(r).stem, "taxon": "unknown", "score": 0} for r in reads], out)
+    unclassified = str(Path(reads[0]).with_suffix(".unclassified.txt"))
+    Path(unclassified).write_text("\n".join(reads) + "\n")
+    return {"assignments_tsv": out, "unclassified_path": unclassified, "summary": "Toy k-mer classifier."}
+
+
+def bin_contigs_basic(contigs_fasta: str, coverage_tsv: Optional[str] = None, min_len: int = 1500,
+                      clusters: Optional[int] = None):
+    # Toy: single bin with contigs >= min_len
+    bin_dir = str(Path(contigs_fasta).with_suffix(".bins"))
+    Path(bin_dir).mkdir(parents=True, exist_ok=True)
+    kept = []
+    for h, s in _iter_fasta(contigs_fasta):
+        if len(s) >= min_len:
+            kept.append((h, s))
+    out_fa = str(Path(bin_dir) / "bin1.fasta")
+    _write_fasta(kept, out_fa)
+    map_tsv = str(Path(bin_dir) / "bin_map.tsv")
+    _write_tsv([{"contig": h, "bin": "bin1"} for h, _ in kept], map_tsv)
+    return {"bins_fasta_dir": bin_dir, "bin_map_tsv": map_tsv, "summary": f"Toy binning: {len(kept)} contigs -> bin1."}
 
 
 def estimate_complexity(assignments_tsv: str, metric: str = "shannon"):
@@ -448,9 +506,34 @@ def contamination_screen(input_path: str, contaminant_ref: str, clean_path: str,
 # Gene Finding & Annotation (toy)
 # -----------------------------
 
-# -----------------------------
-# Genomic Regions & Intervals
-# -----------------------------
+def predict_genes_baseline(contigs_fasta: str, min_aa: int = 60, genetic_code: int = 11):
+    res = translate_orfs(contigs_fasta, min_aa=min_aa, genetic_code=genetic_code, strand="both")
+    # Reuse ORFs as genes (toy)
+    gff = str(Path(contigs_fasta).with_suffix(".genes.gff"))
+    rows = []
+    with open(gff, "w") as out:
+        out.write("##gff-version 3\n")
+    # Convert bed rows to GFF-like (if they exist)
+    try:
+        import csv
+        with open(res["orfs_bed"], newline="") as fh, open(gff, "a") as out:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for r in reader:
+                attrs = f"ID={r['name']};product=hypothetical_protein"
+                out.write(f"{r['chrom']}\ttoy\tCDS\t{int(r['start'])+1}\t{int(r['end'])}\t.\t{r['strand']}\t0\t{attrs}\n")
+    except Exception:
+        pass
+    return {"genes_gff": gff, "proteins_faa": res["proteins_faa"], "summary": "Toy gene finder using ORFs."}
+
+
+def annotate_functions_hmm(proteins_faa: str, db_path: str, evalue: float = 1e-5, top_n: int = 1):
+    # Toy: assign "unknown_function" to all proteins
+    out = str(Path(proteins_faa).with_suffix(".annot.tsv"))
+    rows = []
+    for h, s in _iter_fasta(proteins_faa):
+        rows.append({"protein": h, "hit": "unknown_function", "score": 0.0, "evalue": 1.0})
+    _write_tsv(rows, out)
+    return {"annotations_tsv": out, "summary": "Toy HMM/BLAST annotator (all unknown)."}
 
 
 # -----------------------------
@@ -559,6 +642,36 @@ def intersect_regions(a_bed: str, b_bed: str, output_path: str, mode: str = "wo"
     _write_tsv(rows, output_path)
     return {"output_path": output_path, "overlap_count": len(rows), "summary": f"Intersected {len(A)}x{len(B)} intervals."}
 
+
+# -----------------------------
+# Assembly & Post-Assembly (toy)
+# -----------------------------
+
+def assemble_greedy_baseline(reads: List[str], output_fasta: str, min_overlap: int = 30, max_reads: Optional[int] = None):
+    # Toy: concatenate first N reads as one contig
+    seqs = []
+    taken = 0
+    for r in reads:
+        fmt = _detect_seq_format(r)
+        it = _iter_fasta(r) if fmt == "fasta" else _iter_fastq(r)
+        for rec in it:
+            s = rec[1]
+            seqs.append(s)
+            taken += 1
+            if max_reads and taken >= max_reads:
+                break
+        if max_reads and taken >= max_reads:
+            break
+    contig = "".join(seqs)
+    _write_fasta([("contig1", contig)], output_fasta)
+    return {"contigs_fasta": output_fasta, "n_contigs": 1, "summary": f"Toy assembler produced 1 contig of length {len(contig)}."}
+
+
+def scaffold_gc_link(contigs_fasta: str, coverage_tsv: Optional[str] = None, link_threshold: float = 0.8):
+    # Toy: copy contigs as scaffolds
+    out = str(Path(contigs_fasta).with_suffix(".scaffolds.fasta"))
+    _write_fasta(list(_iter_fasta(contigs_fasta)), out)
+    return {"scaffolds_fasta": out, "summary": "Toy scaffolder (passthrough)."}
 
 
 # -----------------------------
