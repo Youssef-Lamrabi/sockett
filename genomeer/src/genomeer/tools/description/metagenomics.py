@@ -480,6 +480,221 @@ description = [
         "returns": "dict(results_tsv, significant_features, plot_png, summary)",
     },
 
+    # ── BIN DEREPLICATION ─────────────────────────────────────────────────────
+    {
+        "name": "run_das_tool",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] DAS_Tool: bin dereplication and refinement from multiple binners. "
+            "Takes scaffold-to-bin files from several binners and outputs a non-redundant, high-quality bin set. "
+            "Command: DAS_Tool -i bins1,bins2 -l binner1,binner2 -c contigs.fna -o output_prefix "
+            "--threads N --search_engine diamond --write_bins. "
+            "Outputs _DASTool_summary.tsv and _DASTool_bins/ with refined FASTA files."
+        ),
+        "required_parameters": [
+            {"name": "bins_dirs", "type": "list",
+             "description": "List of directories containing per-binner bin FASTA files."},
+            {"name": "contigs_fasta", "type": "str", "description": "Assembled contigs FASTA."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "labels", "type": "list", "default": None,
+             "description": "Labels for each binner (same length as bins_dirs). Auto-generated if None."},
+            {"name": "db_path", "type": "str", "default": None,
+             "description": "Path to DAS_Tool database directory."},
+            {"name": "search_engine", "type": "str", "default": "diamond",
+             "description": "Search engine: diamond or blast."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(summary_tsv, bins_dir, bin_count, output_dir, returncode, stdout, stderr)",
+    },
+
+    # ── ABUNDANCE RE-ESTIMATION ───────────────────────────────────────────────
+    {
+        "name": "run_bracken",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] Bracken: Bayesian re-estimation of species abundances from Kraken2 reports. "
+            "Corrects for read length and k-mer classification biases in Kraken2 output. "
+            "Requires a Bracken-built database (same as Kraken2 DB). "
+            "Command: bracken -d kraken2_db -i kraken2_report.txt -o output.bracken "
+            "-w bracken_report.txt -r read_length -l S -t threshold."
+        ),
+        "required_parameters": [
+            {"name": "kraken2_report", "type": "str",
+             "description": "Kraken2 report file (from --report flag)."},
+            {"name": "db_path", "type": "str", "description": "Path to Kraken2/Bracken database directory."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "read_length", "type": "int", "default": 150,
+             "description": "Average read length in bp."},
+            {"name": "level", "type": "str", "default": "S",
+             "description": "Taxonomic level: D, P, C, O, F, G, S."},
+            {"name": "threshold", "type": "int", "default": 10,
+             "description": "Minimum number of reads for a taxon to be counted."},
+        ],
+        "returns": "dict(bracken_tsv, report_txt, species_count, returncode, stdout, stderr)",
+    },
+
+    # ── MARKER-GENE PROFILING ─────────────────────────────────────────────────
+    {
+        "name": "run_metaphlan4",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] MetaPhlAn 4: marker-gene based taxonomic profiling of metagenomes. "
+            "Uses clade-specific marker genes (mpa_vJan21 or later database). "
+            "Command: metaphlan reads.fastq --input_type fastq --nproc N "
+            "--output_file profile.tsv --bowtie2out reads.bowtie2.bz2 -t rel_ab_w_read_stats. "
+            "Paired reads: comma-separate as 'r1.fastq,r2.fastq'. "
+            "Produces species-level relative abundance profile."
+        ),
+        "required_parameters": [
+            {"name": "reads", "type": "list",
+             "description": "Input FASTQ files (one or two for paired-end)."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "db_path", "type": "str", "default": None,
+             "description": "Path to MetaPhlAn bowtie2 database directory."},
+            {"name": "analysis_type", "type": "str", "default": "rel_ab_w_read_stats",
+             "description": "Analysis type: rel_ab, rel_ab_w_read_stats, reads_map, clade_profiles, marker_ab_table."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(profile_tsv, bowtie2_out, species_count, returncode, stdout, stderr)",
+    },
+
+    # ── PHYLOGENETIC CLASSIFICATION ───────────────────────────────────────────
+    {
+        "name": "run_gtdbtk",
+        "description": (
+            "[CLI Tool][TIMEOUT: 7200s] GTDB-Tk: phylogenetic classification of MAGs against the GTDB reference tree. "
+            "Requires GTDB-Tk reference data (set GTDBTK_DATA_PATH env variable). "
+            "Command: gtdbtk classify_wf --genome_dir bins/ --out_dir output/ "
+            "--cpus N --pplacer_cpus 1 --extension fna. "
+            "Outputs gtdbtk.bac120.summary.tsv and gtdbtk.ar53.summary.tsv with taxonomy assignments."
+        ),
+        "required_parameters": [
+            {"name": "bins_dir", "type": "str",
+             "description": "Directory containing bin FASTA files."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "extension", "type": "str", "default": "fna",
+             "description": "File extension of bin files (fna, fa, fasta)."},
+            {"name": "cpus", "type": "int", "default": 4},
+            {"name": "pplacer_cpus", "type": "int", "default": 1,
+             "description": "CPUs for pplacer placement step (memory-intensive, keep low)."},
+            {"name": "skip_ani_screen", "type": "bool", "default": False,
+             "description": "Skip ANI screening step (faster but less accurate)."},
+        ],
+        "returns": "dict(bac120_summary_tsv, ar53_summary_tsv, classified_count, output_dir, returncode, stdout, stderr)",
+    },
+
+    # ── GENOME ANNOTATION ─────────────────────────────────────────────────────
+    {
+        "name": "run_prokka",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] Prokka: rapid prokaryote whole genome annotation. "
+            "Annotates CDS, rRNA, tRNA, tmRNA, signal peptides, non-coding RNA. "
+            "Command: prokka --outdir output_dir --prefix prokka --kingdom Bacteria "
+            "--cpus N --force contigs.fna. "
+            "Outputs: .gff (annotation), .gbk (GenBank), .faa (protein sequences), "
+            ".ffn (gene sequences), .txt (summary with CDS count)."
+        ),
+        "required_parameters": [
+            {"name": "contigs_fasta", "type": "str",
+             "description": "Input genome/contig FASTA."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "prefix", "type": "str", "default": "prokka",
+             "description": "Output file prefix."},
+            {"name": "kingdom", "type": "str", "default": "Bacteria",
+             "description": "Annotation kingdom: Bacteria, Archaea, Mitochondria, Viruses."},
+            {"name": "genus", "type": "str", "default": "",
+             "description": "Genus name for better annotation lookup."},
+            {"name": "species", "type": "str", "default": "",
+             "description": "Species name for better annotation lookup."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(gff, gbk, faa, ffn, summary_txt, cds_count, output_dir, returncode, stdout, stderr)",
+    },
+
+    # ── LONG-READ POLISHING ───────────────────────────────────────────────────
+    {
+        "name": "run_medaka",
+        "description": (
+            "[CLI Tool][TIMEOUT: 7200s] Medaka: consensus polishing for Oxford Nanopore Technology (ONT) assemblies. "
+            "Uses neural network models trained on specific ONT flowcell/basecaller combinations. "
+            "Command: medaka_consensus -i reads.fastq -d assembly.fasta -o output_dir -m model -t N. "
+            "Common models: r941_min_hac_g507 (MinION HAC), r1041_e82_400bps_sup_v4.2.0 (R10.4.1). "
+            "Outputs consensus.fasta with polished sequences."
+        ),
+        "required_parameters": [
+            {"name": "assembly_fasta", "type": "str",
+             "description": "Draft assembly FASTA to polish."},
+            {"name": "reads_fastq", "type": "str",
+             "description": "ONT reads FASTQ used for polishing."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "model", "type": "str", "default": "r941_min_hac_g507",
+             "description": "Medaka model matching flowcell and basecaller version."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(consensus_fasta, sequence_count, output_dir, returncode, stdout, stderr)",
+    },
+
+    # ── RESISTOME ─────────────────────────────────────────────────────────────
+    {
+        "name": "run_rgi",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] RGI (Resistance Gene Identifier): AMR gene prediction against the CARD database. "
+            "Three input types: protein (--t protein), contig DNA (--t contig), reads (--t read). "
+            "Command: rgi main -i proteins.faa -o output_prefix -t protein -a DIAMOND -n N --clean. "
+            "Outputs output_prefix.txt (TSV) with Best_Hit_ARO, resistance mechanism, drug class per gene. "
+            "Run 'rgi load' with CARD data first."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str",
+             "description": "Input FASTA: protein (.faa), contig (.fna), or reads (.fastq)."},
+            {"name": "output_prefix", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "input_type", "type": "str", "default": "protein",
+             "description": "Input type: protein, contig, or read."},
+            {"name": "alignment_tool", "type": "str", "default": "DIAMOND",
+             "description": "Alignment tool: DIAMOND or BLAST."},
+            {"name": "include_loose", "type": "bool", "default": False,
+             "description": "Include loose hits (lower confidence) in output."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(results_tsv, amr_gene_count, amr_genes_detected, returncode, stdout, stderr)",
+    },
+    {
+        "name": "run_amrfinder",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] NCBI AMRFinderPlus: identification of AMR, stress, and virulence genes. "
+            "Uses NCBI's curated AMR reference gene catalog. "
+            "Command: amrfinder -p proteins.faa -o output.tsv --threads N --organism Escherichia --plus. "
+            "Organism flag enables point mutation detection for supported species "
+            "(Escherichia, Klebsiella, Salmonella, Staphylococcus, Enterococcus, etc.). "
+            "--plus adds stress and virulence genes beyond AMR."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str",
+             "description": "Input protein FASTA (.faa)."},
+            {"name": "output_file", "type": "str",
+             "description": "Output TSV file path."},
+        ],
+        "optional_parameters": [
+            {"name": "organism", "type": "str", "default": None,
+             "description": "Organism name for point mutation detection (e.g. Escherichia, Klebsiella)."},
+            {"name": "plus", "type": "bool", "default": True,
+             "description": "Report stress and virulence genes in addition to AMR."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(results_tsv, amr_gene_count, amr_genes_detected, drug_classes, returncode, stdout, stderr)",
+    },
+
     # ── COVERAGE ESTIMATION ───────────────────────────────────────────────────
     {
         "name": "run_nonpareil",

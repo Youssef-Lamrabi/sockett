@@ -1112,6 +1112,11 @@ class QuastContract(_BaseContract):
     KEYWORDS = ("quast", "assembly qc", "assembly quality", "assembly statistics",
                 "quast.py", "metaquast")
     RUNTIME = "fast"
+    VARIANTS = [
+        "add --min-contig 200 to include shorter contigs in report",
+        "add --gene-finding to enable gene prediction metrics",
+        "add --large for large genome mode if assembly > 100MB",
+    ]
 
     def check(self, run_dir: str, stdout: str) -> ContractResult:
         report = self._glob_first(run_dir, "report.tsv", "transposed_report.tsv",
@@ -1156,6 +1161,10 @@ class SeqkitContract(_BaseContract):
     KEYWORDS = ("seqkit", "seqkit stats", "seqkit seq", "seqkit grep",
                 "seqkit fx2tab")
     RUNTIME = "fast"
+    VARIANTS = [
+        "try seqkit stats -a for extended statistics if basic stats are empty",
+        "check input format: add --id-regexp for non-standard FASTA headers",
+    ]
 
     def check(self, run_dir: str, stdout: str) -> ContractResult:
         # Any output file
@@ -1396,6 +1405,440 @@ class OptitypeContract(_BaseContract):
 
 
 # ===========================================================================
+# BIN DEREPLICATION
+# ===========================================================================
+
+class DasToolContract(_BaseContract):
+    """
+    Output: {prefix}_DASTool_summary.tsv  +  {prefix}_DASTool_bins/*.{fa,fna,fasta}
+    Columns: bin_ID, unique_SCGs.of.bin, redundant_SCGs.of.bin,
+             SCG_completeness (0–1 float), SCG_redundancy (0–1 float),
+             size, N50, contigs, Bin_score
+    Scoring: mean(SCG_completeness×100 − 5×SCG_redundancy×100) per bin / 100.
+             0 bins retained after score filtering → fail (threshold too strict).
+    Source: Sieber et al. 2018 Science doi:10.1126/science.aau6577 (DAS_Tool paper)
+            https://github.com/cmks/DAS_Tool (output column specification)
+            Parks et al. 2017 Nature Microbiology doi:10.1038/nmicrobiol.2017.203
+            (MIMAG thresholds: HQ ≥90% completeness <5% contamination)
+    """
+    KEYWORDS = ("das_tool", "dastool", "das tool", "bin dereplication",
+                "bin refinement", "dereplicate bins")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "lower --score_threshold from 0.5 to 0.35 to recover more bins at lower confidence",
+        "add --write_bins 1 to ensure bin FASTAs are written; verify scaffold-to-bin input files exist",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        summary = self._glob_first(run_dir, "*_DASTool_summary.tsv", "*DASTool*summary*")
+        bin_fas = self._glob_all(run_dir, "*_DASTool_bins/*.fa",
+                                 "*_DASTool_bins/*.fna", "*_DASTool_bins/*.fasta")
+
+        if not summary and not bin_fas:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="das_tool: no _DASTool_summary.tsv or bin FASTAs found",
+                retry_params={"hint": "check -i scaffold-to-bin lists and -c contigs.fna; lower --score_threshold to 0.35"},
+            )
+
+        if summary and not bin_fas:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason="das_tool: summary found but no bins written (all bins below score threshold)",
+                retry_params={"hint": "lower --score_threshold from 0.5 to 0.35 to recover more bins"},
+            )
+
+        n_bins = len(bin_fas)
+        scores: List[float] = []
+
+        if summary:
+            try:
+                with open(summary, encoding="utf-8") as fh:
+                    reader = csv.DictReader(fh, delimiter="\t")
+                    for row in reader:
+                        comp_str = row.get("SCG_completeness", "")
+                        cont_str = row.get("SCG_redundancy", "")
+                        try:
+                            # SCG_completeness and SCG_redundancy are in 0–1 range
+                            comp = float(comp_str) * 100.0
+                            cont = float(cont_str) * 100.0
+                            scores.append(max(0.0, comp - 5.0 * cont))
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass
+
+        if scores:
+            avg = sum(scores) / len(scores)
+            return ContractResult(ok=True, score=min(1.0, avg / 100.0),
+                                  reason=f"das_tool: {n_bins} bin(s) dereplicated, avg quality={avg:.1f}")
+
+        score = min(1.0, n_bins / 5.0)  # 5 high-quality bins = 1.0
+        return ContractResult(ok=True, score=score,
+                              reason=f"das_tool: {n_bins} dereplicated bin(s) produced")
+
+
+# ===========================================================================
+# ABUNDANCE RE-ESTIMATION
+# ===========================================================================
+
+class BrackenContract(_BaseContract):
+    """
+    Output: {prefix}.bracken  (TSV)
+    Columns: name, taxonomy_id, taxonomy_lvl, kraken_assigned_reads,
+             added_reads, new_est_reads, fraction_total_reads
+    Also written: {prefix}_bracken_report.txt (Kraken2-format report)
+    Scoring: number of taxa retained after threshold filter;
+             fraction_total_reads should sum ≈ 1.0.
+    Source: https://github.com/jenniferlu717/Bracken (column specification)
+            Lu et al. 2017 PeerJ Computer Science doi:10.7717/peerj-cs.104
+    0 taxa after filtering = fail (read-length / threshold mismatch).
+    """
+    KEYWORDS = ("bracken", "bracken abundance", "bracken re-estimation",
+                "bayesian re-estimation", "bracken -d")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "lower -t (threshold) from 10 to 1 to include taxa with fewer supporting reads",
+        "change -l level from S to G (genus) for a higher-level profile if species-level gives 0 taxa",
+        "verify the Bracken DB was built for the same read length (-r); rebuild with bracken-build if needed",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        bracken_out = self._glob_first(run_dir, "*.bracken", "*bracken*.tsv")
+
+        if not bracken_out:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="bracken: no .bracken output file found",
+                retry_params={"hint": "add -o <prefix>.bracken to bracken; verify -d DB path and -i kraken2 report"},
+            )
+
+        total_taxa = 0
+        total_fraction = 0.0
+        try:
+            with open(bracken_out, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    total_taxa += 1
+                    try:
+                        total_fraction += float(row.get("fraction_total_reads", 0) or 0)
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+
+        if total_taxa == 0:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="bracken: output file is empty (0 taxa classified)",
+                retry_params={"hint": "lower -t threshold to 1; verify kraken2 report has classified reads before running bracken"},
+            )
+
+        score = min(1.0, total_taxa / 50.0)  # 50 species = 1.0
+        return ContractResult(ok=True, score=score,
+                              reason=f"bracken: {total_taxa} taxon(a) estimated (Σfractions={total_fraction:.3f})")
+
+
+# ===========================================================================
+# MARKER-GENE PROFILING
+# ===========================================================================
+
+class MetaPhlAn4Contract(_BaseContract):
+    """
+    Output: {prefix}_profile.tsv  (or *_profiled_metagenome.txt in v3)
+    Format: comment lines starting with '#' (version info), header '#clade_name ...',
+            then data rows; species rows contain 's__' but not 't__' (strain level).
+    Columns: #clade_name, NCBI_tax_id, relative_abundance, coverage,
+             estimated_number_of_reads_from_the_clade
+    Scoring: count of species-level rows (s__, not t__) with relative_abundance > 0.
+    Source: https://github.com/biobakery/MetaPhlAn (output format, v4)
+            Blanco-Míguez et al. 2023 Nature Methods doi:10.1038/s41592-023-01688-w
+            Beghini et al. 2021 eLife doi:10.7554/eLife.65088 (MetaPhlAn3 benchmark)
+    0 species with data rows = valid (low-biomass sample); no file = fail.
+    """
+    KEYWORDS = ("metaphlan", "metaphlan4", "metaphlan 4", "metaphlan3",
+                "marker gene profil", "metaphlan --input_type", "metaphlan -t")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "add --unclassified_estimation to include the unclassified fraction in the profile",
+        "update the MetaPhlAn database: metaphlan --install --bowtie2db <db_dir>",
+        "verify reads are non-empty after QC; use --input_type fastq explicitly",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        profile = self._glob_first(run_dir, "*_profile.tsv", "*metaphlan*.tsv",
+                                   "*_profiled_metagenome.txt", "*metaphlan*.txt")
+        if not profile:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="metaphlan4: no profile output file found",
+                retry_params={"hint": "add --output_file <prefix>_profile.tsv to metaphlan command"},
+            )
+
+        species_count = 0
+        has_data_rows = False
+        try:
+            with open(profile, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("#"):
+                        continue
+                    has_data_rows = True
+                    # Species rows contain 's__' but not 't__' (strain-level suffix)
+                    if "s__" in line and "t__" not in line:
+                        parts = line.strip().split("\t")
+                        # relative_abundance is column index 2 (0-based)
+                        try:
+                            if len(parts) >= 3 and float(parts[2]) > 0:
+                                species_count += 1
+                        except (ValueError, IndexError):
+                            species_count += 1
+        except Exception:
+            pass
+
+        if not has_data_rows:
+            return ContractResult(
+                ok=True, score=0.3,
+                reason="metaphlan4: profile file exists but no taxa detected (low-biomass or DB mismatch)")
+
+        score = min(1.0, species_count / 20.0)  # 20 species = 1.0
+        return ContractResult(ok=True, score=score,
+                              reason=f"metaphlan4: {species_count} species detected")
+
+
+# ===========================================================================
+# PHYLOGENETIC CLASSIFICATION
+# ===========================================================================
+
+class GtdbtkContract(_BaseContract):
+    """
+    Output: gtdbtk.bac120.summary.tsv  and/or  gtdbtk.ar53.summary.tsv (v2+)
+            (GTDB-Tk v1 used ar122 instead of ar53)
+    Key columns: user_genome, classification, fastani_ani, fastani_af,
+                 msa_percent, red_value, warnings
+    Scoring: fraction of genomes with msa_percent ≥ 50.0
+             (GTDB-Tk documentation: <50% MSA completeness → 'low-quality placement').
+    Source: https://github.com/Ecogenomics/GTDBTk (output column specification)
+            Chaumeil et al. 2022 Bioinformatics doi:10.1093/bioinformatics/btac672 (v2)
+            Parks et al. 2022 Nature Biotechnology doi:10.1038/s41587-021-01094-0 (GTDB r207)
+    """
+    KEYWORDS = ("gtdbtk", "gtdb-tk", "gtdb classify", "gtdbtk classify_wf",
+                "phylogenetic classif", "gtdb taxonomy", "gtdb-tk classify")
+    RUNTIME = "long"
+    VARIANTS = [
+        "set GTDBTK_DATA_PATH env variable to the GTDB-Tk reference data directory",
+        "add --skip_ani_screen for faster placement when ANI screening is not required",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        bac_summary = self._glob_first(run_dir,
+                                       "gtdbtk.bac120.summary.tsv", "*bac120*summary*")
+        arc_summary = self._glob_first(run_dir,
+                                       "gtdbtk.ar53.summary.tsv", "*ar53*summary*",
+                                       "gtdbtk.ar122.summary.tsv", "*ar122*summary*")
+
+        if not bac_summary and not arc_summary:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="gtdbtk: no bac120 or ar53 summary TSV found",
+                retry_params={"hint": "check GTDBTK_DATA_PATH env var; verify --genome_dir and --extension inputs"},
+            )
+
+        total = reliable = 0
+        for tsv in filter(None, [bac_summary, arc_summary]):
+            try:
+                with open(tsv, encoding="utf-8") as fh:
+                    reader = csv.DictReader(fh, delimiter="\t")
+                    for row in reader:
+                        total += 1
+                        try:
+                            if float(row.get("msa_percent", 0) or 0) >= 50.0:
+                                reliable += 1
+                        except (ValueError, TypeError):
+                            reliable += 1  # count row if msa_percent absent/unparseable
+            except Exception:
+                pass
+
+        if total == 0:
+            return ContractResult(ok=True, score=0.3,
+                                  reason="gtdbtk: summary file found but no genomes classified")
+
+        score = reliable / total
+        return ContractResult(ok=True, score=score,
+                              reason=f"gtdbtk: {reliable}/{total} genome(s) with ≥50% MSA completeness")
+
+
+# ===========================================================================
+# LONG-READ POLISHING
+# ===========================================================================
+
+class MedakaContract(_BaseContract):
+    """
+    Output: {output_dir}/consensus.fasta  (primary output)
+            calls_to_draft.bam + .bai     (intermediate alignment files)
+    Scoring: presence + size of consensus.fasta; 5 Mb = score 1.0
+             (5 Mb ≈ median bacterial genome; Mira et al. 2001 PMID 11782624).
+    Source: https://github.com/nanoporetech/medaka
+            https://medaka.readthedocs.io/en/latest/
+    No peer-reviewed threshold; consensus.fasta present and non-empty = success.
+    Typical Nanopore polishing reduces raw error rate ~5% → <1% (ONT tech note).
+    """
+    KEYWORDS = ("medaka", "medaka_consensus", "nanopore polishing",
+                "ont polishing", "medaka consensus", "medaka -i")
+    RUNTIME = "long"
+    VARIANTS = [
+        "run 'medaka tools list_models' to find the correct model for your flowcell/basecaller",
+        "reduce -t (threads) to lower memory usage; split assembly into smaller chunks if OOM",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        consensus = self._glob_first(run_dir,
+                                     "consensus.fasta", "consensus.fa",
+                                     "*consensus*.fasta", "*polished*.fasta")
+
+        if not consensus:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="medaka: consensus.fasta not found",
+                retry_params={"hint": "check -d (draft FASTA), -i (reads), -m (model); run 'medaka tools list_models' to verify model name"},
+            )
+
+        size = os.path.getsize(consensus)
+        if size < 1000:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason=f"medaka: consensus.fasta nearly empty ({size} bytes)",
+                retry_params={"hint": "verify draft assembly -d is non-empty and reads -i map to the assembly"},
+            )
+
+        seq_count = 0
+        try:
+            with open(consensus, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        seq_count += 1
+        except Exception:
+            pass
+
+        score = min(1.0, size / 5_000_000)  # 5 Mb = 1.0
+        return ContractResult(ok=True, score=score,
+                              reason=f"medaka: {seq_count} polished sequence(s), {size:,} bytes")
+
+
+# ===========================================================================
+# RESISTOME
+# ===========================================================================
+
+class RgiContract(_BaseContract):
+    """
+    Output: {prefix}.txt — tab-separated TSV, header on first line
+    Key columns: ORF_ID, Cut_Off, Best_Hit_ARO, Best_Identities,
+                 Drug Class, Resistance Mechanism, AMR Gene Family
+    Scoring: fraction of hits with Cut_Off ∈ {Perfect, Strict}
+             (Loose hits have elevated false-positive rate per CARD documentation).
+    Source: https://github.com/arpcard/rgi (output format)
+            Alcock et al. 2023 Nucleic Acids Research doi:10.1093/nar/gkac920
+            CARD portal: https://card.mcmaster.ca/about
+    0 hits = valid biological result (clean genome); file absent = fail.
+    """
+    KEYWORDS = ("rgi", "rgi main", "resistance gene identifier",
+                "card database", "rgi --input_type", "amr prediction card", "rgi -i")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "load CARD database first: run 'rgi load -i card.json --local' before rgi main",
+        "add --include_loose to report Loose hits in addition to Strict/Perfect",
+        "switch -t input type: use 'contig' for nucleotide FASTA instead of 'protein'",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tsv = self._glob_first(run_dir, "*.txt", "*rgi*.tsv", "*rgi*.txt")
+        if not tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="rgi: no output .txt TSV found",
+                retry_params={"hint": "check -o output prefix; run 'rgi load --local' to load CARD DB first"},
+            )
+
+        total = strict_perfect = 0
+        try:
+            with open(tsv, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    total += 1
+                    if row.get("Cut_Off", "").strip() in ("Strict", "Perfect"):
+                        strict_perfect += 1
+        except Exception:
+            pass
+
+        if total == 0:
+            return ContractResult(ok=True, score=0.5,
+                                  reason="rgi: output found, no AMR hits detected (clean genome or DB not loaded)")
+
+        score = strict_perfect / total
+        return ContractResult(ok=True, score=score,
+                              reason=f"rgi: {strict_perfect}/{total} hits are Strict/Perfect (high confidence)")
+
+
+class AmrFinderContract(_BaseContract):
+    """
+    Output: user-specified TSV via -o flag
+    Columns: Protein identifier, Gene symbol, Sequence name, Scope,
+             Element type, Element subtype, Class, Subclass, Method,
+             Target length, Reference sequence length,
+             % Coverage of reference sequence,
+             % Identity to reference sequence,
+             Alignment length, Accession of closest sequence,
+             Name of closest sequence, HMM id, HMM description
+    Scoring: fraction of hits with ≥90% coverage AND ≥90% identity
+             (NCBI AMRFinder's own criteria for high-confidence core AMR genes).
+    Source: https://github.com/ncbi/amr (output column specification)
+            Feldgarden et al. 2021 Scientific Reports doi:10.1038/s41598-021-91456-0
+            NCBI AMRFinder docs: https://www.ncbi.nlm.nih.gov/pathogens/antimicrobial-resistance/AMRFinder/
+    0 hits = valid biological result (clean genome); file absent = fail.
+    """
+    KEYWORDS = ("amrfinder", "amrfinderplus", "ncbi amr", "amrfinder -p",
+                "amr finder", "amr gene ncbi", "amrfinder --plus")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "run 'amrfinder -u' to update the AMRFinder database to the latest version",
+        "add --organism <name> (e.g. Escherichia) to enable point-mutation detection for supported species",
+        "verify -p is a valid protein FASTA and the AMRFinder DB is installed (amrfinder -u)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tsv = self._glob_first(run_dir, "*.tsv", "*amrfinder*.txt", "*amr_finder*")
+        if not tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="amrfinder: no output TSV found",
+                retry_params={"hint": "add -o <output.tsv> to amrfinder command; run 'amrfinder -u' to install/update DB"},
+            )
+
+        total = high_quality = 0
+        try:
+            with open(tsv, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    total += 1
+                    try:
+                        pct_cov = float(row.get("% Coverage of reference sequence", 0) or 0)
+                        pct_id  = float(row.get("% Identity to reference sequence", 0) or 0)
+                        if pct_cov >= 90.0 and pct_id >= 90.0:
+                            high_quality += 1
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+
+        if total == 0:
+            return ContractResult(ok=True, score=0.5,
+                                  reason="amrfinder: output found, no AMR/virulence genes detected (clean genome)")
+
+        score = high_quality / total
+        return ContractResult(ok=True, score=score,
+                              reason=f"amrfinder: {high_quality}/{total} genes with ≥90% coverage and identity")
+
+
+# ===========================================================================
 # Registry + dispatcher
 # ===========================================================================
 
@@ -1438,6 +1881,19 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # WGS / clinical
     CnvkitContract(),
     OptitypeContract(),
+    # Bin dereplication
+    DasToolContract(),
+    # Abundance re-estimation
+    BrackenContract(),
+    # Marker-gene profiling
+    MetaPhlAn4Contract(),
+    # Phylogenetic classification
+    GtdbtkContract(),
+    # Long-read polishing
+    MedakaContract(),
+    # Resistome
+    RgiContract(),
+    AmrFinderContract(),
 ]
 
 

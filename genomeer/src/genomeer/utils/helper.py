@@ -78,7 +78,11 @@ def _run_in_env(
                 proc.kill()
             except Exception:
                 pass
-            stdout_b, stderr_b = proc.communicate()
+            try:
+                stdout_b, stderr_b = proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                stdout_b = proc.stdout.read() if proc.stdout else b""
+                stderr_b = proc.stderr.read() if proc.stderr else b""
             raise subprocess.TimeoutExpired(
                 cmd, timeout,
                 output=stdout_b,
