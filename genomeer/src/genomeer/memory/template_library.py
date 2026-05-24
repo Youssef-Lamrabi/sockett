@@ -372,6 +372,7 @@ class TemplateLibrary:
                 "run_humann3", "run_amrfinderplus", "run_rgi_card",
                 "run_minimap2", "run_bowtie2", "run_metaphlan4",
                 "run_virsorter2", "run_checkv", "run_deepvirfinder",
+                "run_rgi", "run_amrfinder",
             ]
             title = s.get("title", "").lower()
             for kw in TITLE_KEYWORDS:

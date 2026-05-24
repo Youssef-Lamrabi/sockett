@@ -330,6 +330,55 @@ BIOLOGICAL_GATES: Dict[str, Dict[str, Any]] = {
         ),
     },
 
+    # ── Resistome ────────────────────────────────────────────────────────────
+
+    "run_rgi": {
+        # RGI output: *.txt TSV — column Cut_Off ∈ {Perfect, Strict, Loose}.
+        # Loose hits are excluded (high false-positive rate per CARD documentation).
+        # Metric: fraction of total hits that are Perfect or Strict.
+        # Source: Alcock et al. 2023 NAR doi:10.1093/nar/gkac920
+        "metric_key":     None,
+        "metric_label":   "RGI strict/perfect AMR hits",
+        "warn_threshold": None,
+        "fail_threshold": None,
+        "parse_regex":    r"(?:Perfect|Strict)",  # presence of at least one high-conf hit
+        "fail_sentinel":  False,
+        "warn_below":     None,
+        "fail_below":     None,
+        # Custom: count Perfect+Strict lines — warn if 0, ok otherwise
+        "fail_on_zero":   True,
+        "count_regex":    r"(?:Perfect|Strict)",  # each match = 1 high-confidence hit
+        "fix_hint": (
+            "RGI found no Perfect or Strict AMR gene hits. Check: "
+            "(1) Input protein FASTA is non-empty and correctly translated. "
+            "(2) CARD database is loaded (rgi load --card_json card.json --local). "
+            "(3) Try --input_type contig if proteins are unavailable."
+        ),
+    },
+
+    "run_amrfinder": {
+        # AMRFinderPlus output: TSV — columns:
+        #   '% Coverage of reference sequence', '% Identity to reference sequence'
+        # NCBI high-confidence criterion: coverage >= 90% AND identity >= 90%.
+        # Source: Feldgarden et al. 2021 Scientific Reports doi:10.1038/s41598-021-91456-0
+        "metric_key":     None,
+        "metric_label":   "AMRFinderPlus high-confidence hits (cov≥90% & id≥90%)",
+        "warn_threshold": None,
+        "fail_threshold": None,
+        "parse_regex":    r"\t\d+\t",   # any data row present = non-empty results
+        "fail_sentinel":  False,
+        "warn_below":     None,
+        "fail_below":     None,
+        "fail_on_zero":   False,        # 0 AMR genes is a valid biological result
+        "fix_hint": (
+            "AMRFinderPlus found no AMR genes. This can be a valid biological result "
+            "(clean sample). If unexpected: "
+            "(1) Verify the input FASTA is protein (-p) or nucleotide (-n) as specified. "
+            "(2) Update the AMRFinder database: amrfinder -u. "
+            "(3) Try without -O organism flag to disable point-mutation filtering."
+        ),
+    },
+
 }
 
 
@@ -400,7 +449,14 @@ def check_quality(
         )
         value = value / 100.0
 
-    # 2. From stdout via regex
+    # 2. From stdout via count_regex (count all matches → value = n_matches)
+    #    Used for gates like run_rgi where each regex match = 1 high-confidence hit.
+    count_regex = gate.get("count_regex")
+    if value is None and count_regex and stdout_text:
+        n_matches = len(re.findall(count_regex, stdout_text, re.IGNORECASE))
+        value = float(n_matches)
+
+    # 3. From stdout via parse_regex (capture group 1 → float value)
     if value is None and parse_regex and stdout_text:
         m = re.search(parse_regex, stdout_text, re.IGNORECASE)
         if m:

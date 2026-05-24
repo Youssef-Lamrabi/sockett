@@ -14,9 +14,13 @@ from .auth import try_get_user  # NEW
 
 app = FastAPI(title="Agent Copilot UI")
 
+# C-4: restrict CORS to a specific origin instead of wildcard
+# Set ALLOWED_ORIGIN env var in production (e.g. "https://yourdomain.com")
+_ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "http://localhost")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[_ALLOWED_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,6 +38,8 @@ templates = Jinja2Templates(directory=templates_dir)
 
 @app.on_event("startup")
 def _startup():
+    from .auth import validate_secret_key
+    validate_secret_key()   # C-4 (auth): abort startup if JWT secret is insecure
     init_db()
 
 @app.get("/", response_class=HTMLResponse)

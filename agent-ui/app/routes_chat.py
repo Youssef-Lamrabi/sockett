@@ -20,6 +20,9 @@ AGENTS_LOCK = threading.RLock()
 UPLOAD_DIR = os.path.abspath("./uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# C-2: 5 GB max upload — FASTQ/metagenomics files can be large
+MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_BYTES", str(5 * 1024 * 1024 * 1024)))
+
 
 def _mk_agent_for_user(db: Session, user: User, model_name: str, interaction_mode: str = "auto") -> BioAgent:
     # fallback provider config
@@ -43,17 +46,18 @@ def _mk_agent_for_user(db: Session, user: User, model_name: str, interaction_mod
             base_url = sys.get("base_url") or (cfg.base_url if cfg else None)
             api_key  = sys.get("api_key")  or (cfg.api_key  if cfg else None)
         else:
-            # 3 - fallback provider config only
-            source = cfg.source if cfg else os.getenv("GENOMEER_MODEL_SOURCE") or "Ollama"
-            base_url = cfg.base_url or os.getenv("OPENAI_COMPAT_BASE_URL")
-            api_key  = cfg.api_key  or os.getenv("OPENAI_COMPAT_API_KEY")
+            # 3 - fallback: provider config → env → conf.json → hardcoded Ollama default
+            _sys = system_default()
+            source   = (cfg.source   if cfg else None) or os.getenv("GENOMEER_MODEL_SOURCE") or _sys.get("source") or "Ollama"
+            base_url = (cfg.base_url if cfg else None) or os.getenv("OPENAI_COMPAT_BASE_URL") or _sys.get("base_url") or "http://localhost:11434/v1"
+            api_key  = (cfg.api_key  if cfg else None) or os.getenv("OPENAI_COMPAT_API_KEY")  or _sys.get("api_key")
 
     agent = BioAgent(
         path="./data",
         llm=model_name,
         source=source,
-        use_tool_retriever=True,
-        timeout_seconds=600,
+        use_tool_retriever=False,
+        timeout_seconds=300,
         base_url=base_url,
         api_key=api_key,
         auto_start_artifacts=False,
@@ -349,8 +353,29 @@ def cancel_run(session_id: int, user: User = Depends(get_current_user)):
 
 @router.post("/upload")
 async def upload(file: UploadFile = File(...), user: User = Depends(get_current_user)):
-    dest = Path(UPLOAD_DIR) / file.filename
+    # C-1: sanitize filename — strip any directory component (prevents path traversal)
+    raw_name = file.filename or "upload"
+    safe_name = os.path.basename(raw_name)
+    if not safe_name:
+        safe_name = "upload"
+
+    dest = Path(UPLOAD_DIR) / safe_name
+
+    # C-1: verify the resolved path stays inside UPLOAD_DIR
+    dest_real   = os.path.realpath(dest)
+    upload_real = os.path.realpath(UPLOAD_DIR)
+    if not (dest_real == upload_real or dest_real.startswith(upload_real + os.sep)):
+        raise HTTPException(status_code=400, detail="Invalid filename: path traversal detected.")
+
+    # C-2: read file content and enforce size limit before writing to disk
     data = await file.read()
+    if len(data) > MAX_UPLOAD_SIZE:
+        limit_gb = MAX_UPLOAD_SIZE // (1024 ** 3)
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum allowed size is {limit_gb} GB."
+        )
+
     dest.write_bytes(data)
     return {"path": str(dest.resolve())}
 

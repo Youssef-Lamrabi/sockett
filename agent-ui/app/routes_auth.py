@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from .db import get_db
 from .models import User
 from .auth import get_password_hash, verify_password, create_access_token, get_current_user
@@ -12,7 +12,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 router = APIRouter()
 
 class RegisterBody(BaseModel):
-    email: EmailStr
+    email: str
     name: str
     password: str
 

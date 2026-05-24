@@ -24,7 +24,15 @@ let composerBusy = false;
 
 // Abort the active stream if the tab is closed/refreshed
 let currentChatController = null;
-window.addEventListener('beforeunload', () => {
+window.addEventListener('beforeunload', (e) => {
+  // F-7: warn user if a run is in progress — the run continues server-side
+  // but the user will lose real-time visibility
+  if (composerBusy) {
+    e.preventDefault();
+    // Standard cross-browser way to trigger the "Leave site?" dialog
+    e.returnValue = 'Un pipeline est en cours. Quitter la page interrompra le suivi en temps réel (le run continue côté serveur).';
+    return e.returnValue;
+  }
   try { currentChatController?.abort(); } catch { }
 });
 
@@ -517,11 +525,12 @@ function renderSessionsList() {
       e.stopPropagation(); closeSessionsDrawer();
       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
       btn.parentElement.classList.add('active');
-      await loadSessionMessages(btn.parentElement.dataset.sid); // ← add
+      await loadSessionMessages(btn.parentElement.dataset.sid);
       await loadSessionDetails(btn.parentElement.dataset.sid);
       notify('info', 'Chat opened');
     });
   });
+
 }
 
 /* -------------------------- Uploads ------------------------------------- */
@@ -666,60 +675,140 @@ async function send() {
   }));
   const body = JSON.stringify({ message: msg, stream: true, interaction_mode, attachments });
 
-  try {
-    const resp = await fetch(`/api/sessions/${sid}/messages`, {
-      method: 'POST',
-      headers,
-      body,
-      signal: currentChatController.signal
-    });
-    if (!resp.ok) { throw new Error('Send failed'); }
+  // F-6: SSE auto-reconnect — max 5 attempts, 3 s delay, visual indicator
+  const SSE_MAX_RETRIES   = 5;
+  const SSE_RETRY_DELAY   = 3000; // ms
+  let   streamCompletedOk = false;
+  let   attempt           = 0;
 
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += dec.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const evt = JSON.parse(line);
-
-          if (evt.type === 'meta' && evt.session_id && evt.session_title) {
-            updateSessionTitleInSidebar(String(evt.session_id), String(evt.session_title));
-            continue; // don't pass to renderAssistantEvent
-          }
-          
-          renderAssistantEvent(evt);
-        } catch { /* ignore parse errors */ }
-      }
+  function _showReconnectBanner(n, max) {
+    const logsEl = document.getElementById('logs');
+    if (!logsEl) return;
+    let banner = document.getElementById('_sse_reconnect_banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = '_sse_reconnect_banner';
+      banner.style.cssText = 'padding:6px 12px;margin:4px 0;border-radius:8px;font-size:13px;' +
+        'background:#FFF3CD;border:1px solid #FFEAA7;color:#856404;display:flex;align-items:center;gap:8px;';
+      logsEl.appendChild(banner);
     }
-
-    if (buffer.trim()) {
-      try { renderAssistantEvent(JSON.parse(buffer.trim())); } catch { }
-    }
-  } 
-  catch (err) {
-    if (err?.name === 'AbortError') {
-      try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch {}
-      if (window.AgentRender?.renderLogBlock) window.AgentRender.renderLogBlock('STATUS', 'Canceled by user');
-    } else {
-      notify('error', err?.message || 'Send failed');
-      try { renderAssistantEvent({ type: 'error', text: err?.message || 'Send failed' }); } catch {}
-    }
-  } 
-  finally {
-    hideAssistantTyping();
-    setComposerBusy(false);
-    currentChatController = null;
+    banner.innerHTML = `<i class="fa fa-refresh fa-spin"></i> Reconnexion en cours… (tentative ${n}/${max})`;
+    logsEl.scrollTop = logsEl.scrollHeight;
   }
+
+  function _clearReconnectBanner() {
+    const b = document.getElementById('_sse_reconnect_banner');
+    if (b) b.remove();
+  }
+
+  function _showReconnectFailed() {
+    _clearReconnectBanner();
+    const logsEl = document.getElementById('logs');
+    if (!logsEl) return;
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:8px 12px;margin:4px 0;border-radius:8px;font-size:13px;' +
+      'background:#FFE3E3;border:1px solid #F5B7B7;color:#8b0000;display:flex;align-items:center;gap:8px;';
+    div.innerHTML = `<i class="fa fa-times-circle"></i> La connexion a échoué après ${SSE_MAX_RETRIES} tentatives.
+      <button onclick="location.reload()" style="margin-left:auto;padding:2px 10px;cursor:pointer;
+        border:1px solid #c00;border-radius:6px;background:#fff;color:#8b0000;font-size:12px;">
+        Réessayer manuellement
+      </button>`;
+    logsEl.appendChild(div);
+    logsEl.scrollTop = logsEl.scrollHeight;
+  }
+
+  while (attempt <= SSE_MAX_RETRIES && !streamCompletedOk) {
+    if (attempt > 0) {
+      _showReconnectBanner(attempt, SSE_MAX_RETRIES);
+      await new Promise(r => setTimeout(r, SSE_RETRY_DELAY));
+      // Re-create abort controller for the new attempt
+      if (currentChatController) currentChatController.abort();
+      currentChatController = new AbortController();
+    }
+
+    try {
+      const resp = await fetch(`/api/sessions/${sid}/messages`, {
+        method: 'POST',
+        headers,
+        body,
+        signal: currentChatController.signal
+      });
+      if (!resp.ok) { throw new Error('Send failed'); }
+
+      _clearReconnectBanner();
+
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += dec.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const evt = JSON.parse(line);
+
+            if (evt.type === 'meta' && evt.session_id && evt.session_title) {
+              updateSessionTitleInSidebar(String(evt.session_id), String(evt.session_title));
+              continue;
+            }
+
+            // Track normal stream completion
+            if (evt.type === 'done') streamCompletedOk = true;
+
+            renderAssistantEvent(evt);
+          } catch { /* ignore parse errors */ }
+        }
+      }
+
+      if (buffer.trim()) {
+        try {
+          const evt = JSON.parse(buffer.trim());
+          if (evt.type === 'done') streamCompletedOk = true;
+          renderAssistantEvent(evt);
+        } catch { }
+      }
+
+      // If we reach here without a 'done', the stream dropped silently
+      if (!streamCompletedOk && attempt < SSE_MAX_RETRIES) {
+        attempt++;
+        continue; // retry
+      }
+      break; // either done=true, or exhausted retries
+
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch {}
+        if (window.AgentRender?.renderLogBlock) window.AgentRender.renderLogBlock('STATUS', 'Canceled by user');
+        _clearReconnectBanner();
+        break; // user-initiated cancel — do not retry
+      }
+      // Network / server error
+      attempt++;
+      if (attempt > SSE_MAX_RETRIES) {
+        _showReconnectFailed();
+        break;
+      }
+      // else: retry loop continues
+    }
+  }
+
+  if (!streamCompletedOk && attempt > SSE_MAX_RETRIES) {
+    // All retries exhausted without clean completion — already showed banner above
+  } else if (!streamCompletedOk) {
+    // Edge case: exited loop but no explicit done and no error
+    hideAssistantTyping();
+  }
+
+  hideAssistantTyping();
+  setComposerBusy(false);
+  currentChatController = null;
 }
 
 // Render a simple assistant bubble (no typing effect, safe HTML)

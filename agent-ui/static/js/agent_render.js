@@ -950,6 +950,127 @@ function processInlineSystemTagsInOrder(text = "") {
   return rest;
 }
 
+/* ----------- Agent info-line renderer (validator / quality / diag) ------- */
+/**
+ * Renders a compact inline status line in the logs pane.
+ * @param {string} icon   - FontAwesome class (e.g. 'fa-check-circle')
+ * @param {string} label  - Bold left-side label
+ * @param {string} detail - Right-side detail text
+ * @param {string} bg     - CSS background color
+ * @param {string} border - CSS border color
+ * @param {string} color  - CSS text color
+ */
+function renderAgentInfoLine(icon, label, detail, bg, border, color) {
+  const box = $('logs'); if (!box) return null;
+  const div = document.createElement('div');
+  div.className = 'tag-block tag-agent-info';
+  div.style.cssText = `background:${bg};border:1px solid ${border};border-radius:8px;` +
+    `padding:5px 10px;margin:2px 0;display:flex;align-items:center;gap:8px;font-size:13px;color:${color};`;
+  div.innerHTML =
+    `<i class="fa ${escapeHtml(icon)}" style="flex-shrink:0;"></i>` +
+    `<b style="flex-shrink:0;">${escapeHtml(label)}</b>` +
+    `<span style="opacity:.85;white-space:pre-wrap;word-break:break-word;">${escapeHtml(detail)}</span>`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  window.dispatchEvent(new Event('logs:changed'));
+  return div;
+}
+
+// Colour palettes reused across new event handlers
+const _C = {
+  green:  { bg: '#D4EDDA', border: '#A8D5B5', text: '#155724' },
+  orange: { bg: '#FFF3CD', border: '#FFEAA7', text: '#856404' },
+  red:    { bg: '#FFE3E3', border: '#F5B7B7', text: '#8b0000' },
+  grey:   { bg: '#F0F0F0', border: '#CCCCCC', text: '#555555' },
+  blue:   { bg: '#D0E8FF', border: '#90C4F5', text: '#00407A' },
+};
+
+/**
+ * Handle new agent event tags that are not part of the original tag set.
+ * Returns true if the tag was handled, false to fall through to existing logic.
+ */
+function handleNewAgentTag(tag, raw) {
+  const body = raw.replace(/^<[^>]+>/, '').replace(/<\/[^>]+>$/, '').trim();
+
+  // ── VALIDATOR DONE ── green check, shows tool name + score ────────────────
+  if (tag === 'VALIDATOR DONE' || tag === 'VALIDATOR_DONE') {
+    // Expected body: "run_fastp score=0.87" or similar
+    const scoreMatch = body.match(/score\s*[=:]\s*([0-9.]+)/i);
+    const scoreStr   = scoreMatch ? ` → score ${parseFloat(scoreMatch[1]).toFixed(2)}` : '';
+    const toolName   = body.replace(/score\s*[=:]\s*[0-9.]+/i, '').trim() || 'tool';
+    renderAgentInfoLine('fa-check-circle', 'VALIDATOR', `${toolName}${scoreStr}`,
+      _C.green.bg, _C.green.border, _C.green.text);
+    return true;
+  }
+
+  // ── VALIDATOR RETRY ── orange refresh, shows tool + attempt ───────────────
+  if (tag === 'VALIDATOR RETRY' || tag === 'VALIDATOR_RETRY') {
+    renderAgentInfoLine('fa-refresh', 'RETRY', body || 'validator retry',
+      _C.orange.bg, _C.orange.border, _C.orange.text);
+    return true;
+  }
+
+  // ── VALIDATOR PASS-THROUGH ── grey neutral, no contract ───────────────────
+  if (tag === 'VALIDATOR PASS-THROUGH' || tag === 'VALIDATOR_PASS_THROUGH' || tag === 'VALIDATOR PASS THROUGH') {
+    renderAgentInfoLine('fa-circle-o', 'NO CONTRACT', body || 'no validator contract for this tool',
+      _C.grey.bg, _C.grey.border, _C.grey.text);
+    return true;
+  }
+
+  // ── QUALITY GATE ── colour by level (ok/warn/fail) ────────────────────────
+  if (tag === 'QUALITY GATE' || tag === 'QUALITY_GATE') {
+    const levelMatch = body.match(/^\s*(ok|warn(?:ing)?|fail(?:ed)?)\b/i);
+    const level      = levelMatch ? levelMatch[1].toLowerCase() : 'ok';
+    let   c, ico;
+    if (/^fail/.test(level))       { c = _C.red;    ico = 'fa-times-circle'; }
+    else if (/^warn/.test(level))  { c = _C.orange; ico = 'fa-exclamation-triangle'; }
+    else                           { c = _C.green;  ico = 'fa-check-circle'; }
+    const detail = body.replace(/^\s*(ok|warn(?:ing)?|fail(?:ed)?)\b\s*/i, '').trim() || body;
+    renderAgentInfoLine(ico, 'QUALITY GATE', detail, c.bg, c.border, c.text);
+    return true;
+  }
+
+  // ── SIGKILL DETECTED ── red alert, OOM / CPU kill ─────────────────────────
+  if (tag === 'SIGKILL DETECTED' || tag === 'SIGKILL_DETECTED') {
+    renderAgentInfoLine('fa-bolt', 'SIGKILL', body || 'Process killed — probable OOM or CPU limit exceeded.',
+      _C.red.bg, _C.red.border, _C.red.text);
+    return true;
+  }
+
+  // ── DIAG ROUND COUNTER ── blue info ───────────────────────────────────────
+  if (tag === 'DIAG ROUND COUNTER' || tag === 'DIAG_ROUND_COUNTER') {
+    renderAgentInfoLine('fa-stethoscope', 'DIAGNOSTICS', body || 'diagnostic round in progress',
+      _C.blue.bg, _C.blue.border, _C.blue.text);
+    return true;
+  }
+
+  // ── DIAG ROUNDS CAP ── orange warning, human intervention required ─────────
+  if (tag === 'DIAG ROUNDS CAP' || tag === 'DIAG_ROUNDS_CAP') {
+    renderAgentInfoLine('fa-exclamation-triangle', 'DIAG LIMIT', body || 'Diagnostic limit reached — human intervention may be required.',
+      _C.orange.bg, _C.orange.border, _C.orange.text);
+    return true;
+  }
+
+  // ── STATUS UNKNOWN ── grey with second-LLM hint ───────────────────────────
+  if (tag === 'STATUS UNKNOWN' || tag === 'STATUS_UNKNOWN') {
+    renderAgentInfoLine('fa-question-circle', 'STATUS?', body || 'Ambiguous status — second LLM call in progress.',
+      _C.grey.bg, _C.grey.border, _C.grey.text);
+    return true;
+  }
+
+  // ── BioRAG ── blue info line ──────────────────────────────────────────────
+  if (tag === 'BIORAG' || tag === 'RAG CONTEXT' || tag === 'RAG_CONTEXT' || tag === 'RAG DEGRADED' || tag === 'RAG_DEGRADED') {
+    const isDegraded = tag.includes('DEGRADED');
+    const c   = isDegraded ? _C.orange : _C.blue;
+    const ico = isDegraded ? 'fa-exclamation-triangle' : 'fa-database';
+    renderAgentInfoLine(ico, 'BioRAG', body || 'RAG context injected',
+      c.bg, c.border, c.text);
+    return true;
+  }
+
+  return false; // not handled by this function
+}
+
 /* ------------------------- Stream event router -------------------------- */
 const CHAT_BLOCK_TAGS = new Set(["SOLUTION", "FINAL", "ANSWER", "REVIEW", "SUMMARY"]);
 
@@ -1044,6 +1165,9 @@ export function renderAssistantEvent(evt) {
       }
       return;
     }
+
+    // F-1: new agent event tags (VALIDATOR *, QUALITY GATE, SIGKILL, DIAG *, BioRAG)
+    if (handleNewAgentTag(tag, raw)) return;
 
     // Fallback: process inline inside this block and render leftover text
     const rest = processInlineSystemTagsInOrder(raw.replace(/^<[^>]+>/, '').replace(/<\/[^>]+>$/, ''));

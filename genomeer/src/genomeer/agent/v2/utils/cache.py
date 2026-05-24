@@ -316,6 +316,13 @@ class ToolOutputCache:
         "run_amrfinderplus": 7  * 24 * 3600,
         "run_humann3":       14 * 24 * 3600,
         "download_from_ncbi": 90 * 24 * 3600,  # 90j — données NCBI stables
+        # New tools added 2026-05
+        "run_das_tool":      14 * 24 * 3600,   # 14j — output déterministe sur mêmes bins
+        "run_bracken":       30 * 24 * 3600,   # 30j — re-estimation déterministe si même DB Kraken2
+        "run_gtdbtk":        30 * 24 * 3600,   # 30j — classification stable si même DB GTDB
+        "run_medaka":        14 * 24 * 3600,   # 14j — polissage déterministe sur mêmes reads+modèle
+        "run_rgi":           14 * 24 * 3600,   # 14j — DB CARD mise à jour ~trimestrielle
+        "run_amrfinder":     7  * 24 * 3600,   # 7j  — DB NCBI AMRFinder mise à jour fréquente
     }
 
     def __init__(self, cache_dir: str, ttl: int = _TOOL_TTL):

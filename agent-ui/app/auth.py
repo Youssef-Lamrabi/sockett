@@ -10,9 +10,23 @@ from .db import get_db
 from .models import User
 from sqlalchemy.orm import Session
 
-SECRET_KEY = os.getenv("AGENT_COPILOT_SECRET", "dev-secret-change-me")
+_DEFAULT_SECRET = "dev-secret-change-me"
+SECRET_KEY = os.getenv("AGENT_COPILOT_SECRET", _DEFAULT_SECRET)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+
+
+def validate_secret_key() -> None:
+    """Raise RuntimeError at startup if the JWT secret is missing or still set to the insecure default."""
+    if not SECRET_KEY or SECRET_KEY == _DEFAULT_SECRET:
+        raise RuntimeError(
+            "\n\n[SECURITY ERROR] JWT secret key is not configured or is set to the insecure default.\n"
+            "Set the AGENT_COPILOT_SECRET environment variable to a strong random value before starting.\n"
+            "Example (Linux/macOS):\n"
+            "  export AGENT_COPILOT_SECRET=$(python -c \"import secrets; print(secrets.token_hex(32))\")\n"
+            "Example (Windows):\n"
+            "  $env:AGENT_COPILOT_SECRET = python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+        )
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")

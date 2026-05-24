@@ -57,9 +57,17 @@ _BLOCKED_BASH: List[Tuple[re.Pattern, str]] = [
     (re.compile(r":\s*\(\s*\)\s*\{[^}]*\}", re.IGNORECASE),
      "fork bomb pattern"),
 
-    # curl/wget pipe to bash (remote code execution)
-    (re.compile(r"(curl|wget)\s+\S+\s*\|\s*(bash|sh|zsh|ksh)", re.IGNORECASE),
+    # curl/wget pipe to bash — covers flags between URL and pipe (e.g. wget URL -O - | sh)
+    (re.compile(r"(curl|wget)\b[^|]*\|\s*(bash|sh|zsh|ksh)\b", re.IGNORECASE),
      "remote code execution via curl/wget pipe to shell"),
+
+    # Netcat reverse/bind shell: nc -e /bin/sh, ncat -e, busybox nc -e
+    (re.compile(r"\b(nc|ncat|netcat|busybox\s+nc)\b.*-e\s+/", re.IGNORECASE),
+     "reverse shell via netcat -e"),
+
+    # python/perl/ruby -c/-e inline code execution from bash
+    (re.compile(r"\b(python[23]?|perl|ruby|php)\s+-[ce]\s+['\"]", re.IGNORECASE),
+     "inline code execution via interpreter -c/-e flag"),
 
     # Écriture directe sur device
     (re.compile(r">\s*/dev/sd[a-z]", re.IGNORECASE),
@@ -121,13 +129,21 @@ _BLOCKED_PYTHON: List[Tuple[re.Pattern, str]] = [
         re.IGNORECASE,
     ), "shutil.rmtree on root or sensitive path"),
 
-    # os.system avec rm -rf
-    (re.compile(r"\bos\s*\.\s*system\s*\(.*\brm\s+-[a-zA-Z]*r[a-zA-Z]*f", re.IGNORECASE | re.DOTALL),
-     "os.system with rm -rf"),
+    # os.system — any call is forbidden (arbitrary shell command execution)
+    (re.compile(r"\bos\s*\.\s*system\s*\(", re.IGNORECASE),
+     "os.system() is forbidden (arbitrary shell execution); use subprocess with a list"),
 
     # subprocess avec rm -rf sur racine
     (re.compile(r"\bsubprocess\b.*\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\s+/(?!tmp)", re.IGNORECASE | re.DOTALL),
      "subprocess rm -rf on root path"),
+
+    # subprocess.run / Popen / call with shell=True — command injection vector
+    (re.compile(r"\bsubprocess\s*\.\s*(run|Popen|call|check_output|check_call)\s*\([^)]*\bshell\s*=\s*True", re.IGNORECASE | re.DOTALL),
+     "subprocess with shell=True is forbidden (command injection risk); pass a list of args"),
+
+    # pickle.loads / pickle.load — arbitrary code execution via deserialization
+    (re.compile(r"\bpickle\s*\.\s*(loads?|Unpickler)\s*\(", re.IGNORECASE),
+     "pickle.loads/load is forbidden (arbitrary code execution via deserialization)"),
 
     # eval() — exécution dynamique de code arbitraire
     (re.compile(r"\beval\s*\(", re.IGNORECASE),

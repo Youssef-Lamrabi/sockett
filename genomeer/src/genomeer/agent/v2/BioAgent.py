@@ -39,6 +39,8 @@ from genomeer.agent.v2.utils.validator import ToolValidator
 from genomeer.agent.v2.utils.quality_gate import check_quality, BIOLOGICAL_GATES
 from genomeer.utils.version_tracker import VersionTracker
 from genomeer.model.feedback import FeedbackParser
+from genomeer.utils.security import check_bash_script, check_python_code
+from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever, build_finalizer_rag_context
 
 # -----------------------------------------------
 # UTILS
@@ -160,7 +162,7 @@ class BioAgent:
 
         # show agent-specific LLM if different from default
         if agent_llm != settings.llm or agent_source != settings.source:
-            print("\n🤖 AGENT LLM (Constructor Override):")
+            print("\n[AGENT LLM] Constructor Override:")
             print(f"  LLM Model: {agent_llm}")
             if agent_source is not None:
                 print(f"  Source: {agent_source}")
@@ -1710,6 +1712,46 @@ class BioAgent:
             if diagnostic_mode:
                 code = diagnostic_code
 
+            # ── SECURITY CHECK (pre-execution) ───────────────────────────────────
+            _is_bash_code = (
+                code.strip().startswith("#!R")
+                or code.strip().startswith("# R code")
+                or code.strip().startswith("# R script")
+                or code.strip().startswith("#!BASH")
+                or code.strip().startswith("# Bash script")
+                or code.strip().startswith("#!CLI")
+            )
+            if _is_bash_code:
+                _sec_ok, _sec_reason = check_bash_script(code)
+            else:
+                _sec_ok, _sec_reason = check_python_code(code)
+
+            if not _sec_ok:
+                self._log(
+                    "SECURITY BLOCK",
+                    body=f"WARNING: {_sec_reason}\nCode preview (first 300 chars): {code[:300]}",
+                    node=node,
+                )
+                _sec_manifest = self._clean_manifest(state.get("manifest") or {})
+                _sec_manifest["repair_feedback"] = (
+                    f"SECURITY_BLOCK: The generated code was rejected by the security checker.\n"
+                    f"Reason: {_sec_reason}\n"
+                    f"Rewrite the code avoiding the dangerous pattern entirely. "
+                    f"Use safe alternatives (e.g. shutil.rmtree on /tmp paths, "
+                    f"not os.system, not eval/exec)."
+                )
+                _sec_manifest["repair_step_idx"] = state.get("current_idx", 0)
+                return {
+                    "next_step":   "generator",
+                    "last_result": f"[SECURITY BLOCK] {_sec_reason}",
+                    "manifest":    _sec_manifest,
+                    "messages": [AIMessage(content=(
+                        f"<STATUS:blocked>\n[SECURITY BLOCK] Code rejected before execution.\n"
+                        f"Reason: {_sec_reason}"
+                    ))],
+                }
+            # ── END SECURITY CHECK ────────────────────────────────────────────────
+
             try:
                 if (code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script")):
                     r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
@@ -2508,8 +2550,45 @@ class BioAgent:
                 self._log("PUBLISH ERROR", body=str(e), node=node)
                 artifacts = {"artifacts": [], "error": str(e)}
 
+            # ── BioRAG context injection ─────────────────────────────────────────
+            _rag_context = ""
+            try:
+                from pathlib import Path as _RAGPath
+                _rag_store = BioRAGStore(
+                    persist_dir=str(_RAGPath.home() / ".genomeer" / "rag_cache")
+                )
+                _rag_retriever = BioRAGRetriever(_rag_store)
+                _quality_signals = manifest.get("quality_signals") or {}
+                _pipeline_results = {
+                    "amr_genes":         manifest.get("amr_genes_detected", []),
+                    "pathways":          manifest.get("pathways", []),
+                    "assembly_n50":      _quality_signals.get("n50_bp"),
+                    "mean_completeness": _quality_signals.get("mean_completeness"),
+                }
+                _rag_context = build_finalizer_rag_context(_rag_retriever, _pipeline_results)
+                if _rag_context:
+                    self._log(
+                        "RAG CONTEXT",
+                        body=f"BioRAG active — {len(_rag_context)} chars injected",
+                        node=node,
+                    )
+                else:
+                    self._log("RAG CONTEXT", body="BioRAG returned empty context", node=node)
+            except Exception as _rag_err:
+                self._log(
+                    "RAG DEGRADED",
+                    body=f"BioRAG failed (non-fatal, continuing without RAG): {_rag_err}",
+                    node=node,
+                )
+                _rag_context = ""
+            # ── END BioRAG ───────────────────────────────────────────────────────
+
+            _finalizer_system_prompt = instructions.FINALIZER_PROMPT
+            if _rag_context:
+                _finalizer_system_prompt = _finalizer_system_prompt + "\n\n" + _rag_context
+
             msgs = [
-                SystemMessage(content=instructions.FINALIZER_PROMPT),
+                SystemMessage(content=_finalizer_system_prompt),
                 HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
                     user_goal=state.get("last_prompt"),
                     plan=state.get("plan"),
