@@ -12,7 +12,28 @@ from genomeer.runtime.env_manager import (
     ensure_env,
     ENVS_DIR
 )
-_persistent_namespace = {} 
+_persistent_namespace = {}
+
+# Cached result: True if this micromamba binary accepts --no-rc, False otherwise.
+_MICROMAMBA_NO_RC_SUPPORTED: Optional[bool] = None
+
+def _micromamba_supports_no_rc() -> bool:
+    """Return True if the installed micromamba supports the --no-rc flag.
+    Result is cached after the first call."""
+    global _MICROMAMBA_NO_RC_SUPPORTED
+    if _MICROMAMBA_NO_RC_SUPPORTED is not None:
+        return _MICROMAMBA_NO_RC_SUPPORTED
+    try:
+        exe = ensure_micromamba()
+        result = subprocess.run(
+            [str(exe), "run", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        _MICROMAMBA_NO_RC_SUPPORTED = "--no-rc" in (result.stdout + result.stderr)
+    except Exception:
+        _MICROMAMBA_NO_RC_SUPPORTED = False
+    return _MICROMAMBA_NO_RC_SUPPORTED
+
 class api_schema(BaseModel):
     """api schema specification."""
     api_schema: str | None = Field(description="The api schema as a dictionary")
@@ -42,8 +63,9 @@ def _run_in_env(
     exe = ensure_micromamba()
     prefix = ENVS_DIR / env_name
 
-    # --no-rc suppresses shell-init PATH warnings — only valid on Linux/macOS.
-    _extra = ["--no-rc"] if _platform.system() != "Windows" else []
+    # --no-rc suppresses shell-init PATH warnings but is not available on all
+    # micromamba versions — check support once and cache the result.
+    _extra = ["--no-rc"] if _platform.system() != "Windows" and _micromamba_supports_no_rc() else []
     cmd = [str(exe), "run", *_extra, "-p", str(prefix), *argv]
 
     env = dict(os.environ)

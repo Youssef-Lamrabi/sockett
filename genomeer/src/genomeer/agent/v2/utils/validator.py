@@ -1051,6 +1051,80 @@ class PharokkaContract(_BaseContract):
         return ContractResult(ok=True, score=score, reason=reason)
 
 
+class ProdigalContract(_BaseContract):
+    """
+    Covers Prodigal ORF/protein-prediction steps.
+    Expected output: .faa (protein FASTA).  Optional: .fna (nucleotide ORFs), .gff.
+    A contig .fasta present without .faa = Prodigal failed or was never run → blocked.
+    Scoring: number of predicted proteins; 1000 proteins = score 1.0.
+    Source: https://github.com/hyattpd/Prodigal
+    """
+    KEYWORDS = (
+        "prodigal", "orf prediction", "orf calling",
+        "protein prediction", "predict orf", "predict protein",
+    )
+    RUNTIME = "fast"
+    VARIANTS = [
+        "add -p meta for metagenomic contigs (mixed-species input)",
+        "lower minimum gene length: add -g 11 (standard genetic code)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        faa   = self._glob_first(run_dir, "*.faa", "proteins.faa", "prodigal.faa")
+        fasta = self._glob_first(
+            run_dir, "contigs.fasta", "assembly.fasta", "*.fasta", "*.fa",
+        )
+
+        if not faa:
+            if fasta:
+                return ContractResult(
+                    ok=False, score=0.1,
+                    reason=(
+                        "prodigal: contig FASTA found but .faa (protein predictions) "
+                        "is missing — Prodigal likely failed or was not run"
+                    ),
+                    retry_params={
+                        "hint": (
+                            "run: prodigal -i contigs.fasta -a proteins.faa "
+                            "-p meta -f gff -o prodigal.gff"
+                        )
+                    },
+                )
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="prodigal: no .faa protein file found in run directory",
+                retry_params={
+                    "hint": (
+                        "run: prodigal -i <contigs.fasta> -a proteins.faa "
+                        "-p meta -f gff -o prodigal.gff"
+                    )
+                },
+            )
+
+        size = os.path.getsize(faa)
+        if size < 100:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason=f"prodigal: .faa exists but nearly empty ({size} bytes) — no ORFs predicted",
+                retry_params={
+                    "hint": "check assembly quality; confirm contigs are >100 bp; add -p meta"
+                },
+            )
+
+        try:
+            n_proteins = sum(1 for line in open(faa, encoding="utf-8") if line.startswith(">"))
+        except Exception:
+            n_proteins = None
+
+        score = min(1.0, (n_proteins or 0) / 1000)
+        reason = (
+            f"prodigal: {n_proteins:,} proteins predicted"
+            if n_proteins is not None
+            else f"prodigal: .faa found ({size:,} bytes)"
+        )
+        return ContractResult(ok=True, score=score, reason=reason)
+
+
 class ProkkaContract(_BaseContract):
     """
     Output: *.gff, *.faa, *.gbk
@@ -1850,6 +1924,10 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     Kraken2Contract(),
     SylphContract(),
     KaijuContract(),
+    # ORF/protein prediction — checked BEFORE assembly so "orf prediction" steps
+    # aren't absorbed by AssemblyContract (which also matches "assembly statistics")
+    ProdigalContract(),
+    ProkkaContract(),
     # Assembly
     AssemblyContract(),
     QuastContract(),
@@ -1871,7 +1949,6 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     AbricateContract(),
     DbcanContract(),
     PharokkaContract(),
-    ProkkaContract(),
     # Community / diversity
     NonpareilContract(),
     LefseContract(),

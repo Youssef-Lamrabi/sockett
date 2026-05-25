@@ -1742,9 +1742,16 @@ class BioAgent:
                 _sec_manifest["repair_feedback"] = (
                     f"SECURITY_BLOCK: The generated code was rejected by the security checker.\n"
                     f"Reason: {_sec_reason}\n"
-                    f"Rewrite the code avoiding the dangerous pattern entirely. "
-                    f"Use safe alternatives (e.g. shutil.rmtree on /tmp paths, "
-                    f"not os.system, not eval/exec)."
+                    f"Rewrite the code avoiding the dangerous pattern entirely.\n"
+                    f"MANDATORY FIXES:\n"
+                    f"1. NEVER use subprocess.run(..., shell=True) — always pass a list of args:\n"
+                    f"   WRONG : subprocess.run('seqkit stats -a file > out.tsv', shell=True)\n"
+                    f"   RIGHT : res = subprocess.run(['seqkit', 'stats', '-a', fasta_path],\n"
+                    f"               capture_output=True, text=True, check=True)\n"
+                    f"           with open(output_tsv, 'w') as f: f.write(res.stdout)\n"
+                    f"2. NEVER use os.system() — replace with subprocess.run(list_of_args).\n"
+                    f"3. NEVER use eval() or exec().\n"
+                    f"For shell redirection (>): capture stdout with capture_output=True and write to file manually."
                 )
                 _sec_manifest["repair_step_idx"] = state.get("current_idx", 0)
                 return {
@@ -1788,6 +1795,14 @@ class BioAgent:
                     # Inject custom functions into the Python execution environment
                     self._inject_custom_functions_to_repl()
                     code = re.sub(r"^\s*#!PY\s*\r?\n", "", code, count=1)
+                    # Fix UUID hallucination: normalize every run_dir string assignment
+                    # to the correct path so LLM typos in the UUID are silently corrected.
+                    if _run_temp_dir:
+                        code = re.sub(
+                            r'run_dir\s*=\s*r?["\'][^"\']*["\']',
+                            f'run_dir = r"{_run_temp_dir}"',
+                            code,
+                        )
                     out = run_with_timeout(
                         run_python_code,
                         args=[code],
@@ -1854,6 +1869,17 @@ class BioAgent:
             step        = self._get_current_step(state)
             run_dir     = state.get("run_temp_dir", "")
             last_result = state.get("last_result") or ""
+
+            # If execution failed (non-zero exit code), contracts cannot prove success.
+            # Pass directly to observer so its HARD BLOCK catches the failure.
+            _exit_m = re.search(r"Exit code[:\s]+(\d+)", last_result, re.IGNORECASE)
+            if _exit_m and _exit_m.group(1) != "0":
+                self._log(
+                    "VALIDATOR BYPASS (exit!=0)",
+                    body=f"exit_code={_exit_m.group(1)} — skipping contracts → observer",
+                    node=node,
+                )
+                return {"next_step": "observer"}
 
             result = ToolValidator.validate(step["title"], run_dir, last_result)
             max_r  = ToolValidator.max_retries(step["title"])
@@ -2249,6 +2275,26 @@ class BioAgent:
                         f"(os, glob, subprocess, sys, shutil, gzip, pathlib) and "
                         f"conda packages (biopython, ncbi-genome-download, etc.)."
                     )
+                elif missing_pkg == "Bio" or missing_pkg.startswith("Bio."):
+                    summary = (
+                        f"ModuleNotFoundError: 'Bio' (biopython) is not installed in this environment. "
+                        f"Missing module: '{missing_pkg}'. "
+                        f"STRICT REPAIR RULE — do NOT retry with any Bio.* import. "
+                        f"Rewrite using the standard library only:\n"
+                        f"  1. Parse FASTA with a plain for-loop (no SeqIO, no SeqRecord, no Seq):\n"
+                        f"       records = []\n"
+                        f"       with open(fasta_path) as _f:\n"
+                        f"           _sid, _seq = None, []\n"
+                        f"           for _line in _f:\n"
+                        f"               _line = _line.rstrip()\n"
+                        f"               if _line.startswith('>'):\n"
+                        f"                   if _sid: records.append((_sid, ''.join(_seq)))\n"
+                        f"                   _sid, _seq = _line[1:].split()[0], []\n"
+                        f"               else: _seq.append(_line)\n"
+                        f"           if _sid: records.append((_sid, ''.join(_seq)))\n"
+                        f"  2. Compute lengths as: lengths = [len(seq) for _, seq in records]\n"
+                        f"  3. Never import from Bio.* — not even 'from Bio import SeqIO'."
+                    )
                 else:
                     summary = (
                         f"ModuleNotFoundError: package '{missing_pkg}' is not available in the environment. "
@@ -2257,6 +2303,25 @@ class BioAgent:
                         f"Do NOT ask the user to install anything."
                     )
                 self._log("FAST-PATH ModuleNotFoundError", body=summary, node=node)
+                new_manifest = self._clean_manifest(state["manifest"])
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items() if str(k).isdigit()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                next_step = "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator"
+                plan = list(state["plan"])
+                plan[state["current_idx"]] = {**plan[state["current_idx"]], "notes": summary, "status": "blocked"}
+                return {
+                    "plan": plan,
+                    "current_idx": state["current_idx"],
+                    "next_step": next_step,
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary}")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
             elif not diagnostic_mode and _is_bad_import:
                 # ImportError on a name that doesn't exist in an installed module.
                 # Extract what was hallucinated and give precise repair guidance.
@@ -2795,6 +2860,7 @@ class BioAgent:
             lambda s: s["next_step"],
             {
                 "validator": "validator",
+                "generator": "generator",
             },
         )
         workflow.add_conditional_edges(
@@ -3842,6 +3908,21 @@ class BioAgent:
         }
 
 
+    # ENV ROUTING — deterministic, based on prompt keywords
+    _HEAVY_TOOLS_RE = re.compile(
+        r'\b(kraken2|kraken\b|checkm2|checkm\b|antismash|humann3?|'
+        r'semibin2?|concoct|maxbin2?|metabat2?|das_tool|dastool|'
+        r'gtdbtk|metaphlan|bracken|kaiju|'
+        r'eggnog|emapper|genomad|abricate|pharokka|'
+        r'lefse|nonpareil|phyloseq|medaka|rgi\b|amrfinder|'
+        r'binning|metagenome.assembled|dereplicate.bin)\b',
+        re.IGNORECASE,
+    )
+
+    def _select_env(self, prompt: str) -> str:
+        """Return meta-env1 for heavy pipeline requests, bio-agent-env1 otherwise."""
+        return "meta-env1" if self._HEAVY_TOOLS_RE.search(prompt) else "bio-agent-env1"
+
     # AGENT RUNNER
     def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
         """Execute the agent with the given prompt.
@@ -3868,10 +3949,12 @@ class BioAgent:
 
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
+                _env = self._select_env(prompt)
+                self._log("ENV ROUTING", body=f"prompt → {_env}", node="go")
                 inputs = {
                     "messages": [HumanMessage(content=prompt)],
                     "next_step": None,
-                    "env_name": "bio-agent-env1",
+                    "env_name": _env,
                     "env_ready": False,
                     "pending_code": None,
                     "manifest": {
@@ -3978,10 +4061,12 @@ class BioAgent:
 
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
+                _env = self._select_env(prompt)
+                self._log("ENV ROUTING", body=f"prompt → {_env}", node="go")
                 inputs = {
                     "messages": [HumanMessage(content=prompt)],
                     "next_step": None,
-                    "env_name": "bio-agent-env1",
+                    "env_name": _env,
                     "env_ready": False,
                     "pending_code": None,
                     "manifest": {

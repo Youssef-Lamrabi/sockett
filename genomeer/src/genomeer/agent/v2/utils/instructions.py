@@ -293,6 +293,21 @@ SPECIAL ALWAYS-TRUE RULES:
 - SeqIO.parse() returns a one-time generator. ALWAYS convert it to a list immediately:
     contigs = list(SeqIO.parse(fasta_path, "fasta"))
   Never call SeqIO.parse() twice or iterate its result after any other list()/loop usage.
+- If Bio/biopython is not available (previous error was ModuleNotFoundError: No module named 'Bio'),
+  NEVER retry with Bio imports. Use the standard library only. Parse FASTA with a plain loop:
+    records = []
+    with open(fasta_path) as _f:
+        _sid, _seq = None, []
+        for _line in _f:
+            _line = _line.rstrip()
+            if _line.startswith(">"):
+                if _sid: records.append((_sid, "".join(_seq)))
+                _sid, _seq = _line[1:].split()[0], []
+            else:
+                _seq.append(_line)
+        if _sid: records.append((_sid, "".join(_seq)))
+  Compute lengths as: lengths = [len(seq) for _, seq in records]
+  Never import from Bio in repair mode if the previous error was ModuleNotFoundError: No module named 'Bio'.
 - N50 computation: ALWAYS use this exact pattern  -  no walrus operator, no None placeholder:
     lengths = sorted([len(r.seq) for r in contigs], reverse=True)
     total = sum(lengths)

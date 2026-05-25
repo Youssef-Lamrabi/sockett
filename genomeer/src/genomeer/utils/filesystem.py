@@ -44,17 +44,22 @@ def get_file(run_dir: str, pattern: str) -> str:
 # ── Prompt snippet injected into GENERATOR / INPUT_GUARD prompts ─────────────
 
 FILESYSTEM_PROMPT_SNIPPET = """\
-FILESYSTEM HELPERS (always available in your code — use these instead of hardcoding paths):
+FILESYSTEM HELPERS — use these patterns to locate files (works in every script):
 
-  from genomeer.utils.filesystem import list_files, get_file
+  import glob, os
 
   # List all .fna files in the run directory:
-  fna_files = list_files(run_dir, "*.fna")
-  # Also works with .fna.gz, *.faa, *.gff, etc.
+  fna_files = sorted(glob.glob(os.path.join(run_dir, "*.fna")))
 
-  # Get the first matching file (raises FileNotFoundError with a helpful message if missing):
-  fasta_path = get_file(run_dir, "*.fna")
+  # Get the first matching file (raise a clear error if missing):
+  matches = sorted(glob.glob(os.path.join(run_dir, "*.fna")))
+  if not matches:
+      import sys; sys.exit(f"No .fna file found in {run_dir}")
+  fasta_path = matches[0]
+
+  # Works with any extension: *.fna.gz, *.faa, *.gff, *.json, *.tsv, etc.
 
   # NEVER hardcode filenames like "GCF_000005845.2.fna" — they will be wrong.
-  # ALWAYS use list_files() or get_file() with run_dir.
+  # ALWAYS use glob.glob() with run_dir to locate files.
+  # Do NOT call get_file() or list_files() — they are not available in script context.
 """

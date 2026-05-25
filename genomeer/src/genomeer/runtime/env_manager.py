@@ -201,7 +201,53 @@ def ensure_micromamba() -> Path:
     return exe
 
 
-_PIP_SENTINEL = ".genomeer_pip_ok"
+_PIP_SENTINEL  = ".genomeer_pip_ok"
+_SPEC_HASH_SENTINEL = ".genomeer_spec_hash"
+
+
+def _spec_hash(spec_file: Path) -> str:
+    """Short SHA-256 of the spec YAML (used to detect spec changes)."""
+    return hashlib.sha256(spec_file.read_bytes()).hexdigest()[:16]
+
+
+def _stored_spec_hash(name: str) -> str | None:
+    """Return the spec hash written at last install, or None if not stored yet."""
+    p = env_prefix(name) / "conda-meta" / _SPEC_HASH_SENTINEL
+    try:
+        return p.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _write_spec_hash(name: str, spec_file: Path) -> None:
+    (env_prefix(name) / "conda-meta" / _SPEC_HASH_SENTINEL).write_text(
+        _spec_hash(spec_file)
+    )
+
+
+def _update_env_from_spec(
+    name: str,
+    spec_file: Path,
+    stream_cb=None,
+) -> None:
+    """Install packages that were added to the spec after the env was created.
+    Uses `micromamba install` (idempotent: skips already-present packages).
+    Also re-runs the pip step and refreshes the spec-hash sentinel."""
+    mm = ensure_micromamba()
+    prefix = env_prefix(name)
+    args = [str(mm), "install", "-y", "-p", str(prefix), "-f", str(spec_file)]
+    proc = subprocess.Popen(
+        args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
+    )
+    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=1800)
+    if rc != 0:
+        raise RuntimeError(
+            f"micromamba install failed (exit {rc}) while updating env '{name}'. "
+            "Check the spec file and channel availability."
+        )
+    # Re-run pip step — new pip deps in the spec would also have been missed.
+    _pip_install_from_spec(prefix, spec_file, stream_cb=stream_cb)
+    _write_spec_hash(name, spec_file)
 
 def env_prefix(name: str) -> Path:
     """Absolute path to the env prefix directory."""
@@ -366,6 +412,7 @@ def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None 
 
     # Explicitly install pip packages (workaround: micromamba on Windows silently skips pip: sections)
     _pip_install_from_spec(prefix, spec_file, stream_cb=stream_cb)
+    _write_spec_hash(name, spec_file)
 
 
 def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = None):
@@ -403,24 +450,41 @@ def ensure_env(name: str, auto_install: bool = True, log_cb: Optional[Callable[[
     prefix = env_prefix(name)
 
     if has_env(name):
-        # Env directory exists but pip packages may be absent (Windows micromamba bug:
-        # conda create silently skips pip: sections). Check the sentinel and repair if needed.
+        spec = spec_path(rec["spec"])
+        current_hash = _spec_hash(spec)
+        stored_hash  = _stored_spec_hash(name)
+        spec_changed = stored_hash != current_hash
+
+        if spec_changed and auto_install:
+            # Spec was updated since last install (or first run after this fix was deployed).
+            # micromamba install is idempotent: already-present packages are skipped.
+            with _install_lock(name):
+                # Re-check after acquiring lock — another process may have just updated it.
+                if _stored_spec_hash(name) != current_hash:
+                    _update_env_from_spec(name, spec, stream_cb=log_cb)
+            return prefix, False, f"Environment '{name}' updated to latest spec."
+
         if not has_pip_installed(name):
+            # Pip sentinel missing: Windows micromamba bug or interrupted install.
             if auto_install:
-                _pip_install_from_spec(prefix, spec_path(rec["spec"]), stream_cb=log_cb)
+                _pip_install_from_spec(prefix, spec, stream_cb=log_cb)
+                _write_spec_hash(name, spec)
             else:
                 raise RuntimeError(
                     f"Env '{name}' exists but pip packages are not installed "
                     f"(sentinel {_PIP_SENTINEL} missing). Re-run with auto_install=True."
                 )
+
         return prefix, False, f"Environment '{name}' ready."
 
     if auto_install:
         with _install_lock(name):
             if has_env(name):
-                # Another thread just created it — still check pip sentinel.
+                # Another thread just created it — still check pip sentinel and hash.
+                spec = spec_path(rec["spec"])
                 if not has_pip_installed(name):
-                    _pip_install_from_spec(prefix, spec_path(rec["spec"]), stream_cb=log_cb)
+                    _pip_install_from_spec(prefix, spec, stream_cb=log_cb)
+                    _write_spec_hash(name, spec)
                 return prefix, False, f"Environment '{name}' became ready."
 
             spec = spec_path(rec["spec"])

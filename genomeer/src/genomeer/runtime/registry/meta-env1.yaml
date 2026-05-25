@@ -37,6 +37,10 @@ dependencies:
   - run-dbcan              # run_dbcan     → run_dbcan.py
   - pharokka               # run_pharokka  → pharokka.py
 
+  # ── ORF / Gene prediction ────────────────────────────────────────────────────
+  - prodigal               # prodigal     → prodigal (ORF prediction)
+  - prokka                 # prokka       → prokka (bacterial genome annotation)
+
   # ── Sequence manipulation ────────────────────────────────────────────────────
   - seqkit                 # run_seqkit   → seqkit
   - bbtools                # run_bbduk    → bbduk.sh

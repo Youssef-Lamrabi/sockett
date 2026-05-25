@@ -5,7 +5,11 @@ channels:
   - bioconda
 dependencies:
   - python=3.11
-  - ncbi-genome-download  
+  - ncbi-genome-download
+  - biopython
+  - seqkit
+  - prodigal
+  - prokka
   - pip
   - pip:
       - numpy==2.1
