@@ -128,7 +128,7 @@ def _format_proc_error(title: str, cmd: list[str] | str, rc: int, stdout: str, s
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
+def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     code = (code or "").strip()
     if not code: 
@@ -143,7 +143,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeou
                 ensure_env(env_name, auto_install=True, log_cb=log_cb)
             except Exception as _env_err:
                 return f"Environment '{env_name}' is not available: {_env_err}" 
-            proc = _run_in_env(env_name, ["Rscript", path], timeout=timeout or settings.timeout_seconds)
+            proc = _run_in_env(env_name, ["Rscript", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -188,7 +188,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeou
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
+def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     script = (script or "").strip()
     if not script: 
@@ -207,7 +207,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None,
             except Exception as _env_err:
                 return f"Environment '{env_name}' is not available: {_env_err}"
 
-            proc = _run_in_env(env_name, ["bash", path], timeout=timeout or settings.timeout_seconds)
+            proc = _run_in_env(env_name, ["bash", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -282,7 +282,7 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
 # ------------------------------------------------------------------------------------------
-def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None) -> str:
+def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None) -> str:
     """
     Executes the provided Python code.
     - If env_name is provided: runs it in that micromamba env (fresh process).
@@ -305,7 +305,7 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, t
                 path = f.name
 
             try:
-                proc = _run_in_env(env_name, ["python", path], timeout=timeout or settings.timeout_seconds)
+                proc = _run_in_env(env_name, ["python", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env)
             except subprocess.TimeoutExpired as te:
                 cmd_display = getattr(te, "cmd", ["python", path])
                 return (

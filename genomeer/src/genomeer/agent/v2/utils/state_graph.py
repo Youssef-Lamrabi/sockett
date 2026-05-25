@@ -51,6 +51,52 @@ class StateGraphHelper:
         else:
             text = text[: end + len("</EXECUTE>")]
 
+        # Fix multi-line binary-operator splits that cause SyntaxError / IndentationError.
+        #
+        # Two failure modes the LLM produces:
+        #   1. Trailing +/|  (no enclosing parens)  →  SyntaxError on line ending with operator
+        #      fasta = glob("*.fna") +
+        #              glob("*.fna.gz")       ← Python rejects this without parens
+        #
+        #   2. Leading +/| with indent  →  IndentationError (unexpected indent)
+        #      fasta = glob("*.fna")
+        #              + glob("*.fna.gz")     ← IndentationError at module level
+        #
+        # Fix: join the continuation line onto its predecessor so the full expression
+        # sits on one line.  Works for both cases and preserves quoted content.
+
+        # Pass 1 — absorb lines that START with + or | into the previous line.
+        _p1 = []
+        for _line in text.splitlines():
+            _s = _line.lstrip()
+            if _p1 and _s and _s[0] in ('+', '|') and (len(_s) < 2 or _s[1] in (' ', '\t', '(')):
+                _p1[-1] = _p1[-1].rstrip() + ' ' + _s
+            else:
+                _p1.append(_line)
+
+        # Pass 2 — absorb lines whose TAIL is + or | into the following line.
+        _p2: list = []
+        _j = 0
+        while _j < len(_p1):
+            _ln = _p1[_j]
+            _rt = _ln.rstrip()
+            # Keep joining while the current line ends with a bare operator
+            # (guard: don't join if the + is inside a string literal ending the line,
+            #  detected by trailing quotes after the operator — rare but safe check)
+            while (
+                _j + 1 < len(_p1)
+                and _rt
+                and _rt[-1] in ('+', '|')
+                and not _rt.endswith(('"""', "'''"))
+            ):
+                _j += 1
+                _ln = _rt + ' ' + _p1[_j].lstrip()
+                _rt = _ln.rstrip()
+            _p2.append(_ln)
+            _j += 1
+
+        text = '\n'.join(_p2)
+
         return text
 
     # Fallback: markdown fenced code blocks  ```python / ```py / ```bash / ```r

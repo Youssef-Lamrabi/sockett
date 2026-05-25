@@ -142,17 +142,15 @@ If needed: the home direcltory for this context if : TEMP_DIR={temp_run_dir}.
 
 
 QA_PROMPT = """
-You are QA. 
-Your job is to response to user question based on context and ressource available to you.
-- If `route_hint == "ask_for_missing"`, ask the user *only* for the missing items, concisely, as a short numbered list.
-- If `route_hint == "finalize"`, summarize results clearly and answer the user's original question.
+You are QA. Answer the user's question directly and concisely.
 
+Rules:
+- If `route_hint == "ask_for_missing"`: ask the user *only* for the missing items, as a short numbered list. Nothing else.
+- If `route_hint == "finalize"`: summarize results clearly and answer the user's original question.
+- Otherwise: answer directly. Do NOT open with phrases like "Based on the recent history", "As I mentioned", or any reference to prior messages. Just answer.
 
-- If user question is related to history only look in this history provided to you to try to respond:
-RECENT HISTORY:
----------------
+Context (for continuity only — never summarize or quote it explicitly):
 {history}
----------------
 """
 
 # INPUT_VALIDATOR_PROMPT = """
@@ -307,6 +305,8 @@ SPECIAL ALWAYS-TRUE RULES:
   Do NOT use Bio.Assembly. Do NOT write n50 = None or n50 = 0 with a "# compute later" comment.
 - All output files must be written to run_dir (provided in context). Use os.path.join(run_dir, "filename.ext"). Never hardcode absolute paths for outputs.
 - When a metric cannot be computed because data is genuinely missing, print a clear error and call sys.exit(1). Never silently return None or 0.
+- Never split a list concatenation across multiple lines with + at the start of a continuation line. Always use a single list literal or extend() instead.
+- NEVER import from genomeer.* in generated code. The execution environment (micromamba) does not have access to the genomeer package. Use only standard libraries and packages available in the conda environment.
 """
 
 GENERATOR_CTX_PROMPT="""

@@ -149,27 +149,23 @@ class BioAgent:
         print("BioAgent_v1 CONFIGURATION")
         print("=" * 50)
 
-        # get the actual LLM values that will be used by the agent
-        agent_llm = llm if llm is not None else settings.llm
-        agent_source = source if source is not None else settings.source
-
-        # show default config (database LLM)
-        print("DEFAULT CONFIG :")
-        config_dict = settings.to_dict()
-        for key, value in config_dict.items():
+        # show the effective (resolved) config — constructor args take priority over settings defaults
+        effective = {
+            "path":               path,
+            "run_dir":            settings.run_dir,
+            "timeout_seconds":    timeout_seconds,
+            "llm":                llm,
+            "temperature":        settings.temperature,
+            "use_tool_retriever": use_tool_retriever,
+            "source":             source,
+            "base_url":           base_url,
+        }
+        print("EFFECTIVE CONFIG :")
+        for key, value in effective.items():
             if value is not None:
                 print(f"  {key.replace('_', ' ').title()}: {value}")
-
-        # show agent-specific LLM if different from default
-        if agent_llm != settings.llm or agent_source != settings.source:
-            print("\n[AGENT LLM] Constructor Override:")
-            print(f"  LLM Model: {agent_llm}")
-            if agent_source is not None:
-                print(f"  Source: {agent_source}")
-            if base_url is not None:
-                print(f"  Base URL: {base_url}")
-            if api_key is not None and api_key != "EMPTY":
-                print(f"  API Key: {'*' * 8 + api_key[-4:] if len(api_key) > 8 else '***'}")
+        if api_key is not None and api_key != "EMPTY":
+            print(f"  Api Key: {'*' * 8 + api_key[-4:] if len(api_key) > 8 else '***'}")
         print("=" * 50 + "\n")
 
 
@@ -736,17 +732,27 @@ class BioAgent:
                 return t.strip() or "Step"
             steps = [{**s, "title": _clean_title(s["title"])} for s in steps]
 
+            # When routing to QA, suppress the planner's LLM draft from state messages.
+            # Two reasons:
+            # 1. The draft would appear as a spurious first response in the user stream.
+            # 2. QA's _history_snippet would pick it up and generate "Based on recent history…"
+            #    instead of a clean direct answer — causing the double-response bug.
+            if route == "qa" or not steps:
+                planner_msg = AIMessage(content=f"<log><route>{route}</route></log>")
+            else:
+                planner_msg = AIMessage(content=resp.content)
+
             updates = {
                 "plan": steps,
                 "current_idx": 0,
                 "next_step": route,
-                "messages": [AIMessage(content=resp.content)],
+                "messages": [planner_msg],
                 "last_prompt": user_prompt,
             }
             if manifest.get("route_hint") == "await_user":
                 updates["manifest"] = new_manifest
             self._log("EXIT NODE", body=f"route={route}\nsteps={steps}", node=node)
-            
+
             if route == "qa" or not steps:
                 self._log("HITL: skip planner pause for QA", body=f"route={route}, steps={len(steps)}", node=node)
                 return updates
@@ -826,7 +832,7 @@ class BioAgent:
                 self._log("EXIT NODE", body=f"batch_mode=True strategy={_batch_strategy} samples={len(_sample_manifest)} → batch_orchestrator", node=node)
                 return {
                     "next_step": "batch_orchestrator",
-                    "messages": [AIMessage(content=f"<observe>Batch mode activated ({_batch_strategy}, {len(_sample_manifest)} samples).</observe>")],
+                    "messages": [AIMessage(content=f"<log>Batch mode activated ({_batch_strategy}, {len(_sample_manifest)} samples).</log>")],
                 }
 
             idx = state["current_idx"]
@@ -847,7 +853,7 @@ class BioAgent:
                 return {
                     "current_idx": idx,
                     "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>All steps complete. Finalizing…</observe>")],
+                    "messages": [AIMessage(content="<log>All steps complete. Finalizing…</log>")],
                 }
 
             # otherwise go check inputs
@@ -874,7 +880,7 @@ class BioAgent:
                 self._log("EXIT NODE", body="sample_manifest empty → finalizer", node=node)
                 return {
                     "next_step": "finalizer",
-                    "messages": [AIMessage(content="<observe>No samples in manifest — skipping batch.</observe>")],
+                    "messages": [AIMessage(content="<log>No samples in manifest — skipping batch.</log>")],
                 }
 
             # --- concurrency / RAM config ---
@@ -1010,7 +1016,7 @@ class BioAgent:
             return {
                 "per_sample_results": per_sample,
                 "next_step": "finalizer",
-                "messages": [AIMessage(content=f"<observe>Batch complete: {len(per_sample)}/{len(samples)} samples processed.</observe>")],
+                "messages": [AIMessage(content=f"<log>Batch complete: {len(per_sample)}/{len(samples)} samples processed.</log>")],
             }
 
         def _input_guard(self, state: AgentState) -> AgentState:
@@ -1119,7 +1125,7 @@ class BioAgent:
                 return {
                     "manifest": new_manifest,
                     "next_step": "generator",
-                    "messages": [AIMessage(content=resp.content)],
+                    "messages": [AIMessage(content=f"<log>{resp.content}</log>")],
                 }
         
         def _generator(self, state: AgentState) -> AgentState:
@@ -1593,18 +1599,18 @@ class BioAgent:
                             "env_ready": False,
                             "next_step": "end",
                             "messages": [AIMessage(content=(
-                                f"<observe>Environment '{env_name}' pip install failed: {msg}\n"
+                                f"<log>Environment '{env_name}' pip install failed: {msg}\n"
                                 f"Delete the env folder and retry, or install packages manually:\n"
-                                f"  micromamba run -p {prefix} pip install biopython numpy pandas</observe>"
+                                f"  micromamba run -p {prefix} pip install biopython numpy pandas</log>"
                             ))],
                         }
 
                 return {
                     "env_ready": True,
                     "next_step": "executor",
-                    "messages": [AIMessage(content=f"<observe>Environment '{env_name}' ready at {prefix}</observe>")],
+                    "messages": [AIMessage(content=f"<log>Environment '{env_name}' ready at {prefix}</log>")],
                 }
-            
+
             # first visit: create a stream and announce
             entry = self._install_threads.get(env_name)
             if entry is None:
@@ -1627,7 +1633,7 @@ class BioAgent:
                     self._install_threads.pop(env_name, None)
                     return {
                         "next_step": "end",
-                        "messages": [AIMessage(content=f"<observe>Error: Env '{env_name}' not found in registry.</observe>")],
+                        "messages": [AIMessage(content=f"<log>Error: Env '{env_name}' not found in registry.</log>")],
                     }
                 
                 spec = spec_path(rec["spec"])
@@ -1649,7 +1655,7 @@ class BioAgent:
                 return {
                     "env_ready": True,
                     "next_step": "executor",
-                    "messages": [AIMessage(content=f"<observe>Environment '{env_name}' ready at {prefix}</observe>")]
+                    "messages": [AIMessage(content=f"<log>Environment '{env_name}' ready at {prefix}</log>")]
                 }
             except Exception as e:
                 try: entry["stream"].push(f"ERROR: {e}\n")
@@ -1659,7 +1665,7 @@ class BioAgent:
                 self._install_threads.pop(env_name, None)
                 return {
                     "next_step": "end",
-                    "messages": [AIMessage(content=f"<observe>Env install failed: {e}</observe>")]
+                    "messages": [AIMessage(content=f"<log>Env install failed: {e}</log>")]
                 }
         
         def _get_current_step(self, state: AgentState):
@@ -1722,7 +1728,7 @@ class BioAgent:
                 or code.strip().startswith("#!CLI")
             )
             if _is_bash_code:
-                _sec_ok, _sec_reason = check_bash_script(code)
+                _sec_ok, _sec_reason = check_bash_script(code, diagnostic_mode=bool(diagnostic_mode))
             else:
                 _sec_ok, _sec_reason = check_python_code(code)
 
@@ -1999,7 +2005,10 @@ class BioAgent:
                 re.IGNORECASE,
             )
             _MEANINGFUL_OUTPUT = re.compile(
-                r"\d+|percent|%|N50|GC|contig|length|sequence|scaffold|"
+                # \d{3,} requires ≥3-digit numbers (biological magnitudes like N50, genome length).
+                # Plain \d+ would falsely match "0" in "Exit code: 0" and trigger FAST-DONE
+                # on runs that produced zero stdout.
+                r"\d{3,}|percent|%|N50|GC|contig|length|sequence|scaffold|"
                 r"found|done|success|saved|written|downloaded|parsed|FASTA ready",
                 re.IGNORECASE,
             )
@@ -2020,6 +2029,36 @@ class BioAgent:
                 and (_MEANINGFUL_OUTPUT.search(last_result) or _output_files_exist)
                 and len(last_result.strip()) > 5
             )
+
+            # ── HARD BLOCK 0: no output at all ──────────────────────────────────────
+            # An empty last_result means the executor produced nothing — no stdout,
+            # no stderr, no exit code.  Sending this to the LLM observer causes small
+            # models to hallucinate STATUS:done on a step that never ran or crashed
+            # silently.  Force a blocked return so the generator can retry.
+            if not diagnostic_mode and not last_result.strip():
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items() if str(k).isdigit()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["repair_feedback"] = (
+                    "Execution produced no output (empty stdout and stderr). "
+                    "The script likely crashed before printing anything or was never executed. "
+                    "Fix: add a print() at the top of the script to confirm it starts, "
+                    "and wrap the main logic in try/except to surface any hidden error."
+                )
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                self._log("HARD BLOCK empty output", body="last_result is empty", node=node)
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content="<STATUS:blocked>\nExecution produced no output — treated as failure.")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
 
             # ── HARD BLOCK 1: non-zero exit code ────────────────────────────────────
             if not diagnostic_mode and _exit_code_nonzero:
@@ -2198,12 +2237,25 @@ class BioAgent:
             if not diagnostic_mode and _is_missing_package:
                 pkg_m = re.search(r"No module named '([^']+)'", last_result)
                 missing_pkg = pkg_m.group(1) if pkg_m else "unknown"
-                summary = (
-                    f"ModuleNotFoundError: package '{missing_pkg}' is not available in the environment. "
-                    f"Fix: use subprocess.run([sys.executable, '-m', 'pip', 'install', '{missing_pkg}']) "
-                    f"at the top of the script, then re-import. "
-                    f"Do NOT ask the user to install anything."
-                )
+                # genomeer is the agent's internal package — it is never on PyPI and
+                # must never be imported in generated code.  Give targeted guidance
+                # instead of the generic "pip install" advice which the LLM can't follow.
+                if missing_pkg.startswith("genomeer"):
+                    summary = (
+                        f"ModuleNotFoundError: '{missing_pkg}' is an internal agent module "
+                        f"and does NOT exist in the execution environment (micromamba). "
+                        f"NEVER import from genomeer.* in generated code. "
+                        f"Remove the import entirely and use only standard libraries "
+                        f"(os, glob, subprocess, sys, shutil, gzip, pathlib) and "
+                        f"conda packages (biopython, ncbi-genome-download, etc.)."
+                    )
+                else:
+                    summary = (
+                        f"ModuleNotFoundError: package '{missing_pkg}' is not available in the environment. "
+                        f"Fix: use subprocess.run([sys.executable, '-m', 'pip', 'install', '{missing_pkg}']) "
+                        f"at the top of the script, then re-import. "
+                        f"Do NOT ask the user to install anything."
+                    )
                 self._log("FAST-PATH ModuleNotFoundError", body=summary, node=node)
             elif not diagnostic_mode and _is_bad_import:
                 # ImportError on a name that doesn't exist in an installed module.
@@ -2350,7 +2402,11 @@ class BioAgent:
             if status == "blocked":
                 rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
                 new_manifest["retry_count"] = rc[state["current_idx"]]
-                new_manifest["repair_feedback"] = summary
+                _raw_output = (last_result or "").strip()
+                new_manifest["repair_feedback"] = (
+                    f"{summary}\n\nEXECUTION OUTPUT:\n{_raw_output[:1000]}"
+                    if _raw_output else summary
+                )
                 new_manifest["repair_step_idx"] = state["current_idx"]
                 
                 # routing
@@ -2660,6 +2716,7 @@ class BioAgent:
         self.observer = types.MethodType(_observer, self)
         self.diagnostics = types.MethodType(_diagnostics, self)
         self.finalizer = types.MethodType(_finalizer, self)
+        self._get_current_step = types.MethodType(_get_current_step, self)
         
         # Create the workflow
         # --------------------------------------------------------------------------------
@@ -4005,4 +4062,3 @@ class BioAgent:
                                 _sh.rmtree(_fp, ignore_errors=True)
                     except Exception:
                         pass
-    

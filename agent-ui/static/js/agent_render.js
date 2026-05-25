@@ -1116,6 +1116,10 @@ export function renderAssistantEvent(evt) {
 
     if (tag === 'OK' || tag === 'PRESENT') return;
 
+    // Internal routing messages from orchestrator / input_guard / ensure_env.
+    // These carry no user-visible content — silently discard.
+    if (tag === 'LOG' || tag === 'ROUTE') return;
+
     if (tag === 'RUNNING') {
       // close current stream, then insert cards NOW
       endCurrentChatStreamNow();

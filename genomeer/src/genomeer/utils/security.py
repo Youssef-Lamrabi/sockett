@@ -225,9 +225,19 @@ def _normalize_script(script: str) -> str:
 # API publique
 # ---------------------------------------------------------------------------
 
-def check_bash_script(script: str) -> Tuple[bool, str]:
+# Labels of bash patterns that are safe to skip in diagnostic mode
+# (environment probing commands, not attack vectors).
+_DIAG_SKIP_BASH = frozenset({
+    "inline code execution via interpreter -c/-e flag",
+})
+
+
+def check_bash_script(script: str, diagnostic_mode: bool = False) -> Tuple[bool, str]:
     """
     Vérifie un script bash avant exécution.
+
+    diagnostic_mode=True relaxes rules for environment verification commands
+    (e.g. `python -c "import biopython"`) that are safe in a controlled context.
     """
     if not script or not script.strip():
         return True, "ok"
@@ -249,13 +259,15 @@ def check_bash_script(script: str) -> Tuple[bool, str]:
                     decoded = _b64.b64decode(candidate).decode("utf-8", errors="strict")
                 except UnicodeDecodeError:
                     return False, "[SECURITY BLOCK] Non-UTF-8 base64 payload rejected (possible binary exploit)"
-                is_safe, reason = check_bash_script(decoded)
+                is_safe, reason = check_bash_script(decoded, diagnostic_mode=diagnostic_mode)
                 if not is_safe:
                     return False, f"[SECURITY BLOCK] Dangerous content hidden in base64: {reason}"
             except Exception:
                 continue
 
     for pattern, label in _BLOCKED_BASH:
+        if diagnostic_mode and label in _DIAG_SKIP_BASH:
+            continue
         if pattern.search(normalized):
             reason = f"[SECURITY BLOCK] Dangerous bash pattern detected: {label}"
             logger.error(f"{reason}\nScript (first 300 chars): {script[:300]!r}")
