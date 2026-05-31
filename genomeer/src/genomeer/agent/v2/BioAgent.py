@@ -42,6 +42,13 @@ from genomeer.model.feedback import FeedbackParser
 from genomeer.utils.security import check_bash_script, check_python_code
 from genomeer.model.bio_rag import BioRAGStore, BioRAGRetriever, build_finalizer_rag_context
 
+# Minimum validator score required to accept a step as genuinely done.
+# The AssemblyContract false-positive (staged FASTA with score=0.02) is now prevented
+# by word-boundary matching in _match_contract. This threshold is kept very low (0.005)
+# to allow valid low-protein-count runs (e.g. Prodigal on 15kb FASTA → 13 proteins
+# → score=0.013) without false-blocking them.
+_VALIDATOR_MIN_SCORE: float = 0.005
+
 # -----------------------------------------------
 # UTILS
 # -----------------------------------------------
@@ -208,8 +215,12 @@ class BioAgent:
         self.MAX_STEP_RETRIES = 3          # retries before diagnostics
         self.MAX_DIAG_ROUNDS_PER_STEP = 2  # how many times we allow re-entering diagnostics for the same step
         
-        # Artifact server
-        self.artifacts_base_url = os.getenv("PUBLIC_ARTIFACTS_URL", "http://localhost:8910/api/v1/artifacts")
+        # Artifact server — set PUBLIC_ARTIFACTS_URL env var from the configured port
+        # so artifacts_service.py (which reads it at call time) uses the correct URL.
+        _artifacts_url = f"http://{artifacts_host}:{artifacts_port}{artifacts_prefix}"
+        if not os.environ.get("PUBLIC_ARTIFACTS_URL"):
+            os.environ["PUBLIC_ARTIFACTS_URL"] = _artifacts_url
+        self.artifacts_base_url = os.environ["PUBLIC_ARTIFACTS_URL"]
         if auto_start_artifacts:
             self._start_artifacts_server_in_bg(host=artifacts_host, port=artifacts_port, prefix=artifacts_prefix)
 
@@ -711,8 +722,44 @@ class BioAgent:
             )
 
             def _clean_title(t: str) -> str:
-                # 1. Remove backtick-quoted code blocks
-                t = re.sub(r"`[^`]+`", "", t)
+                # 1. Replace backtick-quoted code blocks with just the first token
+                # (the CLI command / tool name) so the Generator knows which tool to use.
+                # e.g. `seqkit stats -a --tabular genome.fna` → seqkit
+                #      `quast.py genome.fna -o quast_output` → quast.py
+                #      `prodigal -i genome -p meta` → prodigal
+                # Previously this removed the block entirely, losing the tool name.
+                # Accession / ID patterns that must survive title cleaning.
+                # These are critical for the Generator to use the right input.
+                _ACCESSION_RX = re.compile(
+                    r'\b(?:GCF|GCA|SRR|ERR|DRR|PRJ|SAM|SRS|SRX)'
+                    r'[_\d]{5,20}(?:\.\d+)?\b'   # include version suffix e.g. GCF_000027325.1
+                    r'|\b[A-Z]{2,3}\d{5,9}(?:\.\d+)?\b',  # e.g. NC_000913.3
+                    re.IGNORECASE,
+                )
+                # Output file patterns critical for downstream steps (e.g. seqkit_stats.tsv)
+                _OUTPUT_FILE_RX = re.compile(
+                    r'\b[\w\-]+\.(?:tsv|txt|faa|fna|gff|gff3|fasta|bed|json|csv|png|html)\b',
+                    re.IGNORECASE,
+                )
+                def _keep_tool(m: re.Match) -> str:
+                    inner = m.group(0)[1:-1].strip()   # content without backticks
+                    tokens = inner.split()
+                    if not tokens:
+                        return ""
+                    tool = tokens[0]
+                    extras = []
+                    # Keep accession IDs (critical for downloads)
+                    accessions = _ACCESSION_RX.findall(inner)
+                    if accessions:
+                        extras.append(f"accession: {', '.join(accessions)}")
+                    # Keep output filenames (critical for inter-step contracts)
+                    out_files = _OUTPUT_FILE_RX.findall(inner)
+                    if out_files:
+                        extras.append(f"output: {', '.join(dict.fromkeys(out_files))}")
+                    if extras:
+                        return f"{tool} ({'; '.join(extras)})"
+                    return tool
+                t = re.sub(r"`[^`]+`", _keep_tool, t)
                 # 2. Collapse multiple spaces left by the removal
                 t = re.sub(r" {2,}", " ", t)
                 # 3. Clean mid-sentence orphans: "using and"→"and", "using with"→"with", "save to ."→"save"
@@ -730,7 +777,9 @@ class BioAgent:
                 # 7. Drop trailing colon and tidy whitespace
                 t = re.sub(r":\s*$", "", t.strip())
                 return t.strip() or "Step"
-            steps = [{**s, "title": _clean_title(s["title"])} for s in steps]
+            # Keep raw_title (pre-cleaning) so the Generator receives the full instruction.
+            # _clean_title is used everywhere else (routing, validator, display).
+            steps = [{**s, "title": _clean_title(s["title"]), "raw_title": s["title"]} for s in steps]
 
             # When routing to QA, suppress the planner's LLM draft from state messages.
             # Two reasons:
@@ -1042,12 +1091,23 @@ class BioAgent:
                         _texts_to_scan.append(_mc)
             _all_text = "\n".join(_texts_to_scan)
 
-            # Extract absolute paths (Windows and Unix, quoted or bare)
+            # Extract absolute paths (Windows and Unix, quoted or bare, spaces allowed).
             _quoted_win  = _re.findall(r'["\']([A-Za-z]:[/\\][^"\']+)["\']', _all_text)
             _bare_win    = _re.findall(r'(?<!["\'/\\])([A-Za-z]:[/\\]\S+)', _all_text)
             _quoted_unix = _re.findall(r'["\'](/(?:[^"\']+))["\']', _all_text)
+            # Bare Unix paths with bio extensions (allow spaces — common on /mnt/c/ WSL mounts).
+            _bio_ext = r'(?:fasta|fna|fastq|fa|fq|tsv|gff|gff3|faa|bam|vcf|bed|txt|csv|json|gz|png|pdf)'
+            _bare_unix_bio = [
+                m.group(1).strip()
+                for m in _re.finditer(
+                    r'(/[^\n"\']+\.' + _bio_ext + r')\b',
+                    _all_text, _re.IGNORECASE
+                )
+            ]
             _abs_paths = list(dict.fromkeys(
-                p.rstrip('.,;:)>]}') for p in (_quoted_win + _bare_win + _quoted_unix)
+                p.rstrip('.,;:)>]}') for p in (
+                    _quoted_win + _bare_win + _quoted_unix + _bare_unix_bio
+                )
                 if p.rstrip('.,;:)>]}')
             ))
             files = self._list_ctx_files(temp_dir, extra_paths=_abs_paths)
@@ -1149,13 +1209,21 @@ class BioAgent:
                     )
                 else:
                     prompt = instructions.GENERATOR_PROMPT_REPAIR
+                    # Add line numbers to PREVIOUS_CODE so the LLM can pinpoint
+                    # the exact faulty line in repair context instead of regenerating
+                    # from memory (which causes identical broken code on every retry).
+                    _raw_code = (state.get("pending_code") or "").strip()
+                    _numbered = "\n".join(
+                        f"{i+1:4d}: {line}"
+                        for i, line in enumerate(_raw_code.splitlines())
+                    )
                     content = instructions.GENERATOR_REPAIR_CTX_PROMPT.format(
                         user_goal=state['last_prompt'],
-                        current_step_title=step['title'],
+                        current_step_title=step.get('raw_title') or step['title'],
                         manifest=manifest.get("input_state"),
                         run_temp_dir=temp_dir,
                         repair_feedback=repair_feedback,
-                        previous_code=(state.get("pending_code") or "").strip(),
+                        previous_code=_numbered,
                         last_result=(state.get("last_result") or "").strip(),
                         files_str=files_str,
                     )
@@ -1163,7 +1231,7 @@ class BioAgent:
                 prompt = instructions.GENERATOR_PROMPT
                 content = instructions.GENERATOR_CTX_PROMPT.format(
                     user_goal=state['last_prompt'],
-                    current_step_title=step['title'],
+                    current_step_title=step.get('raw_title') or step['title'],
                     manifest=state['manifest'].get("input_state"),
                     run_temp_dir=state.get('run_temp_dir') or "",
                 )
@@ -1497,10 +1565,29 @@ class BioAgent:
                 code = self._fix_gc_formula(code)
                 code = self._fix_cli_commands(code)
                 code = self._fix_fasta_reading(code)
+                code = self._fix_faa_line_counting(code)
+                code = self._fix_quast_parsing(code)
+                code = self._fix_subprocess_kwargs_in_str(code)
+                code = self._inject_print_sentinel(code)
                 # Final compile() after all post-processing.
                 # If our own fixers (or residual LLM errors) produced a SyntaxError,
                 # attempt the deterministic f-string quote normalizer before giving up.
                 code = self._auto_fix_fstring_quotes(code)
+
+            # Layer 2 — post-generation env correction.
+            # _select_env decided env from the prompt (early, no code yet).
+            # Now that code is generated, re-evaluate: if the generated code
+            # contains a binary that belongs to a different env, correct it.
+            if code and not is_diagnostic:
+                from genomeer.agent.v2.utils.structured_output import _resolve_env_from_code
+                resolved_env = _resolve_env_from_code(code)
+                if resolved_env != env_name:
+                    self._log(
+                        "ENV CORRECTION",
+                        body=f"{env_name} → {resolved_env} (based on generated code content)",
+                        node=node,
+                    )
+                    env_name = resolved_env
 
             code_key = "diagnostic_code" if is_diagnostic else "pending_code"
             updates = {
@@ -1569,41 +1656,50 @@ class BioAgent:
         
         def _ensure_env(self, state: AgentState) -> AgentState:
             from genomeer.runtime.env_manager import (
-                load_registry, spec_path, create_or_update_env, env_prefix,
-                has_env, has_pip_installed, _pip_install_from_spec,
+                load_registry, spec_path, env_prefix,
+                has_env, has_conda_installed, has_pip_installed,
+                _write_conda_sentinel,
             )
-            env_name = state.get("env_name")
+            from genomeer.agent.v2.utils.structured_output import _resolve_env_from_code
+
+            # No-downgrade rule: once meta-env1 is selected for this pipeline,
+            # never switch back to bio-agent-env1 — even if a repair cycle
+            # regenerates code that doesn't mention meta-env1 tools.
+            current_env  = state.get("env_name", "bio-agent-env1")
+            pending_code = state.get("pending_code") or state.get("diagnostic_code") or ""
+            resolved_env = _resolve_env_from_code(pending_code)
+            env_name = (
+                "meta-env1"
+                if resolved_env == "meta-env1" or current_env == "meta-env1"
+                else "bio-agent-env1"
+            )
+            if env_name != current_env:
+                self._log(
+                    "ENV NO-DOWNGRADE",
+                    body=f"keeping meta-env1 (resolved={resolved_env}, state={current_env})",
+                    node="ensure_env",
+                )
 
             if has_env(env_name):
                 prefix = env_prefix(env_name)
+
+                # Level 1 — conda sentinel: env is usable if conda packages are installed.
+                # For legacy envs (installed before two-level sentinel system), write it now.
+                if not has_conda_installed(env_name):
+                    _write_conda_sentinel(env_name)
+
+                # Level 2 — pip: attempt non-blocking repair if sentinel missing.
                 if not has_pip_installed(env_name):
-                    # Conda env exists but pip packages were never installed (Windows micromamba bug).
-                    # Install explicitly now. Do NOT proceed to executor if this fails.
-                    pip_error: str | None = None
                     try:
+                        from genomeer.runtime.env_manager import _pip_install_from_spec
                         reg = load_registry()
                         rec = next((e for e in reg.get("envs", []) if e.get("name") == env_name), None)
                         if rec:
                             _pip_install_from_spec(prefix, spec_path(rec["spec"]))
                             self._log("PIP REPAIR", body=f"pip packages installed into '{env_name}'", node="ensure_env")
-                        else:
-                            pip_error = f"Env '{env_name}' not found in registry — cannot install pip packages."
                     except Exception as exc:
-                        pip_error = str(exc)
-                        self._log("PIP REPAIR ERROR", body=pip_error, node="ensure_env")
-
-                    # Verify sentinel was written — if not, pip failed and env is unusable.
-                    if not has_pip_installed(env_name):
-                        msg = pip_error or "pip install completed but sentinel not written."
-                        return {
-                            "env_ready": False,
-                            "next_step": "end",
-                            "messages": [AIMessage(content=(
-                                f"<log>Environment '{env_name}' pip install failed: {msg}\n"
-                                f"Delete the env folder and retry, or install packages manually:\n"
-                                f"  micromamba run -p {prefix} pip install biopython numpy pandas</log>"
-                            ))],
-                        }
+                        # Pip failure is non-fatal — conda packages are sufficient for code execution.
+                        self._log("PIP REPAIR SKIPPED", body=f"non-fatal: {exc}", node="ensure_env")
 
                 return {
                     "env_ready": True,
@@ -1897,7 +1993,10 @@ class BioAgent:
                 return {"next_step": "observer"}
 
             # ── CONTRACT OK → done bookkeeping ────────────────────────────────
-            if result.ok:
+            # Require both ok=True AND score >= _VALIDATOR_MIN_SCORE.
+            # A low score (e.g. 0.02) means the contract matched a wrong file
+            # (e.g. staged input FASTA found by AssemblyContract) — treat as no-contract.
+            if result.ok and result.score >= _VALIDATOR_MIN_SCORE:
                 summary = f"[validator] {result.reason} (score={result.score:.2f})"
                 _dir_files = self._list_ctx_files(run_dir)
                 plan = list(state["plan"])
@@ -2228,6 +2327,58 @@ class BioAgent:
                         "diagnostic_code": None,
                         "diagnostic_observation": None,
                     }
+
+            # KeyError: dictionary key missing — most commonly wrong column name in a TSV
+            _key_err_m = re.search(r"KeyError:\s*'([^']+)'", last_result)
+            if not diagnostic_mode and _key_err_m and not _is_missing_package:
+                _bad_key = _key_err_m.group(1)
+                # Find any TSV/TXT/CSV files in run_dir that may be the culprit
+                _file_preview = ""
+                if _temp_dir_err:
+                    _candidate_files = []
+                    for _ext in ("*.tsv", "*.txt", "*.csv"):
+                        _candidate_files.extend(
+                            sorted(__import__("glob").glob(os.path.join(_temp_dir_err, "**", _ext), recursive=True))
+                        )
+                    # Read the first 5 lines of the first 2 matching files
+                    _previews = []
+                    for _cf in _candidate_files[:2]:
+                        try:
+                            with open(_cf, encoding="utf-8", errors="replace") as _fh:
+                                _lines = [_fh.readline().rstrip() for _ in range(5)]
+                            _previews.append(
+                                f"File: {os.path.relpath(_cf, _temp_dir_err)}\n"
+                                + "\n".join(f"  {l}" for l in _lines if l)
+                            )
+                        except Exception:
+                            pass
+                    if _previews:
+                        _file_preview = "\n\nActual file contents (first 5 lines each):\n" + "\n\n".join(_previews)
+
+                summary = (
+                    f"KeyError: '{_bad_key}' — the dictionary key does not exist in the file. "
+                    f"The column name or key is wrong. Check the actual headers/keys in the file, "
+                    f"then fix the code to use the exact key present."
+                    f"{_file_preview}"
+                )
+                self._log("FAST-PATH KeyError", body=summary[:400], node=node)
+                new_manifest = self._clean_manifest(state["manifest"])
+                rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items() if str(k).isdigit()}
+                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                new_manifest["repair_feedback"] = summary
+                new_manifest["repair_step_idx"] = state["current_idx"]
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "diagnostics" if rc[state["current_idx"]] > self.MAX_STEP_RETRIES else "generator",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\n{summary[:600]}")],
+                    "manifest": new_manifest,
+                    "retry_counts": rc,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
 
             # FileNotFoundError: file path wrong
             _fnf_m = re.search(r"FileNotFoundError.*?'([^']+)'", last_result)
@@ -2904,8 +3055,8 @@ class BioAgent:
     # OTHER UTILS
     def _stage_attachments(self, tmp_dir: str, attachments: list[str]) -> list[str]:
         """
-        Copy user-supplied file paths into the run's temp dir
-        Returns the relative paths inside tmp_dir
+        Copy user-supplied file paths into the run's temp dir.
+        Returns the relative paths inside tmp_dir.
         """
         staged_rel: list[str] = []
         up = os.path.join(tmp_dir, "uploads")
@@ -2914,12 +3065,47 @@ class BioAgent:
             try:
                 bn = os.path.basename(src)
                 dst = os.path.join(up, bn)
-                # copy (safer across FS boundaries)
                 shutil.copy2(src, dst)
                 staged_rel.append(os.path.relpath(dst, tmp_dir))
             except Exception as e:
                 self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
         return staged_rel
+
+    def _stage_prompt_files(self, prompt: str, tmp_dir: str) -> list[str]:
+        """
+        Scan the prompt for absolute file paths (Unix and Windows, quoted or unquoted)
+        and copy them into tmp_dir so generated code can find them without path-with-spaces issues.
+        Returns list of staged destination paths.
+        """
+        import re as _re
+        staged: list[str] = []
+        _bio_ext = r'(?:fasta|fna|fastq|fa|fq|tsv|gff|gff3|faa|bam|vcf|bed|txt|csv|json|gz|png|pdf)'
+        # Unix paths — quoted or bare, spaces allowed (common on /mnt/c/ WSL mounts)
+        unix_rx  = _re.compile(r'(/[^\n"\']+\.' + _bio_ext + r')\b', _re.IGNORECASE)
+        # Windows paths: C:\path\to\file.ext (with or without surrounding quotes)
+        win_rx   = _re.compile(r'["\']?([A-Za-z]:\\[^"\']+\.[a-zA-Z0-9]+)["\']?')
+        candidates: list[str] = []
+        for m in unix_rx.finditer(prompt):
+            candidates.append(m.group(1).strip())
+        for m in win_rx.finditer(prompt):
+            candidates.append(m.group(1).strip())
+        seen: set[str] = set()
+        for src in candidates:
+            if src in seen:
+                continue
+            seen.add(src)
+            try:
+                if not os.path.isfile(src):
+                    continue
+                bn = os.path.basename(src)
+                dst = os.path.join(tmp_dir, bn)
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+                staged.append(dst)
+                self._log("PROMPT FILE STAGED", body=f"{src} → {dst}", node="driver")
+            except Exception as e:
+                self._log("PROMPT STAGE SKIP", body=f"{src}: {e}", node="driver")
+        return staged
 
     @staticmethod
     def _infer_task_type(prompt: str) -> str:
@@ -3455,6 +3641,9 @@ class BioAgent:
 
         # ── ncbi-genome-download ────────────────────────────────────────────
         if "ncbi-genome-download" in code:
+            # --dry-run causes TimeoutExpired (slow network check) and is never needed.
+            code = re.sub(r'[\s]*["\']--dry-run["\'][\s]*,?', '', code)
+            code = re.sub(r'\s+--dry-run\b', '', code)
             # --genus → --genera  (--genus is a long-deprecated alias, use canonical)
             code = re.sub(r"--genus\b", "--genera", code)
             # --species <name>  does not exist → remove entirely
@@ -3597,6 +3786,234 @@ class BioAgent:
 
         return code
 
+    def _fix_subprocess_kwargs_in_str(self, code: str) -> str:
+        """
+        The LLM generates str(fna_path, timeout=300) when it means
+        subprocess.run([..., str(fna_path)], timeout=300).
+
+        str() and Path() only accept the value to convert — never keyword
+        arguments like timeout=, check=, capture_output=, text=.  These
+        belong to subprocess.run() and are silently misplaced by the LLM
+        when it confuses the str() call site with the subprocess call site.
+
+        This fix is NARROW: only strips the specific subprocess kwargs from
+        str() and Path() calls.  It never touches:
+          - subprocess.run() itself
+          - str() with a valid single-argument call
+          - any other function that legitimately uses these kwargs
+        """
+        import re as _re
+
+        if not code:
+            return code
+
+        # Subprocess kwargs that have no business inside str() / Path()
+        _BAD_KWS = (
+            r'timeout', r'check', r'capture_output', r'text',
+            r'shell', r'cwd', r'env', r'stdin', r'stdout', r'stderr',
+            r'encoding', r'errors', r'bufsize',
+        )
+        # Build a pattern: str( or Path( ... bad_kw=<value> ...)
+        # We match the entire str()/Path() call content and strip bad kwargs.
+        _BAD_KW_PATTERN = _re.compile(
+            r'\b(str|Path)\s*\(([^)]*?)\b(?:' + '|'.join(_BAD_KWS) + r')\s*=[^,)]*(?:,\s*)?([^)]*)\)',
+            _re.DOTALL,
+        )
+
+        def _strip_bad_kwargs(m: _re.Match) -> str:
+            func   = m.group(1)   # str or Path
+            inner  = m.group(0)[len(func):]   # full (...) including parens
+
+            # Re-parse: split on commas at paren-depth-0
+            # to reliably strip bad kwargs
+            body = inner.strip()
+            if not (body.startswith('(') and body.endswith(')')):
+                return m.group(0)
+            args_str = body[1:-1]
+
+            good_args = []
+            depth = 0
+            current = ''
+            for ch in args_str:
+                if ch in '([{':
+                    depth += 1
+                    current += ch
+                elif ch in ')]}':
+                    depth -= 1
+                    current += ch
+                elif ch == ',' and depth == 0:
+                    arg = current.strip()
+                    if arg:
+                        # Check if it's a bad kwarg
+                        kw_match = _re.match(
+                            r'^(?:' + '|'.join(_BAD_KWS) + r')\s*=', arg
+                        )
+                        if not kw_match:
+                            good_args.append(arg)
+                    current = ''
+                else:
+                    current += ch
+            # Last arg
+            arg = current.strip()
+            if arg:
+                kw_match = _re.match(
+                    r'^(?:' + '|'.join(_BAD_KWS) + r')\s*=', arg
+                )
+                if not kw_match:
+                    good_args.append(arg)
+
+            if len(good_args) < len(args_str.split(',')):   # actually stripped something
+                fixed = f"{func}({', '.join(good_args)})"
+                self._log(
+                    "STR_KWARG_FIX",
+                    body=f"{m.group(0)!r} → {fixed!r}",
+                    node="generator",
+                )
+                return fixed
+            return m.group(0)
+
+        return _BAD_KW_PATTERN.sub(_strip_bad_kwargs, code)
+
+    def _inject_print_sentinel(self, code: str) -> str:
+        """
+        If the generated Python code contains no print() or sys.stdout.write() call,
+        append a minimal stdout line so the observer never sees empty output.
+
+        Empty stdout triggers HARD BLOCK even when the step succeeded (files written
+        correctly). This injection is the last line of defence — it fires only when
+        the LLM forgot to add any print() despite the GENERATOR_PROMPT rule.
+        """
+        import re as _re
+        if not code:
+            return code
+        # Already has stdout output — nothing to do.
+        if _re.search(r'\bprint\s*\(|sys\.stdout\.write\s*\(', code):
+            return code
+        # Inject at the very end: list files present in run_dir + success message.
+        sentinel = (
+            '\n# Auto-injected stdout sentinel — prevents empty-output HARD BLOCK\n'
+            'import glob as _g, os as _o\n'
+            '_sentinel_dir = run_dir if "run_dir" in dir() else ""\n'
+            '_sentinel_files = [_o.path.basename(f) for f in sorted(_g.glob(_o.path.join(_sentinel_dir, "*"))) if _o.path.isfile(f)] if _sentinel_dir else []\n'
+            'print(f"Step completed. Files present: {_sentinel_files}")\n'
+        )
+        self._log("PRINT_SENTINEL", body="No print() found — injecting sentinel", node="generator")
+        return code + sentinel
+
+    def _fix_faa_line_counting(self, code: str) -> str:
+        """
+        Detects the common bug where the generator counts FASTA sequence LINES
+        instead of SEQUENCES when parsing .faa protein files.
+
+        Broken pattern (counts lines, not proteins):
+            for line in fh:
+                if line.startswith(">"):
+                    continue
+                protein_seqs.append(line)      ← one line per append ≠ one protein
+            protein_count = len(protein_seqs)  ← WRONG (can be 5x too high)
+
+        Correct pattern (counts header lines = sequences):
+            protein_count = sum(1 for line in open(faa_path) if line.startswith(">"))
+
+        The fix injects a corrected counter before the broken assignment so the
+        variable is overwritten with the right value before use.
+        """
+        import re as _re
+        if not code:
+            return code
+        # Only trigger for .faa files
+        if not _re.search(r'\.faa', code):
+            return code
+
+        # Detect: appending non-header lines in a loop then using len() as count
+        # Pattern: the list collects sequence lines and protein_count = len(list)
+        _broken = _re.compile(
+            r'(protein_seqs|prot_seqs|sequences?|seqs?)\s*\.\s*append\s*\(\s*(?:line|seq)\s*\)',
+            _re.IGNORECASE,
+        )
+        if not _broken.search(code):
+            return code
+
+        # Find the corresponding len() call and inject correct counter before it
+        _len_rx = _re.compile(
+            r'(protein_count|prot_count|num_proteins?|n_proteins?)\s*=\s*len\s*\([^)]+\)',
+        )
+        if not _len_rx.search(code):
+            return code
+
+        # Inject a correct protein_count immediately before the broken len() call.
+        # We look for a faa_path / proteins_faa / faa variable to use.
+        _faa_var = "faa_path"
+        for _cand in ("faa_path", "proteins_faa", "proteins_path", "faa", "faa_file"):
+            if _cand in code:
+                _faa_var = _cand
+                break
+
+        _correction = (
+            f"\n# Auto-corrected: count header lines (= sequences), not sequence lines\n"
+            f"protein_count = sum(1 for _l in open({_faa_var}) if _l.startswith('>'))\n"
+        )
+
+        def _inject(m: _re.Match) -> str:
+            return _correction + m.group(0)
+
+        fixed = _len_rx.sub(_inject, code, count=1)
+        if fixed != code:
+            self._log("FAA_COUNT_FIX", body="Injected header-line counter", node="generator")
+        return fixed
+
+    def _fix_quast_parsing(self, code: str) -> str:
+        """
+        QUAST report.tsv is a key-value file, not a header-row CSV.
+        LLMs consistently try csv.DictReader / pandas.read_csv → KeyError: 'N50'.
+
+        When we detect a read of a quast report file combined with csv.DictReader
+        or pandas.read_csv, replace the whole CSV-reader block with the correct
+        key-value parser and inject it before the existing (broken) read call.
+        """
+        import re as _re
+        if not code:
+            return code
+
+        # Only trigger when the code mentions a quast report file
+        if not _re.search(r'report\.tsv|quast.*report|quast_output', code, _re.IGNORECASE):
+            return code
+
+        # Only trigger when the code uses csv.DictReader or pandas.read_csv on it
+        if not _re.search(r'csv\.DictReader|pd\.read_csv|pandas\.read_csv', code):
+            return code
+
+        # Inject the correct key-value parser as a helper function at the top of the code
+        # and replace the first csv.DictReader(...report...) with a call to the helper.
+        _kv_helper = (
+            "\n# Auto-corrected: QUAST report.tsv is KEY-VALUE, not a header CSV\n"
+            "def _parse_quast_report(path):\n"
+            "    stats = {}\n"
+            "    try:\n"
+            "        with open(path) as _f:\n"
+            "            for _line in _f:\n"
+            "                if _line.startswith('#') or not _line.strip():\n"
+            "                    continue\n"
+            "                _parts = _line.rstrip().split('\\t')\n"
+            "                if len(_parts) >= 2:\n"
+            "                    stats[_parts[0].strip()] = _parts[1].strip()\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "    return stats\n"
+            "def _quast_contigs(stats):\n"
+            "    # prefix match catches all QUAST key variants regardless of --min-contig\n"
+            "    return next((v for k, v in stats.items() if k.startswith('# contigs')), 'NA')\n\n"
+        )
+
+        # Insert helper before the first import or at the very top after #!PY
+        if code.startswith('#!PY'):
+            code = code[:5] + _kv_helper + code[5:]
+        else:
+            code = _kv_helper + code
+
+        self._log("QUAST_FIX", body="Injected _parse_quast_report() helper", node="generator")
+        return code
+
     def _fix_fasta_reading(self, code: str) -> str:
         """
         Two deterministic fixes for common FASTA reading bugs:
@@ -3709,27 +4126,44 @@ class BioAgent:
                 self._log("FIX_FASTA", body="Cached SeqIO.parse to avoid iterator exhaustion", node="generator")
 
         # Fix 1 — reorder glob so .fna comes before .fna.gz
-        # Simple string substitution: swap "*.fna.gz" and "*.fna" in any multi-glob line.
-        # The regex approach fails with nested parens (os.path.join), so we do line-by-line.
-        _fixed_lines = []
-        _fna_gz_line = None
-        for _ln in code.splitlines(keepends=True):
-            # Detect a line that has *.fna.gz glob but no *.fna (only gz variant)
-            if '*.fna.gz' in _ln and '*.fna"' not in _ln and '*.fna\'' not in _ln:
-                _fna_gz_line = _ln  # hold it; next line may be the *.fna glob
-            elif _fna_gz_line is not None and ('*.fna"' in _ln or '*.fna\'' in _ln):
-                # Swap: output *.fna line first, then the gz line
-                _fixed_lines.append(_ln)
-                _fixed_lines.append(_fna_gz_line)
-                _fna_gz_line = None
-            else:
-                if _fna_gz_line is not None:
-                    _fixed_lines.append(_fna_gz_line)
-                    _fna_gz_line = None
-                _fixed_lines.append(_ln)
-        if _fna_gz_line is not None:
-            _fixed_lines.append(_fna_gz_line)
-        code = "".join(_fixed_lines)
+        # ONLY applies to lines that are PART OF A CONTINUATION EXPRESSION
+        # (i.e., they end with + or are inside a multi-glob parenthesised block).
+        # NEVER swaps standalone assignment lines like:
+        #   gz_files = sorted(glob.glob(..., "*.fna.gz"))
+        #   fna_files = sorted(glob.glob(..., "*.fna"))
+        # because swapping those moves the definition AFTER its first use → NameError.
+        _lines = code.splitlines(keepends=True)
+        # Only swap GLOB CONTINUATION lines (part of a multi-line expression).
+        # A continuation glob line: stripped content starts with glob.glob (not an assignment).
+        # The gz line must end with + (it's not last). The fna line may or may not.
+        # NEVER swap standalone assignment lines (gz_files = ..., fna_files = ...).
+        def _is_glob_continuation(l: str) -> bool:
+            s = l.strip()
+            return s.startswith('glob.glob') and '=' not in s.split('glob.glob')[0]
+        _fna_idx   = next((i for i, l in enumerate(_lines)
+                           if ('*.fna"' in l or "*.fna'" in l)
+                           and '*.fna.gz' not in l
+                           and _is_glob_continuation(l)), None)
+        _fna_gz_idx = next((i for i, l in enumerate(_lines)
+                            if '*.fna.gz' in l
+                            and _is_glob_continuation(l)
+                            and l.rstrip().endswith('+')), None)
+        # Only reorder when gz comes STRICTLY before fna (wrong order)
+        if _fna_gz_idx is not None and _fna_idx is not None and _fna_gz_idx < _fna_idx:
+            # Swap the trailing continuation operators (+) along with the lines.
+            _gz_ln  = _lines[_fna_gz_idx]
+            _fna_ln = _lines[_fna_idx]
+            _gz_trail  = '+' if _gz_ln.rstrip().endswith('+') else ''
+            _fna_trail = '+' if _fna_ln.rstrip().endswith('+') else ''
+            def _set_trail(ln: str, trail: str) -> str:
+                stripped = ln.rstrip().rstrip('+').rstrip()
+                nl = '\n' if ln.endswith('\n') else ''
+                return stripped + (' +' if trail else '') + nl
+            _lines[_fna_gz_idx] = _set_trail(_gz_ln, _fna_trail)
+            _lines[_fna_idx]    = _set_trail(_fna_ln, _gz_trail)
+            _lines[_fna_gz_idx], _lines[_fna_idx] = _lines[_fna_idx], _lines[_fna_gz_idx]
+            self._log("FIX_FASTA", body="Reordered glob: .fna before .fna.gz (continuation lines only)", node="generator")
+        code = "".join(_lines)
 
         # Fix 2 — gzip-safe SeqIO.parse
         # If code has SeqIO.parse(fasta_path, ...) but no gzip.open guard, inject one.
@@ -3840,6 +4274,49 @@ class BioAgent:
         except SyntaxError:
             return code  # give up — executor will surface the error cleanly
 
+    def _fix_escaped_newlines_in_write(self, code: str) -> str:
+        """
+        Fix LLM-generated \\\\n (literal backslash+n) inside write() / writelines() calls.
+
+        The LLM sometimes generates:
+            out_f.write(f"value: {x:.4f}\\n")   ← writes backslash+n to file (wrong)
+        instead of:
+            out_f.write(f"value: {x:.4f}\\n")   ← writes newline character (correct)
+
+        This pass replaces \\\\n → \\n ONLY inside the string argument of write() /
+        writelines() calls. It is intentionally narrow to avoid touching:
+          - regex patterns where \\\\n is a valid escaped newline pattern
+          - raw strings (r"...")
+          - \\\\n that appears outside of write() calls
+
+        Strategy: match .write("...") or .write(f"...") and replace \\\\n with \\n
+        inside the string argument only.
+        """
+        import re as _re
+
+        # Match .write( or .writelines( followed by an optional f/b prefix and a quote,
+        # then capture the string content up to the matching closing quote (single-line).
+        # We replace \\\\n (4 chars in source, 2 in Python: backslash+n) with \\n (newline).
+        _WRITE_RX = _re.compile(
+            r'(\.\s*write(?:lines)?\s*\(\s*)'   # .write( or .writelines(
+            r'([fFbBuU]?)'                        # optional prefix f/b/u
+            r'("(?:[^"\\]|\\.)*?"'               # double-quoted string
+            r'|\'(?:[^\'\\]|\\.)*?\')',           # or single-quoted string
+            _re.DOTALL,
+        )
+
+        def _fix_string(m: re.Match) -> str:
+            call_prefix = m.group(1)   # .write(
+            str_prefix  = m.group(2)   # f / b / u / ""
+            string_body = m.group(3)   # "..." or '...'
+            # Replace \\n (two chars: \ + n) with \n (newline char) inside the string.
+            # In the source text, \\n is stored as the two-char sequence \\ + n.
+            # We must NOT touch \\\\n (intentional literal backslash + n).
+            fixed_body = _re.sub(r'(?<!\\)\\n', '\n', string_body)
+            return call_prefix + str_prefix + fixed_body
+
+        return _WRITE_RX.sub(_fix_string, code)
+
     def _sanitize_output_paths(self, code: str, run_dir: str) -> str:
         """
         Replace absolute Windows/Unix paths used for OUTPUT files with run_dir-relative paths.
@@ -3908,20 +4385,23 @@ class BioAgent:
         }
 
 
-    # ENV ROUTING — deterministic, based on prompt keywords
-    _HEAVY_TOOLS_RE = re.compile(
-        r'\b(kraken2|kraken\b|checkm2|checkm\b|antismash|humann3?|'
-        r'semibin2?|concoct|maxbin2?|metabat2?|das_tool|dastool|'
-        r'gtdbtk|metaphlan|bracken|kaiju|'
-        r'eggnog|emapper|genomad|abricate|pharokka|'
-        r'lefse|nonpareil|phyloseq|medaka|rgi\b|amrfinder|'
-        r'binning|metagenome.assembled|dereplicate.bin)\b',
-        re.IGNORECASE,
-    )
-
+    # ENV ROUTING — driven by registry provides_bins, not a hardcoded regex.
+    # Source of truth: meta-env1.provides_bins in index.yaml.
     def _select_env(self, prompt: str) -> str:
-        """Return meta-env1 for heavy pipeline requests, bio-agent-env1 otherwise."""
-        return "meta-env1" if self._HEAVY_TOOLS_RE.search(prompt) else "bio-agent-env1"
+        """
+        Route to meta-env1 only when the prompt explicitly names a binary
+        declared in meta-env1's provides_bins registry entry.
+        Falls back to bio-agent-env1 for everything else.
+        """
+        try:
+            from genomeer.runtime.env_resolver import get_meta_env_signals
+            signals = get_meta_env_signals()
+            prompt_lower = prompt.lower()
+            if any(sig in prompt_lower for sig in signals):
+                return "meta-env1"
+        except Exception:
+            pass
+        return "bio-agent-env1"
 
     # AGENT RUNNER
     def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
@@ -3944,6 +4424,8 @@ class BioAgent:
 
         with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
+            # Also stage any absolute file paths mentioned in the prompt text.
+            staged += self._stage_prompt_files(prompt, tmp)
             # Keep basenames of user uploads so they survive a fatal-error cleanup.
             _staged_basenames = {os.path.basename(p) for p in staged}
 
@@ -4057,6 +4539,7 @@ class BioAgent:
 
         with run_workdir("run", session_id) as tmp:
             staged = self._stage_attachments(tmp, attachments or [])
+            staged += self._stage_prompt_files(prompt, tmp)
             _staged_basenames = {os.path.basename(p) for p in staged}
 
             if not self._has_session_state(thread_id):

@@ -216,9 +216,24 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None,
     if not script: 
         return "Error: Empty script"
     
+    # Inject run_dir from RUN_TEMP_DIR into every bash script unconditionally.
+    # This defines $run_dir as a shell variable before any user script content runs,
+    # preventing "unbound variable" errors (set -u) when the Generator uses $run_dir
+    # without defining it. helper.py owns this injection — the Generator must never
+    # write run_dir= or mkdir -p "$run_dir" itself.
+    _run_tmp = (extra_env or {}).get("RUN_TEMP_DIR") or os.environ.get("RUN_TEMP_DIR", "")
+    _run_dir_preamble = ""
+    if _run_tmp:
+        _run_dir_preamble = (
+            f'run_dir="{_run_tmp}"\n'
+            f'RUN_DIR="$run_dir"\n'   # uppercase alias — model sometimes uses $RUN_DIR
+            f'mkdir -p "$run_dir"\n'
+        )
+
     with tempfile.NamedTemporaryFile(suffix=".sh", mode="w", encoding="utf-8", dir=settings.run_dir, delete=False) as f:
         if not script.startswith("#!/"): f.write("#!/bin/bash\n")
         if "set -e" not in script: f.write("set -euo pipefail\n")
+        if _run_dir_preamble: f.write(_run_dir_preamble)
         f.write(script); path = f.name
     os.chmod(path, 0o755)
     

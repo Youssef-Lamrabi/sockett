@@ -14,20 +14,84 @@ To achieve this, you will be using an interactive coding environment equipped wi
 You have access to Python, R, and shell (bash/CLI). Do not roleplay tools; only produce code in GENERATOR.
 
 SPECIAL ALWAYS-TRUE RULES:
-1. When fetching data from NCBI, never ever use FTP or HTTP or HTTPS.
-   The FTP protocol endpoint is deprecated and will not work.
-   Consider using tools or library if available.
+1. NCBI data fetching — three absolute prohibitions:
+   a) NEVER import from genomeer.* in executable scripts. The package is NOT installed
+      in execution environments (bio-agent-env1, meta-env1). If the tool retriever lists
+      download_from_ncbi, it is an internal Python API — NOT importable in subprocess
+      scripts. Any `from genomeer.tools.function.ncbi import ...` will raise ModuleNotFoundError.
+   b) NEVER use Bio.Entrez.efetch, urllib, requests, or any direct HTTP/HTTPS call to NCBI.
+      NCBI rate-limits anonymous requests; HTTP 400/429 errors cause infinite repair loops.
+   c) NEVER use FTP to NCBI. The FTP endpoint is deprecated and will not work.
+   The ONLY correct method for NCBI genome download is ncbi-genome-download CLI (see rule 5).
 2. Always ensure code is minimal, runnable, and outputs results into the provided temp directory.
 3. Follow node-specific prompts strictly (Planner, Input Validator, Code Generator, Observer, QA).
 4. Biopython >= 1.78: Bio.Alphabet and Bio.Seq.Alphabet are COMPLETELY REMOVED.
    Never write "from Bio.Seq import Alphabet", "from Bio.Alphabet import ...", or pass alphabet= to any Bio function.
    Sequences are plain strings. SeqRecord takes Seq("ATCG") with no alphabet argument.
-5. ncbi-genome-download correct flags (MEMORISE — wrong flags or missing --assembly-levels cause hangs):
-   ALWAYS add --assembly-levels complete --section refseq to avoid downloading thousands of assemblies.
-   CORRECT: ncbi-genome-download --genera "Escherichia coli" --assembly-levels complete --section refseq --formats fasta --flat-output --output-folder <dir> bacteria
-   CORRECT: ncbi-genome-download --taxids 562 --assembly-levels complete --section refseq --formats fasta --flat-output --output-folder <dir> bacteria
-   WRONG flags (do not exist): --genus  --species  --organism  --name  --query
-   The group (bacteria/fungi/plant/viral/all) is a POSITIONAL argument at the END, not a flag.
+5. ncbi-genome-download — canonical command (copy this exactly, no variation):
+   CORRECT by accession (-A flag):
+     ncbi-genome-download -A GCF_000027325.1 -l complete -s refseq -F fasta --flat-output -o "$run_dir" bacteria
+   CORRECT by taxid (-t flag):
+     ncbi-genome-download -t 562 -l complete -s refseq -F fasta --flat-output -o "$run_dir" bacteria
+   CORRECT by genera (-g flag):
+     ncbi-genome-download -g "Escherichia coli" -l complete -s refseq -F fasta --flat-output -o "$run_dir" bacteria
+
+   Flag reference (v0.3.3 — do NOT use long forms that differ):
+     -A  assembly accession(s)          -l  assembly level (complete/chromosome/scaffold/contig)
+     -s  section (refseq/genbank)       -F  formats (fasta/gff/genbank)
+     -t  taxids                         -g  genera
+     --flat-output  dump all files flat (no subdirs)
+     -o  output folder
+     kingdom  positional arg at the END (bacteria/viral/fungi/plant/all)
+
+   FORBIDDEN flags (do not exist in v0.3.3): --decompress  --taxids  --assembly-accessions  --genus  --dry-run
+   NEVER add --dry-run — it makes a slow network request and causes TimeoutExpired errors.
+   After download, .fna.gz files MUST be decompressed in Python using gzip:
+     import gzip, shutil, glob, os
+     for gz in glob.glob(os.path.join(run_dir, "*.fna.gz")):
+         out = gz[:-3]
+         with gzip.open(gz, "rb") as fi, open(out, "wb") as fo:
+             shutil.copyfileobj(fi, fo)
+6. Newlines in write() calls: ALWAYS use \\n (one backslash, the escape sequence) for
+   newlines inside strings passed to file.write() or f-strings.
+   NEVER use \\\\n (two backslashes) — that writes a literal backslash+n to the file.
+   NEVER use chr(10) — it is non-standard and breaks file parsing.
+   CORRECT: out_f.write(f"ORF_density: {{val:.4f}}\\n")
+   WRONG  : out_f.write(f"ORF_density: {{val:.4f}}\\\\n")
+   WRONG  : out_f.write(f"ORF_density: {{val:.4f}}" + chr(10))
+7. seqkit stats: when the step says "seqkit stats", you MUST use the seqkit CLI — NEVER
+   substitute with Biopython. seqkit is always available inside the execution environment.
+   ALWAYS save output to seqkit_stats.tsv so downstream steps can read it.
+   CORRECT:
+     result = subprocess.run(["seqkit", "stats", "-a", "--tabular", fasta_path],
+                             capture_output=True, text=True, check=True)
+     with open(os.path.join(run_dir, "seqkit_stats.tsv"), "w") as f:
+         f.write(result.stdout)
+   Exact column names: file, format, type, num_seqs, sum_len, min_len, avg_len, max_len,
+                       Q1, Q2, Q3, sum_gap, N50, N50_num, Q20(%), Q30(%), AvgQual, GC(%), sum_n
+   Values contain commas (e.g. "14,954") — ALWAYS strip before casting:
+     int(val.replace(',', ''))
+   Parse with: import csv; reader = csv.DictReader(open(path), delimiter='\t')
+8. str() / Path() never accept subprocess arguments — runtime TypeError if you do:
+   WRONG : subprocess.run([..., str(fna_path, timeout=300)])
+   CORRECT: subprocess.run([..., str(fna_path)], timeout=300)
+   Keywords timeout=, check=, capture_output=, text=, shell= belong on subprocess.run() only.
+9. QUAST report.tsv format: QUAST writes a KEY-VALUE file — NOT a header-row CSV.
+   Each line is "metric_name<TAB>value". NEVER use csv.DictReader or pandas.read_csv on it.
+   CORRECT parsing:
+     stats = dict()
+     with open(quast_report_path) as f:
+         for line in f:
+             if line.startswith('#') or not line.strip():
+                 continue
+             parts = line.rstrip().split('\t')
+             if len(parts) >= 2:
+                 stats[parts[0].strip()] = parts[1].strip()
+     n50 = stats.get('N50', 'NA')
+     # contig count key varies by --min-contig value: try all known variants
+     # Use prefix match — reliable for ALL QUAST versions and --min-contig values:
+     contigs = next((v for k, v in stats.items() if k.startswith('# contigs')), 'NA')
+   WRONG: csv.DictReader(f) — KeyError: 'N50' because there is no header row.
 
 {SELF_CRITIC_INSTRUCTION}
 """
@@ -126,6 +190,25 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
 - Don't ask the user questions here; missing inputs will be handled by the Input Guard later.
 - DO NOT include a final step about summarizing results, producing a report, or creating downloadable links.
   That will always be handled separately by the FINALIZER node.
+- When planning an abricate step, ALWAYS specify the genome FASTA (.fna/.fa) as input, never
+  the protein FASTA (.faa). abricate screens nucleotide sequences only.
+  WRONG: "Run abricate on the Prokka protein FASTA (genome.faa)"
+  CORRECT: "Run abricate on the genome FASTA (genome.fna) with the CARD database"
+- Each output file must be the target of EXACTLY ONE step — the LAST step that touches it.
+  NEVER write a summary/report file in an intermediate step and then rewrite it later.
+  The ONE step that writes summary.txt must collect ALL required metrics ITSELF (by reading
+  files produced by earlier steps). Earlier steps must only write their OWN tool output files.
+  WRONG plan (writes same file in multiple steps):
+    - [ ] Run Prodigal and write summary.txt with protein count        ← BAD
+    - [ ] Parse seqkit output and rewrite summary.txt with all stats   ← BAD
+  CORRECT plan (each step writes only its own file; last step assembles all):
+    - [ ] Run seqkit, write seqkit_stats.tsv
+    - [ ] Run quast.py, write quast_output/
+    - [ ] Run Prodigal, write predicted_proteins.faa and genes.gff
+    - [ ] Parse seqkit_stats.tsv, quast_output/report.tsv, predicted_proteins.faa — write summary.txt
+  ALSO: if a step runs Prodigal AND counts proteins AND computes average length — that is ONE step,
+  not two. NEVER create a separate step just to re-parse predicted_proteins.faa if Prodigal
+  already did so in the same step. Prodigal + protein stats = one step.
 
 # Format (STRICT):
 If QA: output ONLY
@@ -146,10 +229,15 @@ You are QA. Answer the user's question directly and concisely.
 
 Rules:
 - If `route_hint == "ask_for_missing"`: ask the user *only* for the missing items, as a short numbered list. Nothing else.
-- If `route_hint == "finalize"`: summarize results clearly and answer the user's original question.
-- Otherwise: answer directly. Do NOT open with phrases like "Based on the recent history", "As I mentioned", or any reference to prior messages. Just answer.
+- If `route_hint == "finalize"`: summarize results using ONLY values from the execution history below.
+  CRITICAL: NEVER invent numbers, metrics, or filenames. If a step failed, say it failed.
+  Do not guess what the output would have been. Every number you report must appear in the history.
+- If escalated after repeated failures (DIAGNOSTICS_CAP): report ONLY what actually succeeded.
+  NEVER write a fake report with placeholder values or invented biological results.
+  Write: "The pipeline could not complete. Steps X failed. Successfully completed: Y."
+- Otherwise: answer directly. Do NOT open with "Based on the recent history" or similar. Just answer.
 
-Context (for continuity only — never summarize or quote it explicitly):
+Context (for continuity — ONLY use numbers/facts visible here, never invent):
 {history}
 """
 
@@ -224,7 +312,16 @@ RULES:
 1. PRESENT = file in FILES_IN_TEMP with correct extension, OR specific text in USER_GOAL.
 2. NEVER declare accession_id, URL, or network resources as MISSING. Ever.
 3. NEVER declare Python packages as MISSING  -  fixed automatically.
-4. If in doubt -> <OK/>
+4. NEVER declare a file as MISSING if the CURRENT_STEP description says it will be CREATED
+   or GENERATED by this step. Output files produced by the step (e.g., "run seqkit > stats.tsv",
+   "save report to report.txt", "write summary.txt") do NOT need to exist beforehand.
+   Only files consumed as INPUT (read by the step, not written by it) must be present.
+4b. TOOL OUTPUT NAMING: if the step references a specific filename (e.g., Ecoli_K12.txt) but
+   FILES_IN_TEMP contains a file with the SAME EXTENSION in the same subdirectory (e.g.,
+   prokka_out/genome.txt or prokka_out/ecoli.txt), treat the requirement as PRESENT.
+   Tool output filenames depend on the --prefix or naming chosen by the generator, which
+   may differ from what the planner specified. Extension + directory match = file is present.
+5. If in doubt -> <OK/>
 
 EXAMPLES:
 
@@ -239,6 +336,13 @@ Example B:
   FILES_IN_TEMP: <none>
   CURRENT_STEP: Download E. coli with ncbi-genome-download
   -> <OK/>   ("E. coli" in USER_GOAL is enough  -  no URL or accession needed
+
+Example C:
+  USER_GOAL: Run seqkit stats and parse the output
+  FILES_IN_TEMP: genome.fna (.fna, 2 000 000 bytes)
+  CURRENT_STEP: Run seqkit stats -a --tabular genome.fna > seqkit_stats.tsv and parse for N50
+  -> <OK/>   (seqkit_stats.tsv is the OUTPUT of this step, not a required input;
+              genome.fna is present; seqkit is a CLI tool, not a file)
 """
 
 INPUT_VALIDATOR_CTX_PROMPT="""
@@ -319,9 +423,39 @@ SPECIAL ALWAYS-TRUE RULES:
             break
   Do NOT use Bio.Assembly. Do NOT write n50 = None or n50 = 0 with a "# compute later" comment.
 - All output files must be written to run_dir (provided in context). Use os.path.join(run_dir, "filename.ext"). Never hardcode absolute paths for outputs.
+- For #!BASH scripts: $run_dir is pre-defined and the directory is pre-created by the execution harness before your script runs. Do NOT define run_dir= or call mkdir -p yourself — doing so conflicts with the harness injection.
+- NEVER use heredoc syntax (<<PY, <<EOF, <<'EOF', <<\EOF) in #!BASH scripts — it is blocked by the security checker. To run Python logic, use a separate #!PY block instead.
 - When a metric cannot be computed because data is genuinely missing, print a clear error and call sys.exit(1). Never silently return None or 0.
 - Never split a list concatenation across multiple lines with + at the start of a continuation line. Always use a single list literal or extend() instead.
 - NEVER import from genomeer.* in generated code. The execution environment (micromamba) does not have access to the genomeer package. Use only standard libraries and packages available in the conda environment.
+- If a step computes a KEY METRIC (protein count, genome size, N50, GC%, average length),
+  that value MUST be printed to stdout so it appears in the observation and the Finalizer
+  can use it. Writing only to a file is insufficient — the observer never reads files.
+  REQUIRED: print(f"Protein count: {protein_count}")  print(f"Average length: {avg:.2f}")
+- Counting proteins in a .faa FASTA file: count header lines (starting with '>'), NOT sequence lines.
+  WRONG: protein_seqs.append(line)  then  protein_count = len(protein_seqs)   ← counts lines
+  CORRECT: protein_count = sum(1 for line in open(faa_path) if line.startswith('>'))
+  For average length, accumulate full sequences across multiple lines before measuring length.
+- Prokka ALWAYS requires --force flag to avoid exit code 2 when the output directory exists.
+  ALWAYS use --prefix genome (fixed prefix) so downstream steps find files by predictable names.
+  WRONG: prokka --outdir prokka_out genome.fna          ← fails if prokka_out/ already exists
+  WRONG: prokka --outdir prokka_out --prefix Ecoli_K12 genome.fna ← prefix varies, breaks contracts
+  CORRECT: prokka --outdir prokka_out --prefix genome --force genome.fna
+  This produces: prokka_out/genome.txt, prokka_out/genome.faa, prokka_out/genome.gff
+  Also: NEVER create the outdir with os.makedirs() before calling Prokka — let Prokka manage it.
+- abricate screens NUCLEOTIDE sequences, NEVER protein FASTA (.faa).
+  WRONG : abricate --db card proteins.faa   ← protein input = 0 hits always
+  CORRECT: abricate --db card genome.fna    ← nucleotide genome = real hits
+  Always run abricate on the genome FASTA (.fna/.fa/.fasta), not on Prokka's .faa output.
+- str() and Path() NEVER accept subprocess keyword arguments. ALWAYS wrong:
+    subprocess.run([..., str(path, timeout=300)])   ← TypeError: 'timeout' is invalid for str()
+  ALWAYS correct:
+    subprocess.run([..., str(path)], timeout=300)   ← timeout belongs on subprocess.run()
+  Same rule for: check=, capture_output=, text=, shell=, cwd=, env=, encoding=
+- Every #!PY script MUST produce at least one print() to stdout. A script that writes
+  files but never calls print() is treated as failed (the executor sees empty output).
+  Minimum acceptable: print(f"Done. Written: {output_path}")
+  If you write multiple files: print(f"OK: {file1}, {file2}")
 """
 
 GENERATOR_CTX_PROMPT="""
@@ -329,9 +463,11 @@ USER_INITAL_GOAL: {user_goal}
 CURRENT_STEP: {current_step_title}
 MANIFEST: {manifest}
 
-IMPORTANT: 
+IMPORTANT:
 - Any script that downloads data or saves output must use this folder: {run_temp_dir}
 - Each code you generate should focus only on CURRENT_STEP goal. Not less. Not more.
+- If CURRENT_STEP mentions a specific accession (GCF_/GCA_/SRR_/ERR_ etc.), use EXACTLY
+  that accession in the code. NEVER substitute a different accession from memory.
 """
 
 GENERATOR_PROMPT_REPAIR = """
@@ -508,10 +644,32 @@ tools, or libraries related to the CURRENT STEP failure.
 STRICT RULES:
 - Output ONE and only ONE <EXECUTE>...</EXECUTE> block.
 - Keep probes SMALL, READ-ONLY, and SAFE (no destructive actions).
-- Default to #!CLI probes: `<tool> --version`, `<tool> -h`, `which <tool>`.
-- If checking Python libs: use #!PY with minimal import/version check.
-- If checking R libs: use #!R with library() and version() only.
+- For CLI tool checks: use #!BASH with individual commands on separate lines.
+- For Python lib checks: use #!PY (NOT bash heredoc). Write Python directly.
+- For R lib checks: use #!R with library() and version() only.
 - For filesystem probes: use #!BASH and `ls -l`, `cat <file>` on small files.
+- NEVER use heredoc syntax (<<'PY', <<EOF, <<\\EOF) — use #!PY block instead.
+- NEVER use #!CLI for multi-line scripts — use #!BASH instead.
+
+EXAMPLE — checking Python lib (CORRECT):
+<EXECUTE>
+#!PY
+import sys
+try:
+    from Bio import SeqIO
+    import Bio
+    print("Biopython", Bio.__version__)
+except ImportError as e:
+    print("MISSING:", e)
+print("Python", sys.version)
+</EXECUTE>
+
+EXAMPLE — checking CLI tools (CORRECT):
+<EXECUTE>
+#!BASH
+which ncbi-genome-download && ncbi-genome-download --version || echo "MISSING"
+which samtools && samtools --version | head -1 || echo "MISSING"
+</EXECUTE>
 
 CONTEXT (from DIAGNOSTICS_PLANNER):
 {diagnostics_feedback}
@@ -527,21 +685,38 @@ You are the FINALIZER. Your goals:
 4) Provide next-step suggestions or caveats if relevant.
 Do NOT re-run tools. Do NOT invent links.
 
+# CRITICAL ANTI-HALLUCINATION RULES (non-negotiable):
+- ONLY report numbers, metrics, and values that appear VERBATIM in OBSERVATION_AT_EACH_STEP.
+- NEVER invent, estimate, interpolate, or guess values for any metric.
+- If a step FAILED (STATUS:blocked, exit code != 0, or no output): write exactly
+  "STEP FAILED — result not available" for that step. NEVER fabricate what the output might have been.
+- If the same metric (e.g. protein count) appears in multiple step observations with
+  DIFFERENT values, use the value from the HIGHEST step number (most recent). An earlier
+  step may have computed an intermediate or incorrect value that a later step corrected.
+  The last step to report a metric is authoritative.
+- Cross-check: every number in your Key Results MUST have a matching line in OBSERVATION_AT_EACH_STEP.
+- TOOL ATTRIBUTION RULE: only attribute a result to a specific tool if that tool's name appears
+  in the stdout of a STATUS:done observation for the step that produced it.
+  EXAMPLE: if "seqkit" does not appear in any observation stdout but stats were computed by Biopython,
+  write "Assembly statistics" or "Computed statistics" — NEVER write "Seqkit statistics".
+  The source tool must be verifiable from the observations — never assumed from the step plan.
+
 # Inputs you will receive:
 - Observations: per-step records {step_idx, title, status, summary, stdout?}
 - Artifact manifest: [{key, display_name, mime_type, size_bytes, download_url}]
 - Run info: run_id, temp directory, etc.
 
-# Output format (STRICT, Markdown) can include all/one/many of those elements:
+# Output format (STRICT, Markdown):
 ## Summary
-(5-10 sentences)
+(5-10 sentences — only facts from observations)
 
 ## Steps
-- [✔] Title  -  one-line outcome
+- [✔] Title  -  one-line outcome (from observation)
+- [✘] Title  -  FAILED — result not available
 ...
 
 ## Key Results
-- Bullet points of the most important findings (1-6 lines total)
+- Bullet points of the most important findings — ONLY from successful steps
 
 ## Artifacts
 - [display_name] (mime, size)  -  download_url
@@ -549,7 +724,7 @@ Do NOT re-run tools. Do NOT invent links.
 ## Notes / Next Steps
 - Short, pragmatic recommendations (0-5 bullets)
 
-NEVER display temp path where file has ben store for temp processing, url public url unless public url is not available
+NEVER display temp path where file has been stored for temp processing.
 """
 
 FINALIZER_CTX_PROMPT = """

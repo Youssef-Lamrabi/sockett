@@ -75,22 +75,37 @@ class StateGraphHelper:
                 _p1.append(_line)
 
         # Pass 2 — absorb lines whose TAIL is + or | into the following line.
+        # GUARD: skip joining when inside open brackets (, [, { — Python's implicit
+        # line-continuation already handles those, and stripping the indent of the
+        # next line with .lstrip() would produce an IndentationError in the file.
         _p2: list = []
         _j = 0
+        _depth = 0  # bracket depth: (, [, {
         while _j < len(_p1):
             _ln = _p1[_j]
             _rt = _ln.rstrip()
-            # Keep joining while the current line ends with a bare operator
-            # (guard: don't join if the + is inside a string literal ending the line,
-            #  detected by trailing quotes after the operator — rare but safe check)
+            # Update bracket depth for this line (simplified: ignore strings)
+            for _ch in _ln:
+                if _ch in '([{':
+                    _depth += 1
+                elif _ch in ')]}':
+                    _depth = max(0, _depth - 1)
+            # Only join when NOT inside implicit-continuation brackets
             while (
-                _j + 1 < len(_p1)
+                _depth == 0
+                and _j + 1 < len(_p1)
                 and _rt
                 and _rt[-1] in ('+', '|')
                 and not _rt.endswith(('"""', "'''"))
             ):
                 _j += 1
-                _ln = _rt + ' ' + _p1[_j].lstrip()
+                _next = _p1[_j]
+                for _ch in _next:
+                    if _ch in '([{':
+                        _depth += 1
+                    elif _ch in ')]}':
+                        _depth = max(0, _depth - 1)
+                _ln = _rt + ' ' + _next.lstrip()
                 _rt = _ln.rstrip()
             _p2.append(_ln)
             _j += 1

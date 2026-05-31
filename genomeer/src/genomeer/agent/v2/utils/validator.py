@@ -2000,10 +2000,21 @@ class ToolValidator:
 
     @staticmethod
     def _match_contract(step_title: str) -> Optional[_BaseContract]:
+        """Match a contract using whole-word boundary matching.
+
+        Substring matching caused false positives, e.g. "assemble" matching
+        "assembled sequence" in unrelated ORF-density steps. Whole-word regex
+        ensures keywords only match when they appear as complete words.
+        """
+        import re as _re
         title_lower = (step_title or "").lower()
         for contract in _ALL_CONTRACTS:
-            if any(kw in title_lower for kw in contract.KEYWORDS):
-                return contract
+            for kw in contract.KEYWORDS:
+                # Build a word-boundary pattern. Keywords may contain spaces
+                # (e.g. "orf prediction") — anchor only the outer edges.
+                pattern = r'\b' + _re.escape(kw.lower()) + r'\b'
+                if _re.search(pattern, title_lower):
+                    return contract
         return None
 
     @staticmethod

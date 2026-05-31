@@ -229,6 +229,11 @@ def _normalize_script(script: str) -> str:
 # (environment probing commands, not attack vectors).
 _DIAG_SKIP_BASH = frozenset({
     "inline code execution via interpreter -c/-e flag",
+    # Heredoc (<<'PY', <<EOF) is used by diagnostic scripts to run inline
+    # Python probes (e.g. `python - <<'PY'\nfrom Bio import SeqIO\nPY`).
+    # It is safe in a controlled diagnostic context — the content is fully
+    # validated by check_python_code before the heredoc body is allowed.
+    "heredoc (<<EOF / <<\\EOF) syntax not allowed in generated scripts",
 })
 
 

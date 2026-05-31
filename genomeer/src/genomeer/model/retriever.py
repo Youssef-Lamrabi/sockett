@@ -4,9 +4,12 @@ from langchain_openai import ChatOpenAI
 
 _RETRIEVAL_TIMEOUT_SEC = 60
 
-# Keywords that mark a tool as a stub/toy/deprecated — excluded from retrieval
+# Keywords that mark a tool as a stub/toy/deprecated/internal — excluded from retrieval
 _STUB_KEYWORDS = re.compile(
-    r"\[STUB\]|\[DEPRECATED\]|\bToy\b|\bstub\b|\bplaceholder\b|\bDO NOT USE\b",
+    r"\[STUB\]|\[DEPRECATED\]|\[INTERNAL API\]|\[INTERNAL\]"
+    r"|\bToy\b|\bstub\b|\bplaceholder\b|\bDO NOT USE\b"
+    r"|DO NOT IMPORT IN GENERATED SCRIPTS"
+    r"|NOT AVAILABLE IN EXECUTION ENVIRONMENTS",
     re.IGNORECASE,
 )
 
@@ -50,6 +53,12 @@ _CLI_TOOL_BINARIES = {
     "abricate": "abricate",
     "dbcan": "run_dbcan.py",
     "pharokka": "pharokka.py",
+    # ── AMR / Resistance ──────────────────────────────────────────────────────
+    "amrfinder": "amrfinder",
+    "amrfinderplus": "amrfinder",
+    "rgi": "rgi",
+    # ── Genome annotation ─────────────────────────────────────────────────────
+    "prokka": "prokka",
     # ── Community / stats ─────────────────────────────────────────────────────
     "lefse": "lefse_run.py",
     "nonpareil": "nonpareil",

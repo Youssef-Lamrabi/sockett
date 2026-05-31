@@ -248,7 +248,9 @@ def create_artifacts_router(prefix: str = "") -> APIRouter:
         user=Depends(maybe_auth),
     ):
         run_dir = ensure_run_dir(run_id)
-        manifest = publish_artifacts(run_id, str(run_dir), req.expose_paths, PUBLIC_ARTIFACTS_URL)
+        # Re-read PUBLIC_ARTIFACTS_URL at call time so BioAgent's port setting is used.
+        manifest = publish_artifacts(run_id, str(run_dir), req.expose_paths,
+                                     os.getenv("PUBLIC_ARTIFACTS_URL", PUBLIC_ARTIFACTS_URL))
         return JSONResponse(content=manifest)
 
     @router.get("/download/{run_id}/{path:path}")

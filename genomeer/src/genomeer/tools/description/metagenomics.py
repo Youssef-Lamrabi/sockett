@@ -647,11 +647,11 @@ description = [
     {
         "name": "run_rgi",
         "description": (
-            "[CLI Tool][TIMEOUT: 1800s] RGI (Resistance Gene Identifier): AMR gene prediction against the CARD database. "
-            "Three input types: protein (--t protein), contig DNA (--t contig), reads (--t read). "
-            "Command: rgi main -i proteins.faa -o output_prefix -t protein -a DIAMOND -n N --clean. "
-            "Outputs output_prefix.txt (TSV) with Best_Hit_ARO, resistance mechanism, drug class per gene. "
-            "Run 'rgi load' with CARD data first."
+            "[INTERNAL API — DO NOT IMPORT IN GENERATED SCRIPTS] "
+            "[CLI Tool][TIMEOUT: 1800s] RGI (Resistance Gene Identifier): AMR gene prediction against CARD. "
+            "NOT AVAILABLE IN EXECUTION ENVIRONMENTS — requires CARD database download ('rgi load'). "
+            "Verify installation with 'which rgi' before use. "
+            "Consider using abricate as a lightweight alternative that requires no database setup."
         ),
         "required_parameters": [
             {"name": "input_fasta", "type": "str",
@@ -672,12 +672,12 @@ description = [
     {
         "name": "run_amrfinder",
         "description": (
+            "[INTERNAL API — DO NOT IMPORT IN GENERATED SCRIPTS] "
             "[CLI Tool][TIMEOUT: 600s] NCBI AMRFinderPlus: identification of AMR, stress, and virulence genes. "
-            "Uses NCBI's curated AMR reference gene catalog. "
-            "Command: amrfinder -p proteins.faa -o output.tsv --threads N --organism Escherichia --plus. "
-            "Organism flag enables point mutation detection for supported species "
-            "(Escherichia, Klebsiella, Salmonella, Staphylococcus, Enterococcus, etc.). "
-            "--plus adds stress and virulence genes beyond AMR."
+            "NOT AVAILABLE IN EXECUTION ENVIRONMENTS — amrfinder requires a separate database installation "
+            "('amrfinder --update') and is rarely present. If amrfinder is needed, verify it is installed "
+            "first with 'which amrfinder', then call via subprocess.run(['amrfinder', ...]). "
+            "Consider using abricate as a lightweight alternative (bundled databases, no setup required)."
         ),
         "required_parameters": [
             {"name": "proteins_faa", "type": "str",

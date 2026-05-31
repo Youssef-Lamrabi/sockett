@@ -201,8 +201,9 @@ def ensure_micromamba() -> Path:
     return exe
 
 
-_PIP_SENTINEL  = ".genomeer_pip_ok"
-_SPEC_HASH_SENTINEL = ".genomeer_spec_hash"
+_CONDA_SENTINEL     = ".genomeer_conda_ok"   # Level 1 — conda packages ready (env usable)
+_PIP_SENTINEL       = ".genomeer_pip_ok"    # Level 2 — pip packages ready (optional, non-blocking)
+_SPEC_HASH_SENTINEL = ".genomeer_spec_hash" # hash of spec at conda-install time
 
 
 def _spec_hash(spec_file: Path) -> str:
@@ -232,9 +233,36 @@ def _update_env_from_spec(
 ) -> None:
     """Install packages that were added to the spec after the env was created.
     Uses `micromamba install` (idempotent: skips already-present packages).
-    Also re-runs the pip step and refreshes the spec-hash sentinel."""
+    Also re-runs the pip step and refreshes the spec-hash sentinel.
+
+    Optimisation: do a fast dry-run first. If micromamba reports that all requested
+    packages are already installed (output contains 'All requested packages already
+    installed'), skip the full resolution (which can take 1000+ seconds) and just
+    update the stored spec hash. This eliminates the recurring 1129s penalty after
+    any yaml change that doesn't actually add new packages.
+    """
     mm = ensure_micromamba()
     prefix = env_prefix(name)
+
+    # Fast pre-check: run `micromamba install --dry-run` to detect no-op updates.
+    dry_args = [str(mm), "install", "-y", "-p", str(prefix), "-f", str(spec_file), "--dry-run"]
+    try:
+        dry_proc = subprocess.run(
+            dry_args, capture_output=True, text=True, timeout=120
+        )
+        dry_out = (dry_proc.stdout or "") + (dry_proc.stderr or "")
+        if dry_proc.returncode == 0 and "All requested packages already installed" in dry_out:
+            # Nothing to install — just refresh the hash and return.
+            import logging as _logging
+            _logging.getLogger("genomeer.env_manager").info(
+                f"env '{name}': spec hash changed but all packages already installed "
+                "— skipping full resolution, refreshing hash."
+            )
+            _write_spec_hash(name, spec_file)
+            return
+    except Exception:
+        pass  # dry-run failed or timed out → fall through to full install
+
     args = [str(mm), "install", "-y", "-p", str(prefix), "-f", str(spec_file)]
     proc = subprocess.Popen(
         args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
@@ -256,9 +284,16 @@ def env_prefix(name: str) -> Path:
 def has_env(name: str) -> bool:
     return (env_prefix(name) / "conda-meta").exists()
 
+def has_conda_installed(name: str) -> bool:
+    """Level 1 — True when conda packages installed successfully. Env is usable."""
+    return (env_prefix(name) / "conda-meta" / _CONDA_SENTINEL).exists()
+
 def has_pip_installed(name: str) -> bool:
-    """True only after the explicit pip post-install step completed successfully."""
+    """Level 2 — True when pip packages also installed. Informational only."""
     return (env_prefix(name) / "conda-meta" / _PIP_SENTINEL).exists()
+
+def _write_conda_sentinel(name: str) -> None:
+    (env_prefix(name) / "conda-meta" / _CONDA_SENTINEL).touch()
 
 def _pip_packages_from_spec(spec_file: Path) -> list[str]:
     """Return the pip package list from a conda YAML spec, skipping broken editable installs."""
@@ -306,7 +341,11 @@ def _pip_install_from_spec(
     )
     rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=600)
     if rc != 0:
-        raise RuntimeError(f"pip install failed (exit {rc}) for env at {prefix}")
+        import logging as _logging
+        _logging.getLogger("genomeer.env_manager").warning(
+            f"pip install failed (exit {rc}) for env at {prefix} — env still usable (conda ok)"
+        )
+        return  # non-fatal: conda packages are sufficient
 
     (prefix / "conda-meta" / _PIP_SENTINEL).touch()
 
@@ -410,9 +449,12 @@ def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None 
     if rc != 0:
         raise RuntimeError("micromamba create failed")
 
-    # Explicitly install pip packages (workaround: micromamba on Windows silently skips pip: sections)
-    _pip_install_from_spec(prefix, spec_file, stream_cb=stream_cb)
+    # Level 1 sentinel — conda packages ready, env is usable from this point.
+    _write_conda_sentinel(name)
     _write_spec_hash(name, spec_file)
+
+    # Level 2 — pip packages (non-blocking: failure is logged but does not prevent env use).
+    _pip_install_from_spec(prefix, spec_file, stream_cb=stream_cb)
 
 
 def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = None):
@@ -456,23 +498,26 @@ def ensure_env(name: str, auto_install: bool = True, log_cb: Optional[Callable[[
         spec_changed = stored_hash != current_hash
 
         if spec_changed and auto_install:
-            # Spec was updated since last install (or first run after this fix was deployed).
-            # micromamba install is idempotent: already-present packages are skipped.
+            # Spec changed since last install → update conda packages (idempotent).
             with _install_lock(name):
-                # Re-check after acquiring lock — another process may have just updated it.
                 if _stored_spec_hash(name) != current_hash:
                     _update_env_from_spec(name, spec, stream_cb=log_cb)
             return prefix, False, f"Environment '{name}' updated to latest spec."
 
-        if not has_pip_installed(name):
-            # Pip sentinel missing: Windows micromamba bug or interrupted install.
-            if auto_install:
+        # Level 1 check — if conda sentinel missing but conda-meta exists, this is a
+        # legacy env installed before the two-level sentinel system. Write it now so
+        # subsequent calls are fast.
+        if not has_conda_installed(name):
+            _write_conda_sentinel(name)
+
+        # Level 2 — pip: attempt if missing, but never block on failure.
+        if not has_pip_installed(name) and auto_install:
+            try:
                 _pip_install_from_spec(prefix, spec, stream_cb=log_cb)
-                _write_spec_hash(name, spec)
-            else:
-                raise RuntimeError(
-                    f"Env '{name}' exists but pip packages are not installed "
-                    f"(sentinel {_PIP_SENTINEL} missing). Re-run with auto_install=True."
+            except Exception as _pip_err:
+                import logging as _logging
+                _logging.getLogger("genomeer.env_manager").warning(
+                    f"pip step skipped for '{name}': {_pip_err} — env usable (conda ok)"
                 )
 
         return prefix, False, f"Environment '{name}' ready."
@@ -480,11 +525,9 @@ def ensure_env(name: str, auto_install: bool = True, log_cb: Optional[Callable[[
     if auto_install:
         with _install_lock(name):
             if has_env(name):
-                # Another thread just created it — still check pip sentinel and hash.
-                spec = spec_path(rec["spec"])
-                if not has_pip_installed(name):
-                    _pip_install_from_spec(prefix, spec, stream_cb=log_cb)
-                    _write_spec_hash(name, spec)
+                # Another thread just created it.
+                if not has_conda_installed(name):
+                    _write_conda_sentinel(name)
                 return prefix, False, f"Environment '{name}' became ready."
 
             spec = spec_path(rec["spec"])

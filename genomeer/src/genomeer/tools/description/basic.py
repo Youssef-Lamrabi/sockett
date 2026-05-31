@@ -93,7 +93,7 @@ description = [
     },
     {
         "name": "translate_orfs",
-        "description": "Find ORFs and translate to proteins (both strands optional).  The output includes structured results with ORF coordinates, translated protein sequences, and a summary of findings as a dictionary liek this `dict(orfs_bed, proteins_faa, summary)`",
+        "description": "[INTERNAL API — DO NOT IMPORT IN GENERATED SCRIPTS] Find ORFs and translate to proteins. NOT AVAILABLE IN EXECUTION ENVIRONMENTS. Use prodigal CLI instead: prodigal -i genome.fna -a proteins.faa -f gff -o genes.gff -p meta",
         "required_parameters": [
             {"name": "fasta_path", "type": "str"}
         ],

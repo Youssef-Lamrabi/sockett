@@ -224,6 +224,22 @@ def resolve_env(tool: str, kind: Kind, registry_path: Path | str = REGISTRY_PATH
     }
 
 
+def get_meta_env_signals() -> set[str]:
+    """
+    Return the set of binary names declared in meta-env1's provides_bins.
+    Used by _select_env and _resolve_env_from_code as the single source of
+    truth for deciding when meta-env1 is needed.
+    """
+    try:
+        envs = _load_registry(REGISTRY_PATH)
+        meta = next((e for e in envs if e.name == "meta-env1"), None)
+        if not meta:
+            return set()
+        return {b.strip().lower() for b in meta.provides_bins if b.strip()}
+    except Exception:
+        return set()
+
+
 # --- tiny CLI for debugging (optional) ---
 if __name__ == "__main__":
     import sys

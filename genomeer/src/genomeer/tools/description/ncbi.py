@@ -2,10 +2,12 @@ description = [
     {
         "name": "download_from_ncbi",
         "description": (
-            "Download genomes or annotations from NCBI using ncbi-genome-download. "
-            "Supports selection by groups (e.g. 'bacteria', 'plant', 'all'), specific accessions "
-            "(e.g. 'GCF_000001735.4'), species/taxids (e.g. '-T 3702'), assembly level filters, formats "
-            "('fasta', 'gff', 'genbank', etc.), and optional post-download decompression."
+            "[INTERNAL API — DO NOT IMPORT IN GENERATED SCRIPTS] "
+            "This function is a Python wrapper around ncbi-genome-download CLI. "
+            "It is NOT available in execution environments (bio-agent-env1, meta-env1). "
+            "Importing it raises ModuleNotFoundError. "
+            "To download from NCBI in generated code, use ncbi-genome-download CLI directly: "
+            "ncbi-genome-download -A <accession> -l complete -s refseq -F fasta --flat-output -o <dir> bacteria"
         ),
         "required_parameters": [
             {"name": "groups", "type": "str", "description": "Taxonomic group(s) (comma-separated). Examples: 'bacteria', 'plant', 'all'."}
