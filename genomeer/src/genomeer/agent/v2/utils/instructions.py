@@ -78,11 +78,13 @@ SPECIAL ALWAYS-TRUE RULES:
    Keywords timeout=, check=, capture_output=, text=, shell= belong on subprocess.run() only.
 9. QUAST report.tsv format: QUAST writes a KEY-VALUE file — NOT a header-row CSV.
    Each line is "metric_name<TAB>value". NEVER use csv.DictReader or pandas.read_csv on it.
+   CRITICAL: QUAST uses "# contigs (>= 0 bp)" as a real metric key that starts with "#".
+   NEVER skip lines starting with "#" — they are valid data rows, not comments.
    CORRECT parsing:
      stats = dict()
      with open(quast_report_path) as f:
          for line in f:
-             if line.startswith('#') or not line.strip():
+             if not line.strip():
                  continue
              parts = line.rstrip().split('\t')
              if len(parts) >= 2:
@@ -92,6 +94,7 @@ SPECIAL ALWAYS-TRUE RULES:
      # Use prefix match — reliable for ALL QUAST versions and --min-contig values:
      contigs = next((v for k, v in stats.items() if k.startswith('# contigs')), 'NA')
    WRONG: csv.DictReader(f) — KeyError: 'N50' because there is no header row.
+   WRONG: skipping lines with startswith('#') — loses all contig count entries.
 
 {SELF_CRITIC_INSTRUCTION}
 """
@@ -219,6 +222,10 @@ If ORCHESTRATOR: output ONLY a checklist + the routing tag, e.g.:
 - [ ] Step 2...
 - [ ] Step 3...
 <next:ORCHESTRATOR>
+
+CRITICAL: Step descriptions MUST be plain text only — NO code blocks, NO backtick fences (``` or `````),
+NO example commands, NO inline code snippets. The Generator node writes all code; the Planner writes
+only human-readable step titles.
 
 If needed: the home direcltory for this context if : TEMP_DIR={temp_run_dir}.
 """
@@ -456,6 +463,45 @@ SPECIAL ALWAYS-TRUE RULES:
   files but never calls print() is treated as failed (the executor sees empty output).
   Minimum acceptable: print(f"Done. Written: {output_path}")
   If you write multiple files: print(f"OK: {file1}, {file2}")
+- After decompressing or downloading any file, ALWAYS verify it is non-empty before proceeding:
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        sys.exit(f"File {output_path} is missing or empty after download/decompression")
+  Never print "ready" or "success" without this size check — a 0-byte file causes silent failures downstream.
+- NEVER create placeholder, empty, or fake output files to bypass a tool failure.
+  If a required tool is not found (exit 127, "command not found") or fails:
+    CORRECT: sys.exit(f"Required tool 'wgsim' not found. Install it before running this step.")
+    WRONG:   open("output.fastq", "w").close()   ← empty placeholder, corrupts pipeline
+    WRONG:   printf "" > output.fastq            ← empty placeholder
+  Creating fake output silently propagates errors through all downstream steps.
+  Always fail loudly with sys.exit() so the pipeline stops at the real problem.
+- samtools usage rules:
+  NEVER use the deprecated -bS flag: samtools view -bS is obsolete. Use -b only:
+    CORRECT: samtools view -b -o out.bam in.sam
+    WRONG:   samtools view -bS in.sam -o out.bam
+  For the minimap2 → sort pipeline, always use a single-step sort with explicit -T temp dir:
+    minimap2 -ax sr contigs.fa R1.fq R2.fq | samtools sort -T /tmp/samsort_ -o sorted.bam
+    samtools index sorted.bam
+  Always verify the sorted BAM was created with non-zero size before proceeding:
+    if not os.path.exists(sorted_bam) or os.path.getsize(sorted_bam) == 0:
+        sys.exit("samtools sort failed — sorted BAM not created")
+  NOTE: samtools --version may exit with code 1 on some versions — this is normal.
+  Do NOT conclude samtools is missing just because --version returned non-zero.
+- Simulating reads from a FASTA genome: NEVER use seqkit for read simulation.
+  seqkit seq/grep are FILTERING tools — they cannot generate paired-end FASTQ reads.
+  ALWAYS use wgsim (bundled with samtools, always available when samtools is installed):
+  CORRECT: wgsim -N 50000 -1 150 -2 150 genome.fna reads_R1.fastq reads_R2.fastq
+  wgsim flags: -N <read_pairs> -1 <read1_len> -2 <read2_len> -e <error_rate=0.02>
+               -r <mutation_rate=0.001> -d <insert_mean=500> -s <insert_std=50>
+  NOTE: the -q flag does NOT exist in all wgsim versions — NEVER use -q. wgsim
+  generates reads with low quality scores (Phred ~10-15); to handle this in fastp
+  use --qualified_quality_phred 10 --average_qual 0 instead of the default 20.
+  Output: reads_R1.fastq and reads_R2.fastq — true paired FASTQ files.
+  WRONG: seqkit seq --min-len 150 genome.fna | awk ... → produces FASTA fragments, not reads
+- NCBI accession extraction from filename: NCBI filenames follow the pattern
+  "GCF_000027325.1_ASM2732v1_genomic.fna". The accession is the first TWO underscore-separated
+  parts joined back: "_".join(basename.split("_")[:2])  →  "GCF_000027325.1"
+  WRONG: basename.split("_")[0]  →  "GCF"   (truncates after first underscore)
+  CORRECT: "_".join(os.path.basename(fasta_path).split("_")[:2])  →  "GCF_000027325.1"
 """
 
 GENERATOR_CTX_PROMPT="""
@@ -750,3 +796,27 @@ VERY IMPORTANT: User feedback to considere absolutely in this step
 # --------------------------------------------------------------------------------------------------------
 # OTHER UTILS PROMPT
 # --------------------------------------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------
+# BIO_HINT — Context block injected into Generator when 8B hint is present
+# -----------------------------------------------------------------------
+BIO_HINT_CONTEXT_BLOCK = """
+
+--- DOMAIN CONTEXT (specialized bioinformatics model — treat as junior expert notes) ---
+A fine-tuned bioinformatics domain model provided the following notes about this step:
+
+{bio_hint}
+
+HOW TO USE THIS CONTEXT:
+- This model understands WHY metagenomics steps fail and knows common pipeline patterns,
+  but it frequently states wrong CLI flags, wrong column names, wrong tool versions,
+  and may invent tool names that do not exist.
+- EXTRACT the biological reasoning and causal understanding if it makes sense.
+- VERIFY or IGNORE any specific flag names, parameter values, or tool names before using them.
+- If anything here contradicts an explicit rule in your instructions above, IGNORE this context.
+- If it suggests a biological cause that matches the observed error, consider it even if the
+  proposed fix needs to be reformulated with correct syntax from your own expertise.
+- When in doubt: your knowledge + explicit rules > these hints.
+---
+"""

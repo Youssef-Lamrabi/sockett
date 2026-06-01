@@ -267,7 +267,7 @@ def _update_env_from_spec(
     proc = subprocess.Popen(
         args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
     )
-    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=1800)
+    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=3600)
     if rc != 0:
         raise RuntimeError(
             f"micromamba install failed (exit {rc}) while updating env '{name}'. "
@@ -357,7 +357,7 @@ def spec_path(spec_filename: str) -> Path:
     return PACKAGE_ENVS_DIR / spec_filename
 
 @contextmanager
-def _install_lock(name: str, timeout_sec: int = 1800):
+def _install_lock(name: str, timeout_sec: int = 3600):
     """Simple file lock to avoid concurrent installs."""
     _ensure_dirs()
     ENVS_DIR.mkdir(parents=True, exist_ok=True)
@@ -445,7 +445,7 @@ def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None 
             args += ["-c", ch]
 
     proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
-    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=1800)
+    rc = _drain_proc(proc, stream_cb=stream_cb, timeout_sec=3600)
     if rc != 0:
         raise RuntimeError("micromamba create failed")
 

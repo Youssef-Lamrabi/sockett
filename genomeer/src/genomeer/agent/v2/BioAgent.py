@@ -102,8 +102,13 @@ class AgentState(TypedDict):
     current_sample_idx: int
     current_sample_id: str | None
     per_sample_results: Dict[str, Any]
-    
-    
+    # ── bio_hint optional fields (set to None / -1 when not used) ───────────
+    bio_hint: str | None          # raw validated text from the 8B domain model
+    bio_hint_step_idx: int        # current_idx at last bio_hint call (dedup guard)
+    bio_hint_mode: str | None     # "pre_gen" | "debug"
+    bio_hint_skipped: bool        # True when triage decided to skip the 8B call
+
+
 # -----------------------------------------------
 # CORE AGENT CLASS
 # -----------------------------------------------
@@ -122,7 +127,8 @@ class BioAgent:
         artifacts_host: str = "127.0.0.1",
         artifacts_port: int = 8910,
         artifacts_prefix: str = "/api/v1/artifacts",
-        interaction_mode: str = "auto"
+        interaction_mode: str = "auto",
+        bio_hint_llm: Any = None,
     ):
         """
         Agent initalization
@@ -200,6 +206,9 @@ class BioAgent:
         
         # Interaction mode
         self.interaction_mode = interaction_mode
+
+        # Optional secondary LLM for biological domain hints (bio_hint node)
+        self.bio_hint_llm = bio_hint_llm
 
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds
@@ -1235,7 +1244,13 @@ class BioAgent:
                     manifest=state['manifest'].get("input_state"),
                     run_temp_dir=state.get('run_temp_dir') or "",
                 )
-            
+
+            # Inject bio_hint context when available (bio_hint node ran before this call)
+            if not is_diagnostic:
+                _bio_hint = (manifest.get("bio_hint")) or state.get("bio_hint")
+                if _bio_hint:
+                    content += instructions.BIO_HINT_CONTEXT_BLOCK.format(bio_hint=_bio_hint)
+
             # Dynamically inject code pattern snippets when the step involves known-hard patterns.
             # Small models (llama3:8b) reliably ignore rules in the general prompt but DO follow
             # examples placed immediately before the task. This is the reliable fix for N50 / SeqIO.
@@ -1658,7 +1673,7 @@ class BioAgent:
             from genomeer.runtime.env_manager import (
                 load_registry, spec_path, env_prefix,
                 has_env, has_conda_installed, has_pip_installed,
-                _write_conda_sentinel,
+                _write_conda_sentinel, create_or_update_env,
             )
             from genomeer.agent.v2.utils.structured_output import _resolve_env_from_code
 
@@ -1737,7 +1752,7 @@ class BioAgent:
                 stream = entry["stream"]
                 
                 # Block until micromamba finishes; logs go to stream.push(...)
-                create_or_update_env(env_name, spec, channels, stream)
+                create_or_update_env(env_name, spec, channels, stream.push)
                 
                 # Success: mark ready, close stream, cleanup
                 stream.push(f"Environment '{env_name}' created.")
@@ -2950,6 +2965,16 @@ class BioAgent:
         workflow.add_node("diagnostics", self.diagnostics)
         workflow.add_node("finalizer", self.finalizer)
 
+        # ── bio_hint optional node ────────────────────────────────────────────
+        # Added only when a secondary domain LLM is configured.
+        # When bio_hint_llm is None the graph is completely unchanged.
+        _bio_hint_active = self.bio_hint_llm is not None
+        if _bio_hint_active:
+            from genomeer.agent.v2.utils.bio_hint import BioHintNode, make_bio_hint_router
+            _bio_hint_node = BioHintNode(llm=self.bio_hint_llm, log_fn=self._log)
+            workflow.add_node("bio_hint_node", _bio_hint_node)
+            _route_via_bio_hint = make_bio_hint_router("bio_hint_node")
+
         # defining workflow edges
         workflow.add_edge(START, "planner")
         workflow.add_conditional_edges(
@@ -2983,10 +3008,11 @@ class BioAgent:
         )
         workflow.add_conditional_edges(
             "input_guard",
-            lambda s: s["next_step"],
+            _route_via_bio_hint if _bio_hint_active else (lambda s: s["next_step"]),
             {
                 "qa": "qa",
                 "generator": "generator",
+                **( {"bio_hint_node": "bio_hint_node"} if _bio_hint_active else {} ),
             },
         )
         workflow.add_conditional_edges(
@@ -3025,12 +3051,13 @@ class BioAgent:
         )
         workflow.add_conditional_edges(
             "observer",
-            lambda s: s["next_step"],
+            _route_via_bio_hint if _bio_hint_active else (lambda s: s["next_step"]),
             {
                 "orchestrator": "orchestrator",
                 "generator": "generator",
                 "diagnostics": "diagnostics",
                 "qa": "qa",
+                **( {"bio_hint_node": "bio_hint_node"} if _bio_hint_active else {} ),
             },
         )
         workflow.add_conditional_edges(
@@ -3042,6 +3069,14 @@ class BioAgent:
                 "end": END,
             },
         )
+        # bio_hint always routes to generator (no other target)
+        if _bio_hint_active:
+            workflow.add_conditional_edges(
+                "bio_hint_node",
+                lambda s: s["next_step"],
+                {"generator": "generator"},
+            )
+
         workflow.add_edge("qa", END)
         workflow.add_edge("finalizer", END)
         
@@ -4456,6 +4491,11 @@ class BioAgent:
                     "diagnostic_code": None,
                     "diagnostic_observation": None,
                     "run_id": tmp.split('run')[1][1:],
+                    # bio_hint defaults — neutral, overwritten when bio_hint node runs
+                    "bio_hint": None,
+                    "bio_hint_step_idx": -1,
+                    "bio_hint_mode": None,
+                    "bio_hint_skipped": False,
                 }
             else:
                 # FOLLOW-UP TURN -> only append the new message and record any new attachments
@@ -4569,6 +4609,11 @@ class BioAgent:
                     "diagnostic_code": None,
                     "diagnostic_observation": None,
                     "run_id": tmp.split('run')[1][1:],
+                    # bio_hint defaults — neutral, overwritten when bio_hint node runs
+                    "bio_hint": None,
+                    "bio_hint_step_idx": -1,
+                    "bio_hint_mode": None,
+                    "bio_hint_skipped": False,
                 }
             else:
                 # FOLLOW-UP TURN -> only append the new message and record any new attachments

@@ -5,6 +5,145 @@ Detailed usage snippets live in tools/software/resources.py.
 """
 
 description = [
+    # ── READ QC ──────────────────────────────────────────────────────────────
+    {
+        "name": "run_fastqc",
+        "description": (
+            "[CLI Tool][TIMEOUT: 120s] FastQC: per-read quality control on raw FASTQ files. "
+            "Generates an HTML report and a zip archive with per-base quality scores, "
+            "adapter content, GC distribution, duplication levels, and overrepresented sequences. "
+            "Command: fastqc sample_R1.fastq.gz sample_R2.fastq.gz -o output_dir -t threads. "
+            "Inspect report to decide trimming parameters before assembly or mapping. "
+            "Does NOT modify reads — read-only QC diagnostic tool."
+        ),
+        "required_parameters": [
+            {"name": "reads", "type": "list",
+             "description": "List of FASTQ file paths (R1 and optionally R2)."},
+            {"name": "output_dir", "type": "str",
+             "description": "Directory where HTML + zip reports are written."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4,
+             "description": "Number of files processed in parallel."},
+        ],
+        "returns": "dict(report_html, report_zip, summary_txt, per_base_quality_ok)",
+    },
+    {
+        "name": "run_fastp",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] fastp: all-in-one FASTQ adapter trimming, quality filtering, "
+            "and QC reporting. Handles paired-end reads natively. "
+            "Command: fastp -i R1.fastq.gz -I R2.fastq.gz -o R1_clean.fastq.gz -O R2_clean.fastq.gz "
+            "--json fastp.json --html fastp.html -q 20 -l 50 --thread 4. "
+            "Outputs: trimmed reads + fastp.json (machine-readable stats) + fastp.html (visual report). "
+            "fastp.json always written — parse it for: summary.filtering_result.passed_filter_reads, "
+            "summary.before_filtering.q30_rate, summary.after_filtering.q30_rate."
+        ),
+        "required_parameters": [
+            {"name": "read1", "type": "str", "description": "Path to R1 FASTQ (or single-end FASTQ)."},
+            {"name": "output1", "type": "str", "description": "Path for trimmed R1 output."},
+        ],
+        "optional_parameters": [
+            {"name": "read2", "type": "str", "default": None,
+             "description": "Path to R2 FASTQ (paired-end). Omit for single-end."},
+            {"name": "output2", "type": "str", "default": None,
+             "description": "Path for trimmed R2 output (required if read2 provided)."},
+            {"name": "json_path", "type": "str", "default": "fastp.json"},
+            {"name": "html_path", "type": "str", "default": "fastp.html"},
+            {"name": "min_quality", "type": "int", "default": 20,
+             "description": "Phred quality threshold (-q flag)."},
+            {"name": "min_length", "type": "int", "default": 50,
+             "description": "Minimum read length after trimming (-l flag)."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(output1, output2, json_path, html_path, passed_reads, q30_rate_after)",
+    },
+
+    # ── ASSEMBLY ─────────────────────────────────────────────────────────────
+    {
+        "name": "run_megahit",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] MEGAHIT: ultra-fast de-novo metagenomic assembler. "
+            "Optimized for large, complex metagenomes with variable coverage. "
+            "Command: megahit -1 R1.fastq.gz -2 R2.fastq.gz -o output_dir -t threads --min-contig-len 500. "
+            "Single-end: megahit -r reads.fastq.gz -o output_dir. "
+            "Output: output_dir/final.contigs.fa — assembled contigs FASTA. "
+            "Key options: --k-min 21 --k-max 141 --k-step 10 for complex communities; "
+            "--min-contig-len 500 to discard very short contigs before downstream steps."
+        ),
+        "required_parameters": [
+            {"name": "output_dir", "type": "str", "description": "Output directory (must not exist)."},
+        ],
+        "optional_parameters": [
+            {"name": "read1", "type": "str", "default": None,
+             "description": "R1 FASTQ path (paired-end)."},
+            {"name": "read2", "type": "str", "default": None,
+             "description": "R2 FASTQ path (paired-end)."},
+            {"name": "reads", "type": "str", "default": None,
+             "description": "Single-end FASTQ path (-r flag)."},
+            {"name": "min_contig_len", "type": "int", "default": 500},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "memory", "type": "float", "default": 0.9,
+             "description": "Max fraction of RAM to use (0–1)."},
+        ],
+        "returns": "dict(contigs_fasta, contig_count, summary)",
+    },
+
+    # ── READ MAPPING ──────────────────────────────────────────────────────────
+    {
+        "name": "run_minimap2",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] minimap2: fast read mapping for coverage estimation. "
+            "Essential for generating per-contig coverage depth required by MetaBAT2 binning. "
+            "Paired-end mapping: minimap2 -ax sr contigs.fa R1.fastq R2.fastq | samtools sort -o mapped.bam. "
+            "Then index: samtools index mapped.bam. "
+            "Then compute coverage: jgi_summarize_bam_contig_depths --outputDepth depth.txt mapped.bam. "
+            "Presets: -ax sr (short reads Illumina), -ax map-ont (Oxford Nanopore), -ax map-pb (PacBio)."
+        ),
+        "required_parameters": [
+            {"name": "reference_fasta", "type": "str",
+             "description": "Reference/contigs FASTA to map reads against."},
+            {"name": "reads", "type": "list",
+             "description": "List of FASTQ paths (1 for single-end, 2 for paired-end)."},
+            {"name": "output_bam", "type": "str",
+             "description": "Path for sorted, indexed output BAM file."},
+        ],
+        "optional_parameters": [
+            {"name": "preset", "type": "str", "default": "sr",
+             "description": "Mapping preset: sr (short reads), map-ont, map-pb."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(bam_path, depth_txt, mapped_reads, summary)",
+    },
+
+    # ── BINNING ───────────────────────────────────────────────────────────────
+    {
+        "name": "run_metabat2",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] MetaBAT2: metagenomic binning using coverage + tetranucleotide frequency. "
+            "Requires contigs FASTA + coverage depth file from jgi_summarize_bam_contig_depths. "
+            "Workflow: "
+            "(1) Map reads: minimap2 -ax sr contigs.fa R1.fq R2.fq | samtools sort -o mapped.bam && samtools index mapped.bam. "
+            "(2) Compute depth: jgi_summarize_bam_contig_depths --outputDepth depth.txt mapped.bam. "
+            "(3) Bin: metabat2 -i contigs.fa -a depth.txt -o bins_dir/bin -m 1500. "
+            "Output: bins_dir/bin.1.fa, bin.2.fa, ... (one FASTA per MAG). "
+            "IMPORTANT: -o sets the output PREFIX (not a directory) — MetaBAT2 creates files named <prefix>.N.fa."
+        ),
+        "required_parameters": [
+            {"name": "contigs_fasta", "type": "str", "description": "Assembled contigs FASTA."},
+            {"name": "depth_file", "type": "str",
+             "description": "Coverage depth file from jgi_summarize_bam_contig_depths."},
+            {"name": "output_prefix", "type": "str",
+             "description": "Output prefix path (e.g. bins_dir/bin). NOT a directory."},
+        ],
+        "optional_parameters": [
+            {"name": "min_contig", "type": "int", "default": 1500,
+             "description": "Minimum contig length for binning (-m flag)."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(bins_dir, bin_count, bin_fastas, summary)",
+    },
+
     # ── ASSEMBLY QC ──────────────────────────────────────────────────────────
     {
         "name": "run_quast",

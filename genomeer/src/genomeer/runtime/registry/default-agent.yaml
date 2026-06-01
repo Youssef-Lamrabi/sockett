@@ -2,23 +2,16 @@ name: bio-agent-env1
 channels:
   - conda-forge
   - defaults
-  - bioconda
 dependencies:
   - python=3.11
-  - ncbi-genome-download
-  - biopython
-  - seqkit
-  - prodigal
-  - prokka
   - pip
   - pip:
-      - numpy==2.1
+      - numpy
       - pandas
       - matplotlib
       - scipy
       - statsmodels
       - scikit-learn
-      - gradio
       - langchain
       - langgraph==0.3.18
       - langchain-openai
@@ -33,12 +26,6 @@ dependencies:
       - networkx
       - requests
       - pyyaml
-      - jupyter
-      - notebook
-      - ipykernel
-      - pytest
-      - transformers
-      - sentencepiece
-      - mcp
-      - tooluniverse
       - python-dotenv
+      - tooluniverse
+      - mcp

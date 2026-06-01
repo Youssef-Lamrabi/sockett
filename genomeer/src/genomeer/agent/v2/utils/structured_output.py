@@ -142,7 +142,7 @@ _PYTHON_HEURISTICS = [
     re.compile(r"run_\w+\("),
 ]
 _BASH_HEURISTICS = [
-    re.compile(r"^(fastp|kraken2|metaspades|megahit|minimap2|samtools|prokka|checkm2)", re.MULTILINE),
+    re.compile(r"^(fastp|kraken2|metaspades|megahit|minimap2|samtools|wgsim|prokka|checkm2|fastqc|metabat2|sylph)", re.MULTILINE),
     re.compile(r"\bmicromamba\b"),
     re.compile(r"#!/bin/bash"),
 ]

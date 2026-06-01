@@ -140,6 +140,78 @@ class FastpContract(_BaseContract):
                               reason=f"fastp: {score*100:.1f}% reads kept")
 
 
+class FastqcContract(_BaseContract):
+    """
+    Output: {sample}_fastqc.html + {sample}_fastqc.zip per input file.
+    Scoring: presence-based (FastQC is diagnostic only — does not filter reads).
+    Score 1.0 if at least one HTML or ZIP report found; 0.0 otherwise.
+    Source: https://www.bioinformatics.babraham.ac.uk/projects/fastqc/
+    """
+    KEYWORDS = ("fastqc", "read quality report", "per base quality", "fastqc report",
+                "quality control fastq", "qc fastq")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "ensure output directory exists and is writable before calling fastqc",
+        "pass -t <n> to process multiple files in parallel",
+        "use --noextract to keep zip only (avoids permission issues on some systems)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        html = self._glob_first(run_dir, "*_fastqc.html")
+        zipped = self._glob_first(run_dir, "*_fastqc.zip")
+        if not html and not zipped:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="fastqc: no *_fastqc.html or *_fastqc.zip report found",
+                retry_params={"hint": "check -o output_dir path and ensure input FASTQ files exist"},
+            )
+        found = html or zipped
+        return ContractResult(ok=True, score=1.0,
+                              reason=f"fastqc: report found ({os.path.basename(found)})")
+
+
+class WgsimContract(_BaseContract):
+    """
+    Output: reads_R1.fastq + reads_R2.fastq — both must exist AND be non-empty.
+    An empty file (size 0) means the LLM created a placeholder to bypass failure.
+    Score 0.0 if either file is missing or empty — forces retry with correct tool.
+    """
+    KEYWORDS = ("wgsim", "simulate reads", "simulated reads", "read simulation",
+                "paired-end reads", "simulate illumina", "generate reads")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "ensure wgsim is available: it is bundled with samtools in meta-env1",
+        "use wgsim -N 50000 -1 150 -2 150 genome.fna reads_R1.fastq reads_R2.fastq",
+        "if wgsim not found, run: samtools --version to confirm samtools is installed",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        r1 = self._glob_first(run_dir, "reads_R1.fastq", "*_R1.fastq", "*_R1.fq")
+        r2 = self._glob_first(run_dir, "reads_R2.fastq", "*_R2.fastq", "*_R2.fq")
+
+        if not r1 or not r2:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="wgsim: reads_R1.fastq / reads_R2.fastq not found",
+                retry_params={"hint": "wgsim is in meta-env1 (bundled with samtools). Ensure meta-env1 is active."},
+            )
+
+        r1_size = os.path.getsize(r1)
+        r2_size = os.path.getsize(r2)
+
+        if r1_size == 0 or r2_size == 0:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason=f"wgsim: output files are empty (R1={r1_size}B, R2={r2_size}B) — placeholder detected",
+                retry_params={"hint": "Do NOT create empty placeholder files. Use wgsim from meta-env1 to generate real reads."},
+            )
+
+        return ContractResult(
+            ok=True, score=1.0,
+            reason=f"wgsim: R1={r1_size//1024}KB R2={r2_size//1024}KB — reads present",
+        )
+
+
 class BbdukContract(_BaseContract):
     """
     Output: user-specified FASTQ file; stats appear in stderr.
@@ -1919,6 +1991,8 @@ class AmrFinderContract(_BaseContract):
 _ALL_CONTRACTS: List[_BaseContract] = [
     # QC / trimming
     FastpContract(),
+    FastqcContract(),
+    WgsimContract(),
     BbdukContract(),
     # Taxonomic
     Kraken2Contract(),
@@ -2017,8 +2091,30 @@ class ToolValidator:
                     return contract
         return None
 
+    # Patterns in stdout that indicate the execution environment never ran —
+    # any contract check would produce a false positive (files from previous
+    # steps are still present in run_dir).
+    _ENV_FAILURE_PATTERNS: Tuple[str, ...] = (
+        "timed out after",
+        "is not available: process timed out",
+        "timeouterrorwithcontext",
+        "environment.*not available",
+        "process timed out",
+    )
+
     @staticmethod
     def validate(step_title: str, run_dir: str, stdout: str) -> ContractResult:
+        # Hard-gate: if the execution env never started (timeout / unavailable),
+        # no contract check should run — files in run_dir belong to prior steps.
+        stdout_lower = (stdout or "").lower()
+        import re as _re2
+        for pat in ToolValidator._ENV_FAILURE_PATTERNS:
+            if _re2.search(pat, stdout_lower):
+                return ContractResult(
+                    ok=False, score=0.0,
+                    reason="env-timeout: execution environment unavailable — step did not run",
+                    retry_params={"hint": "wait for the conda environment to finish installing, then retry"},
+                )
         contract = ToolValidator._match_contract(step_title)
         if contract is not None:
             return contract.check(run_dir, stdout)

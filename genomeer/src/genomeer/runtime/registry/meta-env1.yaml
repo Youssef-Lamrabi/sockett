@@ -7,14 +7,20 @@ dependencies:
   - python=3.10
   - pip
 
-  # ── ORF / Gene prediction  [ACTIF pour tests] ────────────────────────────
+  # ── ORF / Gene prediction ─────────────────────────────────────────────────
   - prodigal               # prodigal     → prodigal (ORF prediction)
 
-  # ── Sequence manipulation  [ACTIF pour tests] ────────────────────────────
+  # ── Read QC ──────────────────────────────────────────────────────────────
+  - fastqc                 # run_fastqc   → fastqc (per-base quality + adapter content reports)
+  - fastp                  # run_fastp    → fastp  (adapter trimming + QC, paired-end aware)
+
+  # ── Sequence manipulation ─────────────────────────────────────────────────
   - seqkit                 # run_seqkit   → seqkit
   - samtools               # indexing     → samtools faidx
+  - wgsim                  # wgsim        → paired-end read simulation from FASTA
+  - bbtools                # bbduk.sh     → read trimming, decontamination
 
-  # ── Core Python  [ACTIF pour tests] ──────────────────────────────────────
+  # ── Core Python ───────────────────────────────────────────────────────────
   - biopython
   - numpy
   - pandas
@@ -22,36 +28,52 @@ dependencies:
   - scipy
   - tqdm
 
-  # ── Assembly QC  [ACTIF pour tests] ─────────────────────────────────────
+  # ── Assembly ─────────────────────────────────────────────────────────────
+  - megahit                # run_megahit  → megahit (de-novo metagenomic assembler)
+
+  # ── Read mapping ─────────────────────────────────────────────────────────
+  - minimap2               # run_minimap2 → minimap2 (fast read mapping, coverage for binning)
+
+  # ── Binning ──────────────────────────────────────────────────────────────
+  - metabat2               # run_metabat2 → metabat2 + jgi_summarize_bam_contig_depths
+  - semibin2               # run_semibin2 → SemiBin2 (deep-learning-assisted binning)
+  - concoct                # run_concoct  → concoct (coverage + composition binning)
+  - maxbin2                # run_maxbin2  → run_MaxBin2.pl
+
+  # ── Bin quality ───────────────────────────────────────────────────────────
+  - checkm2                # run_checkm2  → checkm2 (completeness/contamination)
+
+  # ── Taxonomy ─────────────────────────────────────────────────────────────
+  - sylph                  # run_sylph    → sylph (ANI-based taxonomic profiling, <1 GB RAM)
+  - kraken2                # run_kraken2  → kraken2 (k-mer taxonomic classification)
+  - kaiju                  # run_kaiju    → kaiju (protein-level classification)
+
+  # ── Assembly QC ──────────────────────────────────────────────────────────
   - quast                  # run_quast → quast.py (assembly quality assessment)
 
-  # ── Annotation + AMR  [ACTIF pour tests] ────────────────────────────────
+  # ── Annotation + AMR ─────────────────────────────────────────────────────
   - prokka                 # prokka → bacterial genome annotation
   - abricate               # run_abricate → AMR/virulence gene screening
+  - hmmer                  # hmmscan → protein domain search (HMM profiles)
+  - diamond                # diamond → fast protein alignment (BLAST-like)
 
-  # ── COMMENTÉ — trop lourd pour les tests (décommenter en production) ─────
-  # - semibin2
-  # - concoct
-  # - maxbin2
-  # - checkm2
-  # - kraken2
-  # - sylph
-  # - kaiju
-  # - hmmer
-  # - eggnog-mapper
-  # - diamond
-  # - humann
-  # - antismash
-  # - genomad
-  # - run-dbcan
-  # - pharokka
-  # - bbtools
-  # - lefse
-  # - nonpareil
+  # ── Phage annotation ─────────────────────────────────────────────────────
+  - pharokka               # pharokka → phage genome annotation
+
+  # ── Diversity / stats ────────────────────────────────────────────────────
+  - lefse                  # lefse_run.py → LEfSe (linear discriminant analysis)
+  - nonpareil              # nonpareil → sequencing depth / diversity estimation
+
+  # ── COMMENTÉ — nécessite grandes bases de données externes ────────────────
+  # - eggnog-mapper        # emapper.py → functional annotation (needs 50GB+ DB)
+  # - humann               # humann → pathway analysis (needs multiple large DBs)
+  # - antismash            # antismash → biosynthetic gene clusters (complex setup)
+  # - genomad              # genomad → virus/plasmid detection (needs large DB)
+  # - run-dbcan            # run_dbcan.py → CAZyme annotation (needs large DB)
   # - r-base>=4.2
   # - bioconductor-phyloseq
   # - r-ggplot2
   # - r-vegan
 
-  # pip: genomeer retiré — code généré ne peut pas l'importer (GENERATOR_PROMPT)
-  #       et genomeer requiert Python>=3.11 incompatible avec cet env Python 3.10
+  - pip:
+    - ncbi-genome-download   # ncbi-genome-download CLI (genome download from NCBI RefSeq/GenBank)

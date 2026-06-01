@@ -1,23 +1,20 @@
 envs:
   - name: bio-agent-env1
-    description: "General-purpose Python 3.11 agent environment (LLM + analytics + notebooks)."
+    description: "General-purpose Python 3.11 agent environment (LLM + analytics)."
     spec: "default-agent.yaml"
     python: "3.11"
     provides_bins:
       - python
       - pip
-      - jupyter
-      - jupyter-notebook
     provides_py:
-      - numpy==2.1
+      - numpy
       - pandas
       - matplotlib
       - scipy
       - statsmodels
       - scikit-learn
-      - gradio
       - langchain
-      - langgraph==0.3.18
+      - langgraph
       - langchain-openai
       - langchain-anthropic
       - langchain-ollama
@@ -30,15 +27,9 @@ envs:
       - networkx
       - requests
       - pyyaml
-      - jupyter
-      - notebook
-      - ipykernel
-      - pytest
-      - transformers
-      - sentencepiece
+      - python-dotenv
       - mcp
       - tooluniverse
-      - python-dotenv
     provides_r: []
 
   - name: meta-env1
@@ -70,6 +61,14 @@ envs:
       - genomad
       - abricate
       - seqkit
+      - fastqc
+      - fastp
+      - megahit
+      - minimap2
+      - metabat2
+      - jgi_summarize_bam_contig_depths
+      - sylph
+      - wgsim
       - bbduk.sh
       - run_dbcan.py
       - pharokka.py
@@ -84,10 +83,7 @@ envs:
       - pandas
       - matplotlib
       - scipy
-    provides_r:
-      - phyloseq
-      - ggplot2
-      - vegan
+    provides_r: []
 
   - name: btools_env_py310
     description: "Bioinformatics CLI stack with CNVkit, BWA, samtools, bedtools, and OptiType (Python 3.10)."
