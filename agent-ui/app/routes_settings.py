@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from .db import get_db
-from .models import User, ProviderConfig, UserModel
+from .models import User, ProviderConfig, UserModel, ChatSession
 from .auth import get_current_user
 from .config import system_default
 
@@ -53,6 +53,18 @@ def save_provider(body: ProviderBody, db: Session = Depends(get_db), user: User 
     cfg.default_model = body.default_model
     cfg.updated_at = datetime.utcnow()
     db.commit()
+
+    # FIX: invalidate all cached agents for this user so the next request
+    # picks up the newly saved provider config instead of serving a stale
+    # agent that was built with the old credentials/source/base_url.
+    try:
+        from .routes_chat import cancel_and_evict
+        sessions = db.query(ChatSession).filter(ChatSession.user_id == user.id).all()
+        for sess in sessions:
+            cancel_and_evict(user.id, sess.id)
+    except Exception:
+        pass  # cache invalidation is best-effort; never fail the save
+
     return {"ok": True}
 
 
@@ -105,4 +117,15 @@ def delete_model(mid: int, db: Session = Depends(get_db), user: User = Depends(g
     if not m:
         raise HTTPException(status_code=404, detail="Not found")
     db.delete(m); db.commit()
+
+    # FIX: evict cached agents whose session model name matched the deleted UserModel,
+    # so the next request doesn't reuse an agent built with now-deleted credentials.
+    try:
+        from .routes_chat import cancel_and_evict
+        sessions = db.query(ChatSession).filter(ChatSession.user_id == user.id).all()
+        for sess in sessions:
+            cancel_and_evict(user.id, sess.id)
+    except Exception:
+        pass
+
     return {"ok": True}

@@ -1,6 +1,6 @@
 {
-    "default_model": "llama3:8b",
-    "default_source": "Ollama",
-    "default_base_url": "http://localhost:11434/v1",
-    "default_api_key": null
-}  
+  "default_model": "meta-llama/llama-3.3-70b-instruct",
+  "default_source": "Custom",
+  "default_base_url": "https://openrouter.ai/api/v1",
+  "default_api_key": ""
+}

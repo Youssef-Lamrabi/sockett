@@ -7,6 +7,30 @@ if TYPE_CHECKING:
 SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "Custom"]
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
 
+# Connection/read timeout for LLM API calls. A short connect timeout makes an
+# unreachable endpoint (wrong base_url / no network) fail fast instead of hanging
+# for minutes; a long read timeout still allows slow free-tier generation.
+# Without this, the openai/anthropic SDK defaults (600s + retries) leave the UI
+# spinning indefinitely when the endpoint is down or the API key is invalid.
+_LLM_CONNECT_TIMEOUT = float(os.getenv("GENOMEER_LLM_CONNECT_TIMEOUT", "10"))
+_LLM_READ_TIMEOUT    = float(os.getenv("GENOMEER_LLM_READ_TIMEOUT", "300"))
+_LLM_MAX_RETRIES     = int(os.getenv("GENOMEER_LLM_MAX_RETRIES", "1"))
+
+
+def _llm_timeout():
+    """Granular httpx timeout: fail fast on connect, allow slow generation on read."""
+    try:
+        import httpx
+        return httpx.Timeout(
+            connect=_LLM_CONNECT_TIMEOUT,
+            read=_LLM_READ_TIMEOUT,
+            write=30.0,
+            pool=_LLM_CONNECT_TIMEOUT,
+        )
+    except Exception:
+        # httpx unavailable — fall back to a single float (read) timeout.
+        return _LLM_READ_TIMEOUT
+
 def get_llm(
     model: str | None = None,
     temperature: float | None = None,
@@ -105,6 +129,8 @@ def get_llm(
             model=model,
             temperature=temperature,
             stop=stop_sequences,
+            timeout=_llm_timeout(),
+            max_retries=_LLM_MAX_RETRIES,
             model_kwargs={
                 # CRITICAL: don’t let the client infer/parse tool calls
                 "tool_choice": "none",
@@ -150,6 +176,8 @@ def get_llm(
             temperature=temperature,
             max_tokens=8192,
             stop_sequences=stop_sequences,
+            timeout=_llm_timeout(),
+            max_retries=_LLM_MAX_RETRIES,
         )
 
     elif source == "Gemini":
@@ -210,6 +238,8 @@ def get_llm(
             stop=stop_sequences,
             base_url=base_url,
             api_key=api_key,
+            timeout=_llm_timeout(),
+            max_retries=_LLM_MAX_RETRIES,
             # Fixed: To avoid automatic tools call by ChatOpenAI->we want it as plain text in <execute></execute>
             model_kwargs={
                 "tool_choice": "none",

@@ -1,4 +1,4 @@
-import asyncio, threading, json, os, re
+import asyncio, threading, json, os, re, logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -8,10 +8,13 @@ from pathlib import Path
 
 from .db import get_db
 from .models import User, ChatSession, Message, ProviderConfig, UserModel, MessageLog
-from .config import system_default
+from .config import system_default, bio_hint_default
 from .auth import get_current_user
 
 from genomeer.agent.v2 import BioAgent
+from genomeer.utils.llm import get_llm
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 INFLIGHT: dict[tuple[int, int], threading.Event] = {}
@@ -38,19 +41,61 @@ def _mk_agent_for_user(db: Session, user: User, model_name: str, interaction_mod
         source = um.source
         base_url = um.base_url or (cfg.base_url if cfg else None)
         api_key  = um.api_key  or (cfg.api_key  if cfg else None)
+        logger.info(
+            "Agent config resolved from UserModel: model=%s source=%s base_url=%s api_key_set=%s",
+            model_name, source, base_url, bool(api_key),
+        )
     else:
-        # 2 -system default (conf.json)
-        sys = system_default()
-        if sys.get("model") == model_name:
-            source = sys.get("source") or (cfg.source if cfg else "Ollama")
-            base_url = sys.get("base_url") or (cfg.base_url if cfg else None)
-            api_key  = sys.get("api_key")  or (cfg.api_key  if cfg else None)
+        # 2 - system default (conf.json) — match on model name
+        _sys = system_default()
+        if _sys.get("model") == model_name:
+            source   = _sys.get("source")   or (cfg.source   if cfg else "Ollama")
+            base_url = _sys.get("base_url") or (cfg.base_url if cfg else None)
+            api_key  = _sys.get("api_key")  or (cfg.api_key  if cfg else None)
+            logger.info(
+                "Agent config resolved from conf.json system default: model=%s source=%s",
+                model_name, source,
+            )
+        elif cfg:
+            # 3a - provider config stored in DB (user saved settings via UI)
+            source   = cfg.source   or os.getenv("GENOMEER_MODEL_SOURCE") or _sys.get("source") or "Ollama"
+            base_url = cfg.base_url or os.getenv("OPENAI_COMPAT_BASE_URL") or _sys.get("base_url") or "http://localhost:11434/v1"
+            api_key  = cfg.api_key  or os.getenv("OPENAI_COMPAT_API_KEY")  or _sys.get("api_key")
+            logger.info(
+                "Agent config resolved from ProviderConfig DB row: model=%s source=%s base_url=%s api_key_set=%s",
+                model_name, source, base_url, bool(api_key),
+            )
         else:
-            # 3 - fallback: provider config → env → conf.json → hardcoded Ollama default
-            _sys = system_default()
-            source   = (cfg.source   if cfg else None) or os.getenv("GENOMEER_MODEL_SOURCE") or _sys.get("source") or "Ollama"
-            base_url = (cfg.base_url if cfg else None) or os.getenv("OPENAI_COMPAT_BASE_URL") or _sys.get("base_url") or "http://localhost:11434/v1"
-            api_key  = (cfg.api_key  if cfg else None) or os.getenv("OPENAI_COMPAT_API_KEY")  or _sys.get("api_key")
+            # 3b - absolute last resort: env vars → conf.json → hardcoded Ollama
+            source   = os.getenv("GENOMEER_MODEL_SOURCE") or _sys.get("source") or "Ollama"
+            base_url = os.getenv("OPENAI_COMPAT_BASE_URL") or _sys.get("base_url") or "http://localhost:11434/v1"
+            api_key  = os.getenv("OPENAI_COMPAT_API_KEY")  or _sys.get("api_key")
+            logger.warning(
+                "Agent config: no UserModel, ProviderConfig, or conf.json match for model=%s "
+                "— falling back to Ollama local (%s). "
+                "If you intended to use an API provider, save your settings in the Settings panel.",
+                model_name, base_url,
+            )
+
+    # Optional secondary LLM for bio_hint. Enabled only when bio_hint_model is set
+    # in conf.json; source/base_url/api_key fall back to the main provider creds.
+    bio_hint_llm = None
+    _bh = bio_hint_default()
+    if _bh.get("model"):
+        try:
+            bio_hint_llm = get_llm(
+                model=_bh["model"],
+                source=_bh.get("source") or source,
+                base_url=_bh.get("base_url") or base_url,
+                api_key=_bh.get("api_key") or api_key,
+            )
+            logger.info(
+                "bio_hint LLM enabled: model=%s source=%s",
+                _bh["model"], _bh.get("source") or source,
+            )
+        except Exception as e:
+            logger.warning("bio_hint LLM disabled (build failed): %s", e)
+            bio_hint_llm = None
 
     agent = BioAgent(
         path="./data",
@@ -62,6 +107,7 @@ def _mk_agent_for_user(db: Session, user: User, model_name: str, interaction_mod
         api_key=api_key,
         auto_start_artifacts=False,
         interaction_mode=interaction_mode,
+        bio_hint_llm=bio_hint_llm,
     )
     return agent
 
@@ -239,8 +285,12 @@ async def chat(session_id: int, body: ChatBody, request: Request,
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue[bytes] = asyncio.Queue()
 
+            # FIX: queue.put_nowait is NOT thread-safe when called from a
+            # background thread into an asyncio.Queue — use call_soon_threadsafe
+            # so the put is scheduled on the event-loop thread.
             def _send(obj: Dict[str, Any]):
-                queue.put_nowait((json.dumps(obj) + "\n").encode("utf-8"))
+                payload = (json.dumps(obj) + "\n").encode("utf-8")
+                loop.call_soon_threadsafe(queue.put_nowait, payload)
 
             def _producer():
                 try:
@@ -271,7 +321,7 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                                     inner = re.sub(r"^<[^>]+>", "", raw)
                                     inner = re.sub(r"</[^>]+>$", "", inner).strip()
                                     if inner: assistant_parts.append(inner)
-                                
+
                                 # Save loggable blocks for history
                                 # These are the ones your right panel renderer understands.
                                 LOGGABLE = {"EXECUTE","OBSERVE","LOGS","THINK","STATUS","NEXT"}
@@ -294,6 +344,13 @@ async def chat(session_id: int, body: ChatBody, request: Request,
 
                         _send(evt)
                 except Exception as e:
+                    # FIX: log the full traceback server-side so the error is
+                    # visible in server logs (not just silently swallowed).
+                    import traceback as _tb
+                    logger.error(
+                        "Streaming producer raised an exception for user=%s session=%s model=%s: %s\n%s",
+                        user.id, sess.id, sess.model, e, _tb.format_exc(),
+                    )
                     _send({"type": "error", "text": str(e)})
                 finally:
                     _send({"type": "done"})
@@ -301,12 +358,38 @@ async def chat(session_id: int, body: ChatBody, request: Request,
 
             loop.run_in_executor(None, _producer)
 
+            # FIX: use a first-token timeout so that an unreachable/hung LLM
+            # endpoint is detected early (30 s) rather than letting the UI
+            # spin indefinitely (the agent's own timeout_seconds=300 only fires
+            # AFTER the connection is established and the model is running).
+            FIRST_TOKEN_TIMEOUT = float(os.getenv("STREAM_FIRST_TOKEN_TIMEOUT", "30"))
+
             try:
+                first_chunk = True
                 while True:
                     if await request.is_disconnected():
                         cancel_event.set()
                         break
-                    chunk = await queue.get()
+                    try:
+                        if first_chunk:
+                            chunk = await asyncio.wait_for(queue.get(), timeout=FIRST_TOKEN_TIMEOUT)
+                            first_chunk = False
+                        else:
+                            chunk = await queue.get()
+                    except asyncio.TimeoutError:
+                        cancel_event.set()
+                        timeout_msg = (
+                            f"No response from model '{sess.model}' within "
+                            f"{int(FIRST_TOKEN_TIMEOUT)} seconds. "
+                            "Check that the endpoint is reachable and the API key is correct."
+                        )
+                        logger.warning(
+                            "First-token timeout for user=%s session=%s model=%s after %.0fs",
+                            user.id, sess.id, sess.model, FIRST_TOKEN_TIMEOUT,
+                        )
+                        yield (json.dumps({"type": "error", "text": timeout_msg}) + "\n").encode("utf-8")
+                        yield (json.dumps({"type": "done"}) + "\n").encode("utf-8")
+                        break
                     yield chunk
 
                     # stop when producer says "done"

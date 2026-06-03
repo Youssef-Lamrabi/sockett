@@ -44,11 +44,11 @@ def _startup():
 
 @app.get("/", response_class=HTMLResponse)
 def landing(request: Request):
-    return templates.TemplateResponse("landing.html", {"request": request, "page": "landing"})
+    return templates.TemplateResponse(request, "landing.html", {"page": "landing"})
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "page": "login"})
+    return templates.TemplateResponse(request, "login.html", {"page": "login"})
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page(request: Request):
@@ -73,7 +73,7 @@ def dashboard_page(request: Request):
     if not request.cookies.get("agent_token"):
         return RedirectResponse("/login", status_code=302)
 
-    return templates.TemplateResponse("dashboard.html", {"request": request, "page": "dashboard"})
+    return templates.TemplateResponse(request, "dashboard.html", {"page": "dashboard"})
 
 # APIs
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
