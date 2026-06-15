@@ -69,6 +69,24 @@ envs:
       - jgi_summarize_bam_contig_depths
       - sylph
       - wgsim
+      - bwa
+      - bcftools
+      - samtools
+      - prokka
+      - prodigal
+      - barrnap
+      - mafft
+      - fasttree
+      - FastTree
+      - trimal
+      - spades.py
+      - metaspades.py
+      - rnaspades.py
+      - plasmidspades.py
+      - makeblastdb
+      - blastp
+      - blastn
+      - bracken
       - bbduk.sh
       - run_dbcan.py
       - pharokka.py

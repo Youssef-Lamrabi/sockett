@@ -7,30 +7,6 @@ if TYPE_CHECKING:
 SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "Custom"]
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
 
-# Connection/read timeout for LLM API calls. A short connect timeout makes an
-# unreachable endpoint (wrong base_url / no network) fail fast instead of hanging
-# for minutes; a long read timeout still allows slow free-tier generation.
-# Without this, the openai/anthropic SDK defaults (600s + retries) leave the UI
-# spinning indefinitely when the endpoint is down or the API key is invalid.
-_LLM_CONNECT_TIMEOUT = float(os.getenv("GENOMEER_LLM_CONNECT_TIMEOUT", "10"))
-_LLM_READ_TIMEOUT    = float(os.getenv("GENOMEER_LLM_READ_TIMEOUT", "300"))
-_LLM_MAX_RETRIES     = int(os.getenv("GENOMEER_LLM_MAX_RETRIES", "1"))
-
-
-def _llm_timeout():
-    """Granular httpx timeout: fail fast on connect, allow slow generation on read."""
-    try:
-        import httpx
-        return httpx.Timeout(
-            connect=_LLM_CONNECT_TIMEOUT,
-            read=_LLM_READ_TIMEOUT,
-            write=30.0,
-            pool=_LLM_CONNECT_TIMEOUT,
-        )
-    except Exception:
-        # httpx unavailable — fall back to a single float (read) timeout.
-        return _LLM_READ_TIMEOUT
-
 def get_llm(
     model: str | None = None,
     temperature: float | None = None,
@@ -124,19 +100,27 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 f"langchain-openai package is required for "+source+" models. Install with: pip install langchain-openai"
             )
-            
+        # Hard timeout guardrail — prevents silent hangs when endpoint is slow or
+        # the API key is invalid. Connect fails fast (10s); reads allow 300s for
+        # generation. max_retries=1 so a real error surfaces instead of looping.
+        try:
+            import httpx
+            _timeout = httpx.Timeout(connect=10, read=300, write=30, pool=10)
+        except ImportError:
+            _timeout = None
         kwargs = dict(
             model=model,
             temperature=temperature,
             stop=stop_sequences,
-            timeout=_llm_timeout(),
-            max_retries=_LLM_MAX_RETRIES,
+            max_retries=1,
             model_kwargs={
                 # CRITICAL: don’t let the client infer/parse tool calls
                 "tool_choice": "none",
                 "response_format": {"type": "text"},
             },
         )
+        if _timeout is not None:
+            kwargs["timeout"] = _timeout
         if api_key is not None:
             kwargs["api_key"] = api_key
         if base_url is not None:
@@ -171,14 +155,21 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-anthropic package is required for Anthropic models. Install with: pip install langchain-anthropic"
             )
-        return ChatAnthropic(
+        try:
+            import httpx
+            _anth_timeout = httpx.Timeout(connect=10, read=300, write=30, pool=10)
+        except ImportError:
+            _anth_timeout = None
+        _anth_kwargs = dict(
             model=model,
             temperature=temperature,
             max_tokens=8192,
             stop_sequences=stop_sequences,
-            timeout=_llm_timeout(),
-            max_retries=_LLM_MAX_RETRIES,
+            max_retries=1,
         )
+        if _anth_timeout is not None:
+            _anth_kwargs["timeout"] = _anth_timeout
+        return ChatAnthropic(**_anth_kwargs)
 
     elif source == "Gemini":
         return _mk_openai_like(
@@ -231,21 +222,28 @@ def get_llm(
             )
         # Custom LLM serving such as SGLang or Ollama. Must expose an openai compatible API
         assert base_url is not None, "base_url must be provided for customly served LLMs"
-        llm = ChatOpenAI(
+        try:
+            import httpx
+            _custom_timeout = httpx.Timeout(connect=10, read=300, write=30, pool=10)
+        except ImportError:
+            _custom_timeout = None
+        _custom_kwargs = dict(
             model=model,
             temperature=temperature,
             max_tokens=8192,
             stop=stop_sequences,
             base_url=base_url,
             api_key=api_key,
-            timeout=_llm_timeout(),
-            max_retries=_LLM_MAX_RETRIES,
+            max_retries=1,
             # Fixed: To avoid automatic tools call by ChatOpenAI->we want it as plain text in <execute></execute>
             model_kwargs={
                 "tool_choice": "none",
                 "response_format": {"type": "text"},
             },
         )
+        if _custom_timeout is not None:
+            _custom_kwargs["timeout"] = _custom_timeout
+        llm = ChatOpenAI(**_custom_kwargs)
         return llm
 
     else:

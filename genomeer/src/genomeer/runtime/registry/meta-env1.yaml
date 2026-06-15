@@ -2,7 +2,6 @@ name: meta-env1
 channels:
   - conda-forge
   - bioconda
-  - defaults
 dependencies:
   - python>=3.12.1,<3.13   # >=3.12.1 satisfies checkm2 "python >3.12" constraint
   - pip
@@ -37,31 +36,33 @@ dependencies:
   # ── Binning ──────────────────────────────────────────────────────────────
   - metabat2               # run_metabat2 → metabat2 + jgi_summarize_bam_contig_depths
   # semibin2 has zero bioconda builds — installed via pip as "SemiBin" (see pip section below)
-  - concoct                # run_concoct  → concoct (coverage + composition binning)
+  - concoct=1.1.0          # run_concoct  → concoct (coverage + composition binning)
   - maxbin2                # run_maxbin2  → run_MaxBin2.pl
 
   # ── Bin quality ───────────────────────────────────────────────────────────
-  - checkm2                # run_checkm2  → checkm2 (completeness/contamination)
+  # checkm2 installed via pip (see pip section) — bioconda pins h5py=2.10 incompatible with py312 stack
 
   # ── Taxonomy ─────────────────────────────────────────────────────────────
   - sylph                  # run_sylph    → sylph (ANI-based taxonomic profiling, <1 GB RAM)
   - kraken2                # run_kraken2  → kraken2 (k-mer taxonomic classification)
+  # bracken: bioconda solver hangs in this env (10+ min). Installed manually via GitHub
+  # symlinks → /home/workshop/Bracken/{bracken,bracken-build} → meta-env1/bin/
   - kaiju                  # run_kaiju    → kaiju (protein-level classification)
 
   # ── Assembly QC ──────────────────────────────────────────────────────────
   - quast                  # run_quast → quast.py (assembly quality assessment)
 
   # ── Annotation + AMR ─────────────────────────────────────────────────────
-  - prokka                 # prokka → bacterial genome annotation
+  - prokka=1.15.6          # prokka → bacterial genome annotation
   - abricate               # run_abricate → AMR/virulence gene screening
   - hmmer                  # hmmscan → protein domain search (HMM profiles)
   - diamond                # diamond → fast protein alignment (BLAST-like)
 
   # ── Phage annotation ─────────────────────────────────────────────────────
-  - pharokka               # pharokka → phage genome annotation
+  # pharokka installed via pip (see pip section) — conda solver hang due to dnaapler→torch deps
 
   # ── Diversity / stats ────────────────────────────────────────────────────
-  - lefse                  # lefse_run.py → LEfSe (linear discriminant analysis)
+  - lefse=1.1.2            # lefse_run.py → LEfSe (linear discriminant analysis)
   - nonpareil              # nonpareil → sequencing depth / diversity estimation
 
   # ── COMMENTÉ — nécessite grandes bases de données externes ────────────────
@@ -78,3 +79,8 @@ dependencies:
   - pip:
     - ncbi-genome-download   # ncbi-genome-download CLI (genome download from NCBI RefSeq/GenBank)
     - SemiBin                # SemiBin2 deep-learning binner — PyPI only (no bioconda py312 build)
+    - pharokka               # phage annotation — conda solver hangs due to dnaapler→torch dep tree
+    - git+https://github.com/chklovski/CheckM2.git  # checkm2 — bioconda pins h5py=2.10 incompatible with py312
+    - lightgbm
+    - keras
+    - tensorflow-cpu         # checkm2 inference engine (CPU sufficient, avoids CUDA conflict with torch)

@@ -66,10 +66,13 @@ class _BaseContract:
 
     @staticmethod
     def _glob_all(run_dir: str, *patterns: str) -> List[str]:
+        # Same file can match multiple patterns (e.g. bin.1.fa matches bin.*.fa AND *.fa)
+        # → dedupe with dict.fromkeys to preserve insertion order, otherwise validators
+        # like metabat2/semibin2/checkm2 over-count bins by a factor of N patterns.
         results: List[str] = []
         for pat in patterns:
             results.extend(glob.glob(os.path.join(run_dir, "**", pat), recursive=True))
-        return results
+        return list(dict.fromkeys(results))
 
     @staticmethod
     def _file_nonempty(path: Optional[str]) -> bool:

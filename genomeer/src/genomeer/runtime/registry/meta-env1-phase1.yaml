@@ -1,0 +1,40 @@
+name: meta-env1
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - pip
+
+  # ── C binaries (no Python deps — solve instantly) ──────────────────────────
+  - prodigal
+  - fastqc
+  - fastp
+  - seqkit
+  - samtools
+  - wgsim
+  - bbmap
+  - megahit
+  - minimap2
+  - metabat2
+  - maxbin2
+  - sylph
+  - kraken2
+  # bracken installed manually via GitHub symlinks (bioconda solver hangs)
+  - kaiju
+  - hmmer
+  - diamond
+  - nonpareil
+
+  # ── Core Python libs ──────────────────────────────────────────────────────
+  - biopython
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - tqdm
+  - scikit-learn
+
+  - pip:
+    - ncbi-genome-download
+    - SemiBin

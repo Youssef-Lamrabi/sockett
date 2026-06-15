@@ -245,7 +245,7 @@ def _update_env_from_spec(
     prefix = env_prefix(name)
 
     # Fast pre-check: run `micromamba install --dry-run` to detect no-op updates.
-    dry_args = [str(mm), "install", "-y", "-p", str(prefix), "-f", str(spec_file), "--dry-run"]
+    dry_args = [str(mm), "install", "-y", "--no-rc", "--strict-channel-priority", "-p", str(prefix), "-f", str(spec_file), "--dry-run"]
     try:
         dry_proc = subprocess.run(
             dry_args, capture_output=True, text=True, timeout=120
@@ -263,7 +263,7 @@ def _update_env_from_spec(
     except Exception:
         pass  # dry-run failed or timed out → fall through to full install
 
-    args = [str(mm), "install", "-y", "-p", str(prefix), "-f", str(spec_file)]
+    args = [str(mm), "install", "-y", "--no-rc", "--strict-channel-priority", "--freeze-installed", "-p", str(prefix), "-f", str(spec_file)]
     proc = subprocess.Popen(
         args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
     )
@@ -437,6 +437,8 @@ def create_or_update_env(name: str, spec_file: Path, channels: list[str] | None 
         str(mm),
         "create",
         "-y",
+        "--no-rc",                    # ignore ~/.condarc (extra channels like pytorch slow the solver)
+        "--strict-channel-priority",  # reduces solver search space from O(channels^pkgs) to O(pkgs)
         "-p", str(prefix),
         "-f", str(spec_file),
     ]
@@ -466,7 +468,7 @@ def install_env_iter(name: str, spec_file: Path, channels: list[str] | None = No
     prefix = env_prefix(name)
     prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    args = [str(mm), "create", "-y", "-p", str(prefix), "-f", str(spec_file)]
+    args = [str(mm), "create", "-y", "--no-rc", "--strict-channel-priority", "-p", str(prefix), "-f", str(spec_file)]
     if channels:
         for ch in channels:
             args += ["-c", ch]

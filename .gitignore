@@ -344,3 +344,16 @@ dataset/06-quality-check/input/scored
 dataset/06-quality-check/input/final
 test_data
 
+# Agent pipeline garbage (outputs accidentels dans le repo)
+**/fasterq.tmp.*/
+**/fastp.html
+**/fastp.json
+**/checkm2=*
+**/run-*/
+.genomeer_runs/
+
+# Flags CLI accidentellement capturés en fichiers
+/--no-rc
+/-c
+/-p
+

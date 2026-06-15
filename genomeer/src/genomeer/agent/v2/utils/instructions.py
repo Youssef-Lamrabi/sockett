@@ -29,23 +29,38 @@ SPECIAL ALWAYS-TRUE RULES:
    Never write "from Bio.Seq import Alphabet", "from Bio.Alphabet import ...", or pass alphabet= to any Bio function.
    Sequences are plain strings. SeqRecord takes Seq("ATCG") with no alphabet argument.
 5. ncbi-genome-download — canonical command (copy this exactly, no variation):
-   CORRECT by accession (-A flag):
-     ncbi-genome-download -A GCF_000027325.1 -l complete -s refseq -F fasta --flat-output -o "$run_dir" bacteria
+   CORRECT by accession (-A / --assembly-accessions flag) — OMIT -l when using -A:
+     ncbi-genome-download -A GCF_000027325.1 -s refseq -F fasta --flat-output -o "$run_dir" bacteria
    CORRECT by taxid (-t flag):
      ncbi-genome-download -t 562 -l complete -s refseq -F fasta --flat-output -o "$run_dir" bacteria
    CORRECT by genera (-g flag):
      ncbi-genome-download -g "Escherichia coli" -l complete -s refseq -F fasta --flat-output -o "$run_dir" bacteria
 
-   Flag reference (v0.3.3 — do NOT use long forms that differ):
-     -A  assembly accession(s)          -l  assembly level (complete/chromosome/scaffold/contig)
-     -s  section (refseq/genbank)       -F  formats (fasta/gff/genbank)
-     -t  taxids                         -g  genera
-     --flat-output  dump all files flat (no subdirs)
-     -o  output folder
-     kingdom  positional arg at the END (bacteria/viral/fungi/plant/all)
+   Flag reference (both short and long forms work):
+     -A / --assembly-accessions   assembly accession(s)
+     -l / --assembly-levels       assembly level (complete/chromosome/scaffold/contig)
+     -s / --section               section (refseq/genbank)
+     -F / --formats               formats — valid values: fasta, gff, genbank, protein-fasta,
+                                  assembly-report, assembly-stats, rna-fasta, cds-fasta, all.
+                                  CRITICAL: the value for protein download is "protein-fasta"
+                                  (with hyphen), NOT "protein" — passing "protein" → error
+                                  "Unsupported file format: protein". Multiple formats are
+                                  comma-separated, no spaces: -F "fasta,protein-fasta".
+                                  After download: proteins land as *.faa.gz, genome as *.fna.gz.
+     -t / --taxids                taxid(s)
+     -g / --genera                genera
+     --flat-output                dump all files flat (no subdirs)
+     -o / --output-folder         output folder
+     kingdom                      positional arg at the END (bacteria/viral/fungi/plant/all)
 
-   FORBIDDEN flags (do not exist in v0.3.3): --decompress  --taxids  --assembly-accessions  --genus  --dry-run
+   FORBIDDEN flags (truly do not exist): --decompress  --genus  --species  --organism  --name
    NEVER add --dry-run — it makes a slow network request and causes TimeoutExpired errors.
+   NEVER combine -A <accession> with -l / --assembly-levels. When a specific accession is given
+   with -A, the accession already identifies the exact assembly — adding -l filters by assembly
+   level and will reject it if its level is "Chromosome" or "Scaffold", causing "No downloads
+   matched your filter". CORRECT: omit -l entirely when using -A.
+     WRONG : ncbi-genome-download -A GCF_000006945.2 -l complete -s refseq -F fasta ... bacteria
+     CORRECT: ncbi-genome-download -A GCF_000006945.2 -s refseq -F fasta --flat-output -o dir bacteria
    After download, .fna.gz files MUST be decompressed in Python using gzip:
      import gzip, shutil, glob, os
      for gz in glob.glob(os.path.join(run_dir, "*.fna.gz")):
@@ -76,7 +91,11 @@ SPECIAL ALWAYS-TRUE RULES:
    WRONG : subprocess.run([..., str(fna_path, timeout=300)])
    CORRECT: subprocess.run([..., str(fna_path)], timeout=300)
    Keywords timeout=, check=, capture_output=, text=, shell= belong on subprocess.run() only.
-9. QUAST report.tsv format: QUAST writes a KEY-VALUE file — NOT a header-row CSV.
+9. QUAST binary name: ALWAYS call `quast.py`, NEVER `quast`. The conda package installs only
+   `quast.py`; `quast` does not exist and raises FileNotFoundError immediately.
+   WRONG : subprocess.run(["quast", "-o", quast_dir, fasta_path], ...)
+   CORRECT: subprocess.run(["quast.py", "-o", quast_dir, fasta_path], ...)
+10. QUAST report.tsv format: QUAST writes a KEY-VALUE file — NOT a header-row CSV.
    Each line is "metric_name<TAB>value". NEVER use csv.DictReader or pandas.read_csv on it.
    CRITICAL: QUAST uses "# contigs (>= 0 bp)" as a real metric key that starts with "#".
    NEVER skip lines starting with "#" — they are valid data rows, not comments.
@@ -399,6 +418,13 @@ First line: #!PY (default) | #!R | #!BASH | #!CLI
 No text, no markdown, no comments outside the block. Never omit </EXECUTE>.
 
 SPECIAL ALWAYS-TRUE RULES:
+⚠ PRODIGAL: ALWAYS include -f gff. Without it the output is native Genbank format — not GFF.
+  GFF parsers will find 0 CDS. This applies to every mode: -p meta, -p single, -p ab initio.
+  WRONG : ["prodigal", "-i", fa, "-a", prot, "-o", gff, "-p", "single"]
+  CORRECT: ["prodigal", "-i", fa, "-a", prot, "-o", gff, "-f", "gff", "-p", "single"]
+⚠ QUAST: binary is quast.py, NOT quast. quast does not exist in this environment.
+  WRONG : ["quast",    "-o", quast_dir, fasta]
+  CORRECT: ["quast.py", "-o", quast_dir, fasta]
 - If you want to use any cli tools or even library that create or download data, make sure to have command to display or check output to have a stdout.
 - Biopython >= 1.78: Bio.Alphabet and Bio.Seq.Alphabet are REMOVED. Never import them. Use plain strings for sequence types. Use Bio.SeqRecord.SeqRecord(Seq("ATCG")) without an alphabet argument.
 - SeqIO.parse() returns a one-time generator. ALWAYS convert it to a list immediately:
@@ -450,6 +476,30 @@ SPECIAL ALWAYS-TRUE RULES:
   CORRECT: prokka --outdir prokka_out --prefix genome --force genome.fna
   This produces: prokka_out/genome.txt, prokka_out/genome.faa, prokka_out/genome.gff
   Also: NEVER create the outdir with os.makedirs() before calling Prokka — let Prokka manage it.
+- Prodigal ALWAYS requires -f gff to produce a real GFF file. Without -f, it writes its native
+  Genbank-like format regardless of the output filename — GFF parsers will find 0 CDS features.
+  This applies to ALL modes: -p meta, -p single, -p ab initio — -f gff is ALWAYS required.
+  WRONG : prodigal -i contigs.fasta -a proteins.faa -o genes.gff -p meta    ← native format, not GFF
+  WRONG : prodigal -i genome.fasta  -a proteins.faa -o genes.gff -p single  ← native format, not GFF
+  CORRECT: prodigal -i contigs.fasta -a proteins.faa -o genes.gff -f gff -p meta
+  CORRECT: prodigal -i genome.fasta  -a proteins.faa -o genes.gff -f gff -p single
+  Always parse genes.gff by checking parts[2] == "CDS" on tab-split lines (skip lines starting with #).
+  ORF density = orf_count / (total_length_bp / 1000)  — never read orf_density from the FAA file.
+  For ORF density, NEVER match GFF contig names against the seqkit "file" column — the GFF column 0
+  is a sequence ID (e.g. "NC_000913_Small") while seqkit's "file" is the file path ("/tmp/.../a.fasta").
+  They never match. CORRECT approach: count ALL CDS lines in the GFF, use seqkit sum_len as denominator:
+    orf_count = sum(1 for l in open(gff_path) if not l.startswith('#') and '\t' in l and l.split('\t')[2]=='CDS')
+    density = orf_count / (sum_len / 1000)
+- Reading seqkit --tabular output: ALWAYS use csv.DictReader — NEVER use a custom key-value reader.
+  seqkit tabular format is: row 1 = header columns, row 2 = values. DictReader maps them correctly.
+  WRONG: for row in reader: data[row[0]] = row[1]   ← builds {"file":"format",...}, all lookups return NA
+  CORRECT:
+    with open(stats_path, newline='') as f:
+        stats = next(csv.DictReader(f, delimiter='\t'))
+    total_len = int(stats['sum_len'].replace(',',''))
+    gc_pct    = float(stats['GC(%)'])
+    n50       = int(stats['N50'].replace(',',''))
+    num_seqs  = int(stats['num_seqs'].replace(',',''))
 - abricate screens NUCLEOTIDE sequences, NEVER protein FASTA (.faa).
   WRONG : abricate --db card proteins.faa   ← protein input = 0 hits always
   CORRECT: abricate --db card genome.fna    ← nucleotide genome = real hits
@@ -474,18 +524,91 @@ SPECIAL ALWAYS-TRUE RULES:
     WRONG:   printf "" > output.fastq            ← empty placeholder
   Creating fake output silently propagates errors through all downstream steps.
   Always fail loudly with sys.exit() so the pipeline stops at the real problem.
-- samtools usage rules:
-  NEVER use the deprecated -bS flag: samtools view -bS is obsolete. Use -b only:
-    CORRECT: samtools view -b -o out.bam in.sam
-    WRONG:   samtools view -bS in.sam -o out.bam
-  For the minimap2 → sort pipeline, always use a single-step sort with explicit -T temp dir:
-    minimap2 -ax sr contigs.fa R1.fq R2.fq | samtools sort -T /tmp/samsort_ -o sorted.bam
-    samtools index sorted.bam
-  Always verify the sorted BAM was created with non-zero size before proceeding:
+- fastqc requires the output directory to already exist. ALWAYS create it with
+  os.makedirs(out_dir, exist_ok=True) BEFORE calling fastqc. Never rely on fastqc creating it.
+  WRONG: subprocess.run(["fastqc", "-o", out_dir, ...])   ← fails if out_dir absent
+  CORRECT:
+    os.makedirs(out_dir, exist_ok=True)
+    subprocess.run(["fastqc", "-o", out_dir, r1_path, r2_path], ...)
+- fastp with wgsim-simulated reads: wgsim assigns quality scores of ~10-15 (Phred).
+  Using --qualified_quality_phred 20 (fastp default) will discard ALL 100% of reads.
+  ALWAYS add --disable_quality_filtering when fastp runs on wgsim-generated reads.
+  WRONG: fastp --qualified_quality_phred 20 ... → 0 reads pass → empty trimmed output
+  CORRECT: fastp --disable_quality_filtering --length_required 50 ...
+- samtools + minimap2 usage rules:
+  The pipe pattern (minimap2 | samtools sort) FAILS in the installed samtools:
+    "samtools view -b -" → "[main_samview] fail to read the header from '-'"
+    Popen pipe: samtools sort exits early → minimap2 gets SIGPIPE → "minimap2 failed"
+  ALWAYS use the SAM-file approach: minimap2 → SAM file → samtools view -bS → BAM → sort → index
+  The -bS flag is REQUIRED (-b = output BAM, -S = input is SAM text). Never omit -S.
+    sam_path   = os.path.join(run_dir, "reads_aligned.sam")
+    bam_path   = os.path.join(run_dir, "reads_aligned.bam")
+    sorted_bam = os.path.join(run_dir, "reads_aligned.sorted.bam")
+    # Step 1: minimap2 → SAM file
+    with open(sam_path, "w") as _sam_f:
+        res = subprocess.run(
+            ["minimap2", "-ax", "sr", contig_fa, trim_r1, trim_r2],
+            stdout=_sam_f, stderr=subprocess.PIPE, timeout=600)
+    if res.returncode != 0: sys.exit(f"minimap2 failed: {res.stderr.decode()}")
+    # Step 2: SAM → BAM (-bS: -b=output BAM, -S=input is SAM)
+    # CRITICAL: -o flag is ignored in this samtools version — BAM goes to stdout.
+    # BAM is binary (gzip). NEVER use text=True or capture_output here. Redirect stdout to file.
+    with open(bam_path, "wb") as _bam_f:
+        res = subprocess.run(
+            ["samtools", "view", "-bS", sam_path],
+            stdout=_bam_f, stderr=subprocess.PIPE, timeout=300)
+    if res.returncode != 0: sys.exit(f"samtools view failed: {res.stderr.decode(errors='replace')}")
+    if not os.path.exists(bam_path) or os.path.getsize(bam_path) == 0:
+        sys.exit("samtools view produced empty BAM")
+    # Step 3: sort BAM — OLD samtools (v0.x) positional-prefix syntax.
+    # Usage: samtools sort <in.bam> <out.prefix>   → creates <out.prefix>.bam automatically
+    # -o is a FLAG with NO argument (= 'output to stdout'), NOT '-o filename'. Never use -o.
+    sorted_prefix = sorted_bam[:-4] if sorted_bam.endswith(".bam") else sorted_bam
+    res = subprocess.run(["samtools", "sort", bam_path, sorted_prefix],
+        stderr=subprocess.PIPE, timeout=300)
+    if res.returncode != 0: sys.exit(f"samtools sort failed: {res.stderr.decode(errors='replace')}")
     if not os.path.exists(sorted_bam) or os.path.getsize(sorted_bam) == 0:
-        sys.exit("samtools sort failed — sorted BAM not created")
-  NOTE: samtools --version may exit with code 1 on some versions — this is normal.
-  Do NOT conclude samtools is missing just because --version returned non-zero.
+        sys.exit("Sorted BAM not created or empty")
+    # Step 4: index (creates .bai file, no binary to stdout)
+    subprocess.run(["samtools", "index", sorted_bam], stderr=subprocess.PIPE, check=True, timeout=120)
+    # Step 5: jgi_summarize_bam_contig_depths
+    depth_path = os.path.join(run_dir, "depth.txt")
+    res = subprocess.run(
+        ["jgi_summarize_bam_contig_depths", "--outputDepth", depth_path, sorted_bam],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
+    if res.returncode != 0: sys.exit(f"jgi failed: {res.stderr.decode(errors='replace')}")
+  NOTE: samtools --version exits with code 1 on some versions — NORMAL (tool IS present).
+  NOTE: jgi_summarize_bam_contig_depths --version segfaults — NEVER call with --version.
+  WRONG: samtools sort bam -o sorted.bam → in old samtools, -o is a STDOUT FLAG with no arg
+  WRONG: samtools sort bam (no output target) → 'Usage: samtools sort <in.bam> <out.prefix>'
+  WRONG: samtools view -bS sam -o bam (with -o) → -o ignored, binary BAM goes to stdout
+  WRONG: capture_output=True / text=True on any samtools command that outputs BAM
+  WRONG: Popen pipe minimap2 | samtools sort → SIGPIPE
+- MetaBAT2 binning rules (v2.12.1):
+  -m / --minContig has a HARD MINIMUM of 1500. Any lower value → 'Contig length < 1500 is not allowed'.
+  Even when user/plan requests --minContig 200, OVERRIDE to 1500 (the tool will not run otherwise).
+  NEVER pass --minContig AND -m together (boost throws 'option specified more than once').
+  --minContigLen does NOT exist; only -m / --minContig.
+  CORRECT command:
+    metabat2 -i contigs.fa -a depth.txt -m 1500 -o bins/bin
+  If no bins are produced (assembly too fragmented), report bin_count=0 and continue — not an error.
+  For binning summary statistics ("% of assembly placed in bins", "assembly N50", etc.),
+  the assembly file is ALWAYS megahit_output/final.contigs.fa (or spades_output/contigs.fasta) —
+  NEVER mixed.fna, genome.fna, or any concatenated reference that was used as wgsim input.
+  The reference is upstream of the simulation; the assembly is downstream of MEGAHIT/SPAdes.
+- Kraken2 database location is FIXED on this server: /mnt/nfs/llmhub/kraken2_db
+  Use this exact path — do NOT search /usr/local/share/kraken2, /opt/kraken2, conda envs, etc.
+  Do NOT print "database not installed" — it IS installed at the path above.
+  Use env var KRAKEN2_DEFAULT_DB if set, otherwise fall back to /mnt/nfs/llmhub/kraken2_db.
+  Required files in DB: hash.k2d, opts.k2d, taxo.k2d.
+  CORRECT:
+    KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/mnt/nfs/llmhub/kraken2_db'
+    kraken2 --db $KRAKEN2_DB --paired r1.fq r2.fq --report kraken2.report --output kraken2.out
+  This DB is VIRAL-only — bacterial reads (E. coli, Salmonella) will mostly be 'unclassified'.
+  That is expected behaviour; the pipeline must continue regardless of classification rate.
+- Bracken on kraken2.report: use the same DB path. Bracken may exit non-zero when no reads
+  were classified at the requested level — write an empty header-only TSV and continue:
+    name\ttaxonomy_id\ttaxonomy_lvl\tkraken_assigned_reads\tadded_reads\tnew_est_reads\tfraction_total_reads
 - Simulating reads from a FASTA genome: NEVER use seqkit for read simulation.
   seqkit seq/grep are FILTERING tools — they cannot generate paired-end FASTQ reads.
   ALWAYS use wgsim (bundled with samtools, always available when samtools is installed):
@@ -493,8 +616,8 @@ SPECIAL ALWAYS-TRUE RULES:
   wgsim flags: -N <read_pairs> -1 <read1_len> -2 <read2_len> -e <error_rate=0.02>
                -r <mutation_rate=0.001> -d <insert_mean=500> -s <insert_std=50>
   NOTE: the -q flag does NOT exist in all wgsim versions — NEVER use -q. wgsim
-  generates reads with low quality scores (Phred ~10-15); to handle this in fastp
-  use --qualified_quality_phred 10 --average_qual 0 instead of the default 20.
+  generates reads with low quality scores (Phred ~10-15) — downstream fastp must
+  use --disable_quality_filtering (not --qualified_quality_phred 20 which filters all reads).
   Output: reads_R1.fastq and reads_R2.fastq — true paired FASTQ files.
   WRONG: seqkit seq --min-len 150 genome.fna | awk ... → produces FASTA fragments, not reads
 - NCBI accession extraction from filename: NCBI filenames follow the pattern
@@ -502,6 +625,14 @@ SPECIAL ALWAYS-TRUE RULES:
   parts joined back: "_".join(basename.split("_")[:2])  →  "GCF_000027325.1"
   WRONG: basename.split("_")[0]  →  "GCF"   (truncates after first underscore)
   CORRECT: "_".join(os.path.basename(fasta_path).split("_")[:2])  →  "GCF_000027325.1"
+- When reading files produced by earlier steps and whose EXACT name is known, ALWAYS open
+  them by that exact name — NEVER use glob patterns or `first_match(".tsv")` style helpers
+  that can accidentally match the wrong file (e.g. matching abricate_card.tsv when you
+  want seqkit_stats.tsv).
+  WRONG: seqkit_path = sorted([p for p in os.listdir(run_dir) if p.endswith(".tsv")])[0]
+  CORRECT: seqkit_path = os.path.join(run_dir, "seqkit_stats.tsv")
+  The only exception: use glob when the filename is genuinely unknown (e.g. NCBI download
+  produces "GCF_XXXXXXXX.N_*_genomic.fna" whose exact stem varies by assembly).
 """
 
 GENERATOR_CTX_PROMPT="""

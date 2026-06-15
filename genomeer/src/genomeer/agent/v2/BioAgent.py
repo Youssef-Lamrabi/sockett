@@ -159,7 +159,7 @@ class BioAgent:
 
         # display configuration in a nice, readable format
         print("\n" + "=" * 50)
-        print("BioAgent_v1 CONFIGURATION")
+        print("BioAgent_v3 CONFIGURATION")
         print("=" * 50)
 
         # show the effective (resolved) config — constructor args take priority over settings defaults
@@ -181,6 +181,15 @@ class BioAgent:
             print(f"  Api Key: {'*' * 8 + api_key[-4:] if len(api_key) > 8 else '***'}")
         print("=" * 50 + "\n")
 
+        # ── LangSmith tracing (optional, silent if no API key) ────────────────
+        _ls_key = os.environ.get("LANGCHAIN_API_KEY", "").strip()
+        if _ls_key:
+            os.environ["LANGCHAIN_TRACING_V2"] = os.environ.get("LANGCHAIN_TRACING_V2", "true")
+            os.environ["LANGCHAIN_API_KEY"] = _ls_key
+            os.environ["LANGCHAIN_PROJECT"] = os.environ.get("LANGCHAIN_PROJECT", "genomeer")
+            os.environ.setdefault("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+            print(f"LangSmith tracing: ON (project={os.environ['LANGCHAIN_PROJECT']})")
+        # If LANGCHAIN_API_KEY is unset/empty → do nothing, langgraph defaults apply.
 
         # [helper] to import tools-mapper, llm
         self.path = os.path.join(path, "bioagent_data")
@@ -1255,6 +1264,10 @@ class BioAgent:
             # Small models (llama3:8b) reliably ignore rules in the general prompt but DO follow
             # examples placed immediately before the task. This is the reliable fix for N50 / SeqIO.
             _step_ctx = f"{step['title']} {state.get('last_prompt', '')}".lower()
+            # Use step title ONLY for tool-specific injections (prodigal, quast) so that
+            # mentioning those tools in OTHER steps of the user prompt doesn't spuriously
+            # inject the wrong code pattern into the wrong step.
+            _step_title_ctx = step['title'].lower()
             _injections = []
 
             if any(k in _step_ctx for k in ("n50", "assembly stat", "contig stat", "scaffold stat",
@@ -1394,6 +1407,750 @@ class BioAgent:
                         "\n"
                         "  WRONG flags that DO NOT EXIST: --genus  --species  --organism  --name"
                     )
+
+            # Prodigal injection — triggered on step title only (not full user prompt)
+            # so that mentioning prodigal in step 4 doesn't inject into steps 1-3.
+            if any(k in _step_title_ctx for k in ("prodigal", "orf pred", "gene pred", "gene call", "orf call")):
+                _injections.append(
+                    "THIS STEP RUNS PRODIGAL. The -f gff flag is MANDATORY — without it, Prodigal\n"
+                    "writes its native Genbank-like format and GFF parsers will count 0 CDS.\n"
+                    "\n"
+                    "  import subprocess, os\n"
+                    "  gff_path     = os.path.join(run_dir, 'genes.gff')\n"
+                    "  protein_path = os.path.join(run_dir, 'predicted_proteins.faa')\n"
+                    "  # For an isolate genome:\n"
+                    "  cmd = ['prodigal', '-i', fasta_path, '-a', protein_path,\n"
+                    "         '-o', gff_path, '-f', 'gff', '-p', 'single']\n"
+                    "  # For a metagenome: replace '-p', 'single' with '-p', 'meta'\n"
+                    "  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)\n"
+                    "  print(result.stdout[-2000:] or result.stderr[-1000:])\n"
+                    "  if result.returncode != 0:\n"
+                    "      import sys; sys.exit(f'Prodigal failed: {result.stderr}')\n"
+                    "\n"
+                    "  # Count CDS features — ONLY from GFF lines (not # comment lines):\n"
+                    "  orf_count = sum(1 for l in open(gff_path)\n"
+                    "                  if not l.startswith('#') and '\\t' in l\n"
+                    "                  and l.split('\\t')[2] == 'CDS')\n"
+                    "  protein_count = sum(1 for l in open(protein_path) if l.startswith('>'))\n"
+                    "  print(f'Predicted proteins: {protein_count}')\n"
+                    "  print(f'CDS features in GFF: {orf_count}')\n"
+                    "\n"
+                    "  WRONG: omitting -f gff  → Genbank format → 0 CDS parsed\n"
+                    "  WRONG: ['prodigal', '-i', fa, '-a', prot, '-o', gff, '-p', 'single']  ← no -f gff!"
+                )
+
+            # QUAST injection — triggered on step title only
+            if any(k in _step_title_ctx for k in ("quast", "assembly qc", "assembly quality")):
+                _injections.append(
+                    "THIS STEP RUNS QUAST. Binary is quast.py — NOT quast, NOT seqkit.\n"
+                    "Do NOT run seqkit in this step — seqkit was already run in a previous step.\n"
+                    "\n"
+                    "  import subprocess, os\n"
+                    "  quast_dir = os.path.join(run_dir, 'quast_output')\n"
+                    "  result = subprocess.run(\n"
+                    "      ['quast.py', '-o', quast_dir, fasta_path],\n"
+                    "      capture_output=True, text=True, timeout=300)\n"
+                    "  print(result.stdout[-2000:] or result.stderr[-500:])\n"
+                    "  if result.returncode != 0:\n"
+                    "      import sys; sys.exit(f'quast.py failed: {result.stderr}')\n"
+                    "\n"
+                    "  # Parse quast_output/report.tsv — KEY-VALUE file (NOT a header-row CSV):\n"
+                    "  report_path = os.path.join(quast_dir, 'report.tsv')\n"
+                    "  stats = {}\n"
+                    "  with open(report_path) as _f:\n"
+                    "      for _line in _f:\n"
+                    "          if not _line.strip(): continue\n"
+                    "          _parts = _line.rstrip().split('\\t')\n"
+                    "          if len(_parts) >= 2:\n"
+                    "              stats[_parts[0].strip()] = _parts[1].strip()\n"
+                    "  n50      = stats.get('N50', 'NA')\n"
+                    "  contigs  = next((v for k, v in stats.items() if k.startswith('# contigs')), 'NA')\n"
+                    "  print(f'QUAST N50: {n50}')\n"
+                    "  print(f'QUAST contigs: {contigs}')\n"
+                    "\n"
+                    "  WRONG: ['quast', ...]  ← FileNotFoundError\n"
+                    "  WRONG: running seqkit in this step — it was already done"
+                )
+
+            # FastQC injection — triggered on step title only
+            if any(k in _step_title_ctx for k in ("fastqc", "fast qc", "quality control report", "qc report")):
+                _injections.append(
+                    "THIS STEP RUNS FASTQC. FastQC requires the output directory to already exist.\n"
+                    "ALWAYS call os.makedirs(out_dir, exist_ok=True) BEFORE calling fastqc.\n"
+                    "\n"
+                    "  import os, subprocess, sys\n"
+                    "  out_dir = os.path.join(run_dir, 'fastqc_raw')\n"
+                    "  os.makedirs(out_dir, exist_ok=True)  # REQUIRED — fastqc errors if dir missing\n"
+                    "  result = subprocess.run(\n"
+                    "      ['fastqc', '-o', out_dir, r1_path, r2_path],\n"
+                    "      capture_output=True, text=True, timeout=300)\n"
+                    "  if result.returncode != 0:\n"
+                    "      sys.exit(f'FastQC failed: {result.stderr}')\n"
+                    "  print(f'FastQC done. Reports in: {out_dir}')\n"
+                    "\n"
+                    "  WRONG: forgetting os.makedirs() → 'Specified output directory does not exist'"
+                )
+
+            # bbduk.sh injection — server has BBMap 39.01 in meta-env1; the standard
+            # Illumina adapters reference path is fixed. Without this hint the LLM
+            # hesitates and emits meta-format text instead of code.
+            if any(k in _step_title_ctx for k in ("bbduk", "bb duk", "adapter detect",
+                                                   "adapter screen", "adapter check",
+                                                   "bbtools adapter")):
+                _injections.append(
+                    "THIS STEP USES bbduk.sh (BBMap 39.01) FOR ADAPTER DETECTION.\n"
+                    "The Illumina adapter reference is pre-installed at a FIXED path on this server:\n"
+                    "  /home/workshop/.bioagentpkg/runtime/pkgs/envs/meta-env1/opt/bbmap-39.01-1/resources/adapters.fa\n"
+                    "DO NOT search /usr/share/bbmap, /opt/bbmap, or other locations — they do not exist.\n"
+                    "DO NOT pass ref='adapters' as a keyword — the absolute path is required here.\n"
+                    "\n"
+                    "  import subprocess, os, sys\n"
+                    "  ADAPTERS_FA = '/home/workshop/.bioagentpkg/runtime/pkgs/envs/meta-env1/opt/bbmap-39.01-1/resources/adapters.fa'\n"
+                    "  stats_out = os.path.join(run_dir, 'adapter_stats.tsv')\n"
+                    "  cmd = ['bbduk.sh',\n"
+                    "         f'in={os.path.join(run_dir, \"raw_R1.fastq\")}',\n"
+                    "         f'ref={ADAPTERS_FA}',\n"
+                    "         f'stats={stats_out}',\n"
+                    "         'k=23', 'mink=11', 'hdist=1',\n"
+                    "         f'out={os.path.join(run_dir, \"bbduk_clean_R1.fastq\")}']\n"
+                    "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'bbduk.sh failed: {res.stderr}')\n"
+                    "  if not os.path.exists(stats_out) or os.path.getsize(stats_out) == 0:\n"
+                    "      sys.exit(f'bbduk stats file missing: {stats_out}')\n"
+                    "  print(f'Adapter detection done: {stats_out}')\n"
+                    "  # adapter_stats.tsv format: comment lines start with '#'; data lines are\n"
+                    "  # tab-separated: name<TAB>reads<TAB>reads_pct<TAB>bases<TAB>bases_pct\n"
+                    "\n"
+                    "  WRONG: ref='adapters' (keyword) — works on some BBTools installs, not here\n"
+                    "  WRONG: omitting ref= entirely — bbduk requires it for adapter detection\n"
+                    "  WRONG: using ref=/usr/share/bbmap/resources/adapters.fa — wrong path\n"
+                    "  NOTE: bbduk also writes a 'cleaned' FASTQ (out=) but for stats-only mode,\n"
+                    "        you can keep or delete it after; the key output is stats=<file>.tsv."
+                )
+
+            # fastp + wgsim injection — triggered when fastp step follows a wgsim simulation.
+            # wgsim assigns quality scores of ~10-15; --qualified_quality_phred 20 filters ALL reads.
+            if (any(k in _step_title_ctx for k in ("fastp", "trim", "adapter trim", "quality trim"))
+                    and any(k in _step_ctx for k in ("wgsim", "simulated read", "simulate read",
+                                                     "simul", "synthetic read", "artificial read"))):
+                _injections.append(
+                    "IMPORTANT — WGSIM READS + FASTP: wgsim assigns quality scores of ~10-15.\n"
+                    "Using --qualified_quality_phred 20 (fastp default) will discard ALL reads.\n"
+                    "ALWAYS add --disable_quality_filtering when running fastp on wgsim-simulated reads.\n"
+                    "\n"
+                    "  cmd = ['fastp',\n"
+                    "         '-i', r1_path, '-I', r2_path,\n"
+                    "         '-o', trim_r1, '-O', trim_r2,\n"
+                    "         '--json', json_report, '--html', html_report,\n"
+                    "         '--disable_quality_filtering',  # wgsim reads have no real quality scores\n"
+                    "         '--length_required', '50']\n"
+                    "\n"
+                    "  WRONG: '--qualified_quality_phred', '20' without --disable_quality_filtering\n"
+                    "        → reads passed filter: 0 — entire output is empty"
+                )
+
+            # minimap2 → samtools mapping injection — triggered on step title only.
+            # The pipe pattern (minimap2 | samtools sort) FAILS in the installed samtools:
+            #   samtools view -b - → "[main_samview] fail to read the header from '-'"
+            #   Popen pipe → samtools sort exits early → minimap2 gets SIGPIPE → "minimap2 failed"
+            # The only reliable approach is: minimap2 → SAM file → samtools view -bS → BAM → sort → index
+            if any(k in _step_title_ctx for k in ("minimap2", "map reads", "read mapping",
+                                                   "read alignment", "coverage depth",
+                                                   "bam", "samtools", "jgi_summarize")):
+                _injections.append(
+                    "THIS STEP MAPS READS WITH MINIMAP2 + SAMTOOLS.\n"
+                    "CRITICAL — use the SAM-file approach. The pipe pattern FAILS in this environment:\n"
+                    "  samtools view -b - fails with 'fail to read the header from -'\n"
+                    "  Popen pipe: samtools sort exits early → minimap2 SIGPIPE → 'minimap2 failed'\n"
+                    "ALWAYS write minimap2 output to a SAM file, then convert with -bS, then sort.\n"
+                    "\n"
+                    "  import subprocess, os, sys\n"
+                    "  sam_path    = os.path.join(run_dir, 'reads_aligned.sam')\n"
+                    "  bam_path    = os.path.join(run_dir, 'reads_aligned.bam')\n"
+                    "  sorted_bam  = os.path.join(run_dir, 'reads_aligned.sorted.bam')\n"
+                    "\n"
+                    "  # Step 1: minimap2 → SAM file\n"
+                    "  with open(sam_path, 'w') as _sam_f:\n"
+                    "      res = subprocess.run(\n"
+                    "          ['minimap2', '-ax', 'sr', contig_fa, trim_r1, trim_r2],\n"
+                    "          stdout=_sam_f, stderr=subprocess.PIPE, timeout=600)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'minimap2 failed: {res.stderr.decode()}')\n"
+                    "\n"
+                    "  # Step 2: SAM → BAM  (-bS: -b=output BAM, -S=input is SAM — required here)\n"
+                    "  # CRITICAL: -o flag may not work in this samtools version — it outputs BAM to stdout.\n"
+                    "  # BAM is binary (gzip-compressed); NEVER use text=True or capture_output=True here.\n"
+                    "  # Redirect stdout to the bam file using stdout=open(bam_path, 'wb').\n"
+                    "  with open(bam_path, 'wb') as _bam_f:\n"
+                    "      res = subprocess.run(\n"
+                    "          ['samtools', 'view', '-bS', sam_path],\n"
+                    "          stdout=_bam_f, stderr=subprocess.PIPE, timeout=300)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'samtools view failed: {res.stderr.decode(errors=\"replace\")}')\n"
+                    "  if not os.path.exists(bam_path) or os.path.getsize(bam_path) == 0:\n"
+                    "      sys.exit('samtools view produced empty BAM')\n"
+                    "\n"
+                    "  # Step 3: sort BAM — this is the OLD samtools (v0.x) syntax:\n"
+                    "  #   samtools sort <in.bam> <out.prefix>  →  creates <out.prefix>.bam\n"
+                    "  # In this old version, -o is a FLAG with NO argument (means 'output to stdout'),\n"
+                    "  # NOT '-o output.bam' like modern samtools. NEVER use -o here.\n"
+                    "  # Pass the prefix WITHOUT the .bam extension; samtools appends .bam automatically.\n"
+                    "  sorted_prefix = sorted_bam[:-4] if sorted_bam.endswith('.bam') else sorted_bam\n"
+                    "  res = subprocess.run(\n"
+                    "      ['samtools', 'sort', bam_path, sorted_prefix],\n"
+                    "      stderr=subprocess.PIPE, timeout=300)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'samtools sort failed: {res.stderr.decode(errors=\"replace\")}')\n"
+                    "\n"
+                    "  if not os.path.exists(sorted_bam) or os.path.getsize(sorted_bam) == 0:\n"
+                    "      sys.exit('Sorted BAM not created or empty')\n"
+                    "\n"
+                    "  # Step 4: index (creates sorted_bam + '.bai', no binary stdout)\n"
+                    "  subprocess.run(['samtools', 'index', sorted_bam],\n"
+                    "      stderr=subprocess.PIPE, check=True, timeout=120)\n"
+                    "  print(f'Sorted and indexed BAM: {sorted_bam}')\n"
+                    "\n"
+                    "  # Step 5: jgi_summarize_bam_contig_depths\n"
+                    "  # DO NOT call jgi_summarize_bam_contig_depths --version — it segfaults.\n"
+                    "  # stdout is text; redirect to PIPE or DEVNULL to keep it out of Python stdout.\n"
+                    "  depth_path = os.path.join(run_dir, 'depth.txt')\n"
+                    "  res = subprocess.run(\n"
+                    "      ['jgi_summarize_bam_contig_depths', '--outputDepth', depth_path, sorted_bam],\n"
+                    "      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'jgi_summarize_bam_contig_depths failed: {res.stderr.decode(errors=\"replace\")}')\n"
+                    "  print(f'Depth file: {depth_path}')\n"
+                    "\n"
+                    "  WRONG: samtools sort bam -o sorted.bam → in old samtools, -o = stdout flag (no arg) → fails\n"
+                    "  WRONG: samtools sort bam (no output) → 'Usage: samtools sort <in.bam> <out.prefix>'\n"
+                    "  WRONG: samtools view -bS sam -o bam + capture_output=True/text=True\n"
+                    "         → -o flag ignored, BAM written to stdout, UnicodeDecodeError (0x8b = gzip)\n"
+                    "  WRONG: Popen pipe minimap2 | samtools sort → SIGPIPE, minimap2 fails\n"
+                    "  WRONG: omitting -S in samtools view -bS → samtools may reject SAM input\n"
+                    "  NOTE: samtools --version exits with code 1 on some versions — NORMAL, not missing.\n"
+                    "  NOTE: jgi_summarize_bam_contig_depths --version segfaults — never call it."
+                )
+
+            # MetaBAT2 binning injection — triggered on step title only.
+            # MetaBAT2 has a HARD minimum of 1500 bp for -m/--minContig regardless of what
+            # the user requests. Setting -m below 1500 → "Contig length < 1500 is not allowed".
+            # Also: --minContig cannot be passed twice (boost::program_options crashes).
+            if any(k in _step_title_ctx for k in ("metabat", "binning", "contig binning", " bin ", "bin contigs")):
+                _injections.append(
+                    "THIS STEP RUNS METABAT2 FOR CONTIG BINNING.\n"
+                    "CRITICAL CONSTRAINTS for this MetaBAT2 version (2.12.1):\n"
+                    "  1. -m / --minContig MUST be >= 1500. The tool hard-rejects anything lower with:\n"
+                    "       '[Error!] Contig length < 1500 is not allowed to be used for binning.'\n"
+                    "     If the user/plan requests a value below 1500 (e.g. 200), OVERRIDE it to 1500.\n"
+                    "  2. NEVER pass --minContig AND -m together — boost throws 'multiple_occurrences'.\n"
+                    "     Use ONE of them only (prefer -m for short flag).\n"
+                    "  3. --minContigLen does NOT exist — only -m / --minContig.\n"
+                    "  4. depth.txt must be the output of jgi_summarize_bam_contig_depths (NOT cvExt format).\n"
+                    "\n"
+                    "  import subprocess, os, sys, glob\n"
+                    "  contig_fa  = os.path.join(run_dir, 'megahit_output', 'final.contigs.fa')\n"
+                    "  depth_path = os.path.join(run_dir, 'depth.txt')\n"
+                    "  bins_dir   = os.path.join(run_dir, 'bins')\n"
+                    "  os.makedirs(bins_dir, exist_ok=True)\n"
+                    "\n"
+                    "  # Force min contig length to MetaBAT2's hard minimum of 1500.\n"
+                    "  # User may request lower; this is non-negotiable for the tool to run.\n"
+                    "  cmd = ['metabat2',\n"
+                    "         '-i', contig_fa,\n"
+                    "         '-a', depth_path,\n"
+                    "         '-m', '1500',  # MetaBAT2 hard minimum; user-requested lower values are forbidden\n"
+                    "         '-o', os.path.join(bins_dir, 'bin')]\n"
+                    "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)\n"
+                    "  print(res.stdout or res.stderr)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'MetaBAT2 failed (exit {res.returncode}): {res.stderr}')\n"
+                    "\n"
+                    "  bin_files = sorted(glob.glob(os.path.join(bins_dir, 'bin.*.fa')))\n"
+                    "  print(f'Number of bins: {len(bin_files)}')\n"
+                    "\n"
+                    "  WRONG: -m 200 (or any value < 1500) → 'Contig length < 1500 is not allowed'\n"
+                    "  WRONG: --minContig 200 --minContigLen 200 → --minContigLen does not exist\n"
+                    "  WRONG: --minContig 200 -m 200 → boost throws 'multiple_occurrences'\n"
+                    "  NOTE: If no bins are produced (very fragmented assembly), report bin_count=0\n"
+                    "        and continue — this is a valid result, not a script failure."
+                )
+
+            # Kraken2 taxonomic classification injection
+            # The Kraken2 DB on this server is pre-installed at /mnt/nfs/llmhub/kraken2_db.
+            # DO NOT scan random filesystem paths for it — the path is fixed.
+            if any(k in _step_title_ctx for k in ("kraken2", "kraken ", "taxonomic class", "taxonom",
+                                                   "classify reads", "read classif")):
+                _injections.append(
+                    "THIS STEP RUNS KRAKEN2.\n"
+                    "CRITICAL: the Kraken2 database is PRE-INSTALLED at a fixed path on this server.\n"
+                    "DO NOT search /usr/local, /opt, /usr/share, conda envs, or any other location.\n"
+                    "DO NOT print 'database not installed' — it IS installed at the path below.\n"
+                    "\n"
+                    "  import os, subprocess, sys\n"
+                    "  # Resolve DB path: env var first, then the known server location.\n"
+                    "  KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/mnt/nfs/llmhub/kraken2_db'\n"
+                    "  if not (os.path.exists(os.path.join(KRAKEN2_DB, 'hash.k2d'))\n"
+                    "          and os.path.exists(os.path.join(KRAKEN2_DB, 'opts.k2d'))\n"
+                    "          and os.path.exists(os.path.join(KRAKEN2_DB, 'taxo.k2d'))):\n"
+                    "      sys.exit(f'Kraken2 DB files missing in {KRAKEN2_DB} — contact admin.')\n"
+                    "\n"
+                    "  trimmed_r1 = os.path.join(run_dir, 'trimmed_R1.fastq')\n"
+                    "  trimmed_r2 = os.path.join(run_dir, 'trimmed_R2.fastq')\n"
+                    "  report_out = os.path.join(run_dir, 'kraken2.report')\n"
+                    "  output_out = os.path.join(run_dir, 'kraken2.out')\n"
+                    "\n"
+                    "  cmd = ['kraken2', '--db', KRAKEN2_DB,\n"
+                    "         '--paired', trimmed_r1, trimmed_r2,\n"
+                    "         '--report', report_out,\n"
+                    "         '--output', output_out,\n"
+                    "         '--threads', '4']\n"
+                    "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)\n"
+                    "  print(res.stdout)\n"
+                    "  print(res.stderr)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'Kraken2 failed: {res.stderr}')\n"
+                    "\n"
+                    "  # report_out and output_out are valid even if 0 reads are classified —\n"
+                    "  # the viral DB on this server will leave bacterial reads unclassified, that is OK.\n"
+                    "  print(f'Kraken2 OK: report={report_out} ({os.path.getsize(report_out)} bytes), '\n"
+                    "        f'output={output_out} ({os.path.getsize(output_out)} bytes)')\n"
+                    "\n"
+                    "  # CORRECT Kraken2 report parsing — read the format carefully:\n"
+                    "  # col 1: percent | col 2: reads_in_clade (CUMULATIVE/hierarchical, do NOT sum across rows!)\n"
+                    "  # col 3: reads_at_taxon (direct) | col 4: rank code | col 5: taxid | col 6: name\n"
+                    "  # Rank codes: U=unclassified, R=root, D=domain, K=kingdom, P=phylum, C=class,\n"
+                    "  #             O=order, F=family, G=genus, S=species (S1/S2 = subspecies/strain)\n"
+                    "  total_reads, unclassified_reads, species_rows = 0, 0, []\n"
+                    "  with open(report_out) as _rf:\n"
+                    "      for _line in _rf:\n"
+                    "          _p = _line.rstrip('\\n').split('\\t')\n"
+                    "          if len(_p) < 6: continue\n"
+                    "          _direct = int(_p[2].strip())   # reads_at_taxon (column 3)\n"
+                    "          _rank   = _p[3].strip()\n"
+                    "          _taxid  = _p[4].strip()\n"
+                    "          _name   = _p[5].strip()\n"
+                    "          total_reads += _direct          # sum of direct reads = total\n"
+                    "          if _taxid == '0' or _rank == 'U':\n"
+                    "              unclassified_reads = _direct\n"
+                    "          if _rank == 'S':                # species ONLY — never root/Viruses/Riboviria\n"
+                    "              species_rows.append((_name, int(_p[1].strip())))  # use clade count for species\n"
+                    "  classified_reads = total_reads - unclassified_reads\n"
+                    "  unclassified_pct = (100.0 * unclassified_reads / total_reads) if total_reads else 0.0\n"
+                    "  top3 = sorted(species_rows, key=lambda x: -x[1])[:3]\n"
+                    "  print(f'classified={classified_reads}, unclassified={unclassified_reads} ({unclassified_pct:.2f}%)')\n"
+                    "  print(f'top3 species: {top3}')\n"
+                    "\n"
+                    "  WRONG: searching /usr/local/share/kraken2/database — that path does NOT exist here\n"
+                    "  WRONG: looping over a candidate list and exiting if none match — DB IS at /mnt/nfs/llmhub/kraken2_db\n"
+                    "  WRONG: calling 'kraken2-build --download-library' — DB is pre-installed, do not build\n"
+                    "  WRONG: classified_reads += int(parts[1])  → sums reads_in_clade across rows → 5-10x over-count\n"
+                    "         (because clade counts are HIERARCHICAL: root, Viruses, Riboviria all carry same reads)\n"
+                    "  WRONG: treating 'root', 'Viruses', 'Riboviria' as species — they are not. Filter rank=='S'.\n"
+                    "  NOTE: This DB is viral-only — bacterial reads (E. coli, Salmonella, etc.) will mostly\n"
+                    "        be 'unclassified'. That is expected. The pipeline must continue."
+                )
+
+            # Bracken (downstream of Kraken2) injection
+            if any(k in _step_title_ctx for k in ("bracken", "abundance estim", "species abundance")):
+                _injections.append(
+                    "THIS STEP RUNS BRACKEN on the kraken2.report from the previous step.\n"
+                    "Use the SAME Kraken2 DB path as the Kraken2 step (it's required to be the same DB used to classify).\n"
+                    "\n"
+                    "  import os, subprocess, sys\n"
+                    "  KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/mnt/nfs/llmhub/kraken2_db'\n"
+                    "  kraken_report = os.path.join(run_dir, 'kraken2.report')\n"
+                    "  bracken_out   = os.path.join(run_dir, 'bracken_species.tsv')\n"
+                    "\n"
+                    "  cmd = ['bracken', '-d', KRAKEN2_DB,\n"
+                    "         '-i', kraken_report,\n"
+                    "         '-o', bracken_out,\n"
+                    "         '-l', 'S', '-r', '150']\n"
+                    "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)\n"
+                    "  print(res.stdout)\n"
+                    "  print(res.stderr)\n"
+                    "  # Bracken can legitimately exit non-zero when the DB has no Bracken-compatible kmer\n"
+                    "  # distribution at the requested level OR when no reads were classified.\n"
+                    "  # In that case write an empty header-only TSV and continue.\n"
+                    "  if res.returncode != 0 or not os.path.exists(bracken_out):\n"
+                    "      with open(bracken_out, 'w') as f:\n"
+                    "          f.write('name\\ttaxonomy_id\\ttaxonomy_lvl\\tkraken_assigned_reads\\t'\n"
+                    "                  'added_reads\\tnew_est_reads\\tfraction_total_reads\\n')\n"
+                    "      print(f'Bracken produced no estimates (likely no classified reads at species level). '\n"
+                    "            f'Wrote empty header-only file: {bracken_out}')\n"
+                    "  else:\n"
+                    "      print(f'Bracken OK: {bracken_out}')\n"
+                    "\n"
+                    "  WRONG: aborting on non-zero exit — empty result is acceptable for viral DB + bacterial reads"
+                )
+
+            # BLAST bin identification injection — fixes the cascading bug seen in
+            # Pipeline 2 where bin_assignments.tsv had assigned_species correct but
+            # per-reference coverage_pct columns all 0.00, which made the summary step
+            # falsely report "references NOT recovered". Forces correct per-ref coverage.
+            if any(k in _step_title_ctx for k in (
+                    "blast bin", "blastn bin",
+                    "bin identification", "bin assignment",
+                    "blast.*reference", "identify each bin",
+                    "assign each bin", "assign bins")):
+                _injections.append(
+                    "THIS STEP IDENTIFIES BINS BY BLAST AGAINST REFERENCE GENOMES.\n"
+                    "CRITICAL — per-reference coverage_pct MUST be computed correctly,\n"
+                    "not left at 0.00 placeholder. The summary step depends on this column\n"
+                    "to decide which references are recovered.\n"
+                    "\n"
+                    "CORRECT pattern:\n"
+                    "  import subprocess, os, sys, glob, csv\n"
+                    "  # 1. Read each reference FASTA, store its total length (for coverage %)\n"
+                    "  ref_dir = os.path.join(run_dir, 'refs')\n"
+                    "  ref_files = sorted(glob.glob(os.path.join(ref_dir, '*.fna')))\n"
+                    "  ref_sizes = {}\n"
+                    "  ref_short = {}  # short name like 'Bacillus_subtilis'\n"
+                    "  for rp in ref_files:\n"
+                    "      total = 0\n"
+                    "      with open(rp) as f:\n"
+                    "          for L in f:\n"
+                    "              if not L.startswith('>'): total += len(L.strip())\n"
+                    "      acc = os.path.basename(rp).split('_genomic')[0]\n"
+                    "      ref_sizes[rp] = total\n"
+                    "      ref_short[rp] = acc\n"
+                    "\n"
+                    "  # 2. For each bin × each ref, run blastn and aggregate aligned_bp + pident\n"
+                    "  bin_files = sorted(glob.glob(os.path.join(run_dir, 'bins', 'bin.*.fa')))\n"
+                    "  rows = []\n"
+                    "  for bf in bin_files:\n"
+                    "      bin_name = os.path.basename(bf)\n"
+                    "      per_ref = {}\n"
+                    "      for rp in ref_files:\n"
+                    "          res = subprocess.run(\n"
+                    "              ['blastn', '-query', bf, '-subject', rp,\n"
+                    "               '-outfmt', '6 pident length',\n"
+                    "               '-evalue', '1e-10'],\n"
+                    "              capture_output=True, text=True, timeout=600)\n"
+                    "          aligned = 0; weighted = 0.0\n"
+                    "          for line in res.stdout.strip().splitlines():\n"
+                    "              parts = line.split('\\t')\n"
+                    "              if len(parts) < 2: continue\n"
+                    "              try:\n"
+                    "                  pid = float(parts[0]); al = int(parts[1])\n"
+                    "              except ValueError:\n"
+                    "                  continue\n"
+                    "              aligned += al\n"
+                    "              weighted += pid * al\n"
+                    "          per_ref[rp] = (aligned, (weighted/aligned if aligned else 0.0))\n"
+                    "      # 3. Pick best reference per bin (max aligned_bp)\n"
+                    "      best_rp = max(per_ref, key=lambda r: per_ref[r][0])\n"
+                    "      best_aln, best_pid = per_ref[best_rp]\n"
+                    "      best_cov = (100.0 * best_aln / ref_sizes[best_rp]) if ref_sizes[best_rp] else 0.0\n"
+                    "      row = {\n"
+                    "          'bin': bin_name,\n"
+                    "          'assigned_species': ref_short[best_rp],\n"
+                    "          'total_aligned_bp': best_aln,\n"
+                    "          'weighted_pident': f'{best_pid:.2f}',\n"
+                    "          'coverage_pct': f'{best_cov:.2f}',\n"
+                    "      }\n"
+                    "      # Per-reference coverage columns — REAL values, not 0.00 placeholder\n"
+                    "      for rp in ref_files:\n"
+                    "          col = ref_short[rp].replace('.', '_') + '_cov_pct'\n"
+                    "          aln, _ = per_ref[rp]\n"
+                    "          pct = (100.0 * aln / ref_sizes[rp]) if ref_sizes[rp] else 0.0\n"
+                    "          row[col] = f'{pct:.2f}'\n"
+                    "      rows.append(row)\n"
+                    "\n"
+                    "  # 4. Write bin_assignments.tsv with REAL per-ref coverage values\n"
+                    "  out_tsv = os.path.join(run_dir, 'bin_assignments.tsv')\n"
+                    "  if rows:\n"
+                    "      fieldnames = list(rows[0].keys())\n"
+                    "      with open(out_tsv, 'w', newline='') as f:\n"
+                    "          w = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\\t')\n"
+                    "          w.writeheader()\n"
+                    "          for r in rows: w.writerow(r)\n"
+                    "  print(f'bin_assignments written: {out_tsv}')\n"
+                    "  for r in rows:\n"
+                    "      print(r['bin'], '->', r['assigned_species'],\n"
+                    "            'cov_pct=', r['coverage_pct'], 'pident=', r['weighted_pident'])\n"
+                    "\n"
+                    "  WRONG: leaving per-reference cov_pct columns at 0.00 placeholder\n"
+                    "  WRONG: computing coverage as (aligned_bp / bin_size) — must use ref_size\n"
+                    "  WRONG: forgetting to read ref FASTA to get its true total length\n"
+                    "  WRONG: only running blastn once for all bins concatenated — must be per-bin"
+                )
+
+            # Final summary/report injection — prevents LLM hallucination of numeric values
+            # when synthesizing summary.txt from multiple sources. The LLM was inventing
+            # values (e.g. duplication 0.74% instead of real 51.41%) because two tools
+            # measure the same metric differently. Forces a single source of truth.
+            if any(k in _step_title_ctx for k in (
+                    "summary.txt",          # very specific — matches "Write summary.txt..."
+                    "final summary",
+                    "final report",
+                    "compile summary",
+                    "compile report",
+                    "produce summary",
+                    "produce final",
+                    "write the summary",
+                    "write the final report",
+                    "write a final")):
+                _injections.append(
+                    "THIS STEP WRITES THE FINAL SUMMARY/REPORT FILE.\n"
+                    "CRITICAL — SOURCE OF TRUTH RULE (mandatory):\n"
+                    "BEFORE writing anything, scan run_dir for ALL data files and bind each metric\n"
+                    "to its actual source file. Multi-source pipelines (AMR, MAG, QC) have NO\n"
+                    "single metrics.json — you must check each candidate file individually.\n"
+                    "\n"
+                    "ALGORITHM (follow exactly):\n"
+                    "  import os, csv, json, glob\n"
+                    "  # Step 1: list ALL data files in run_dir\n"
+                    "  available = {os.path.basename(p): p for p in glob.glob(os.path.join(run_dir, '*'))}\n"
+                    "  available.update({os.path.basename(p): p\n"
+                    "                    for p in glob.glob(os.path.join(run_dir, '*', '*'))})\n"
+                    "\n"
+                    "  # Step 2: look up each metric in the file most likely to hold it.\n"
+                    "  # Example bindings (adapt to the pipeline's actual files):\n"
+                    "  #   AMR genes count        → abricate_card.tsv      (count non-header lines)\n"
+                    "  #   AMR gene names         → abricate_card.tsv col 6 (GENE column)\n"
+                    "  #   AMR truth per-ref      → abricate_ref_*.tsv\n"
+                    "  #   CDS count (Prokka)     → prokka_summary.tsv     OR parse combined.gff\n"
+                    "  #   CDS count (Prodigal)   → orf_metrics.tsv\n"
+                    "  #   Concordance %          → concordance_metrics.tsv\n"
+                    "  #   Bin completeness/cont. → checkm2_out/quality_report.tsv (CheckM2)\n"
+                    "  #   Bin → species mapping  → bin_assignments.tsv (col assigned_species)\n"
+                    "  #   Q20/Q30/GC raw         → raw_stats.tsv (seqkit)\n"
+                    "  #   Q20/Q30/GC trimmed     → trimmed_stats.tsv (seqkit)\n"
+                    "  #   fastp filtering stats  → fastp.json (summary.before/after_filtering)\n"
+                    "  #   Insert size peak       → fastp.json (insert_size.peak)\n"
+                    "  #   Viral contamination    → kraken2.report (% classified line)\n"
+                    "  #   Duplication exact-seq  → duplicate_count.txt (seqkit rmdup)\n"
+                    "\n"
+                    "CRITICAL RULES — VIOLATIONS GIVE WRONG SUMMARIES:\n"
+                    "  R1. NEVER write 0 or N/A for a metric if its source file EXISTS and is non-empty.\n"
+                    "      → ALWAYS open and parse the file before falling back to 0/N/A.\n"
+                    "      → Examples seen in production:\n"
+                    "        - abricate_card.tsv had 58 rows → wrote 'AMR genes: 0' (wrong)\n"
+                    "        - concordance_metrics.tsv had 95.55 → wrote 'concordance: N/A' (wrong)\n"
+                    "        - duplicate_count.txt had 51.41 → wrote 'duplication: 0.74' (wrong)\n"
+                    "\n"
+                    "  R2. NEVER invert recovered/not-recovered logic on bin assignments.\n"
+                    "      → If bin_assignments.tsv row has a non-empty 'assigned_species' field,\n"
+                    "        the reference IS recovered — add it to recovered list, NOT to\n"
+                    "        the 'NOT recovered' list, regardless of coverage_pct numerical value.\n"
+                    "      → Example seen in production: 4 bins assigned to 4 species, summary said\n"
+                    "        'all 4 references NOT recovered' (logical inversion).\n"
+                    "\n"
+                    "  R3. NEVER average values from different methodologies measuring the same thing.\n"
+                    "      → seqkit rmdup (exact-sequence dup, 51%) vs fastp (k-mer dup, 0.01%):\n"
+                    "        these are DIFFERENT metrics — report both separately, never average.\n"
+                    "      → Pick ONE method per metric and cite it.\n"
+                    "\n"
+                    "  R4. Pass/fail thresholds use the SOURCE values verbatim:\n"
+                    "      → duplication >= 30% from seqkit rmdup → FAIL\n"
+                    "      → AMR recall = |detected ∩ truth| / |truth| computed by reading\n"
+                    "        abricate_card.tsv (detected) and abricate_ref_*.tsv (truth).\n"
+                    "      → Verdict must be derivable from values cited in the summary.\n"
+                    "\n"
+                    "  R5. The summary's overall PASS/FAIL must match the BINARY of individual\n"
+                    "      pass/fail checks (e.g. PASS only if every required gate passes).\n"
+                    "      Do NOT conclude FAIL while all listed checks are PASS or vice versa.\n"
+                    "\n"
+                    "CORRECT example pattern:\n"
+                    "  # AMR — count from abricate_card.tsv, never assume 0\n"
+                    "  amr_path = available.get('abricate_card.tsv')\n"
+                    "  amr_count = 0; amr_names = set()\n"
+                    "  if amr_path and os.path.getsize(amr_path) > 0:\n"
+                    "      with open(amr_path) as f:\n"
+                    "          rdr = csv.reader(f, delimiter='\\t')\n"
+                    "          hdr = next(rdr, None)\n"
+                    "          if hdr:\n"
+                    "              gene_idx = hdr.index('GENE') if 'GENE' in hdr else 5\n"
+                    "              for row in rdr:\n"
+                    "                  if not row or row[0].startswith('#'): continue\n"
+                    "                  amr_count += 1\n"
+                    "                  if len(row) > gene_idx: amr_names.add(row[gene_idx])\n"
+                    "  # Now amr_count and amr_names are non-zero if abricate found anything.\n"
+                    "\n"
+                    "  WRONG: writing 0 AMR without opening abricate_card.tsv first\n"
+                    "  WRONG: writing 'all refs NOT recovered' when bin_assignments.tsv assigns species\n"
+                    "  WRONG: rounding 51.41 → 0.74 (factor-70 error)\n"
+                    "  RULE  : every number in summary.txt must be byte-for-byte traceable to ONE\n"
+                    "          source file. If the source HAS it, use the source value. If no source\n"
+                    "          file exists, only THEN write N/A."
+                )
+
+            # SRA download injection (fixes recurring fastq-dump failures)
+            # Bare `fastq-dump SRR...` without prefetch first → empty files
+            # Forces ENA direct (wget) as primary path, prefetch+fasterq-dump as fallback
+            if any(k in _step_title_ctx for k in ("sra ", "srr", "fastq-dump", "fasterq-dump",
+                                                   "ena ", "download.*reads", "download reads",
+                                                   "download paired", "illumina reads",
+                                                   "metagenomic reads", "miseq reads")):
+                _injections.append(
+                    "THIS STEP DOWNLOADS SRA READS.\n"
+                    "DO NOT call `fastq-dump SRR...` directly — it produces empty files when run\n"
+                    "without prefetch first, and the LLM cannot reliably wait for it.\n"
+                    "\n"
+                    "PREFERRED — query the ENA API to get the EXACT URLs. NEVER compute the\n"
+                    "subdir manually (rules differ for 7/8/9/10-digit SRR IDs and getting it\n"
+                    "wrong gives 404 — e.g. SRR8359173 → subdir 003, NOT 073).\n"
+                    "  import subprocess, os, sys, gzip, shutil, urllib.request\n"
+                    "  acc = 'SRR8359173'           # adapt to the user-requested accession\n"
+                    "  api = (f'https://www.ebi.ac.uk/ena/portal/api/filereport'\n"
+                    "         f'?accession={acc}&result=read_run&fields=fastq_ftp&format=tsv')\n"
+                    "  with urllib.request.urlopen(api, timeout=30) as _r:\n"
+                    "      _txt = _r.read().decode().strip().splitlines()\n"
+                    "  # Expected: header line then tab-separated values; fastq_ftp is ';'-separated\n"
+                    "  if len(_txt) < 2:\n"
+                    "      sys.exit(f'ENA API returned no data for {acc}: {_txt!r}')\n"
+                    "  _cols = _txt[1].split('\\t')\n"
+                    "  _ftp_csv = _cols[1] if len(_cols) >= 2 else ''\n"
+                    "  _urls = [('https://' + u) if not u.startswith('http') else u\n"
+                    "           for u in _ftp_csv.split(';') if u.strip()]\n"
+                    "  if not _urls:\n"
+                    "      sys.exit(f'No FASTQ URLs in ENA response for {acc}: {_txt!r}')\n"
+                    "  out_paths = []\n"
+                    "  for url in _urls:\n"
+                    "      dest = os.path.join(run_dir, os.path.basename(url))\n"
+                    "      res = subprocess.run(['wget', '-q', '-O', dest, url],\n"
+                    "                           capture_output=True, text=True, timeout=1800)\n"
+                    "      if res.returncode != 0 or os.path.getsize(dest) < 1024:\n"
+                    "          sys.exit(f'ENA download failed for {url}: {res.stderr}')\n"
+                    "      out = dest[:-3] if dest.endswith('.gz') else dest\n"
+                    "      if dest.endswith('.gz'):\n"
+                    "          with gzip.open(dest, 'rb') as fi, open(out, 'wb') as fo:\n"
+                    "              shutil.copyfileobj(fi, fo)\n"
+                    "          os.remove(dest)\n"
+                    "      out_paths.append(out)\n"
+                    "  # For paired-end: out_paths[0] = R1, out_paths[1] = R2\n"
+                    "  raw_r1, raw_r2 = (out_paths + [None, None])[:2]\n"
+                    "\n"
+                    "FALLBACK — only if ENA URL above 404s (rare for valid SRR IDs):\n"
+                    "  subprocess.run(['prefetch', acc, '-O', run_dir, '--max-size', '100g'],\n"
+                    "                 check=True, timeout=1800)\n"
+                    "  subprocess.run(['fasterq-dump', '--split-files', '-O', run_dir,\n"
+                    "                  os.path.join(run_dir, acc, acc + '.sra')],\n"
+                    "                 check=True, timeout=3600)\n"
+                    "\n"
+                    "  WRONG: subprocess.run(['fastq-dump', 'SRR...']) — produces empty files,\n"
+                    "         no --split-files, and the LLM can't reliably detect completion.\n"
+                    "  WRONG: relying on .sra file existing without prefetch step.\n"
+                    "  RULE  : ALWAYS prefer wget on ftp.sra.ebi.ac.uk/vol1/fastq/{prefix}/{subdir}/{acc}/\n"
+                    "          — single command, single file pair, fails fast if URL is wrong."
+                )
+
+            # CheckM2 bin quality injection
+            # DB is pre-registered globally via `checkm2 database --setdblocation`.
+            # Path: /home/workshop/checkm2_db/CheckM2_database/uniref100.KO.1.dmnd
+            # NO need to set CHECKM2DB env var — checkm2 reads its config automatically.
+            if any(k in _step_title_ctx for k in ("checkm2", "checkm 2", "bin quality",
+                                                   "completeness", "contamination",
+                                                   "mag quality", "bin qc")):
+                _injections.append(
+                    "THIS STEP RUNS CheckM2 for bin quality assessment.\n"
+                    "CheckM2 DB is PRE-INSTALLED and pre-registered. DO NOT search filesystem,\n"
+                    "DO NOT export CHECKM2DB, DO NOT call `checkm2 database --download`.\n"
+                    "Just call `checkm2 predict` directly — it finds its DB via internal config.\n"
+                    "\n"
+                    "  import os, subprocess, sys, csv, glob\n"
+                    "  bins_dir = os.path.join(run_dir, 'bins')\n"
+                    "  out_dir  = os.path.join(run_dir, 'checkm2_out')\n"
+                    "  os.makedirs(out_dir, exist_ok=True)\n"
+                    "\n"
+                    "  # bins must exist beforehand (e.g. from MetaBAT2 step)\n"
+                    "  bin_files = sorted(glob.glob(os.path.join(bins_dir, 'bin.*.fa')))\n"
+                    "  if not bin_files:\n"
+                    "      sys.exit(f'No bin .fa files in {bins_dir} — run MetaBAT2 first')\n"
+                    "\n"
+                    "  cmd = ['checkm2', 'predict',\n"
+                    "         '--input', bins_dir,\n"
+                    "         '--output-directory', out_dir,\n"
+                    "         '-x', 'fa',\n"
+                    "         '--threads', '4',\n"
+                    "         '--force']\n"
+                    "  res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)\n"
+                    "  print(res.stdout)\n"
+                    "  print(res.stderr)\n"
+                    "  if res.returncode != 0:\n"
+                    "      sys.exit(f'CheckM2 failed: {res.stderr}')\n"
+                    "\n"
+                    "  # Parse quality_report.tsv\n"
+                    "  report = os.path.join(out_dir, 'quality_report.tsv')\n"
+                    "  rows = list(csv.DictReader(open(report), delimiter='\\t'))\n"
+                    "  for r in rows:\n"
+                    "      print(r['Name'], 'completeness=', r['Completeness'],\n"
+                    "            'contamination=', r['Contamination'])\n"
+                    "  completeness_mean = sum(float(r['Completeness']) for r in rows) / len(rows) if rows else 0\n"
+                    "  contamination_mean = sum(float(r['Contamination']) for r in rows) / len(rows) if rows else 0\n"
+                    "  print(f'Mean completeness: {completeness_mean:.2f}%')\n"
+                    "  print(f'Mean contamination: {contamination_mean:.2f}%')\n"
+                    "\n"
+                    "  WRONG: setting CHECKM2DB env var manually — already registered\n"
+                    "  WRONG: calling `checkm2 database --download` — DB already installed\n"
+                    "  WRONG: passing bin extension as '.fa' (with dot) → use 'fa' (no dot)\n"
+                    "  NOTE: CheckM2 needs CPU+RAM. For 1-5 bins on E.coli scale, ~1-3 min on this server."
+                )
+
+            # bcftools mpileup + call + filter injection (variant calling pipelines)
+            # The server has bcftools 1.21 (modern). The OLD bcftools 0.1.19 was replaced.
+            # Common LLM mistakes this fixes:
+            #   1. mapping rate computed as mapped/R1_only_count → gives 200%
+            #   2. bcftools filter uses bare 'DP' which is ambiguous → 0 variants kept
+            if any(k in _step_title_ctx for k in ("variant call", "bcftools", "mpileup",
+                                                   "vcf filter", "snp call", "call variant",
+                                                   "variant filter")):
+                _injections.append(
+                    "THIS STEP RUNS bcftools (variant calling or filtering).\n"
+                    "Server has bcftools 1.21 (modern syntax) — mpileup and call subcommands exist.\n"
+                    "\n"
+                    "CORRECT mpileup + call pipeline:\n"
+                    "  import subprocess, os, sys\n"
+                    "  mpileup = subprocess.Popen(\n"
+                    "      ['bcftools','mpileup','-f',ref_fasta,'-Ou',sorted_bam],\n"
+                    "      stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n"
+                    "  call = subprocess.run(\n"
+                    "      ['bcftools','call','-mv','-Ov','-o',vcf_path],\n"
+                    "      stdin=mpileup.stdout, capture_output=True, text=True, timeout=600)\n"
+                    "  mpileup.stdout.close()\n"
+                    "  if call.returncode != 0: sys.exit(f'bcftools call failed: {call.stderr}')\n"
+                    "\n"
+                    "CORRECT bcftools filter — use -e (EXCLUDE) and INFO/DP (NOT bare DP):\n"
+                    "  res = subprocess.run(\n"
+                    "      ['bcftools','filter','-e','QUAL<20 || INFO/DP<10',\n"
+                    "       '-Ov','-o',filtered_vcf, vcf_path],\n"
+                    "      capture_output=True, text=True)\n"
+                    "  WRONG: -i 'QUAL>20 && DP>10'  →  bare 'DP' is ambiguous in bcftools 1.21\n"
+                    "         (interpreted as FORMAT/DP, often missing on biallelic sites) → 0 hits\n"
+                    "  WRONG: -i 'QUAL>20 & DP>10'   → same DP ambiguity issue\n"
+                    "  USE   : -e 'QUAL<20 || INFO/DP<10'  (exclude negative, explicit INFO/DP)\n"
+                    "\n"
+                    "CORRECT mapping rate computation — use samtools flagstat as SINGLE source:\n"
+                    "  res = subprocess.run(['samtools','flagstat',sorted_bam],\n"
+                    "                       capture_output=True, text=True)\n"
+                    "  total_reads = 0\n"
+                    "  mapped_reads = 0\n"
+                    "  for line in res.stdout.splitlines():\n"
+                    "      parts = line.split()\n"
+                    "      if not parts: continue\n"
+                    "      n = int(parts[0])\n"
+                    "      if 'in total' in line and total_reads == 0: total_reads = n\n"
+                    "      elif 'mapped (' in line and 'primary' not in line and mapped_reads == 0:\n"
+                    "          mapped_reads = n\n"
+                    "  mapping_rate = (100.0 * mapped_reads / total_reads) if total_reads else 0\n"
+                    "  WRONG: total_reads = sum(1 for L in open('trimmed_R1.fastq') if L.startswith('@'))\n"
+                    "         then dividing mapped (which counts R1+R2) by R1-only → gives 200%\n"
+                    "  WRONG: dividing mapped by 4*total_lines/4 of one FASTQ — same off-by-2 bug\n"
+                    "  RULE  : ALWAYS use flagstat 'in total' as the denominator. It already counts\n"
+                    "          both mates, so the rate is mapped/total — guaranteed correct.\n"
+                    "\n"
+                    "CORRECT SNP vs indel counting on VCF — use ALL ALT alleles and length compare:\n"
+                    "  snps, indels = 0, 0\n"
+                    "  for L in open(vcf_path):\n"
+                    "      if L.startswith('#'): continue\n"
+                    "      cols = L.rstrip().split('\\t')\n"
+                    "      if len(cols) < 5: continue\n"
+                    "      ref = cols[3]\n"
+                    "      for alt in cols[4].split(','):\n"
+                    "          if len(ref) == 1 and len(alt) == 1: snps += 1\n"
+                    "          else: indels += 1"
+                )
 
             # ExPASy / SwissProt / UniProt injection
             if any(k in _step_ctx for k in ("expasy", "swissprot", "swiss-prot", "uniprot", "sprot", "p0a7g6", "protein entry", "protein record")):
@@ -1799,7 +2556,7 @@ class BioAgent:
             _run_temp_dir = state.get("run_temp_dir") or ""
             if _run_temp_dir:
                 os.environ["RUN_TEMP_DIR"] = _run_temp_dir
-            _extra_env: dict = {"RUN_TEMP_DIR": _run_temp_dir} if _run_temp_dir else {}
+            _extra_env: dict = {"RUN_TEMP_DIR": _run_temp_dir, "MPLBACKEND": "Agg"} if _run_temp_dir else {"MPLBACKEND": "Agg"}
 
             # Fix T9 — export GENOMEER_MAX_RAM_GB if per-worker RAM limit is set
             _per_worker_ram = state.get("_per_worker_ram_gb")
