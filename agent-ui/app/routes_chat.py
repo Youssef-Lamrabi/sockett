@@ -1,7 +1,8 @@
-import asyncio, threading, json, os, re
+import asyncio, threading, json, os, re, mimetypes, tempfile
+from datetime import datetime
 from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 from .db import get_db
 from .models import User, ChatSession, Message, ProviderConfig, UserModel, MessageLog
 from .config import system_default, bio_hint_default
-from .auth import get_current_user
+from .auth import get_current_user, get_current_user_cookie_or_header
 
 from genomeer.agent.v2 import BioAgent
 
@@ -242,7 +243,12 @@ async def chat(session_id: int, body: ChatBody, request: Request,
     db.add(m_user); db.commit()
 
     # attachments hook (optional)
-    attachments = body.attachments or []
+    # BioAgent expects list[str] of absolute paths. body.attachments is
+    # List[AttachmentIn] (Pydantic). Convert here so _stage_attachments
+    # can shutil.copy2() them. Without this conversion, os.path.basename()
+    # raises TypeError on the Pydantic object and the staging silently fails.
+    _attachment_objs = body.attachments or []
+    attachments = [a.path for a in _attachment_objs if getattr(a, "path", None)]
 
     effective_mode = (body.interaction_mode or sess.interaction_mode or "auto").lower()
     agent = get_or_create_agent(db, user, sess, effective_mode)
@@ -461,3 +467,166 @@ def get_messages(session_id: int, db: Session = Depends(get_db), user: User = De
             item["logs"] = [{"tag": L.tag, "body": L.body} for L in (m.logs or [])]
         out.append(item)
     return out
+
+
+# ============================================================================
+# Workspace files browser — lists uploads + generated outputs of the session's
+# run directory so the UI can show a file explorer panel and preview content.
+# ============================================================================
+# CRITICAL: must match the default used by genomeer.agent.v2.utils.tempdir
+# (`tempfile.gettempdir()` -> "/tmp" on Linux). A different default here would
+# have the backend look in the WRONG directory and the workspace panel would
+# always show "No files yet" while the agent actually wrote files elsewhere.
+_BIOAGENT_TMP_DIR = os.environ.get("BIOAGENT_TMP_DIR", tempfile.gettempdir())
+_WORKSPACE_SKIP_DIRS = {"__pycache__", ".cache", ".ipynb_checkpoints", ".mamba", ".micromamba"}
+_WORKSPACE_PREVIEW_MAX_BYTES = 5 * 1024 * 1024  # 5 MB hard cap for served previews
+
+
+def _session_run_dir(session_id: int) -> Path:
+    """Return the agent's run workdir path for a given session id.
+
+    The agent calls `run_workdir(prefix="run", session_id=str(sess.id))` which
+    produces `{BIOAGENT_TMP_DIR}/run-{session_id}` (see tempdir.run_workdir).
+    """
+    return Path(_BIOAGENT_TMP_DIR) / f"run-{session_id}"
+
+
+def _is_workspace_skipped(name: str) -> bool:
+    """Hide dot-files and known caches from the workspace listing."""
+    if not name:
+        return True
+    if name.startswith("."):
+        return True
+    if name in _WORKSPACE_SKIP_DIRS:
+        return True
+    return False
+
+
+def _walk_workspace_files(root: Path, exclude_subdir: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """List files under root (recursive), excluding caches and `exclude_subdir`.
+
+    Returned dict shape: {name, rel_path, size, mtime (iso)}. Sorted mtime desc.
+    """
+    out: List[Dict[str, Any]] = []
+    if not root.is_dir():
+        return out
+    root_real = root.resolve()
+    ex_real = exclude_subdir.resolve() if exclude_subdir else None
+    for r, dirs, files in os.walk(root_real):
+        # Skip caches and any in-place excluded subdir
+        r_path = Path(r)
+        if ex_real is not None:
+            try:
+                r_path.relative_to(ex_real)
+                # we're inside the excluded subdir → skip entirely
+                continue
+            except ValueError:
+                pass
+        dirs[:] = [d for d in dirs if not _is_workspace_skipped(d)]
+        for fname in files:
+            if _is_workspace_skipped(fname):
+                continue
+            fp = r_path / fname
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            try:
+                rel = fp.relative_to(root_real)
+            except ValueError:
+                continue
+            out.append({
+                "name": fname,
+                "rel_path": str(rel).replace("\\", "/"),
+                "size": st.st_size,
+                "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                "_mtime_raw": st.st_mtime,
+            })
+    out.sort(key=lambda f: f["_mtime_raw"], reverse=True)
+    for f in out:
+        f.pop("_mtime_raw", None)
+    return out
+
+
+def _resolve_session_or_404(db: Session, user: User, session_id: int) -> ChatSession:
+    sess = db.query(ChatSession).filter(
+        ChatSession.id == session_id, ChatSession.user_id == user.id
+    ).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return sess
+
+
+@router.get("/sessions/{session_id}/files")
+def list_session_files(
+    session_id: int,
+    db: Session = Depends(get_db),
+    # Accept Bearer header OR HttpOnly cookie — needed for native browser
+    # navigations like <a href download> which do NOT send Authorization.
+    user: User = Depends(get_current_user_cookie_or_header),
+):
+    """List uploaded + generated files for the session's run workspace.
+
+    Response:
+        {
+          "run_dir":  "/tmp/bioagent/run-12",
+          "uploads":  [ {name, rel_path, size, mtime}, ... ],   # in uploads/
+          "generated":[ {name, rel_path, size, mtime}, ... ],   # everything else
+        }
+    Empty arrays if the run hasn't started yet.
+    """
+    _resolve_session_or_404(db, user, session_id)
+    run_dir = _session_run_dir(session_id)
+    if not run_dir.is_dir():
+        return {"run_dir": str(run_dir), "uploads": [], "generated": []}
+    uploads_dir = run_dir / "uploads"
+    uploads = _walk_workspace_files(uploads_dir) if uploads_dir.is_dir() else []
+    # Rewrite uploads' rel_path to be relative to RUN_DIR (so click path is consistent)
+    for u in uploads:
+        u["rel_path"] = f"uploads/{u['rel_path']}"
+    generated = _walk_workspace_files(run_dir, exclude_subdir=uploads_dir)
+    return {
+        "run_dir": str(run_dir),
+        "uploads": uploads,
+        "generated": generated,
+    }
+
+
+@router.get("/sessions/{session_id}/files/raw")
+def get_session_file_raw(
+    session_id: int,
+    path: str = Query(..., description="rel_path returned by /files (must stay inside the run dir)"),
+    db: Session = Depends(get_db),
+    # Cookie-or-Bearer auth: <a href download> and <img src> trigger native
+    # navigations/requests that cannot attach an Authorization header.
+    user: User = Depends(get_current_user_cookie_or_header),
+):
+    """Serve a single file from the session's run workspace for preview/download.
+
+    Path-traversal safe: the resolved absolute path must be a descendant of the
+    session run dir; any escape attempt returns 400.
+    Files larger than _WORKSPACE_PREVIEW_MAX_BYTES are still served as
+    `FileResponse` (download), but the UI caps the preview client-side.
+    """
+    _resolve_session_or_404(db, user, session_id)
+    run_dir = _session_run_dir(session_id).resolve()
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Run workspace not found")
+    if not path or path.startswith("/") or ".." in path.split("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    try:
+        requested = (run_dir / path).resolve()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    try:
+        requested.relative_to(run_dir)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Path traversal denied")
+    if not requested.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    mime, _ = mimetypes.guess_type(str(requested))
+    return FileResponse(
+        str(requested),
+        media_type=mime or "application/octet-stream",
+        filename=requested.name,
+    )

@@ -348,7 +348,7 @@ def check_python_code(code: str) -> Tuple[bool, str]:
                     else:
                         func_name = func.attr
                 
-                if func_name in ("eval", "exec", "compile", "__import__", "getattr", "setattr", "hasattr", "delattr", "breakpoint"):
+                if func_name in ("eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr", "breakpoint"):
                     reason = f"[SECURITY BLOCK] Forbidden AST call detected: {func_name}()"
                     return False, reason
 

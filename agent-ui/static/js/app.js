@@ -262,7 +262,12 @@ async function loadSessionMessages(sid) {
   const res = await fetch(`/api/sessions/${sid}/messages`, { headers: { ...api.headers() } });
   if (!res.ok) return;
   const msgs = await res.json();
-  const chat = el('chat'); if (chat) chat.innerHTML = '';   // reset chat
+  const chat = el('chat');
+  if (chat) {
+    Array.from(chat.children).forEach(child => {
+      if (child.id !== 'empty-state') child.remove();
+    });
+  }
   const logs = el('logs'); if (logs) logs.innerHTML = '';   // reset right pane
 
   for (const m of msgs) {
@@ -285,7 +290,17 @@ async function loadSessionMessages(sid) {
       }
     }
   }
+  updateEmptyState();
 }
+
+function updateEmptyState() {
+  const chat = el('chat');
+  const emptyState = el('empty-state');
+  if (!chat || !emptyState) return;
+  const hasMessages = chat.querySelectorAll('.msg').length > 0;
+  emptyState.classList.toggle('hidden', hasMessages);
+}
+
 
 function autoGrowTextArea(t) {
   if (!t) return;
@@ -448,12 +463,14 @@ async function createSession(focusAfter = false) {
   }
   const data = await res.json();
 
-  // Reload sessions (so the new one appears), then mark it active
-  await loadSessions(false);
+  // Reload sessions list only — skip loading messages (new session is empty)
+  await loadSessions(false, false);
   markSessionActive(String(data.id));
 
-  // Clear current chat view and get ready to type
-  const chat = el('chat'); if (chat) chat.innerHTML = '';
+  // Clear any previous chat content and show the empty state
+  clearChat();
+
+  updateEmptyState();
   closeSessionsDrawer();
   if (focusAfter) focusComposer();
 
@@ -473,15 +490,15 @@ async function setSessionModelAuto() {
   notify('success', `Model set to ${model}`);
 }
 
-async function loadSessions(andOpen = false) {
+async function loadSessions(andOpen = false, loadMessages = true) {
   const res = await fetch('/api/sessions', { headers: { ...api.headers() } });
   if (!res.ok) return;
   const data = await res.json(); sessionsCache = data || [];
   renderSessionsList();
-  if (sessionsCache.length) {
+  if (loadMessages && sessionsCache.length) {
     const sid = String(sessionsCache[0].id);
     markSessionActive(sid);
-    await loadSessionMessages(sid);            // ← add
+    await loadSessionMessages(sid);
     await loadSessionDetails(sid);
   }
   if (andOpen) openSessionsDrawer();
@@ -562,6 +579,8 @@ async function uploadFile() {
     rec.serverPath = data?.path || null;
     rec.status = 'ready';
     notify('success', `Uploaded: ${f.name}`);
+    // Workspace hook: file just landed on the server; refresh if panel is open
+    try { window.refreshWorkspaceSoon?.(300); } catch {}
   } catch (err) {
     console.error(err);
     rec.status = 'error';
@@ -676,10 +695,10 @@ async function send() {
   const body = JSON.stringify({ message: msg, stream: true, interaction_mode, attachments });
 
   // F-6: SSE auto-reconnect — max 5 attempts, 3 s delay, visual indicator
-  const SSE_MAX_RETRIES   = 5;
-  const SSE_RETRY_DELAY   = 3000; // ms
-  let   streamCompletedOk = false;
-  let   attempt           = 0;
+  const SSE_MAX_RETRIES = 5;
+  const SSE_RETRY_DELAY = 3000; // ms
+  let streamCompletedOk = false;
+  let attempt = 0;
 
   function _showReconnectBanner(n, max) {
     const logsEl = document.getElementById('logs');
@@ -762,6 +781,13 @@ async function send() {
             // Track normal stream completion
             if (evt.type === 'done') streamCompletedOk = true;
 
+            // Workspace hook: each block (especially STATUS / OBSERVE) likely
+            // means a step finished and may have produced new files. Debounced
+            // and no-op when the panel is closed.
+            if (evt.type === 'block' || evt.type === 'done') {
+              try { window.refreshWorkspaceSoon?.(); } catch {}
+            }
+
             renderAssistantEvent(evt);
           } catch { /* ignore parse errors */ }
         }
@@ -784,7 +810,7 @@ async function send() {
 
     } catch (err) {
       if (err?.name === 'AbortError') {
-        try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch {}
+        try { await fetch(`/api/sessions/${sid}/cancel`, { method: 'POST', headers: { ...api.headers() } }); } catch { }
         if (window.AgentRender?.renderLogBlock) window.AgentRender.renderLogBlock('STATUS', 'Canceled by user');
         _clearReconnectBanner();
         break; // user-initiated cancel — do not retry
@@ -809,6 +835,9 @@ async function send() {
   hideAssistantTyping();
   setComposerBusy(false);
   currentChatController = null;
+  // Workspace hook: final refresh at end of stream (covers files produced by
+  // the finalizer node that may arrive after the last streamed block).
+  try { window.refreshWorkspaceSoon?.(500); } catch {}
 }
 
 // Render a simple assistant bubble (no typing effect, safe HTML)
@@ -885,6 +914,7 @@ function boot() {
     closeSessionsDrawer();
     clearChat(); clearLogs();
     const msg = el('message'); if (msg) { msg.value = ''; msg.focus(); }
+    updateEmptyState();
   };
   el('btn-new-chat')?.addEventListener('click', newChatFlow);
   el('drawer-new')?.addEventListener('click', newChatFlow);
@@ -987,7 +1017,7 @@ function boot() {
     });
 
     // observe DOM changes under #chat and auto-scroll if allowed
-    const chatMo = new MutationObserver(() => scrollChatSmooth());
+    const chatMo = new MutationObserver(() => { scrollChatSmooth(); updateEmptyState(); });
     chatMo.observe(chat, { childList: true, subtree: true });
 
     // also honor explicit renderer signals (if agent_render dispatches them)
@@ -1036,6 +1066,112 @@ function boot() {
 
   setComposerBusy(false);
   renderAttachDock();
+  updateEmptyState();
+
+  // Prompt suggestion cards
+  document.querySelectorAll('.prompt-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const prompt = card.dataset.prompt;
+      const textarea = el('message');
+      if (textarea && prompt) {
+        textarea.value = prompt;
+        autoGrowTextArea(textarea);
+        textarea.focus();
+      }
+    });
+  });
+
+  // File Explorer Panel
+  (function () {
+    const feBtn = el('btn-file-explorer');
+    const feEl = el('file-explorer');
+    const feCloseBtn = el('fe-close');
+    const feSplitter = el('fe-splitter');
+    const contentArea = el('content-area');
+
+    function openFE() {
+      contentArea?.classList.add('fe-open');
+      feEl?.setAttribute('aria-hidden', 'false');
+      feBtn?.classList.add('active');
+      feBtn?.setAttribute('aria-expanded', 'true');
+    }
+    function closeFE() {
+      contentArea?.classList.remove('fe-open');
+      feEl?.setAttribute('aria-hidden', 'true');
+      feBtn?.classList.remove('active');
+      feBtn?.setAttribute('aria-expanded', 'false');
+    }
+
+    feBtn?.addEventListener('click', () => {
+      const isOpen = contentArea?.classList.contains('fe-open');
+      if (isOpen) { closeFE(); return; }
+      openFE();
+      // Workspace files refresh on every open so the user sees the latest state
+      try { refreshWorkspaceFiles(); } catch { /* defined below; ignore if not yet wired */ }
+    });
+    feCloseBtn?.addEventListener('click', closeFE);
+
+    // Inject a small refresh button into the workspace header (no HTML change)
+    (function injectRefreshBtn() {
+      const header = document.querySelector('#file-explorer .fe-header');
+      const closeBtn = document.getElementById('fe-close');
+      if (!header || !closeBtn) return;
+      if (document.getElementById('fe-refresh')) return; // idempotent
+      const btn = document.createElement('button');
+      btn.id = 'fe-refresh';
+      btn.type = 'button';
+      btn.className = 'icon fe-refresh-btn';
+      btn.title = 'Refresh workspace';
+      btn.setAttribute('aria-label', 'Refresh workspace');
+      btn.innerHTML = '<i class="fa fa-sync-alt" aria-hidden="true"></i>';
+      closeBtn.parentNode.insertBefore(btn, closeBtn);
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        btn.disabled = true;
+        btn.classList.add('spinning');
+        // Force-refresh bypasses the signature cache by resetting it
+        try { _wsCurrentSig = ''; } catch {}
+        Promise.resolve(refreshWorkspaceFiles())
+          .finally(() => {
+            setTimeout(() => {
+              btn.classList.remove('spinning');
+              btn.disabled = false;
+            }, 450);
+          });
+      });
+    })();
+
+    // Drag the splitter bar to resize the workspace panel
+    if (feSplitter && feEl && contentArea) {
+      const MIN_W = 200, MAX_W = 600;
+      let down = false, startX = 0, startW = 0;
+      feSplitter.addEventListener('mousedown', (e) => {
+        down = true; startX = e.clientX; startW = feEl.offsetWidth;
+        contentArea.classList.add('resizing');
+        feEl.style.transition = 'none';
+        feSplitter.style.transition = 'none';
+        document.body.style.userSelect = 'none';
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!down) return;
+        const w = Math.max(MIN_W, Math.min(MAX_W, startW + (startX - e.clientX)));
+        feEl.style.width = w + 'px';
+      });
+      window.addEventListener('mouseup', () => {
+        if (!down) return;
+        down = false;
+        contentArea.classList.remove('resizing');
+        feEl.style.transition = '';
+        feSplitter.style.transition = '';
+        document.body.style.userSelect = '';
+        const w = feEl.offsetWidth;
+        contentArea.style.setProperty('--fe-col', w + 'px');
+        localStorage.setItem('fe_width', w + 'px');
+      });
+      const savedW = localStorage.getItem('fe_width');
+      if (savedW) contentArea.style.setProperty('--fe-col', savedW);
+    }
+  })();
 
   // review btn
   window.addEventListener('review:approve', (e) => {
@@ -1044,7 +1180,7 @@ function boot() {
     if (t) {
       t.value = msg;
       // keep your auto-grow behavior
-      try { if (typeof autoGrowTextArea === 'function') autoGrowTextArea(t); } catch {}
+      try { if (typeof autoGrowTextArea === 'function') autoGrowTextArea(t); } catch { }
     }
     if (!composerBusy) {
       // use your existing send() to submit immediately
@@ -1063,6 +1199,251 @@ window.addEventListener('unhandledrejection', (e) => {
 window.addEventListener('error', (e) => {
   notify('error', e?.message || 'Unexpected error');
 });
+
+/* =========================================================================
+   Workspace Files Browser (right-side panel)
+   - 2 sections: Uploaded (top) + Generated (bottom)
+   - Click an item -> floating preview modal (text / image / iframe)
+   - Auto-refresh: on panel open, after upload, on stream blocks (debounced),
+                   on stream end. Never polls when panel is closed.
+   ========================================================================= */
+function _wsHumanSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+function _wsHumanTime(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diff = (now - d) / 1000;
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    return d.toLocaleString();
+  } catch { return ''; }
+}
+function _wsIconForFile(name) {
+  const ext = (name || '').split('.').pop().toLowerCase();
+  const map = {
+    fasta: 'fa-dna', fa: 'fa-dna', fna: 'fa-dna', faa: 'fa-dna',
+    fastq: 'fa-dna', fq: 'fa-dna',
+    gff: 'fa-list', gff3: 'fa-list', bed: 'fa-list', vcf: 'fa-list',
+    txt: 'fa-file-alt', md: 'fa-file-alt', log: 'fa-file-alt',
+    json: 'fa-code', yaml: 'fa-code', yml: 'fa-code', xml: 'fa-code',
+    tsv: 'fa-table', csv: 'fa-table',
+    html: 'fa-file-code', htm: 'fa-file-code',
+    png: 'fa-image', jpg: 'fa-image', jpeg: 'fa-image',
+    gif: 'fa-image', svg: 'fa-image', webp: 'fa-image', bmp: 'fa-image',
+    pdf: 'fa-file-pdf',
+    zip: 'fa-file-archive', gz: 'fa-file-archive',
+    tar: 'fa-file-archive', bz2: 'fa-file-archive',
+    bam: 'fa-database', sam: 'fa-database', cram: 'fa-database',
+  };
+  return map[ext] || 'fa-file';
+}
+function _wsEscHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function _wsFileItemHtml(f) {
+  return `
+    <button class="fe-file-item" type="button"
+            data-path="${_wsEscHtml(f.rel_path)}"
+            title="${_wsEscHtml(f.rel_path)}">
+      <i class="fa ${_wsIconForFile(f.name)}" aria-hidden="true"></i>
+      <span class="fe-file-name">${_wsEscHtml(f.name)}</span>
+      <span class="fe-file-meta">${_wsEscHtml(_wsHumanSize(f.size))} · ${_wsEscHtml(_wsHumanTime(f.mtime))}</span>
+    </button>
+  `;
+}
+
+let _wsCurrentSig = '';   // signature of last-rendered list, to avoid unnecessary repaint
+async function refreshWorkspaceFiles() {
+  const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
+  const body = document.querySelector('#file-explorer .fe-body');
+  if (!body) return;
+  if (!sid) { _wsRenderEmpty(body, 'No active session'); return; }
+  try {
+    const res = await fetch(`/api/sessions/${sid}/files`, { headers: { ...api.headers() } });
+    if (!res.ok) {
+      _wsRenderEmpty(body, `Unable to load workspace (${res.status})`);
+      return;
+    }
+    const data = await res.json();
+    const uploads = Array.isArray(data?.uploads) ? data.uploads : [];
+    const generated = Array.isArray(data?.generated) ? data.generated : [];
+    const sig = JSON.stringify([uploads.map(f => [f.rel_path, f.size, f.mtime]),
+                                 generated.map(f => [f.rel_path, f.size, f.mtime])]);
+    if (sig === _wsCurrentSig) return;   // nothing changed, skip repaint to avoid flicker
+    _wsCurrentSig = sig;
+    _wsRenderLists(body, uploads, generated);
+  } catch (err) {
+    /* silent — keep last good render */
+  }
+}
+function _wsRenderEmpty(body, hint = '') {
+  _wsCurrentSig = '';
+  body.innerHTML = `
+    <div class="fe-empty-state">
+      <i class="fa fa-folder-o" aria-hidden="true"></i>
+      <p>No files yet</p>
+      <span>${_wsEscHtml(hint || 'Files generated by the agent during this session will appear here')}</span>
+    </div>
+  `;
+}
+function _wsRenderLists(body, uploads, generated) {
+  if (uploads.length === 0 && generated.length === 0) {
+    _wsRenderEmpty(body);
+    return;
+  }
+  body.innerHTML = `
+    <div class="fe-section" data-kind="uploads">
+      <div class="fe-section-title">
+        <i class="fa fa-cloud-upload-alt" aria-hidden="true"></i>
+        <span>Uploaded</span>
+        <span class="fe-count">${uploads.length}</span>
+      </div>
+      <div class="fe-file-list">
+        ${uploads.length
+          ? uploads.map(_wsFileItemHtml).join('')
+          : '<div class="fe-empty-mini">No uploads yet</div>'}
+      </div>
+    </div>
+    <div class="fe-divider" aria-hidden="true"></div>
+    <div class="fe-section" data-kind="generated">
+      <div class="fe-section-title">
+        <i class="fa fa-cogs" aria-hidden="true"></i>
+        <span>Generated</span>
+        <span class="fe-count">${generated.length}</span>
+      </div>
+      <div class="fe-file-list">
+        ${generated.length
+          ? generated.map(_wsFileItemHtml).join('')
+          : '<div class="fe-empty-mini">No outputs yet — run a step to generate files</div>'}
+      </div>
+    </div>
+  `;
+  body.querySelectorAll('.fe-file-item').forEach(btn => {
+    btn.addEventListener('click', () => openFilePreview(btn.dataset.path));
+  });
+}
+
+/* --- Preview modal (text / image / iframe) ----------------------------- */
+function openFilePreview(relPath) {
+  const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
+  if (!sid || !relPath) return;
+  const url = `/api/sessions/${sid}/files/raw?path=${encodeURIComponent(relPath)}`;
+
+  // Build modal
+  const baseName = relPath.split('/').pop() || 'download';
+  const modal = document.createElement('div');
+  modal.className = 'fe-preview-modal';
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-label', `Preview ${relPath}`);
+  modal.innerHTML = `
+    <div class="fe-preview-backdrop"></div>
+    <div class="fe-preview-card">
+      <div class="fe-preview-header">
+        <i class="fa ${_wsIconForFile(relPath)}" aria-hidden="true"></i>
+        <span class="fe-preview-name">${_wsEscHtml(relPath)}</span>
+        <button class="fe-preview-dl icon" type="button"
+                title="Download" aria-label="Download file">
+          <i class="fa fa-download" aria-hidden="true"></i>
+        </button>
+        <button class="fe-preview-close icon" type="button" aria-label="Close preview">✕</button>
+      </div>
+      <div class="fe-preview-body"><div class="fe-preview-loading">Loading…</div></div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const close = () => { modal.remove(); document.removeEventListener('keydown', escHandler); };
+  function escHandler(e) { if (e.key === 'Escape') close(); }
+  modal.querySelector('.fe-preview-close').addEventListener('click', close);
+  modal.querySelector('.fe-preview-backdrop').addEventListener('click', close);
+  document.addEventListener('keydown', escHandler);
+
+  // Robust download: fetch with Bearer header → blob → trigger client-side
+  // download. This works regardless of cookie state and forces the correct
+  // filename (browsers ignore "download" attr for cross-origin or 401 cases).
+  modal.querySelector('.fe-preview-dl').addEventListener('click', () => {
+    _wsDownloadFile(url, baseName).catch(err => {
+      try { notify('error', `Download failed: ${err?.message || err}`); } catch {}
+    });
+  });
+
+  _wsLoadPreviewContent(url, relPath, modal.querySelector('.fe-preview-body'));
+}
+
+async function _wsDownloadFile(url, filename) {
+  const btn = document.querySelector('.fe-preview-modal .fe-preview-dl');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(url, { headers: { ...api.headers() } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename || 'download';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { document.body.removeChild(a); } catch {}
+      URL.revokeObjectURL(blobUrl);
+    }, 200);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+async function _wsLoadPreviewContent(url, relPath, container) {
+  const ext = (relPath || '').split('.').pop().toLowerCase();
+  const imgExt = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp']);
+  const iframeExt = new Set(['pdf', 'html', 'htm']);
+
+  if (imgExt.has(ext)) {
+    container.innerHTML = `<img class="fe-preview-img" src="${url}" alt="${_wsEscHtml(relPath)}" />`;
+    return;
+  }
+  if (iframeExt.has(ext)) {
+    container.innerHTML = `<iframe class="fe-preview-iframe" src="${url}" sandbox="allow-same-origin"></iframe>`;
+    return;
+  }
+  // Default: text-like — fetch as bytes, decode UTF-8 with replacement, cap at 2 MB
+  try {
+    const res = await fetch(url, { headers: { ...api.headers() } });
+    if (!res.ok) {
+      container.innerHTML = `<div class="muted">Failed to load (HTTP ${res.status}).</div>`;
+      return;
+    }
+    const buf = await res.arrayBuffer();
+    const TEXT_CAP = 2 * 1024 * 1024;
+    const slice = buf.byteLength > TEXT_CAP ? buf.slice(0, TEXT_CAP) : buf;
+    const dec = new TextDecoder('utf-8', { fatal: false });
+    let text = dec.decode(slice);
+    if (buf.byteLength > TEXT_CAP) {
+      text += `\n\n--- truncated (file is ${_wsHumanSize(buf.byteLength)} total) — use download ---`;
+    }
+    container.innerHTML = `<pre class="fe-preview-pre">${_wsEscHtml(text)}</pre>`;
+  } catch (e) {
+    container.innerHTML = `<div class="muted">Cannot preview: ${_wsEscHtml(e?.message || 'error')}</div>`;
+  }
+}
+
+/* --- Auto-refresh helpers (debounced; only acts when panel is open) ---- */
+let _wsDebounceTimer = null;
+function refreshWorkspaceSoon(delay = 800) {
+  const open = document.getElementById('content-area')?.classList.contains('fe-open');
+  if (!open) return;
+  clearTimeout(_wsDebounceTimer);
+  _wsDebounceTimer = setTimeout(() => { refreshWorkspaceFiles().catch(() => {}); }, delay);
+}
+// Expose globally so other modules can trigger refreshes without imports
+window.refreshWorkspaceFiles = refreshWorkspaceFiles;
+window.refreshWorkspaceSoon = refreshWorkspaceSoon;
 
 /* ========================== Settings Modal ============================== */
 function openSettings() {

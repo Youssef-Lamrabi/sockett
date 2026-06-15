@@ -107,6 +107,11 @@ class AgentState(TypedDict):
     bio_hint_step_idx: int        # current_idx at last bio_hint call (dedup guard)
     bio_hint_mode: str | None     # "pre_gen" | "debug"
     bio_hint_skipped: bool        # True when triage decided to skip the 8B call
+    # ── Multi-turn isolation (turn_id starts at 1 on first user prompt of a
+    #    session, increments on every follow-up call). Used by _planner to
+    #    detect a turn boundary and reset transient quality data without
+    #    touching env state / attachments / file_registry / etc. ────────────
+    turn_id: int
 
 
 # -----------------------------------------------
@@ -698,8 +703,17 @@ class BioAgent:
                         "current_idx": resume_idx,
                         "messages": [AIMessage(content="<observe>Regenerating code with your feedback…</observe>")],
                     }
-            
-            
+
+            # Multi-turn context fix (Bug 1): give the planner prior conversation
+            # turns so step titles inherit context. Slicing off the last message
+            # avoids duplicating the current user_prompt (appended just below).
+            # First turn -> empty -> no-op (behavior identical to before).
+            history = self._history_snippet(state["messages"][:-1]) if len(state["messages"]) > 1 else ""
+            if history:
+                msgs.append(HumanMessage(content=(
+                    "CONVERSATION_HISTORY (previous turns for context):\n" + history
+                )))
+
             msgs.append(HumanMessage(content=user_prompt))
             resp = self._llm_invoke(node, "plan_route", msgs)
             steps, route = StateGraphHelper.parse_checklist_and_route(resp.content)
@@ -818,6 +832,38 @@ class BioAgent:
             }
             if manifest.get("route_hint") == "await_user":
                 updates["manifest"] = new_manifest
+
+            # ── Multi-turn isolation (turn boundary reset) ─────────────────
+            # When the planner re-runs for a NEW user turn, transient quality
+            # data from the previous turn (observations, quality_signals) must
+            # be cleared so the finalizer/observer don't mix turn-1 + turn-2
+            # signals. Env-vars-preserved fields (env_name, attachments,
+            # file_registry, tool_versions, etc.) are left untouched because
+            # we mutate only the two known transient keys.
+            # Also accumulate step_offset so the orchestrator's "<running
+            # step=N/>" UI label keeps chronological numbering across turns
+            # (turn-1 ended at step 2 -> turn-2 starts at step 3, not 1).
+            # Kill-switch: GENOMEER_TURN_SCOPING=0 disables this fix.
+            if os.environ.get("GENOMEER_TURN_SCOPING", "1") != "0":
+                _current_turn = int(state.get("turn_id", 1) or 1)
+                _base_manifest = updates.get("manifest") or dict(state.get("manifest") or {})
+                if _current_turn != _base_manifest.get("last_planned_turn"):
+                    _prev_plan_len = len(state.get("plan") or [])
+                    _prev_offset = int(_base_manifest.get("step_offset", 0) or 0)
+                    _new_offset = _prev_offset + _prev_plan_len
+                    _base_manifest["observations"] = []
+                    _base_manifest["quality_signals"] = {}
+                    _base_manifest["last_planned_turn"] = _current_turn
+                    _base_manifest["step_offset"] = _new_offset
+                    updates["manifest"] = _base_manifest
+                    self._log(
+                        "TURN BOUNDARY",
+                        body=(f"turn_id={_current_turn} -> reset observations + "
+                              f"quality_signals; step_offset {_prev_offset}->{_new_offset} "
+                              f"(prev_plan_len={_prev_plan_len})"),
+                        node=node,
+                    )
+
             self._log("EXIT NODE", body=f"route={route}\nsteps={steps}", node=node)
 
             if route == "qa" or not steps:
@@ -870,21 +916,25 @@ class BioAgent:
             
             resp = self._llm_invoke(node, "qa", msgs)
 
-            # Always clean routing keys from manifest before exiting QA.
-            # If we don't, route_hint="ask_for_missing" is checkpointed and the planner
-            # will intercept it on the very next user message — even after our planner fix —
-            # because the planner fast-path relies on reading it from the checkpoint.
-            # Cleaning it here is the authoritative, terminal fix.
+            # Clean routing keys from manifest before exiting QA — but ONLY for
+            # terminal routes ("ask_for_missing", "finalize"). For "await_user",
+            # route_hint MUST persist into the checkpoint so the NEXT user reply
+            # (typically a button-click "Approved — please continue.") is detected
+            # by the planner's await_user fast-path (L ~653). Without this guard,
+            # human-in-the-loop silently breaks: user clicks "I agree" but the
+            # planner sees no route_hint, falls through to normal LLM planning,
+            # and the pipeline never resumes.
             clean_manifest = dict(state.get("manifest") or {})
-            clean_manifest.pop("route_hint", None)
-            clean_manifest.pop("qa_payload", None)
+            if route_hint != "await_user":
+                clean_manifest.pop("route_hint", None)
+                clean_manifest.pop("qa_payload", None)
 
             updates = {
                 "next_step": next_step,
                 "manifest": clean_manifest,
                 "messages": [AIMessage(content=resp.content)],
             }
-            self._log("EXIT NODE", body=f"next_step={next_step}", node=node)
+            self._log("EXIT NODE", body=f"next_step={next_step} route_hint_preserved={route_hint=='await_user'}", node=node)
             return updates
 
         def _orchestrator(self, state: AgentState) -> AgentState:
@@ -924,11 +974,15 @@ class BioAgent:
                 }
 
             # otherwise go check inputs
-            self._log("EXIT NODE", body=f"all_done=False\ncurrent_idx={idx}\nnext_step=input_guard", node=node)
+            # Display step number = current_idx + manifest.step_offset + 1
+            # so chronological order is preserved across multi-turn sessions.
+            _disp_offset = int((state.get("manifest") or {}).get("step_offset", 0) or 0)
+            _disp_step = idx + _disp_offset + 1
+            self._log("EXIT NODE", body=f"all_done=False\ncurrent_idx={idx}\ndisp_step={_disp_step}\nnext_step=input_guard", node=node)
             return {
                 "current_idx": idx,
                 "next_step": "input_guard",
-                "messages": [AIMessage(content=f"<running step={idx+1}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
+                "messages": [AIMessage(content=f"<running step={_disp_step}/>\n<description>\n{plan[idx]['title']}\n</description>\n")],
             }
 
         def _batch_orchestrator(self, state: AgentState) -> AgentState:
@@ -3011,7 +3065,14 @@ class BioAgent:
 
             # ── FAST-DONE: deterministic success ────────────────────────────────────
             if not diagnostic_mode and _is_exit_ok:
+                # Full summary kept in observations + plan.notes for the finalizer
+                # context. The chat-facing message is intentionally brief: the raw
+                # stdout is already streamed via the executor's <observe> block
+                # (rendered in the left logs panel as a collapsible). Dumping it
+                # again in the chat bubble was pure noise (UX feedback).
                 summary = f"Execution succeeded.\n\nOutput:\n{last_result[:500]}"
+                _files_note = f" ({len(_dir_files_obs)} file(s) in run dir)" if _output_files_exist else ""
+                chat_msg = f"Step done.{_files_note}"
                 _reason = "exit_code=0 + files_exist" if _output_files_exist else "exit_code=0 + meaningful output"
                 self._log("OBSERVER FAST-DONE", body=f"{_reason} → done (no LLM)", node=node)
                 plan = list(state["plan"])
@@ -3038,7 +3099,7 @@ class BioAgent:
                     "manifest": new_manifest,
                     "diagnostic_mode": False,
                     "diagnostic_code": None,
-                    "messages": [AIMessage(content=f"<STATUS:done>\n{summary}")],
+                    "messages": [AIMessage(content=f"<STATUS:done>\n{chat_msg}")],
                 }
 
             if not diagnostic_mode and last_result and "GENERATOR_FAILURE:" in last_result:
@@ -3845,20 +3906,82 @@ class BioAgent:
 
 
     # OTHER UTILS
-    def _stage_attachments(self, tmp_dir: str, attachments: list[str]) -> list[str]:
+    def _enrich_prompt_with_uploads(self, prompt: str, staged: list[str]) -> str:
+        """
+        Surface the just-staged upload paths inside the user prompt with an
+        explicit routing directive for the planner. Without this, terse user
+        prompts ("??", "explain", "expplain") combined with an attached file
+        cause the planner LLM to emit <next:QA> instead of <next:ORCHESTRATOR>,
+        and the file is never opened.
+
+        - When staged is empty, returns prompt unchanged (no-op).
+        - When staged is non-empty, appends an "[ATTACHMENTS]" block at the END
+          of the prompt so the planner extracts the original question + sees
+          the directive.
+
+        Kill-switch: GENOMEER_UPLOAD_ROUTING=0 disables the enrichment.
+        """
+        if not staged:
+            return prompt
+        if os.environ.get("GENOMEER_UPLOAD_ROUTING", "1") == "0":
+            return prompt
+        files_block = "\n".join(f"  - {p}" for p in staged)
+        directive = (
+            f"\n\n---\n"
+            f"[ATTACHMENTS — the user uploaded the following file(s) this turn; "
+            f"they are now in the run directory and MUST be opened/inspected:\n"
+            f"{files_block}\n"
+            f"ROUTING DIRECTIVE: emit <next:ORCHESTRATOR> and create at least "
+            f"one step that reads each file with real code. Do NOT emit "
+            f"<next:QA> when fresh uploads exist. Do NOT answer from the "
+            f"filename or from memory — open the file.]"
+        )
+        return prompt + directive
+
+    def _stage_attachments(self, tmp_dir: str, attachments: list) -> list[str]:
         """
         Copy user-supplied file paths into the run's temp dir.
         Returns the relative paths inside tmp_dir.
+
+        Accepts heterogeneous item types so the UI layer can pass any of:
+          - str                          (absolute file path)
+          - dict  with key "path"        (legacy JSON shape)
+          - Pydantic BaseModel / object  (has .path attribute, e.g. AttachmentIn)
+        Items without a usable path are skipped with a log entry instead of
+        being silently consumed by the broad except clause.
         """
+        def _coerce(item) -> str | None:
+            # Direct string
+            if isinstance(item, str):
+                return item
+            # Pydantic model / arbitrary object exposing .path
+            p = getattr(item, "path", None)
+            if isinstance(p, str) and p:
+                return p
+            # Plain dict (from JSON)
+            if isinstance(item, dict):
+                cand = item.get("path") or item.get("name")
+                if isinstance(cand, str) and cand:
+                    return cand
+            return None
+
         staged_rel: list[str] = []
         up = os.path.join(tmp_dir, "uploads")
         os.makedirs(up, exist_ok=True)
-        for src in attachments or []:
+        for raw in attachments or []:
+            src = _coerce(raw)
+            if not src:
+                self._log("ATTACH SKIP", body=f"unsupported attachment shape: {type(raw).__name__}", node="driver")
+                continue
             try:
+                if not os.path.isfile(src):
+                    self._log("ATTACH SKIP", body=f"not a file: {src}", node="driver")
+                    continue
                 bn = os.path.basename(src)
                 dst = os.path.join(up, bn)
                 shutil.copy2(src, dst)
                 staged_rel.append(os.path.relpath(dst, tmp_dir))
+                self._log("ATTACH STAGED", body=f"{src} -> {dst}", node="driver")
             except Exception as e:
                 self._log("ATTACH STAGE ERROR", body=f"{src}: {e}", node="driver")
         return staged_rel
@@ -4374,6 +4497,19 @@ class BioAgent:
             return bool(state and (state.values or state.next))
         except Exception:
             return False
+
+    def _next_turn_id(self, thread_id: str) -> int:
+        """Multi-turn isolation: compute the turn_id for the call about to start.
+        Returns 1 for the first turn of a session, prev+1 for follow-ups.
+        Robust to checkpointer/read errors -> always returns at least 1.
+        """
+        try:
+            state = self.app.get_state({"configurable": {"thread_id": thread_id}})
+            if state and state.values:
+                return int(state.values.get("turn_id", 0)) + 1
+        except Exception:
+            pass
+        return 1
 
     def _inject_missing_imports(self, code: str) -> str:
         """
@@ -5221,12 +5357,23 @@ class BioAgent:
             # Keep basenames of user uploads so they survive a fatal-error cleanup.
             _staged_basenames = {os.path.basename(p) for p in staged}
 
+            # Multi-turn isolation: compute turn_id BEFORE branching so it's
+            # included in both bootstrap and follow-up inputs.
+            _turn_id = self._next_turn_id(thread_id)
+
+            # Upload-routing fix: when the user attaches files this turn, surface
+            # their paths INSIDE the user prompt with an explicit routing directive
+            # so the planner routes to ORCHESTRATOR instead of QA. Without this,
+            # terse prompts like "??" / "explain this" route to QA and the file
+            # is never opened. No-op when staged is empty -> identical to before.
+            _enriched_prompt = self._enrich_prompt_with_uploads(prompt, staged)
+
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
                 _env = self._select_env(prompt)
                 self._log("ENV ROUTING", body=f"prompt → {_env}", node="go")
                 inputs = {
-                    "messages": [HumanMessage(content=prompt)],
+                    "messages": [HumanMessage(content=_enriched_prompt)],
                     "next_step": None,
                     "env_name": _env,
                     "env_ready": False,
@@ -5236,6 +5383,8 @@ class BioAgent:
                         "observations": [],
                         "attachments": staged,
                         "interaction_mode": getattr(self, "interaction_mode", "auto"),
+                        # Multi-turn: cumulative step counter for UI labeling.
+                        "step_offset": 0,
                     },
                     "plan": [],
                     "current_idx": 0,
@@ -5253,13 +5402,13 @@ class BioAgent:
                     "bio_hint_step_idx": -1,
                     "bio_hint_mode": None,
                     "bio_hint_skipped": False,
+                    "turn_id": _turn_id,
                 }
             else:
-                # FOLLOW-UP TURN -> only append the new message and record any new attachments
-                msg_block = [HumanMessage(content=prompt)]
-                if staged:
-                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {"messages": msg_block}
+                # FOLLOW-UP TURN -> only append the new message (with upload routing
+                # directive baked in by _enrich_prompt_with_uploads when applicable).
+                msg_block = [HumanMessage(content=_enriched_prompt)]
+                inputs = {"messages": msg_block, "turn_id": _turn_id}
                 # Fix C1 — reset run_started_at on resume so global timeout doesn't fire immediately
                 inputs["run_started_at"] = time.time()
 
@@ -5339,12 +5488,20 @@ class BioAgent:
             staged += self._stage_prompt_files(prompt, tmp)
             _staged_basenames = {os.path.basename(p) for p in staged}
 
+            # Multi-turn isolation: compute turn_id BEFORE branching so it's
+            # included in both bootstrap and follow-up inputs.
+            _turn_id = self._next_turn_id(thread_id)
+
+            # Upload-routing fix: see _enrich_prompt_with_uploads docstring.
+            # No-op when staged is empty -> identical behavior to before.
+            _enriched_prompt = self._enrich_prompt_with_uploads(prompt, staged)
+
             if not self._has_session_state(thread_id):
                 # FIRST TURN OF THIS SESSION -> full bootstrap state
                 _env = self._select_env(prompt)
                 self._log("ENV ROUTING", body=f"prompt → {_env}", node="go")
                 inputs = {
-                    "messages": [HumanMessage(content=prompt)],
+                    "messages": [HumanMessage(content=_enriched_prompt)],
                     "next_step": None,
                     "env_name": _env,
                     "env_ready": False,
@@ -5354,6 +5511,8 @@ class BioAgent:
                         "observations": [],
                         "attachments": staged,
                         "interaction_mode": getattr(self, "interaction_mode", "auto"),
+                        # Multi-turn: cumulative step counter for UI labeling.
+                        "step_offset": 0,
                     },
                     "plan": [],
                     "current_idx": 0,
@@ -5371,13 +5530,13 @@ class BioAgent:
                     "bio_hint_step_idx": -1,
                     "bio_hint_mode": None,
                     "bio_hint_skipped": False,
+                    "turn_id": _turn_id,
                 }
             else:
-                # FOLLOW-UP TURN -> only append the new message and record any new attachments
-                msg_block = [HumanMessage(content=prompt)]
-                if staged:
-                    msg_block.append(HumanMessage(content=f"[upload notice] New files: {staged}"))
-                inputs = {"messages": msg_block}
+                # FOLLOW-UP TURN -> only append the new message (with upload routing
+                # directive baked in by _enrich_prompt_with_uploads when applicable).
+                msg_block = [HumanMessage(content=_enriched_prompt)]
+                inputs = {"messages": msg_block, "turn_id": _turn_id}
                 # Fix C1 — reset run_started_at on resume so global timeout doesn't fire immediately
                 inputs["run_started_at"] = time.time()
 

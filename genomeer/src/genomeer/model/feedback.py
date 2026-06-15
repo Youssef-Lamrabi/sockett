@@ -26,17 +26,34 @@ class FeedbackParser:
     """
 
     # starts-with approvals (fast path)
+    # Added (HITL robustness): agree(d)?, sure, perfect, confirm(ed)?,
+    # let's go / let's do it, i agree / i approve / i confirm.
+    # These are caught only when the user TYPES the approval. The UI
+    # "I agree" button sends "Approved — please continue." which already
+    # matches via "approved" — this expansion is defensive for typed input.
     _approve_rx = re.compile(
         r"""
-        ^\s*(?:y|yes|yeah|yep|ok|okay|alright|looks\ ?good|lgtm|go|run|proceed|continue|approved|ship\ it|sounds\ good|fine|works)\b
+        ^\s*(?:
+            y|yes|yeah|yep|ok|okay|alright|looks\ ?good|lgtm|go|run|
+            proceed|continue|approved|ship\ it|sounds\ good|fine|works|
+            agree(?:d)?|sure|perfect|confirm(?:ed)?|
+            let'?s\s+(?:go|do\s+it|start|run\ it)|
+            i\s+(?:agree|approve|confirm)
+        )\b
         """,
         re.IGNORECASE | re.VERBOSE,
     )
 
     # anywhere-in-sentence approvals (fallback if no revise hints)
     _approve_any_rx = re.compile(
-        r"\b(?:yes|yeah|yep|ok|okay|alright|looks\ ?good|lgtm|go|run|proceed|continue|approved|ship\ it|sounds\ good|fine|works)\b",
-        re.IGNORECASE,
+        r"""
+        \b(?:
+            yes|yeah|yep|ok|okay|alright|looks\ ?good|lgtm|go|run|
+            proceed|continue|approved|ship\ it|sounds\ good|fine|works|
+            agree(?:d)?|sure|perfect|confirm(?:ed)?
+        )\b
+        """,
+        re.IGNORECASE | re.VERBOSE,
     )
 
     _skip_rx = re.compile(
@@ -49,10 +66,14 @@ class FeedbackParser:
     _question_rx = re.compile(r"\?\s*$", re.IGNORECASE | re.VERBOSE)
 
     # phrases that strongly indicate corrections/changes
+    # Negations (not, n't, no\b) added so "I'm not sure", "I don't agree",
+    # "no, change it" are correctly classified as revise rather than approve.
     _revise_hints = re.compile(
         r"""
         (?:change|fix|edit|modify|adjust|revise|rewrite|update|tweak|different|instead|but|however|
-           add|remove|replace|use|prefer|constraint|limit|avoid|must|should|cannot|don't)\b
+           add|remove|replace|use|prefer|constraint|limit|avoid|must|should|cannot|
+           don't|won't|can't|doesn't|isn't|aren't|wouldn't|shouldn't|n't|
+           \bnot\b|\bno\b)\b
         """,
         re.IGNORECASE | re.VERBOSE,
     )
@@ -63,7 +84,12 @@ class FeedbackParser:
             return FeedbackResult(False, "ambiguous", text, reasons="empty text")
 
         # 1) Fast regex classification
-        if self._approve_rx.match(text):
+        # Guard: even when the message STARTS with an approval word, we must
+        # check for revision/correction signals before approving. Without this
+        # guard, "ok change step 1" or "perfect but use megahit" or "yes however
+        # add a step" would all be wrongly approved. Falls through to the
+        # revise/question/ambiguous classifiers below when revise hints present.
+        if self._approve_rx.match(text) and not self._revise_hints.search(text):
             return FeedbackResult(True, "approve", text, reasons="regex:approve_start")
 
         if self._skip_rx.match(text):

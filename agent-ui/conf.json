@@ -2,7 +2,7 @@
     "default_model": "deepseek-v4-pro",
     "default_source": "Custom",
     "default_base_url": "https://api.deepseek.com/v1",
-    "default_api_key": "sk-27ffb201d0304f05834ab6073c03c909",
+    "default_api_key": "",
     "bio_hint_model": "Apertus-8B-BioInstruct",
     "bio_hint_source": "Custom",
     "bio_hint_base_url": "http://127.0.0.1:8001/v1",

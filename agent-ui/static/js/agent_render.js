@@ -26,11 +26,11 @@ try {
       }
     });
   }
-} catch {}
+} catch { }
 function highlightIn(el) {
   if (!window.hljs || !el) return;
   el.querySelectorAll('pre code').forEach((block) => {
-    try { window.hljs.highlightElement(block); } catch {}
+    try { window.hljs.highlightElement(block); } catch { }
   });
 }
 
@@ -68,7 +68,24 @@ let reviewSeq = 0;
 function retireReviewCard(card, reason = '') {
   if (!card) return;
   const btn = card.querySelector('.btn-approve');
-  if (btn) btn.remove();               // disappear the button
+  if (btn) {
+    // Grey + disable instead of removing the button. Provides visual feedback
+    // that the approval was registered AND keeps the history readable when
+    // the user scrolls back. New REVIEW cards render fresh active buttons;
+    // previous cards remain greyed/non-interactive.
+    btn.disabled = true;
+    btn.setAttribute('aria-disabled', 'true');
+    btn.dataset.retired = '1';
+    btn.style.opacity = '0.45';
+    btn.style.cursor = 'not-allowed';
+    btn.style.pointerEvents = 'none';
+    btn.style.filter = 'grayscale(60%)';
+    if (reason) {
+      // Replace the forward icon with a check + the reason label so it's
+      // immediately clear the action was applied (e.g. "Approved").
+      btn.innerHTML = `<i class="fas fa-check"></i>&nbsp;${escapeHtml(reason)}`;
+    }
+  }
   card.classList.add('review-retired');
   if (reason) {
     const actions = card.querySelector('.review-actions');
@@ -92,6 +109,10 @@ function retireActiveReview(reason = '') {
 function removeApproveButtonsExcept(scopeCard) {
   document.querySelectorAll('.review-card .btn-approve').forEach(btn => {
     const card = btn.closest('.review-card');
+    // Preserve buttons that have already been retired (greyed via retireReviewCard).
+    // They serve as visual history markers; only the current/scoped card's
+    // sibling buttons should be removed.
+    if (btn.dataset.retired === '1' || card?.classList.contains('review-retired')) return;
     if (!scopeCard || card !== scopeCard) btn.remove();
   });
 }
@@ -204,17 +225,17 @@ export function renderUserMessageWithAttachments(content, attachments = []) {
   const grid = attachments && attachments.length ? `
     <div class="att-grid" style="display:flex;flex-wrap:wrap;gap:10px;margin:0 0 10px 0;">
       ${attachments.map(a => {
-        const isImg = /^image\//i.test(a.type) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(a.name || '');
-        const ext   = (a.name?.split('.').pop() || a.type?.split('/').pop() || '').toUpperCase();
-        const src   = a.previewUrl || a.url || a.path || '';
-        const safeName = escapeHtml(a.name || 'file');
-        return `
+    const isImg = /^image\//i.test(a.type) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(a.name || '');
+    const ext = (a.name?.split('.').pop() || a.type?.split('/').pop() || '').toUpperCase();
+    const src = a.previewUrl || a.url || a.path || '';
+    const safeName = escapeHtml(a.name || 'file');
+    return `
           <div class="att-card" style="width:140px;border:1px solid #E3E6EA;border-radius:10px;overflow:hidden;background:#fff;">
             <div class="att-preview" style="height:90px;display:flex;align-items:center;justify-content:center;background:#F8F9FB;">
               ${isImg && src
-                ? `<img src="${escapeHtml(src)}" alt="${safeName}" style="max-width:100%;max-height:100%;display:block;">`
-                : `<div style="font-weight:700;font-family:ui-monospace,monospace;opacity:.7;">.${escapeHtml(ext || 'FILE')}</div>`
-              }
+        ? `<img src="${escapeHtml(src)}" alt="${safeName}" style="max-width:100%;max-height:100%;display:block;">`
+        : `<div style="font-weight:700;font-family:ui-monospace,monospace;opacity:.7;">.${escapeHtml(ext || 'FILE')}</div>`
+      }
             </div>
             <div class="att-meta" style="padding:6px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
               <span style="background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;padding:0 6px;border-radius:999px;font-size:11px;margin-right:6px;">.${escapeHtml(ext || 'file')}</span>
@@ -222,7 +243,7 @@ export function renderUserMessageWithAttachments(content, attachments = []) {
             </div>
           </div>
         `;
-      }).join('')}
+  }).join('')}
     </div>
   ` : ``;
 
@@ -978,11 +999,11 @@ function renderAgentInfoLine(icon, label, detail, bg, border, color) {
 
 // Colour palettes reused across new event handlers
 const _C = {
-  green:  { bg: '#D4EDDA', border: '#A8D5B5', text: '#155724' },
+  green: { bg: '#D4EDDA', border: '#A8D5B5', text: '#155724' },
   orange: { bg: '#FFF3CD', border: '#FFEAA7', text: '#856404' },
-  red:    { bg: '#FFE3E3', border: '#F5B7B7', text: '#8b0000' },
-  grey:   { bg: '#F0F0F0', border: '#CCCCCC', text: '#555555' },
-  blue:   { bg: '#D0E8FF', border: '#90C4F5', text: '#00407A' },
+  red: { bg: '#FFE3E3', border: '#F5B7B7', text: '#8b0000' },
+  grey: { bg: '#F0F0F0', border: '#CCCCCC', text: '#555555' },
+  blue: { bg: '#D0E8FF', border: '#90C4F5', text: '#00407A' },
 };
 
 /**
@@ -996,8 +1017,8 @@ function handleNewAgentTag(tag, raw) {
   if (tag === 'VALIDATOR DONE' || tag === 'VALIDATOR_DONE') {
     // Expected body: "run_fastp score=0.87" or similar
     const scoreMatch = body.match(/score\s*[=:]\s*([0-9.]+)/i);
-    const scoreStr   = scoreMatch ? ` → score ${parseFloat(scoreMatch[1]).toFixed(2)}` : '';
-    const toolName   = body.replace(/score\s*[=:]\s*[0-9.]+/i, '').trim() || 'tool';
+    const scoreStr = scoreMatch ? ` → score ${parseFloat(scoreMatch[1]).toFixed(2)}` : '';
+    const toolName = body.replace(/score\s*[=:]\s*[0-9.]+/i, '').trim() || 'tool';
     renderAgentInfoLine('fa-check-circle', 'VALIDATOR', `${toolName}${scoreStr}`,
       _C.green.bg, _C.green.border, _C.green.text);
     return true;
@@ -1020,11 +1041,11 @@ function handleNewAgentTag(tag, raw) {
   // ── QUALITY GATE ── colour by level (ok/warn/fail) ────────────────────────
   if (tag === 'QUALITY GATE' || tag === 'QUALITY_GATE') {
     const levelMatch = body.match(/^\s*(ok|warn(?:ing)?|fail(?:ed)?)\b/i);
-    const level      = levelMatch ? levelMatch[1].toLowerCase() : 'ok';
-    let   c, ico;
-    if (/^fail/.test(level))       { c = _C.red;    ico = 'fa-times-circle'; }
-    else if (/^warn/.test(level))  { c = _C.orange; ico = 'fa-exclamation-triangle'; }
-    else                           { c = _C.green;  ico = 'fa-check-circle'; }
+    const level = levelMatch ? levelMatch[1].toLowerCase() : 'ok';
+    let c, ico;
+    if (/^fail/.test(level)) { c = _C.red; ico = 'fa-times-circle'; }
+    else if (/^warn/.test(level)) { c = _C.orange; ico = 'fa-exclamation-triangle'; }
+    else { c = _C.green; ico = 'fa-check-circle'; }
     const detail = body.replace(/^\s*(ok|warn(?:ing)?|fail(?:ed)?)\b\s*/i, '').trim() || body;
     renderAgentInfoLine(ico, 'QUALITY GATE', detail, c.bg, c.border, c.text);
     return true;
@@ -1061,7 +1082,7 @@ function handleNewAgentTag(tag, raw) {
   // ── BioRAG ── blue info line ──────────────────────────────────────────────
   if (tag === 'BIORAG' || tag === 'RAG CONTEXT' || tag === 'RAG_CONTEXT' || tag === 'RAG DEGRADED' || tag === 'RAG_DEGRADED') {
     const isDegraded = tag.includes('DEGRADED');
-    const c   = isDegraded ? _C.orange : _C.blue;
+    const c = isDegraded ? _C.orange : _C.blue;
     const ico = isDegraded ? 'fa-exclamation-triangle' : 'fa-database';
     renderAgentInfoLine(ico, 'BioRAG', body || 'RAG context injected',
       c.bg, c.border, c.text);
@@ -1082,7 +1103,7 @@ export function renderAssistantEvent(evt) {
     endCurrentChatStreamNow();
     hideAssistantTyping();
     renderErrorCard(evt.text || 'Connection error.');
-    renderStatusBox('error'); 
+    renderStatusBox('error');
     clearLiveSpinner();
     markRunInactive();
     return;
@@ -1193,7 +1214,7 @@ export function renderAssistantEvent(evt) {
       } else {
         finalizeAssistantMessageLive();
       }
-    } 
+    }
     else {
       finalizeAssistantMessageLive();
     }
@@ -1206,7 +1227,12 @@ export function renderAssistantEvent(evt) {
 
 /* ----------------------------- Clear panes ------------------------------ */
 export function clearChat() {
-  const c = $('chat'); if (c) c.innerHTML = '';
+  const c = $('chat');
+  if (c) {
+    Array.from(c.children).forEach(child => {
+      if (child.id !== 'empty-state') child.remove();
+    });
+  }
   currentAssistantEl = null;
   liveBuf = ""; liveFull = "";
   if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }

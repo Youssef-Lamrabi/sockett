@@ -18,8 +18,10 @@
       </div>
       <div style="font-size: 14px;">&nbsp;&nbsp;MODE</div>
       <div class="mode-switch" id="mode-switch" role="group" aria-label="Agent mode">
-        <button id="mode-auto" class="seg active" data-mode="auto" title="Let the agent run end to end">Agent-Self-critic</button>
-        <button id="mode-feedback" class="seg" data-mode="feedback" title="Ask before running code">Human-in-loop</button>
+        <button id="mode-auto" class="seg active" data-mode="auto"
+          title="Let the agent run end to end">Agent-Self-critic</button>
+        <button id="mode-feedback" class="seg" data-mode="feedback"
+          title="Ask before running code">Human-in-loop</button>
       </div>
     </div>
 
@@ -38,38 +40,111 @@
     </div>
   </div>
 
-  <div id="layout">
-    <aside id="left">
-      <h3 style="margin-top: 0;font-size: 15px;">Tool / Logs</h3>
-      <div id="logs"></div>
-    </aside>
+  <div id="content-area">
+    <div id="layout">
+      <aside id="left">
+        <h3 style="margin-top: 0;font-size: 15px;">Tool / Logs</h3>
+        <div id="logs"></div>
+      </aside>
 
-    <div id="splitter" class="splitter" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize sidebar"></div>
+      <div id="splitter" class="splitter" role="separator" aria-orientation="vertical" tabindex="0"
+        aria-label="Resize sidebar"></div>
 
-    <main id="right">
-      <div id="chat"></div>
-      <div class="composer-wrapper">
-        <div id="attach-dock" class="attach-dock" aria-live="polite"></div>
-        <div id="composer">
-          <label class="upload" title="Attach file">
-            <input type="file" id="file-input" />
-            <span>＋</span>
-          </label>
-          <textarea
-            id="message"
-            class="composer-textarea"
-            placeholder="Enter your message… "
-            rows="1"
-            autocomplete="off"
-            spellcheck="true"
-          ></textarea>
-          <button id="send" type="button" class="primary button-submit">Send</button>
-          <button id="stop" type="button" class="danger button-stop" style="display:none;border-radius: 0px 19px 19px 0px;" aria-label="Stop current run">
-            <i class="fa fa-stop" aria-hidden="true"></i> Stop
-          </button>
+      <main id="right">
+        <div id="chat">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-state-heading">
+              <i class="fa fa-dna" aria-hidden="true"></i>
+              <h2>What would you like to analyze?</h2>
+              <p class="empty-state-sub">Select a prompt below or type your own question</p>
+            </div>
+            <div class="prompt-cards">
+              <button class="prompt-card"
+                data-prompt="I have paired-end Illumina metagenomic reads from a mock microbial community (ZymoBIOMICS standard, 8 species: Escherichia coli, Listeria monocytogenes, Pseudomonas aeruginosa, Salmonella enterica, Staphylococcus aureus, Bacillus subtilis, Saccharomyces cerevisiae, Cryptococcus neoformans — replace with your own reads if available). Simulate 100k paired-end reads from this community if no real reads are provided. Trim adapters with Fastp, then run Kraken2 taxonomic classification using the k2_standard database (--paired mode). Generate a Kraken2 summary report and an interactive Krona HTML visualization. Report the top 20 genera by relative abundance and flag any discrepancy from the expected community composition.">
+                <span class="prompt-card-icon"><i class="fa fa-sitemap" aria-hidden="true"></i></span>
+                <span class="prompt-card-title">Taxonomic Classification</span>
+                <span class="prompt-card-desc">Run Kraken2 on reads and visualize taxonomy with Krona</span>
+              </button>
+              <button class="prompt-card"
+                data-prompt="I have paired-end Illumina metagenomic reads from a synthetic 3-species community: Escherichia coli K-12 MG1655 (60%), Bacillus subtilis 168 (30%), and Pseudomonas putida KT2440 (10%) — replace with your own reads if available. Simulate 200k paired-end 150 bp reads from these genomes using InSilicoSeq if no real reads are provided. Trim with Fastp, then assemble with MEGAHIT (--min-contig-len 1000 --k-min 27 --k-max 127 --k-step 10). Align original reads back to the assembly with Bowtie2 and compute per-contig coverage depths with jgi_summarize_bam_contig_depths. Run MetaBAT2 binning. Assess bins with CheckM lineage_wf. Report all bins with completeness >50% and contamination <10%.">
+                <span class="prompt-card-icon"><i class="fa fa-cubes" aria-hidden="true"></i></span>
+                <span class="prompt-card-title">Assembly &amp; Binning</span>
+                <span class="prompt-card-desc">Assemble with MEGAHIT, bin with MetaBAT2, QC with CheckM</span>
+              </button>
+              <button class="prompt-card"
+                data-prompt="I have the genome of Escherichia coli K-12 MG1655 (RefSeq NC_000913.3, ~4.6 Mb, 4285 genes — replace with your genome of interest). Predict protein-coding genes with Prodigal in single-genome mode (-p single -f gff). Annotate the predicted proteins using eggNOG-mapper v2 against the eggNOG 5.0 database (--itype proteins -m diamond). Summarize results by KEGG pathway category and COG functional group. Generate a bar chart of the top 15 enriched KEGG pathways and a pie chart of COG categories. Export a TSV with gene ID, COG category, KEGG ortholog, and pathway.">
+                <span class="prompt-card-icon"><i class="fa fa-cogs" aria-hidden="true"></i></span>
+                <span class="prompt-card-title">Functional Annotation</span>
+                <span class="prompt-card-desc">Prodigal ORF prediction + eggNOG-mapper KEGG/COG annotation</span>
+              </button>
+              <button class="prompt-card"
+                data-prompt="I have the whole-genome sequence of a Klebsiella pneumoniae clinical isolate (a known carbapenem-resistant strain, ~5.5 Mb — replace with your isolate genome if available; simulate a 5 Mb genome with realistic ARG content using Grinder if needed). Run RGI (Resistance Gene Identifier) v6 with the CARD database v3.2.9 in perfect and strict mode (rgi main --input_type contig). Also run AMRFinderPlus with the NCBI AMR database. Report all identified ARGs by drug class, resistance mechanism, and AMR gene family. Flag genes conferring resistance to last-resort antibiotics (carbapenems, colistin, vancomycin).">
+                <span class="prompt-card-icon"><i class="fa fa-shield" aria-hidden="true"></i></span>
+                <span class="prompt-card-title">Resistance Gene Detection</span>
+                <span class="prompt-card-desc">Identify ARGs using CARD database and report per-sample profiles</span>
+              </button>
+              <button class="prompt-card"
+                data-prompt="I have 16S rRNA V4 amplicon paired-end reads (Illumina 250 bp) from 12 soil samples across 3 elevation zones in the Alps (4 replicates each: 1000 m, 2000 m, 3000 m — replace with your own samples and metadata if available; simulate reads from 30 mock ASVs using grinder if needed). Import into QIIME 2 and denoise with DADA2 (--p-trunc-len-f 230 --p-trunc-len-r 200). Classify ASVs against the SILVA 138 database (--p-confidence 0.7). Compute alpha diversity metrics (Shannon, observed features, Faith's PD, Pielou's evenness) and beta diversity (Bray-Curtis, weighted and unweighted UniFrac). Generate PCoA plots colored by elevation zone and run PERMANOVA to test whether elevation significantly explains community differences (999 permutations).">
+                <span class="prompt-card-icon"><i class="fa fa-bar-chart" aria-hidden="true"></i></span>
+                <span class="prompt-card-title">Diversity Analysis</span>
+                <span class="prompt-card-desc">Alpha (Shannon/Chao1) &amp; beta diversity (Bray-Curtis) with PCoA</span>
+              </button>
+              <button class="prompt-card"
+                data-prompt="I have metagenomic reads from a freshwater lake sample suspected to contain phages targeting Escherichia coli and Bacillus subtilis (replace with your own virome reads if available; simulate 150k paired-end reads from phage genomes T4, Lambda, SPO1, and phi29 using InSilicoSeq if needed). Assemble reads with metaSPAdes (--meta). Identify viral contigs ≥10 kb using VirSorter2 (--min-score 0.5, all groups) and cross-validate with VIBRANT. Annotate viral genes with DRAM-v. Cluster viral genomes at 95% ANI using vConTACT2 to assign phage family taxonomy. Predict bacterial hosts using iPHoP. Report phage-host pairs, phage lifestyle (lytic vs lysogenic), and community-level viral diversity metrics.">
+                <span class="prompt-card-icon"><i class="fa fa-virus" aria-hidden="true"></i></span>
+                <span class="prompt-card-title">Viral Metagenomics</span>
+                <span class="prompt-card-desc">Detect phage contigs with VirSorter2/VIBRANT and annotate hosts</span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="composer-wrapper">
+          <div class="composer-toolbar">
+            <button id="btn-file-explorer" class="fe-trigger" title="Agent Workspace"
+              aria-label="Toggle agent workspace" aria-expanded="false">
+              <i class="fa fa-folder-open" aria-hidden="true"></i>
+              <span>Workspace</span>
+            </button>
+          </div>
+          <div id="attach-dock" class="attach-dock" aria-live="polite"></div>
+          <div id="composer">
+            <label class="upload" title="Attach file" aria-label="Attach file">
+              <input type="file" id="file-input" />
+              <i class="fa fa-paperclip" aria-hidden="true"></i>
+            </label>
+            <textarea id="message" class="composer-textarea" placeholder="Ask anything about your genomic data…"
+              rows="1" autocomplete="off" spellcheck="true"></textarea>
+            <button id="send" type="button" class="button-submit" aria-label="Send message">
+              <i class="fa fa-paper-plane" aria-hidden="true"></i>
+              <!-- send -->
+            </button>
+            <button id="stop" type="button" class="button-stop" style="display:none;" aria-label="Stop current run">
+              <i class="fa fa-stop" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div id="fe-splitter" class="splitter" role="separator" aria-orientation="vertical" tabindex="0"
+      aria-label="Resize workspace panel"></div>
+    <div id="file-explorer" aria-hidden="true">
+      <div class="fe-inner">
+        <div class="fe-header">
+          <div class="fe-title">
+            <i class="fa fa-folder-open" aria-hidden="true"></i>
+            <span>Agent Workspace</span>
+          </div>
+          <button id="fe-close" class="icon fe-close-btn" aria-label="Close workspace">✕</button>
+        </div>
+        <div class="fe-body">
+          <div class="fe-empty-state">
+            <i class="fa fa-folder-o" aria-hidden="true"></i>
+            <p>No files yet</p>
+            <span>Files generated by the agent during this session will appear here</span>
+          </div>
         </div>
       </div>
-    </main>
+    </div>
   </div>
 </div>
 
@@ -114,12 +189,12 @@
           </div>
         </div>
         <div class="grid2">
-          <input id="mdl-base-url" placeholder="Model URL (optional)" class="modal-input"/>
-          <input id="mdl-api-key" placeholder="API key (optional)" class="modal-input"/>
+          <input id="mdl-base-url" placeholder="Model URL (optional)" class="modal-input" />
+          <input id="mdl-api-key" placeholder="API key (optional)" class="modal-input" />
         </div>
         <button id="mdl-add" class="button">Add Model</button>
       </div>
-      
+
       <br>
       <div class="field">
         <label>Your Models</label>
