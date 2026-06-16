@@ -1,4 +1,5 @@
-import re, contextlib, concurrent.futures, threading, shutil
+import re, contextlib, concurrent.futures, threading, shutil, os
+from pathlib import Path
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
@@ -67,9 +68,46 @@ _CLI_TOOL_BINARIES = {
     "nonpareil": "nonpareil",
 }
 
+# ─── Multi-env bin path discovery ─────────────────────────────────────────
+# CRITICAL FIX: shutil.which() only checks the current PATH (= bio-agent-env1
+# when uvicorn runs). Bioinfo tools like seqkit/prokka/kraken2 actually live
+# in meta-env1, a SEPARATE conda env. Without this fix, the agent's tool
+# inventory falsely flags these tools as "UNAVAILABLE" and the planner
+# resorts to fallbacks (e.g. Biopython instead of seqkit), losing
+# correctness and performance.
+#
+# Path resolution: matches genomeer.runtime.env_manager.ENVS_DIR convention
+# (RUNTIME_PKG_HOME defaults to ~/.bioagentpkg).
+_RUNTIME_PKG_HOME = Path(os.environ.get("RUNTIME_PKG_HOME", str(Path.home() / ".bioagentpkg"))).resolve()
+_ENVS_DIR = _RUNTIME_PKG_HOME / "runtime" / "pkgs" / "envs"
+# Order matters: most-likely env first for early-exit optimisation.
+_KNOWN_ENV_BINS = [
+    _ENVS_DIR / "meta-env1" / "bin",        # bioinfo CLI stack (seqkit, prokka, kraken2, ...)
+    _ENVS_DIR / "bio-agent-env1" / "bin",   # generic python env (uvicorn host)
+    _ENVS_DIR / "btools_env_py310" / "bin", # HLA stack (cnvkit, OptiType, ...)
+]
+
+def _which_in_envs(exe: str) -> bool:
+    """Check if executable exists in current PATH OR in any of the known
+    runtime conda env bin directories. Treats a regular file with the +x
+    bit (or just-existing for windows-style scripts) as available."""
+    if shutil.which(exe):
+        return True
+    for env_bin in _KNOWN_ENV_BINS:
+        try:
+            cand = env_bin / exe
+            if cand.is_file():
+                # On unix require +x; on windows .exe/.py are executable by extension
+                if os.name == "nt" or os.access(str(cand), os.X_OK):
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
+
 def _available_cli_tools() -> set:
-    """Return the set of CLI tool names that are actually on PATH."""
-    return {name for name, exe in _CLI_TOOL_BINARIES.items() if shutil.which(exe)}
+    """Return the set of CLI tool names available either on the current PATH
+    or in any of the known runtime conda env bin directories."""
+    return {name for name, exe in _CLI_TOOL_BINARIES.items() if _which_in_envs(exe)}
 
 _AVAILABLE_CLI = _available_cli_tools()  # computed once at import time
 

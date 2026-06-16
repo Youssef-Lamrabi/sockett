@@ -1315,6 +1315,51 @@ function boot() {
     });
     feCloseBtn?.addEventListener('click', closeFE);
 
+    // ─── Global interceptor for "Open Workspace" links from finalizer reports ───
+    // The finalizer emits markdown links with href="#open-workspace" in the
+    // ## Artifacts section. We catch the click here (delegated, so it works
+    // for both streamed and statically-rendered messages) and open the FE
+    // panel instead of letting the browser navigate to a # anchor.
+    // Tag the link so CSS can style it as a button (a[data-action] selector
+    // works for any DOM rendering path without needing per-link classes).
+    document.addEventListener('click', (ev) => {
+      const a = ev.target.closest && ev.target.closest('a[href="#open-workspace"]');
+      if (!a) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const isOpen = contentArea?.classList.contains('fe-open');
+      if (!isOpen) {
+        openFE();
+        try { refreshWorkspaceFiles(); } catch { /* fine */ }
+      } else {
+        try { refreshWorkspaceFiles(); } catch { /* fine */ }
+      }
+    }, true);
+
+    // Idempotently tag any existing or newly-inserted "#open-workspace" links
+    // with data-action="open-workspace" so styling/aria are consistent.
+    const _tagWorkspaceLinks = (root) => {
+      try {
+        (root || document).querySelectorAll('a[href="#open-workspace"]:not([data-action])')
+          .forEach(a => {
+            a.setAttribute('data-action', 'open-workspace');
+            a.setAttribute('role', 'button');
+            a.setAttribute('title', 'Open the Workspace panel');
+          });
+      } catch { /* no-op */ }
+    };
+    _tagWorkspaceLinks(document);
+    try {
+      const _mo = new MutationObserver((muts) => {
+        for (const m of muts) {
+          for (const n of m.addedNodes || []) {
+            if (n.nodeType === 1) _tagWorkspaceLinks(n);
+          }
+        }
+      });
+      _mo.observe(document.body, { childList: true, subtree: true });
+    } catch { /* MutationObserver unavailable -> tagging at click time still works */ }
+
     // Inject view-toggle + refresh buttons into the workspace header
     // (no HTML change — injected once, idempotent).
     (function injectHeaderTools() {
@@ -1350,6 +1395,28 @@ function boot() {
           }
         });
         closeBtn.parentNode.insertBefore(viewBtn, closeBtn);
+      }
+
+      // --- Show success / all toggle ---
+      // Filters the generated list by step status. Default 'success' (hides
+      // files from running/blocked steps). Click toggles to 'all' (shows
+      // everything on disk, including in-progress/failed step outputs).
+      if (!document.getElementById('fe-show-toggle')) {
+        const showBtn = document.createElement('button');
+        showBtn.id = 'fe-show-toggle';
+        showBtn.type = 'button';
+        showBtn.className = 'icon fe-show-toggle';
+        showBtn.setAttribute('aria-pressed', _wsGetShowMode() === 'all' ? 'true' : 'false');
+        showBtn.innerHTML = '<i class="fa fa-filter" aria-hidden="true"></i>';
+        closeBtn.parentNode.insertBefore(showBtn, closeBtn);
+        showBtn.addEventListener('click', () => {
+          const next = _wsGetShowMode() === 'success' ? 'all' : 'success';
+          _wsSetShowMode(next);
+          // Force re-fetch: clear signature so refresh always re-renders
+          try { _wsCurrentSig = ''; } catch {}
+          refreshWorkspaceFiles().catch(() => {});
+        });
+        _wsUpdateShowToggleUi();
       }
 
       // --- Refresh ---
@@ -1501,6 +1568,15 @@ function _wsGetUploadsOpen() {
 function _wsSetUploadsOpen(open) {
   localStorage.setItem('fe_uploads_open', open ? '1' : '0');
 }
+// Workspace show-mode: 'success' (default — only files from done steps)
+// or 'all' (include files from running/blocked steps). Persisted in
+// localStorage so the user's choice survives reload.
+function _wsGetShowMode() {
+  return localStorage.getItem('fe_show_mode') === 'all' ? 'all' : 'success';
+}
+function _wsSetShowMode(m) {
+  localStorage.setItem('fe_show_mode', m === 'all' ? 'all' : 'success');
+}
 
 // File item renderer — same markup for both view modes; CSS handles layout
 function _wsFileItemHtml(f, opts = {}) {
@@ -1538,13 +1614,16 @@ function _wsUploadsFolderHtml(uploads) {
 
 let _wsCurrentSig = '';            // signature of last-rendered list (anti-flicker)
 let _wsPreviewedPath = null;       // path of file currently shown in inline preview
+let _wsLastHiddenCount = 0;        // generated files filtered out by show=success
 async function refreshWorkspaceFiles() {
   const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
   const body = document.querySelector('#file-explorer .fe-body');
   if (!body) return;
   if (!sid) { _wsRenderEmpty(body, 'No active session'); return; }
   try {
-    const res = await fetch(`/api/sessions/${sid}/files`, { headers: { ...api.headers() } });
+    const showMode = _wsGetShowMode();
+    const res = await fetch(`/api/sessions/${sid}/files?show=${encodeURIComponent(showMode)}`,
+                            { headers: { ...api.headers() } });
     if (!res.ok) {
       _wsRenderEmpty(body, `Unable to load workspace (${res.status})`);
       return;
@@ -1552,13 +1631,52 @@ async function refreshWorkspaceFiles() {
     const data = await res.json();
     const uploads = Array.isArray(data?.uploads) ? data.uploads : [];
     const generated = Array.isArray(data?.generated) ? data.generated : [];
+    _wsLastHiddenCount = Number(data?.hidden_count || 0);
+    // Signature includes hidden_count so toggling show=success<->all forces re-render.
     const sig = JSON.stringify([uploads.map(f => [f.rel_path, f.size, f.mtime]),
-                                 generated.map(f => [f.rel_path, f.size, f.mtime])]);
+                                 generated.map(f => [f.rel_path, f.size, f.mtime]),
+                                 showMode, _wsLastHiddenCount]);
     if (sig === _wsCurrentSig) return;
     _wsCurrentSig = sig;
     _wsRenderLists(body, uploads, generated);
+    _wsUpdateShowToggleUi();
   } catch (err) {
     /* silent — keep last good render */
+  }
+}
+
+// Update the visual state of the show=success/all toggle button (label,
+// tooltip, count of hidden files). Idempotent — safe to call on any render.
+//
+// UX semantics (FIXED — was inverted in v1):
+//   - Filter ON (mode=success, default) → icon LIT/ACTIVE blue
+//     "the filter is working; I'm hiding running/blocked"
+//   - Filter OFF (mode=all)            → icon DIM/grayed (with eye overlay)
+//     "the filter is off; you see everything"
+// Rationale: "active" reads as "filter is doing its job", not the opposite.
+function _wsUpdateShowToggleUi() {
+  const btn = document.getElementById('fe-show-toggle');
+  if (!btn) return;
+  const mode = _wsGetShowMode();
+  if (mode === 'success') {
+    // Filter ON — blue active icon, badge shows how many it's hiding.
+    const hidden = _wsLastHiddenCount;
+    btn.classList.add('active');
+    btn.classList.remove('filter-off');
+    btn.setAttribute('aria-pressed', 'true');
+    btn.title = hidden > 0
+      ? `Filter ON — hiding ${hidden} file${hidden > 1 ? 's' : ''} from running/blocked steps. Click to show all.`
+      : 'Filter ON — only files from completed (done) steps are shown. Click to show all.';
+    btn.innerHTML = hidden > 0
+      ? `<i class="fa fa-filter" aria-hidden="true"></i><span class="fe-show-badge">${hidden}</span>`
+      : `<i class="fa fa-filter" aria-hidden="true"></i>`;
+  } else {
+    // Filter OFF — grayed icon with eye overlay (you're seeing everything).
+    btn.classList.remove('active');
+    btn.classList.add('filter-off');
+    btn.setAttribute('aria-pressed', 'false');
+    btn.title = 'Filter OFF — showing ALL files (including from running/blocked steps). Click to filter to done only.';
+    btn.innerHTML = `<i class="fa fa-filter" aria-hidden="true"></i><i class="fa fa-eye fe-show-eye" aria-hidden="true"></i>`;
   }
 }
 function _wsRenderEmpty(body, hint = '') {

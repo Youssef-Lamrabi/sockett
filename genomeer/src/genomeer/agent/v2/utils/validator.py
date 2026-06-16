@@ -272,7 +272,41 @@ class Kraken2Contract(_BaseContract):
     ]
     THRESHOLD = 0.05
 
+    @staticmethod
+    def _db_appears_viral_only(report_path: str) -> bool:
+        """Detect a DB/sample mismatch where the Kraken2 database only contains
+        viral genomes (so bacterial/fungal samples classify at near-zero rate).
+
+        Reads the report's domain-rank ("D") lines and returns True when the
+        Viruses domain has classified reads while Bacteria/Archaea/Eukaryota
+        domains have none. In that case a low classification rate is a
+        configuration/biology outcome, NOT a tool failure, and retrying the
+        identical command against the same DB cannot improve it.
+        """
+        dom = {"Viruses": 0, "Bacteria": 0, "Archaea": 0, "Eukaryota": 0}
+        try:
+            with open(report_path, encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.rstrip("\n").split("\t")
+                    # %\tclade_reads\ttaxon_reads\trank\ttaxid\tname
+                    if len(parts) < 6:
+                        continue
+                    rank = parts[3].strip()
+                    if rank != "D":  # domain / superkingdom rows only
+                        continue
+                    name = parts[5].strip()
+                    if name in dom:
+                        try:
+                            dom[name] = int(parts[1].strip())
+                        except ValueError:
+                            pass
+        except Exception:
+            return False
+        cellular = dom["Bacteria"] + dom["Archaea"] + dom["Eukaryota"]
+        return dom["Viruses"] > 0 and cellular == 0
+
     def check(self, run_dir: str, stdout: str) -> ContractResult:
+        import os as _os
         report = self._glob_first(run_dir, "*.report", "*_report.txt", "*kraken*.txt",
                                   "*kraken2*.report")
         if not report:
@@ -302,6 +336,27 @@ class Kraken2Contract(_BaseContract):
             return ContractResult(ok=True, score=0.5,
                                   reason="kraken2: report found (classification rate unparseable)")
         if score < self.THRESHOLD:
+            # Fix #2 — DB/sample mismatch soft-pass: if the run produced a valid
+            # report with SOME classified reads, and the DB is viral-only while
+            # the sample is cellular, the low rate is not a tool failure.
+            # Accept it (no pointless retry) with a clear advisory reason.
+            # Kill-switch: GENOMEER_KRAKEN2_DBMISMATCH_SOFTPASS=0.
+            _softpass_on = _os.environ.get(
+                "GENOMEER_KRAKEN2_DBMISMATCH_SOFTPASS", "1") != "0"
+            if (
+                _softpass_on
+                and score > 0.0
+                and self._db_appears_viral_only(report)
+            ):
+                return ContractResult(
+                    ok=True, score=score,
+                    reason=(
+                        f"kraken2: {score*100:.1f}% classified — run OK; the "
+                        "configured database appears viral-only, so a cellular "
+                        "(bacterial/fungal) sample classifies at a low rate. "
+                        "Use Kraken2 Standard/PlusPF for cellular communities."
+                    ),
+                )
             return ContractResult(
                 ok=False, score=score,
                 reason=f"kraken2: {score*100:.1f}% classified (threshold {self.THRESHOLD*100:.0f}%)",
@@ -2075,6 +2130,42 @@ class ToolValidator:
         "long":   0,
     }
 
+    # Leading action verbs that mark a step as POST-PROCESSING the output of a
+    # previously-run tool (parse a report, tabulate results, plot a chart…)
+    # rather than EXECUTING the tool itself. When a step starts with one of
+    # these verbs we must NOT apply the tool's runtime contract, otherwise the
+    # contract reads the tool's prior output file and (mis)judges the wrong
+    # thing — e.g. "Parse kraken2.report to extract top genera" was wrongly
+    # graded by Kraken2Contract on the classification rate (1.1% < 5% → FAIL),
+    # blocking a perfectly correct pandas parsing step.
+    #
+    # Conservative on purpose: only unambiguous post-processing verbs are
+    # listed. Ambiguous verbs that can BE a tool invocation are intentionally
+    # excluded (e.g. "filter"→fastp, "compute/calculate"→seqkit, "merge/
+    # convert"→samtools, "extract"→seqkit grep). Excluding them keeps real
+    # tool steps on their deterministic contract; the worst case for a missed
+    # post-proc verb is the prior (buggy) behavior, never a new regression.
+    _POST_PROCESS_LEADING_VERBS: Tuple[str, ...] = (
+        "parse", "summarize", "summarise", "tabulate", "plot",
+        "visualize", "visualise", "collate", "reformat", "render",
+        "report",
+    )
+
+    @staticmethod
+    def _is_post_processing_step(step_title: str) -> bool:
+        """True if the step's LEADING verb marks it as post-processing a tool's
+        output (so no tool runtime contract should apply). Kill-switch:
+        GENOMEER_VALIDATOR_POSTPROC_GUARD=0 disables this guard entirely."""
+        import os as _os
+        if _os.environ.get("GENOMEER_VALIDATOR_POSTPROC_GUARD", "1") == "0":
+            return False
+        import re as _re
+        # First alphabetic word of the (stripped) title, lowercased.
+        m = _re.match(r"\s*([a-zA-Z]+)", step_title or "")
+        if not m:
+            return False
+        return m.group(1).lower() in ToolValidator._POST_PROCESS_LEADING_VERBS
+
     @staticmethod
     def _match_contract(step_title: str) -> Optional[_BaseContract]:
         """Match a contract using whole-word boundary matching.
@@ -2082,7 +2173,15 @@ class ToolValidator:
         Substring matching caused false positives, e.g. "assemble" matching
         "assembled sequence" in unrelated ORF-density steps. Whole-word regex
         ensures keywords only match when they appear as complete words.
+
+        Fix #1 — post-processing guard: a step whose leading verb is a
+        post-processing verb (parse/tabulate/plot…) gets NO contract, so it
+        routes to the observer (LLM) instead of being mis-graded by the tool's
+        runtime contract.
         """
+        # Post-processing steps must never inherit a tool's runtime contract.
+        if ToolValidator._is_post_processing_step(step_title):
+            return None
         import re as _re
         title_lower = (step_title or "").lower()
         for contract in _ALL_CONTRACTS:

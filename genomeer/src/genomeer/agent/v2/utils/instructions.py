@@ -61,6 +61,29 @@ SPECIAL ALWAYS-TRUE RULES:
    matched your filter". CORRECT: omit -l entirely when using -A.
      WRONG : ncbi-genome-download -A GCF_000006945.2 -l complete -s refseq -F fasta ... bacteria
      CORRECT: ncbi-genome-download -A GCF_000006945.2 -s refseq -F fasta --flat-output -o dir bacteria
+
+   ASSEMBLY-LEVEL FALLBACK (critical for fungi / eukaryotes / non-model organisms):
+   When downloading by -g (genera) or -t (taxid), DO NOT hard-code `-l complete`. Many
+   organisms — especially fungi (e.g. Cryptococcus, Saccharomyces) and eukaryotes — have
+   their best RefSeq genome at "Chromosome" or "Scaffold" level, NOT "Complete Genome".
+   Hard-coding `-l complete` rejects them with "No downloads matched your filter".
+   RULE: omit -l for -g/-t downloads (gets the best available assembly), OR if you must
+   constrain it, retry with progressively looser levels on failure. ALWAYS wrap each
+   download in a try/except and, on "No downloads matched your filter" (or returncode != 0),
+   RETRY the SAME command with -l removed (or "-l complete,chromosome,scaffold,contig").
+   Pattern (copy this resilience structure):
+     levels_to_try = [None, "chromosome", "scaffold,contig"]  # None = no -l filter
+     for lvl in levels_to_try:
+         cmd = ["ncbi-genome-download", "-g", organism, "-s", "refseq",
+                "-F", "fasta", "--flat-output", "-o", run_dir, kingdom]
+         if lvl: cmd[1:1] = ["-l", lvl]   # insert -l only when set
+         r = subprocess.run(cmd, capture_output=True, text=True)
+         if r.returncode == 0 and glob.glob(os.path.join(run_dir, "*.fna.gz")):
+             break   # success — stop trying looser levels
+     # if all levels fail, report which organism could not be downloaded; do NOT fabricate it
+   Choosing the kingdom positional arg: bacteria for bacteria, fungi for yeasts/molds
+   (Saccharomyces, Cryptococcus), viral for viruses. A wrong kingdom also yields
+   "No downloads matched your filter".
    After download, .fna.gz files MUST be decompressed in Python using gzip:
      import gzip, shutil, glob, os
      for gz in glob.glob(os.path.join(run_dir, "*.fna.gz")):
@@ -242,9 +265,17 @@ If ORCHESTRATOR: output ONLY a checklist + the routing tag, e.g.:
 - [ ] Step 3...
 <next:ORCHESTRATOR>
 
-CRITICAL: Step descriptions MUST be plain text only — NO code blocks, NO backtick fences (``` or `````),
-NO example commands, NO inline code snippets. The Generator node writes all code; the Planner writes
-only human-readable step titles.
+CRITICAL FORMAT RULES (the parser is regex-based — violating these BREAKS the pipeline):
+1. Each step MUST start with EXACTLY '- [ ] ' (dash, space, bracket, space, bracket, space).
+2. NEVER use numbered lists ('1.', '2.', '1)', '2)'), asterisks ('*'), or any other bullet style.
+3. NEVER write narrative prose like "First, we will..." or "Then we'll..." in place of '- [ ]'.
+4. NEVER embed Python code, subprocess commands, or `import` statements — the Generator node does that.
+5. If the user redirects mid-conversation (e.g. "skip that, use Prokka instead", "use X instead of Y"),
+   you MUST still emit a clean '- [ ] ...' checklist with the new approach, NOT a numbered explanation.
+6. Re-planning after a previous failure MUST also use '- [ ]' format — never switch to narrative mode.
+7. Step descriptions MUST be plain text only — NO code blocks, NO backtick fences (``` or `````),
+   NO example commands, NO inline code snippets. The Generator node writes all code; the Planner writes
+   only human-readable step titles.
 
 If needed: the home direcltory for this context if : TEMP_DIR={temp_run_dir}.
 """
@@ -883,7 +914,8 @@ FINALIZER_PROMPT = """
 You are the FINALIZER. Your goals:
 1) Produce a concise, executive-style report of what was done and the results.
 2) Include a clear checklist of steps with their status.
-3) List key artifacts with download links (provided below).
+3) List artifacts STRICTLY per the rules in the "## Artifacts" section below
+   (compact = workspace pointer + bundle; legacy = per-file enumeration).
 4) Provide next-step suggestions or caveats if relevant.
 Do NOT re-run tools. Do NOT invent links.
 
@@ -921,7 +953,19 @@ Do NOT re-run tools. Do NOT invent links.
 - Bullet points of the most important findings — ONLY from successful steps
 
 ## Artifacts
-- [display_name] (mime, size)  -  download_url
+Decide the format from the ARTIFACTS payload structure:
+- COMPACT mode (payload contains a `workspace_summary` key):
+  - Write EXACTLY these bullets, in order, with NO emoji and NO icons:
+    1) `- [Open Workspace (<workspace_summary.file_count> files)](#open-workspace) — preview and download individual files`
+       The link href MUST be the literal string `#open-workspace` so the UI can intercept it. Do NOT change it. Do NOT add any text like "click the button" or mention any toolbar.
+    2) IF the payload contains a `bundle` key, add:
+       `- [<bundle.display_name>](<bundle.download_url>) (<bundle.size_bytes converted to MB, 2 decimals>) — full bundle download`
+  - Do NOT enumerate individual files. Do NOT invent any URL.
+  - If the payload also has `warning` or `error`, append one final bullet noting it.
+- LEGACY mode (payload contains an `artifacts` list with multiple file entries and NO `workspace_summary`):
+  - One bullet per entry: `- [display_name](download_url) (mime, size)`
+- EMPTY (no files produced, or only a warning/error):
+  - Write one bullet: `- No artifacts available — see logs.` (mention the warning/error if present).
 
 ## Notes / Next Steps
 - Short, pragmatic recommendations (0-5 bullets)

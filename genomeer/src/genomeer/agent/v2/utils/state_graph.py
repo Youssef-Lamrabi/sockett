@@ -12,10 +12,64 @@ class StateGraphHelper:
     RX_STATUS_INLINE  = re.compile(r"<STATUS\s*:\s*(done|blocked)>", re.I)
 
 
+    # Regex used by the tolerant fallback below — compiled once at import time.
+    # Numbered (1. X, 1) X) OR simple bullet (* X, - X without [ ]).
+    _RX_NUMBERED_OR_BULLET = re.compile(r"^\s*(?:\d+[\.\)]|[-*])\s+(.+)$")
+
+    # Action verbs that commonly start a bioinformatics planning step.
+    # Used as a defensive trigger: tolerant fallback ONLY activates when the
+    # line starts with one of these (or when <next:ORCHESTRATOR> is explicit).
+    # Prevents accidental step-extraction from QA answers like
+    # "1. What is N50?  2. How does Prodigal work?".
+    _RX_PLAN_ACTION_VERB = re.compile(
+        r"^(?:download|run|execute|compute|parse|generate|extract|"
+        r"decompress|annotate|align|map|sort|index|filter|trim|assemble|"
+        r"call|classify|cluster|merge|split|convert|verify|validate|"
+        r"build|create|write|save|load|read|fetch|query|search|process|"
+        r"analyze|analyse|predict|estimate|calculate|count|summari[sz]e|"
+        r"visuali[sz]e|plot|chart|report|setup|set\s+up|configure|"
+        r"install|prepare|copy|move|rename|remove|delete|deploy|launch|"
+        r"start|stop|test|benchmark|profile|cluster|bin|polish|scaffold)\b",
+        re.IGNORECASE,
+    )
+
+    # Reject lines that look like CODE (avoids treating snippets in narrative
+    # responses as plan steps). Two layers:
+    #   (1) Line STARTING with code (import, def, etc.)
+    #   (2) Line CONTAINING obvious Python tokens anywhere
+    #       (function calls like subprocess.run(, glob.glob(, etc.)
+    _RX_LOOKS_LIKE_CODE = re.compile(
+        r"```"
+        r"|^(?:import\s|from\s+\w+\s+import\b|def\s+\w|class\s+\w|"
+            r"return\b|res\s*=|cmd\s*=|subprocess\.|os\.|sys\.|shutil\.)"
+        r"|\b(?:subprocess|os|sys|shutil|glob|json|re|csv|pathlib|Path|"
+            r"open|gzip|tarfile|zipfile|tempfile)\.\w+\("
+        r"|\['[\w\-.]+'"        # ['emapper.py', ...] arg lists
+        r"|=\s*\['"            # var = ['...'] assignment
+    )
+
     @staticmethod
     def parse_checklist_and_route(text: str):
+        """
+        Extract planning steps from the LLM response and decide routing.
+
+        PRIMARY format (strict): '- [ ] <title>' — original behavior, untouched.
+
+        TOLERANT FALLBACK (only when PRIMARY found 0 steps): also accept
+        numbered lists ('1. X', '2) X') and simple bullets ('* X', '- X'),
+        BUT only when:
+          - the response also has an explicit '<next:ORCHESTRATOR>' tag, OR
+          - the line's title starts with an action verb (download/run/...)
+        AND the line does NOT look like code (no `import`, `subprocess.`, etc).
+
+        Why: when the conversation history pushes the LLM into a narrative
+        style (e.g. after a redirection like "skip, use Prokka instead"),
+        it sometimes emits a numbered list instead of '- [ ]'. The fallback
+        captures the plan without affecting strict QA answers.
+        """
         txt = text or ""
         m = StateGraphHelper.RX_NEXT.search(txt)
+        _explicit_orchestrator = bool(m and m.group(1).upper() == "ORCHESTRATOR")
 
         steps = []
         for line in txt.splitlines():
@@ -23,6 +77,30 @@ class StateGraphHelper:
             if line.startswith("- [ ]"):
                 title = line[5:].strip()
                 if title:
+                    steps.append({"title": title, "status": "todo", "notes": ""})
+
+        # Tolerant fallback ONLY if strict format found nothing. Never overrides.
+        if not steps:
+            for raw in txt.splitlines():
+                ls = raw.strip()
+                if not ls:
+                    continue
+                if StateGraphHelper._RX_LOOKS_LIKE_CODE.search(ls):
+                    continue
+                nm = StateGraphHelper._RX_NUMBERED_OR_BULLET.match(ls)
+                if not nm:
+                    continue
+                title = nm.group(1).strip()
+                # Strip leading bold/italic markdown that some LLMs add
+                title = re.sub(r"^[*_`]+|[*_`]+$", "", title).strip()
+                # Length guard: real plan steps are usually 15+ chars
+                if len(title) < 12:
+                    continue
+                # Code-in-title guard: if the title itself has code tokens, skip
+                if StateGraphHelper._RX_LOOKS_LIKE_CODE.search(title):
+                    continue
+                # Activate fallback ONLY when intent is clearly a plan
+                if _explicit_orchestrator or StateGraphHelper._RX_PLAN_ACTION_VERB.match(title):
                     steps.append({"title": title, "status": "todo", "notes": ""})
 
         if m:

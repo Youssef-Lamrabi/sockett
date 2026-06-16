@@ -615,6 +615,16 @@ def _resolve_session_or_404(db: Session, user: User, session_id: int) -> ChatSes
 @router.get("/sessions/{session_id}/files")
 def list_session_files(
     session_id: int,
+    show: str = Query(
+        "success",
+        description=(
+            "Filter for `generated` files: 'success' = only files produced by "
+            "completed (status=done) steps; 'all' = include files from "
+            "currently-running or blocked steps too. Default 'success'. "
+            "Uploads are always returned regardless."
+        ),
+        regex="^(success|all)$",
+    ),
     db: Session = Depends(get_db),
     # Accept Bearer header OR HttpOnly cookie — needed for native browser
     # navigations like <a href download> which do NOT send Authorization.
@@ -625,25 +635,82 @@ def list_session_files(
     Response:
         {
           "run_dir":  "/tmp/bioagent/run-12",
-          "uploads":  [ {name, rel_path, size, mtime}, ... ],   # in uploads/
-          "generated":[ {name, rel_path, size, mtime}, ... ],   # everything else
+          "uploads":  [ {name, rel_path, size, mtime, step_status?}, ... ],
+          "generated":[ {name, rel_path, size, mtime, step_status?}, ... ],
+          "hidden_count": <int>   # generated files filtered out by `show=success`
         }
     Empty arrays if the run hasn't started yet.
+
+    Per-file step ownership comes from .genomeer_file_status.json (written by
+    the agent's observer). If that side-channel file is missing or unreadable,
+    `step_status` is absent and NO filtering is applied (legacy behavior).
     """
     _resolve_session_or_404(db, user, session_id)
     run_dir = _session_run_dir(session_id)
     if not run_dir.is_dir():
-        return {"run_dir": str(run_dir), "uploads": [], "generated": []}
+        return {"run_dir": str(run_dir), "uploads": [], "generated": [], "hidden_count": 0}
     uploads_dir = run_dir / "uploads"
     uploads = _walk_workspace_files(uploads_dir) if uploads_dir.is_dir() else []
     # Rewrite uploads' rel_path to be relative to RUN_DIR (so click path is consistent)
     for u in uploads:
         u["rel_path"] = f"uploads/{u['rel_path']}"
     generated = _walk_workspace_files(run_dir, exclude_subdir=uploads_dir)
+
+    # ── Workspace status side-channel ──────────────────────────────────────
+    # The agent writes .genomeer_file_status.json after every observer pass.
+    # We use it to (a) annotate each file with its producing step + status
+    # and (b) hide files from blocked/running steps when show=success.
+    # Missing/corrupt file → legacy behavior (no filter, no annotations).
+    status_map: Dict[str, Dict[str, Any]] = {}
+    try:
+        status_path = run_dir / ".genomeer_file_status.json"
+        if status_path.is_file():
+            import json as _json
+            with open(status_path, "r", encoding="utf-8") as _fh:
+                _doc = _json.load(_fh)
+            _files = _doc.get("files") if isinstance(_doc, dict) else None
+            if isinstance(_files, dict):
+                status_map = {
+                    str(k): (v if isinstance(v, dict) else {})
+                    for k, v in _files.items()
+                }
+    except Exception:
+        status_map = {}
+
+    def _annotate(items: List[Dict[str, Any]]) -> None:
+        for f in items:
+            meta = status_map.get(f.get("rel_path") or "")
+            if isinstance(meta, dict) and meta:
+                if "step_idx" in meta:
+                    f["step_idx"] = meta["step_idx"]
+                if "step_title" in meta:
+                    f["step_title"] = meta["step_title"]
+                if "step_status" in meta:
+                    f["step_status"] = meta["step_status"]
+
+    _annotate(uploads)
+    _annotate(generated)
+
+    hidden_count = 0
+    if show == "success" and status_map:
+        # Hide files whose producing step is "running" or "blocked".
+        # Files with no metadata (= existed before any observation OR status
+        # file is older than current state) stay visible to avoid losing
+        # legitimate outputs on a partial-state race.
+        kept = []
+        for f in generated:
+            st = f.get("step_status")
+            if st in ("running", "blocked"):
+                hidden_count += 1
+                continue
+            kept.append(f)
+        generated = kept
+
     return {
         "run_dir": str(run_dir),
         "uploads": uploads,
         "generated": generated,
+        "hidden_count": hidden_count,
     }
 
 

@@ -61,6 +61,15 @@ PUBLIC_ARTIFACTS_URL = os.getenv("PUBLIC_ARTIFACTS_URL", "http://localhost:8080/
 OPEN_MODE = os.getenv("OPEN_MODE", "true").lower() == "true"
 
 ARTIFACTS_TIMEOUT_SEC = int(os.getenv("ARTIFACTS_TIMEOUT_SEC", "30"))
+# Separate (longer) timeout for the publish_run step. publish_run does
+# real work on the artifacts server: copy → sha256 → zip bundle → write
+# manifest.json. For pipelines that emit ~28 files / ~250 MB total
+# (metagenomics: assemblies, kraken2.out, fastq, etc.), this routinely
+# exceeds the per-file 30 s budget. Default 5 minutes is safe even on a
+# loaded host and small enough that a true hang still surfaces.
+# Override: ARTIFACTS_PUBLISH_TIMEOUT_SEC=N to tune; set =30 to restore
+# the old single-timeout behaviour.
+ARTIFACTS_PUBLISH_TIMEOUT_SEC = int(os.getenv("ARTIFACTS_PUBLISH_TIMEOUT_SEC", "300"))
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
 AGENT_API_HEADER = os.getenv("AGENT_API_HEADER", "X-Agent-Key")
 
@@ -391,7 +400,7 @@ def upload_files(run_id: str, files: Iterable[Union[str, Path, bytes, io.Buffere
     return ArtifactClient(base_url=base_url, timeout=timeout).upload_files(run_id, files, subdir=subdir)
 
 def publish_run_http(run_id: str, expose_paths: List[str], base_url: str = PUBLIC_ARTIFACTS_URL,
-                     timeout: int = ARTIFACTS_TIMEOUT_SEC) -> Dict:
+                     timeout: int = ARTIFACTS_PUBLISH_TIMEOUT_SEC) -> Dict:
     # Named differently to avoid shadowing the server route function above
     return ArtifactClient(base_url=base_url, timeout=timeout).publish_run(run_id, expose_paths)
 

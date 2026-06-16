@@ -657,11 +657,16 @@ class BioAgent:
                 
             user_prompt = state["messages"][-1].content
             _past_templates = self._load_past_templates(user_prompt)
+            # Bug 1.A fix: inject the LIVE inventory of available CLI tools so
+            # the planner LLM never builds steps around tools that don't exist
+            # (e.g. eggNOG-mapper). Computed on-the-fly with a cheap shutil.which
+            # check per-tool. Cached at module import time in retriever.py.
+            _tool_inventory_block = self._available_tools_inventory_block()
             msgs = [
                 self.system_prompt,
                 HumanMessage(content=instructions.PLANNER_PROMPT.format(
                     temp_run_dir=state.get("run_temp_dir") or "",
-                ) + (_past_templates or "")),
+                ) + (_past_templates or "") + _tool_inventory_block),
             ]
 
             # ------ Interactive mode ------
@@ -727,6 +732,17 @@ class BioAgent:
             if history:
                 msgs.append(HumanMessage(content=(
                     "CONVERSATION_HISTORY (previous turns for context):\n" + history
+                )))
+
+            # Bio-hint BRIEF (advisory): short biological considerations from the
+            # secondary fine-tuned 8B. Heavily guarded (cap 400 chars, garbage
+            # filter, timeout). The main LLM stays in charge of plan format.
+            _bh_brief = self._bio_hint_brief(user_prompt, role="planner", max_chars=400)
+            if _bh_brief:
+                msgs.append(HumanMessage(content=(
+                    "[BIOLOGICAL CONTEXT HINT — advisory; use to refine tool choice "
+                    "and risk awareness, do NOT copy verbatim, do NOT let it dictate "
+                    "the plan format]:\n" + _bh_brief
                 )))
 
             msgs.append(HumanMessage(content=user_prompt))
@@ -929,8 +945,22 @@ class BioAgent:
             elif route_hint == "finalize":
                 msgs.append(HumanMessage(content=f"Summarize and answer:\n{payload}"))
                 next_step = "end"
+            elif route_hint == "diagnostics_cap":
+                # Bug 2 fix: terminal failure escalation. The payload contains
+                # structured failure info + STRICT instructions to NOT regenerate
+                # code and to report honestly. Pass it verbatim — do NOT wrap
+                # it inside another "answer the user" phrasing that would dilute
+                # the directive.
+                msgs.append(HumanMessage(content=payload))
+                next_step = "end"
+            elif route_hint == "tool_unavailable":
+                # Fast-path fix (Bug 1.C): a deterministic "tool not found"
+                # detected by observer/planner. Payload already contains the
+                # tool name + alternatives. Same handling as diagnostics_cap.
+                msgs.append(HumanMessage(content=payload))
+                next_step = "end"
             elif route_hint == "await_user":
-                msgs.append(HumanMessage(content="""Prompt the user to review the previous step’s output and either approve it or request corrections before proceeding. Do not repeat the output (already sent to user) —just ask the question.""")) 
+                msgs.append(HumanMessage(content="""Prompt the user to review the previous step’s output and either approve it or request corrections before proceeding. Do not repeat the output (already sent to user) —just ask the question."""))
             else:
                 msgs.append(HumanMessage(content=payload or f"Please be generous and Answer clearly to the user's question or request: '{last_prompt}'"))
                 next_step = "end" #orchestrator
@@ -2787,6 +2817,15 @@ class BioAgent:
                 "manifest": new_manifest,
                 "messages": [AIMessage(content=f"<observe>Code Execution output:  '{last_result}'</observe>")],
             }
+            # Fix A — write the workspace status sidecar IMMEDIATELY after the
+            # executor produced files. Mark them as "running" via the helper's
+            # fallback so the UI can hide them during retry cycles. Observer
+            # / validator will later overwrite with done/blocked status once
+            # the step settles. Side-channel, best-effort.
+            try:
+                self._write_workspace_status_file({**state, "manifest": new_manifest})
+            except Exception:
+                pass
             return updates
 
         # ── VALIDATOR ────────────────────────────────────────────────────────
@@ -2822,6 +2861,14 @@ class BioAgent:
                     body=f"exit_code={_exit_m.group(1)} — skipping contracts → observer",
                     node=node,
                 )
+                # Fix A — refresh workspace status sidecar so files from the
+                # just-failed executor pass are tagged as "running" (the
+                # current step has no observation yet; observer/validator
+                # will write the final done/blocked status once it settles).
+                try:
+                    self._write_workspace_status_file(state)
+                except Exception:
+                    pass
                 return {"next_step": "observer"}
 
             result = ToolValidator.validate(step["title"], run_dir, last_result)
@@ -2867,6 +2914,18 @@ class BioAgent:
                 new_manifest["file_registry"] = self._build_file_registry(run_dir)
                 new_manifest["files"]         = [f["name"] for f in _dir_files]
                 self._log("VALIDATOR DONE", body=summary, node=node)
+                # Fix A — write the sidecar with the newly-done observation so
+                # workspace shows files immediately (no need to wait for the
+                # observer node, which is bypassed in the validator-done path).
+                try:
+                    self._write_workspace_status_file({
+                        **state,
+                        "plan": plan,
+                        "manifest": new_manifest,
+                        "current_idx": state["current_idx"] + 1,
+                    })
+                except Exception:
+                    pass
                 return {
                     "plan":                   plan,
                     "current_idx":            state["current_idx"] + 1,
@@ -3032,6 +3091,117 @@ class BioAgent:
                     "diagnostic_observation": None,
                 }
 
+            # ── FAIL-FAST: deterministic "tool not installed" detection ────────────
+            # Bug 1.C fix: instead of retrying 3× + 2 diagnostic rounds for a
+            # tool that doesn't exist (eggNOG-mapper, antismash, humann, etc.),
+            # detect the pattern in stderr/stdout and escalate IMMEDIATELY to
+            # QA with route_hint="tool_unavailable" + structured alternatives.
+            #
+            # Patterns covered:
+            #   - shell exit 127 / "command not found"
+            #   - FileNotFoundError on an executable
+            #   - "/bin/sh: ...: not found"
+            #   - subprocess raises FileNotFoundError on the program name
+            #   - ModuleNotFoundError for a tool-providing python package
+            _TOOL_NOT_FOUND_RX = re.compile(
+                r"(?:"
+                r"command not found"
+                r"|No such file or directory:\s*['\"]([\w\-./]+\.?\w*)['\"]"
+                r"|FileNotFoundError.*['\"]([\w\-./]+(?:\.py)?)['\"]"
+                r"|/bin/sh:\s*\d*:?\s*([\w\-./]+):\s*not found"
+                r"|executable\s+([\w\-./]+)\s+not found"
+                r"|([\w\-]+):\s*command not found"
+                r")",
+                re.IGNORECASE,
+            )
+            # Exit code 127 = command not found (shell convention)
+            _is_127 = bool(_exit_code_m and _exit_code_m.group(1) == "127")
+            _tnf_match = _TOOL_NOT_FOUND_RX.search(last_result or "")
+
+            # Mapping of common bioinfo tools → readily-available alternatives.
+            # Used to give the user actionable suggestions instead of just saying
+            # "tool missing". Conservative: only well-known fallbacks.
+            _BIO_ALTERNATIVES = {
+                "emapper.py":       "Prokka (already installed) for annotation, or diamond + UniProt for functional homology search.",
+                "eggnog-mapper":    "Prokka (already installed) for annotation, or diamond + UniProt for functional homology search.",
+                "eggnog":           "Prokka (already installed) for annotation, or diamond + UniProt for functional homology search.",
+                "antismash":        "Prokka with --kingdom Bacteria, or hmmscan against Pfam to detect biosynthetic domains.",
+                "humann":           "Kraken2 + Bracken for taxonomic profiling, and Prokka for functional annotation.",
+                "gtdbtk":           "Sylph or Kraken2 for taxonomic classification of MAGs.",
+                "checkm2":          "CheckM (v1) if available, or seqkit stats + Prodigal CDS count as a proxy for MAG completeness.",
+                "virsorter2":       "geNomad (if installed) or DeepVirFinder for viral detection.",
+                "checkv":           "Use VirSorter2 quality flags if available, or report partial info from assembly QC.",
+                "pharokka":         "Prokka with --kingdom Viruses for phage annotation.",
+                "rgi":              "AMRFinderPlus or abricate for AMR detection.",
+                "amrfinder":        "abricate or RGI for AMR detection.",
+                "trimal":           "Skip the trimming step or use seqkit to filter alignment columns.",
+                "iqtree":           "FastTree (already installed) for fast phylogenetic inference.",
+                "mafft":            "muscle if installed, or skip alignment for downstream analyses that don't require it.",
+                "spades.py":        "MEGAHIT (already installed) for metagenome assembly, or Unicycler for hybrid assemblies.",
+                "metaspades.py":    "MEGAHIT (already installed) for metagenomic assembly.",
+                "flye":             "MEGAHIT (short reads) or Unicycler if you have hybrid data.",
+                "unicycler":        "MEGAHIT for short reads, or skip if no long reads available.",
+                "medaka":           "Skip polishing or use Racon (single-pass) if available.",
+                "racon":            "Skip the polishing step.",
+                "lefse":            "Use ANCOM-BC if R is available, or simpler Wilcoxon tests in Python.",
+            }
+            if not diagnostic_mode and (_is_127 or _tnf_match):
+                # Extract the offending tool name from the regex groups (or default)
+                _tool_name = ""
+                if _tnf_match:
+                    _tool_name = next((g for g in _tnf_match.groups() if g), "").strip().lower()
+                if not _tool_name:
+                    # Fallback: try to scrape the step title for a known tool name
+                    _step_title_lc = (step["title"] or "").lower()
+                    for _k in _BIO_ALTERNATIVES.keys():
+                        if _k in _step_title_lc:
+                            _tool_name = _k
+                            break
+                _alt_text = _BIO_ALTERNATIVES.get(_tool_name) or _BIO_ALTERNATIVES.get(
+                    _tool_name.replace(".py", "").split("/")[-1]
+                ) or "No direct equivalent — consider re-formulating the step with a similar tool from the same family."
+
+                _plan_list = list(state.get("plan") or [])
+                _done_steps = [
+                    f"  Step {i+1}: {s.get('title', '')}"
+                    for i, s in enumerate(_plan_list) if s.get("status") == "done"
+                ]
+                new_manifest = self._clean_manifest(state["manifest"])
+                new_manifest["route_hint"] = "tool_unavailable"
+                new_manifest["qa_payload"] = (
+                    f"PIPELINE BLOCKED — a required tool is NOT installed in this environment.\n\n"
+                    f"Missing tool: {_tool_name or '(unknown)'}\n"
+                    f"Failed step (index {state['current_idx'] + 1}): {step['title']}\n"
+                    f"Error excerpt:\n{(last_result or '')[-500:]}\n\n"
+                    f"Suggested alternatives (available in this environment):\n  {_alt_text}\n\n"
+                    f"Steps that completed successfully ({len(_done_steps)}):\n"
+                    + ("\n".join(_done_steps) if _done_steps else "  (none)")
+                    + "\n\n"
+                    "INSTRUCTIONS FOR YOUR REPLY (MUST FOLLOW):\n"
+                    "1. Start with: '# ❌ Pipeline Blocked — Tool Not Installed'\n"
+                    "2. Name the missing tool and explain in 1 sentence why the step cannot run.\n"
+                    "3. Quote the suggested alternative VERBATIM and ask the user if they want to retry.\n"
+                    "4. DO NOT regenerate code. DO NOT pretend the pipeline can continue.\n"
+                    "5. DO NOT invent metrics. List only successful steps' outputs (if any).\n"
+                    "6. Keep your answer concise (max ~180 words)."
+                )
+                self._log(
+                    "HARD BLOCK tool_not_found",
+                    body=f"tool={_tool_name!r} step={state['current_idx']} → QA (fail-fast, no retries)",
+                    node=node,
+                )
+                return {
+                    "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                             for i, p in enumerate(state["plan"])],
+                    "current_idx": state["current_idx"],
+                    "next_step": "qa",
+                    "messages": [AIMessage(content=f"<STATUS:blocked>\nTool not installed: {_tool_name or 'required executable missing'}.")],
+                    "manifest": new_manifest,
+                    "diagnostic_mode": False,
+                    "diagnostic_code": None,
+                    "diagnostic_observation": None,
+                }
+
             # ── HARD BLOCK 1: non-zero exit code ────────────────────────────────────
             if not diagnostic_mode and _exit_code_nonzero:
                 rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items() if str(k).isdigit()}
@@ -3112,6 +3282,17 @@ class BioAgent:
                 # Fix 2 — build and store file_registry after every done step
                 new_manifest["file_registry"] = self._build_file_registry(_temp_dir_obs)
                 new_manifest["files"] = [f["name"] for f in _dir_files_obs]
+                # Fix A — persist per-file step-ownership so workspace UI can
+                # filter on success. Side-channel JSON; no flow depends on it.
+                try:
+                    self._write_workspace_status_file({
+                        **state,
+                        "plan": plan,
+                        "manifest": new_manifest,
+                        "current_idx": state["current_idx"] + 1,
+                    })
+                except Exception:
+                    pass
                 return {
                     "plan": plan,
                     "current_idx": state["current_idx"] + 1,
@@ -3548,7 +3729,20 @@ class BioAgent:
                 "diagnostic_code": None,
                 "diagnostic_observation": None,
             }
-            
+
+            # Fix A — persist per-file step-ownership so workspace UI can
+            # filter on success. Best-effort, side-channel; if write fails,
+            # the workspace falls back to showing all files (legacy behavior).
+            try:
+                self._write_workspace_status_file({
+                    **state,
+                    "plan": plan,
+                    "manifest": new_manifest,
+                    "current_idx": next_idx,
+                })
+            except Exception:
+                pass
+
             # ------ feedback replay mode check ------
             if status == "blocked":
                 pause = self._maybe_pause(
@@ -3593,6 +3787,37 @@ class BioAgent:
                 new_manifest["repair_feedback"] = (
                     f"DIAGNOSTICS_CAP: step '{step['title']}' failed {diag_rounds[_idx]} diagnostic rounds "
                     f"(limit={self.MAX_DIAG_ROUNDS_PER_STEP}). Escalating to QA for human review."
+                )
+                # CRITICAL FIX (Bug 2): set route_hint + qa_payload so the QA
+                # node knows this is a TERMINAL FAILURE and must NOT regenerate
+                # a fake pipeline. Without these keys, _qa falls into the
+                # generic "answer the user's question" branch and the LLM
+                # re-emits the whole pipeline as if nothing had been tried,
+                # producing a fake "done"-looking report.
+                _plan_list = list(state.get("plan") or [])
+                _done_steps = [
+                    f"  Step {i+1}: {s.get('title', '')}"
+                    for i, s in enumerate(_plan_list) if s.get("status") == "done"
+                ]
+                _last_err = (state.get("last_result") or "")[:800]
+                new_manifest["route_hint"] = "diagnostics_cap"
+                new_manifest["qa_payload"] = (
+                    f"PIPELINE FAILED — terminal block, no further retries possible.\n\n"
+                    f"Failed step (index {_idx + 1}): {step['title']}\n"
+                    f"Failure context (last execution output):\n{_last_err}\n\n"
+                    f"Steps that completed successfully ({len(_done_steps)}):\n"
+                    + ("\n".join(_done_steps) if _done_steps else "  (none)")
+                    + "\n\n"
+                    "INSTRUCTIONS FOR YOUR REPLY (MUST FOLLOW):\n"
+                    "1. Start your reply with: '# ❌ Pipeline Could Not Complete'\n"
+                    "2. State CLEARLY which step failed and the concrete reason in 1 sentence.\n"
+                    "3. List successful steps and their outputs (if any).\n"
+                    "4. If the failure is due to a missing tool, NAME THE TOOL and propose "
+                    "    an alternative that IS available (e.g. 'eggNOG-mapper is not installed; "
+                    "    consider using Prokka, hmmscan+Pfam, or diamond+UniProt for annotation').\n"
+                    "5. DO NOT regenerate code. DO NOT pretend the pipeline can continue.\n"
+                    "6. DO NOT invent metric values for failed steps.\n"
+                    "7. Keep your answer concise (max ~200 words)."
                 )
                 return {
                     "manifest": new_manifest,
@@ -3653,25 +3878,128 @@ class BioAgent:
                 SKIP = (".cache/", "__pycache__", ".ipynb_checkpoints", ".mamba", ".micromamba")
                 return not any(x in name for x in SKIP)
 
-            expose_paths = [f["name"] for f in files if _want(f["name"])]
+            # ─── PRODUCTION-HARDENED ARTIFACT PUBLISHING ────────────────────────
+            # Historical issue: a single timeout / OOM on ONE large file used to
+            # wipe ALL artifacts from the finalizer report (the outer try/except
+            # silently returned an empty list). Three layers of resilience now:
+            #
+            #   (1) SIZE CAP — files above GENOMEER_MAX_ARTIFACT_BYTES (default
+            #       500 MB) are excluded from publishing. They REMAIN on disk in
+            #       the run dir and stay reachable via the workspace panel UI
+            #       (/api/sessions/{id}/files/raw?path=...), so no data loss.
+            #
+            #   (2) SEQUENTIAL UPLOAD — each file POSTed in its own request
+            #       with its own try/except. One file failing no longer kills
+            #       the others.
+            #
+            #   (3) PUBLISH-WHAT-SUCCEEDED — publish_run is invoked with the
+            #       SUBSET that actually made it to the artifacts server, so
+            #       the finalizer LLM sees a manifest that matches reality.
+            #
+            # Kill-switch: GENOMEER_ARTIFACT_HARDENING=0 reverts to the
+            # original single-POST behavior (emergency rollback only).
+            # Tuning:
+            #   GENOMEER_MAX_ARTIFACT_BYTES    default 524288000 (500 MB)
+            #   ARTIFACTS_TIMEOUT_SEC          default 30 (used by artifacts_service.py)
+            # ──────────────────────────────────────────────────────────────────
+
+            _hardening_on = os.environ.get("GENOMEER_ARTIFACT_HARDENING", "1") != "0"
+            _max_artifact_bytes = int(
+                os.environ.get("GENOMEER_MAX_ARTIFACT_BYTES", str(500 * 1024 * 1024))
+            )
+
+            # Layer 1: size-based exclusion (only when hardening is on)
+            expose_paths = []
+            _skipped_large = []
+            for _f in files:
+                if not _want(_f["name"]):
+                    continue
+                _sz = int(_f.get("size_bytes", 0) or 0)
+                if _hardening_on and _sz > _max_artifact_bytes:
+                    _skipped_large.append((_f["name"], _sz))
+                    continue
+                expose_paths.append(_f["name"])
+
+            if _skipped_large:
+                _mb_cap = _max_artifact_bytes // 1024 // 1024
+                _preview = ", ".join(
+                    f"{n} ({s // 1024 // 1024} MB)" for n, s in _skipped_large[:5]
+                )
+                if len(_skipped_large) > 5:
+                    _preview += ", ..."
+                self._log(
+                    "ARTIFACTS_SKIP_LARGE",
+                    body=(
+                        f"{len(_skipped_large)} files > {_mb_cap} MB excluded from publish "
+                        f"(still on disk in run dir + workspace UI): {_preview}"
+                    ),
+                    node=node,
+                )
 
             artifacts = {}
             observations = manifest.get("observations", [])
             try:
-                # from genomeer.tools.function.artifacts import create_run, upload_files, publish_run
                 from genomeer.agent.v2.utils.artifacts_service import create_run, upload_files, publish_run_http
                 try:
                     create_run(run_id, base_url=self.artifacts_base_url)
                 except Exception:
                     pass
 
-                abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
-                if abs_paths:
-                    upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
-
-                expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
-                art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
-                artifacts = art_manifest or {}
+                if _hardening_on and expose_paths:
+                    # Layer 2: sequential per-file upload, isolated try/except
+                    _successful_paths = []
+                    _failed_paths = []
+                    for _p in expose_paths:
+                        _abs = str(Path(temp_dir) / _p)
+                        try:
+                            upload_files(run_id, [_abs], subdir="outputs", base_url=self.artifacts_base_url)
+                            _successful_paths.append(_p)
+                        except Exception as _ue:
+                            _failed_paths.append((_p, type(_ue).__name__ + ": " + str(_ue)[:100]))
+                    if _failed_paths:
+                        self._log(
+                            "ARTIFACTS_UPLOAD_FAILURES",
+                            body=(
+                                f"{len(_failed_paths)}/{len(expose_paths)} files failed upload — "
+                                "remaining files are still listed in the report. "
+                                "Details: "
+                                + "; ".join(f"{p} ({err})" for p, err in _failed_paths[:5])
+                                + (", ..." if len(_failed_paths) > 5 else "")
+                            ),
+                            node=node,
+                        )
+                    # Layer 3: publish ONLY the files that actually uploaded
+                    if _successful_paths:
+                        expose_rel = [f"outputs/{Path(p).name}" for p in _successful_paths]
+                        art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
+                        artifacts = art_manifest or {}
+                        self._log(
+                            "ARTIFACTS_PUBLISH_OK",
+                            body=(
+                                f"published={len(_successful_paths)} "
+                                f"skipped_large={len(_skipped_large)} "
+                                f"upload_failed={len(_failed_paths)}"
+                            ),
+                            node=node,
+                        )
+                    else:
+                        # All uploads failed — keep the original error visible to finalizer
+                        artifacts = {
+                            "artifacts": [],
+                            "warning": (
+                                f"No artifacts could be uploaded "
+                                f"({len(_failed_paths)} failures, {len(_skipped_large)} too large). "
+                                "Files remain on disk in the run dir; workspace UI access is unaffected."
+                            ),
+                        }
+                else:
+                    # Kill-switch path: original single-POST behavior (preserved verbatim)
+                    abs_paths = [str(Path(temp_dir) / p) for p in expose_paths]
+                    if abs_paths:
+                        upload_files(run_id, abs_paths, subdir="outputs", base_url=self.artifacts_base_url)
+                    expose_rel = [f"outputs/{Path(p).name}" for p in expose_paths]
+                    art_manifest = publish_run_http(run_id, expose_rel, base_url=self.artifacts_base_url)
+                    artifacts = art_manifest or {}
             except Exception as e:
                 self._log("PUBLISH ERROR", body=str(e), node=node)
                 artifacts = {"artifacts": [], "error": str(e)}
@@ -3713,15 +4041,118 @@ class BioAgent:
             if _rag_context:
                 _finalizer_system_prompt = _finalizer_system_prompt + "\n\n" + _rag_context
 
+            # ─── COMPACT ARTIFACTS (UX: workspace + bundle, like Claude/Cursor) ──
+            # Instead of forcing the finalizer LLM to enumerate every output file
+            # (which clutters chats with 20+ files, risks URL hallucination, and
+            # duplicates the dedicated Workspace panel UI), we condense the
+            # manifest passed to the LLM to:
+            #   - a single "workspace_summary" entry (file count + instruction
+            #     telling the LLM to redirect the user to the Workspace panel)
+            #   - the all_artifacts.zip "bundle" entry (single-click full
+            #     download)
+            # Individual file URLs remain accessible via:
+            #   1) Workspace panel (📁 button) — per-file preview + download
+            #   2) The bundle ZIP (everything in one shot)
+            #   3) manifest.json on disk (unchanged)
+            # Kill-switch: GENOMEER_COMPACT_ARTIFACTS=0 → legacy verbose mode.
+            # ────────────────────────────────────────────────────────────────────
+            _compact_artifacts_on = (
+                os.environ.get("GENOMEER_COMPACT_ARTIFACTS", "1") != "0"
+            )
+            _artifacts_for_llm = artifacts
+            if (
+                _compact_artifacts_on
+                and isinstance(artifacts, dict)
+                and isinstance(artifacts.get("artifacts"), list)
+                and artifacts["artifacts"]
+            ):
+                _bundle = None
+                _file_arts = []
+                for _a in artifacts["artifacts"]:
+                    if not isinstance(_a, dict):
+                        continue
+                    _key = str(_a.get("key", ""))
+                    _dn = str(_a.get("display_name", ""))
+                    if _key.startswith("bundle/") or _dn == "all_artifacts.zip":
+                        _bundle = _a
+                    else:
+                        _file_arts.append(_a)
+                _file_count = len(_file_arts)
+                _compact = {
+                    "run_id": artifacts.get("run_id"),
+                    "workspace_summary": {
+                        "file_count": _file_count,
+                        "instruction": (
+                            f"{_file_count} generated file(s) are browsable in the "
+                            "Workspace panel (click the 📁 Workspace button in the "
+                            "chat toolbar to preview and download individual files). "
+                            "Do NOT enumerate individual file URLs in the report."
+                        ),
+                    },
+                }
+                if _bundle:
+                    _compact["bundle"] = _bundle
+                # Preserve publishing warnings/errors so the LLM still mentions them
+                if artifacts.get("warning"):
+                    _compact["warning"] = artifacts["warning"]
+                if artifacts.get("error"):
+                    _compact["error"] = artifacts["error"]
+                _artifacts_for_llm = _compact
+                self._log(
+                    "ARTIFACTS_COMPACT",
+                    body=(
+                        f"compacted manifest for LLM: {_file_count} files → "
+                        f"workspace pointer + {'bundle' if _bundle else 'NO bundle'}"
+                    ),
+                    node=node,
+                )
+
             msgs = [
                 SystemMessage(content=_finalizer_system_prompt),
                 HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
                     user_goal=state.get("last_prompt"),
                     plan=state.get("plan"),
                     observation=observations,
-                    artifacts=artifacts
+                    artifacts=_artifacts_for_llm
                 ))
             ]
+
+            # Bio-hint BRIEF (advisory): 2-3 short interpretation bullets from the
+            # fine-tuned 8B. Comes AFTER BioRAG so the LLM has facts first, hints
+            # second. Marked clearly as "verify against actual data; RAG wins".
+            try:
+                _bh_query_parts = []
+                if observations:
+                    _bh_query_parts.append(
+                        "Completed steps: " + "; ".join(
+                            (o.get("title", "") or "")[:80] for o in observations[:5]
+                        )
+                    )
+                _qs = manifest.get("quality_signals") or {}
+                if _qs:
+                    import json as _json_qs
+                    _bh_query_parts.append("Key signals: " + _json_qs.dumps(
+                        {k: v for k, v in list(_qs.items())[:6]}, default=str
+                    ))
+                if manifest.get("amr_genes_detected"):
+                    _bh_query_parts.append(
+                        "AMR genes detected: " + ", ".join(
+                            str(g) for g in (manifest.get("amr_genes_detected") or [])[:10]
+                        )
+                    )
+                _bh_query = " | ".join(_bh_query_parts)[:900]
+                _bh_brief_fin = self._bio_hint_brief(_bh_query, role="finalizer", max_chars=500)
+                if _bh_brief_fin:
+                    msgs.append(HumanMessage(content=(
+                        "[BIO INTERPRETATION HINT — advisory only; verify every claim "
+                        "against the actual observations and BioRAG facts above. If a "
+                        "claim conflicts with the data, IGNORE it. Do NOT introduce new "
+                        "numbers; only use this as light interpretive flavour.]:\n"
+                        + _bh_brief_fin
+                    )))
+            except Exception as _bh_err:
+                self._log("BIO_HINT_BRIEF_FIN_ERR", body=str(_bh_err), node=node)
+
             resp = self._llm_invoke(node, "final_report", msgs)
             self._log("EXIT NODE", body="final report generated", node=node)
 
@@ -4059,6 +4490,82 @@ class BioAgent:
             return "amplicon"
         return "general"
 
+    def _available_tools_inventory_block(self) -> str:
+        """
+        Build a tool inventory string to inject at the end of PLANNER_PROMPT.
+        Lists CLI tools actually present on PATH PLUS a curated list of
+        commonly-requested-but-NOT-installed tools and their alternatives.
+
+        The available list is computed by ToolRetriever._available_cli_tools()
+        at module import time (shutil.which) — cheap to read here.
+
+        Returns "" if anything goes wrong (never breaks the planner).
+        Kill-switch: GENOMEER_PLANNER_TOOL_INVENTORY=0 disables injection.
+        """
+        if os.environ.get("GENOMEER_PLANNER_TOOL_INVENTORY", "1") == "0":
+            return ""
+        try:
+            from genomeer.model.retriever import _AVAILABLE_CLI, _CLI_TOOL_BINARIES
+        except Exception:
+            return ""
+        try:
+            avail = sorted(_AVAILABLE_CLI) if _AVAILABLE_CLI else []
+            # Tools registered in the binaries dict that did NOT resolve on PATH.
+            unavailable = sorted(set(_CLI_TOOL_BINARIES.keys()) - set(_AVAILABLE_CLI))
+        except Exception:
+            return ""
+        if not avail and not unavailable:
+            return ""
+
+        # Curated suggested alternatives for the most often-requested missing tools.
+        # Keep concise — the LLM will pick the most relevant one.
+        _alt_map = {
+            "eggnog-mapper": "Prokka or hmmscan + Pfam",
+            "antismash":     "Prokka --kingdom Bacteria for biosynthetic clusters",
+            "humann":        "Kraken2 + Bracken (taxonomy) + Prokka (function)",
+            "gtdbtk":        "Sylph or Kraken2 for MAG classification",
+            "checkm2":       "seqkit stats + Prodigal CDS count as proxy",
+            "virsorter2":    "geNomad or DeepVirFinder if available",
+            "checkv":        "Use assembly QC + VirSorter2 quality flags",
+            "pharokka":      "Prokka --kingdom Viruses",
+            "rgi":           "abricate or AMRFinderPlus",
+            "amrfinder":     "abricate or RGI",
+            "trimal":        "Skip or use seqkit to filter alignment columns",
+            "iqtree":        "FastTree",
+            "mafft":         "muscle (if installed) or skip",
+            "spades.py":     "MEGAHIT",
+            "metaspades.py": "MEGAHIT",
+            "flye":          "MEGAHIT (short reads) or Unicycler (hybrid)",
+            "unicycler":     "MEGAHIT for short reads",
+            "medaka":        "Skip polishing or use Racon",
+            "racon":         "Skip polishing",
+            "lefse":         "ANCOM-BC (R) or Wilcoxon (Python)",
+        }
+        unavail_lines = []
+        for t in unavailable:
+            alt = _alt_map.get(t)
+            if alt:
+                unavail_lines.append(f"  - {t} → use: {alt}")
+            else:
+                unavail_lines.append(f"  - {t} → no direct equivalent in this env")
+
+        block = "\n\n---\nTOOL INVENTORY (do NOT plan steps with unavailable tools — use the suggested alternatives instead):\n"
+        block += "\nAVAILABLE CLI tools in this environment:\n"
+        # Wrap to keep prompt compact — comma-join on 1 line with soft cap.
+        joined = ", ".join(avail)
+        block += "  " + (joined[:1500] + (" ...(truncated)" if len(joined) > 1500 else ""))
+        if unavail_lines:
+            block += "\n\nUNAVAILABLE (do NOT plan steps requiring these — substitute with the alternative):\n"
+            block += "\n".join(unavail_lines)
+        block += (
+            "\n\nIf the user EXPLICITLY names an unavailable tool, your plan must:\n"
+            "  1. Replace the step with the suggested alternative\n"
+            "  2. Add a brief note (within the step title or notes) explaining the substitution\n"
+            "If no suitable alternative exists, emit <next:QA> with a short message asking the user to "
+            "either install the tool or pick a different approach — do NOT create a step that will fail.\n"
+        )
+        return block
+
     def _load_past_templates(self, prompt: str, max_records: int = 5) -> str:
         """
         Phase 4 — load the last N successful runs of the same task_type from
@@ -4184,7 +4691,139 @@ class BioAgent:
                     "size_bytes": os.path.getsize(dst),
                 })
         return files
-    
+
+    def _write_workspace_status_file(self, state):
+        """Persist per-file step-ownership map to .genomeer_file_status.json
+        in the current run dir, so the workspace UI (routes_chat) can filter
+        out files produced by failed (blocked) steps.
+
+        Schema (small JSON, atomic write):
+          {
+            "updated_at": "ISO8601Z",
+            "run_id": "...",
+            "current_running_step_idx": int|null,  # step currently in flight
+            "files": {
+              "<rel_path>": {
+                 "step_idx": int,
+                 "step_title": str,    # truncated to 80 chars
+                 "step_status": "done"|"blocked"
+              },
+              ...
+            }
+          }
+
+        Ownership is derived from the per-step `files_snapshot` recorded by
+        the observer. A file is attributed to the LAST step in which its
+        size changed (or that first introduced it). User uploads / files
+        present before any step (snapshot[0]'s pre-existing items) are
+        attributed to step_idx=-1 with status="done" so they always show.
+
+        This file is intentionally a side-channel: it is OPTIONAL and the
+        routes_chat layer falls back to showing all files if absent. No
+        existing flow depends on it. Kill-switch: GENOMEER_WORKSPACE_STATUS=0
+        skips the write entirely (legacy behaviour).
+        """
+        if os.environ.get("GENOMEER_WORKSPACE_STATUS", "1") == "0":
+            return
+        temp_dir = state.get("run_temp_dir") or ""
+        if not temp_dir or not os.path.isdir(temp_dir):
+            return
+        import json as _json
+        from datetime import datetime as _dt
+
+        observations = (state.get("manifest") or {}).get("observations", []) or []
+        plan = state.get("plan") or []
+        current_idx = state.get("current_idx")
+
+        # Derive ownership: walk observations in order, track size changes.
+        file_owner = {}      # rel_path -> (step_idx, step_title, step_status)
+        prev_sizes = {}      # rel_path -> last seen size
+        for obs in observations:
+            try:
+                step_idx = obs.get("step_idx")
+                step_title = (obs.get("title") or "")[:80]
+                step_status = obs.get("status") or "done"
+                snap = obs.get("files_snapshot") or []
+                cur_sizes = {}
+                for f in snap:
+                    if not isinstance(f, dict):
+                        continue
+                    name = f.get("name")
+                    if not name:
+                        continue
+                    cur_sizes[name] = int(f.get("size_bytes", 0) or 0)
+                # If this is the FIRST observation, files already present
+                # are "pre-existing" (uploads / setup) — mark as done.
+                if not prev_sizes:
+                    for name in cur_sizes:
+                        file_owner[name] = (-1, "(pre-existing / uploads)", "done")
+                # Then attribute any NEW or RESIZED file to current step.
+                for name, sz in cur_sizes.items():
+                    prev = prev_sizes.get(name)
+                    if prev is None or prev != sz:
+                        file_owner[name] = (step_idx, step_title, step_status)
+                prev_sizes = cur_sizes
+            except Exception:
+                # Defensive: a malformed observation shouldn't kill the write.
+                continue
+
+        # Any file on disk RIGHT NOW that no observation has seen yet is
+        # attributed to the currently-running step (status "running") so the
+        # UI hides it by default but the toggle can show it.
+        try:
+            on_disk = self._list_ctx_files(temp_dir)
+            running_idx = current_idx if (
+                isinstance(current_idx, int)
+                and 0 <= current_idx < len(plan)
+                and (plan[current_idx].get("status") in (None, "", "running"))
+            ) else None
+            running_title = (
+                (plan[running_idx].get("title") or "")[:80]
+                if running_idx is not None else ""
+            )
+            for f in on_disk:
+                if not isinstance(f, dict):
+                    continue
+                name = f.get("name")
+                if not name or name in file_owner:
+                    continue
+                if running_idx is not None:
+                    file_owner[name] = (running_idx, running_title, "running")
+                else:
+                    # No observation, no running step → treat as pre-existing
+                    file_owner[name] = (-1, "(pre-existing / uploads)", "done")
+        except Exception:
+            pass
+
+        payload = {
+            "updated_at": _dt.utcnow().isoformat() + "Z",
+            "run_id": state.get("run_id"),
+            "current_running_step_idx": (
+                current_idx if isinstance(current_idx, int) else None
+            ),
+            "files": {
+                path: {
+                    "step_idx": tup[0],
+                    "step_title": tup[1],
+                    "step_status": tup[2],
+                }
+                for path, tup in file_owner.items()
+            },
+        }
+        # Atomic write: tmp + rename. The routes layer reads this file from
+        # disk; an interrupted write could otherwise expose partial JSON.
+        try:
+            status_path = Path(temp_dir) / ".genomeer_file_status.json"
+            tmp_path = status_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as _fh:
+                _json.dump(payload, _fh, ensure_ascii=False)
+            os.replace(str(tmp_path), str(status_path))
+        except Exception as e:
+            try:
+                self._log("FILE_STATUS_WRITE_ERROR", body=str(e), node="observer")
+            except Exception:
+                pass
+
     def _inject_custom_functions_to_repl(self):
         """Inject custom functions into the Python REPL execution environment.
         This makes custom tools available during code execution.
@@ -4531,6 +5170,90 @@ class BioAgent:
         except Exception:
             pass
         return 1
+
+    # ─────────────────────────────────────────────────────────────────────
+    # bio_hint BRIEF — short, safe biological context for planner/finalizer.
+    # Different from the full bio_hint_node (which runs in generator/observer):
+    # this one returns a tightly-bounded advisory text that the main LLM
+    # may consult to enrich its reasoning. Heavy hallucination guards.
+    # ─────────────────────────────────────────────────────────────────────
+    _BIO_HINT_REJECT_RX = re.compile(
+        r"```|<\s*EXECUTE\b|<\s*next\s*:|^---\s*$|^\s*def\s+\w|^\s*class\s+\w|#!PY|#!BASH|#!R|"
+        r"^\s*import\s+\w|^\s*from\s+\w+\s+import\b",
+        re.M | re.I,
+    )
+
+    def _bio_hint_brief(self, query: str, role: str, max_chars: int = 400, timeout_s: int = 12) -> str:
+        """Get a SHORT, safe biological-context note from the secondary
+        bio_hint LLM. Returns "" if disabled, empty query, garbage output,
+        or LLM error. Never raises.
+
+        role: "planner" | "finalizer" — selects the prompt template.
+
+        Guards:
+          - kill-switch env var GENOMEER_BIO_HINT_EXTEND=0 -> return ""
+          - bio_hint_llm absent -> return ""
+          - empty/short query -> return ""
+          - LLM exception -> return ""
+          - LLM timeout (concurrent.futures) -> return ""
+          - output contains code/XML/imports -> return ""
+          - output is hard-capped to max_chars
+        """
+        if not getattr(self, "bio_hint_llm", None):
+            return ""
+        if os.environ.get("GENOMEER_BIO_HINT_EXTEND", "1") == "0":
+            return ""
+        q = (query or "").strip()
+        if len(q) < 3:
+            return ""
+
+        if role == "finalizer":
+            sys_prompt = (
+                "You are a metagenomics knowledge assistant.\n"
+                "Given PIPELINE RESULTS below, write 2-3 SHORT biological INTERPRETATION "
+                "bullets. Each bullet: ONE sentence, MAX 100 characters, factual.\n"
+                "STRICT RULES:\n"
+                "- No code, no commands, no tool flags.\n"
+                "- No XML tags, no <EXECUTE>, no <next:>.\n"
+                "- No greetings, no preamble like 'Sure!' or 'Here are'.\n"
+                "- Output ONLY the bullets, prefixed with '- '.\n"
+                "- If you cannot say anything factual, output exactly: NONE\n\n"
+                f"PIPELINE RESULTS:\n{q}"
+            )
+        else:  # planner
+            sys_prompt = (
+                "You are a metagenomics knowledge assistant.\n"
+                "Given the USER REQUEST below, list 3-5 SHORT biological CONSIDERATIONS as bullets.\n"
+                "Each bullet: ONE sentence, MAX 80 characters, factual.\n"
+                "Focus on: which class of tool fits, common pitfalls, expected data quality.\n"
+                "STRICT RULES:\n"
+                "- Do NOT propose a plan. Do NOT enumerate steps.\n"
+                "- No code, no commands, no tool flags.\n"
+                "- No XML tags, no <EXECUTE>, no <next:>.\n"
+                "- No greetings, no preamble.\n"
+                "- Output ONLY the bullets, prefixed with '- '.\n"
+                "- If you cannot say anything factual, output exactly: NONE\n\n"
+                f"USER REQUEST:\n{q}"
+            )
+
+        try:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(lambda: self.bio_hint_llm.invoke([HumanMessage(content=sys_prompt)]))
+                resp = fut.result(timeout=timeout_s)
+            text = (getattr(resp, "content", str(resp)) or "").strip()
+        except Exception as e:
+            self._log("BIO_HINT_BRIEF_ERR", body=f"{role}: {type(e).__name__}: {e}", node="bio_hint_brief")
+            return ""
+
+        if not text or text.strip().upper() == "NONE":
+            return ""
+        if self._BIO_HINT_REJECT_RX.search(text):
+            self._log("BIO_HINT_BRIEF_REJECT", body=f"{role}: garbage shape (code/XML)", node="bio_hint_brief")
+            return ""
+        out = text[:max_chars].rstrip()
+        self._log("BIO_HINT_BRIEF_OK", body=f"{role}: {len(out)} chars", node="bio_hint_brief")
+        return out
 
     def _inject_missing_imports(self, code: str) -> str:
         """

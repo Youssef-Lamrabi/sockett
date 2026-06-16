@@ -2315,3 +2315,74 @@ ul {
     border-color: #cbd5e1;
     cursor: not-allowed;
 }
+
+/* ─── "Open Workspace" inline button (emitted by finalizer ## Artifacts) ─── */
+/* Selector matches both freshly-emitted links and the data-action-tagged    */
+/* variant (MutationObserver promotes them post-render). Styled as a pill    */
+/* button so users see it as actionable, not just text.                     */
+.msg.assistant .bubble a[href="#open-workspace"],
+.msg.assistant .bubble a[data-action="open-workspace"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border: 1px solid #4f46e5;
+    border-radius: 999px;
+    background: #eef2ff;
+    color: #3730a3;
+    font-weight: 600;
+    text-decoration: none;
+    font-size: 0.92em;
+    line-height: 1.4;
+    transition: background 0.15s ease, transform 0.05s ease;
+    cursor: pointer;
+}
+.msg.assistant .bubble a[href="#open-workspace"]:hover,
+.msg.assistant .bubble a[data-action="open-workspace"]:hover {
+    background: #4f46e5;
+    color: #ffffff;
+    text-decoration: none;
+}
+.msg.assistant .bubble a[href="#open-workspace"]:active,
+.msg.assistant .bubble a[data-action="open-workspace"]:active {
+    transform: translateY(1px);
+}
+
+/* ─── Workspace "show success / all" toggle (FE header) ────────────────── */
+/* UX: .active = filter ON (blue, doing work).                              */
+/*     .filter-off = filter OFF (grayed, you see all).                      */
+/*     Badge shows count hidden (only meaningful while filter is ON).       */
+.fe-show-toggle {
+    position: relative;
+}
+.fe-show-toggle.active {
+    color: #4f46e5;
+    background: rgba(79, 70, 229, 0.12);
+}
+.fe-show-toggle.filter-off {
+    color: #9ca3af;       /* gray-400 — "filter disabled, showing all" */
+    background: transparent;
+    opacity: 0.85;
+}
+.fe-show-toggle .fe-show-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 7px;
+    background: #ef4444;
+    color: #fff;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 14px;
+    text-align: center;
+}
+.fe-show-toggle .fe-show-eye {
+    position: absolute;
+    bottom: 2px;
+    right: 2px;
+    font-size: 9px;
+    color: #9ca3af;       /* matches dimmed state */
+}
