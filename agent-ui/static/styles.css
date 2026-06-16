@@ -958,6 +958,53 @@ button.primary {
     color: var(--accent);
 }
 
+/* --- Delete + rename UI (injected per session-item) ----------------------- */
+.session-item .open {
+    flex: 1 1 auto;
+    min-width: 0;       /* allow title to truncate */
+}
+
+.session-item .session-del {
+    flex-shrink: 0;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: #94a3b8;
+    font-size: 12px;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity .14s ease, background .12s ease, color .12s ease;
+}
+.session-item:hover .session-del,
+.session-item.active .session-del,
+.session-item:focus-within .session-del {
+    opacity: 1;             /* reveal trash icon only on hover/focus */
+}
+.session-item .session-del:hover {
+    background: rgba(239, 68, 68, 0.12);
+    color: #b91c1c;
+}
+.session-item .session-del:disabled {
+    opacity: 0.4;
+    cursor: wait;
+}
+
+/* Inline-editable title state (contenteditable applied via JS) */
+.session-item .title.editing {
+    background: #ffffff;
+    border: 1px solid #6366f1;
+    border-radius: 4px;
+    padding: 2px 6px;
+    outline: none;
+    white-space: nowrap;
+    overflow: hidden;
+    cursor: text;
+    /* Avoid the truncation ellipsis while editing */
+    text-overflow: clip;
+}
+
 /* Responsive tweaks */
 @media (max-width:1100px) {
     #layout {
@@ -1752,109 +1799,96 @@ ul {
 }
 
 /* =============================================================
-   Workspace Files Browser — sections, list items, preview modal
+   Workspace Files Browser — single GENERATED list with optional
+   collapsible Uploads folder at the top, plus INLINE preview
+   (split 1/3 list / 2/3 preview when a file is clicked).
    ============================================================= */
 
-/* Horizontal split layout: Uploaded (left) | Generated (right).
-   Each column scrolls independently so a long list of generated outputs
-   never pushes the uploads out of view. */
 #file-explorer .fe-body {
-    padding: 8px 4px 12px 4px;
-    overflow: hidden;            /* outer scroll disabled — columns scroll */
+    padding: 0;
+    overflow: hidden;
     display: flex;
-    flex-direction: row;
+    flex-direction: column;            /* top: list, bottom: preview when open */
+    /* Override the legacy .fe-body rule above which had align-items/justify-content
+       set to "center" — that was shrinking .fe-list-region to its content width and
+       leaving ~150px of empty white space on the right when the panel is wide. */
     align-items: stretch;
-    gap: 4px;
+    justify-content: flex-start;
     min-height: 0;
     flex: 1 1 auto;
+    background: #ffffff;
 }
 
-.fe-section {
-    flex: 1 1 0;                 /* equal-width columns */
-    min-width: 0;                /* allow shrink for ellipsis */
-    display: flex;
-    flex-direction: column;
-    padding: 4px 6px;
+/* --- List region (top) ----------------------------------------- */
+.fe-list-region {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    /* Horizontal padding stripped so the grid fills 100% of panel width
+       (no side margins). Vertical padding kept for breathing room. */
+    padding: 8px 0;
 }
-.fe-section-title {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 10.5px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    color: #64748b;
-    padding: 4px 4px 8px 4px;
-    flex-shrink: 0;              /* title pinned at top of column */
-    border-bottom: 1px solid #f1f5f9;
-    margin-bottom: 4px;
+#file-explorer .fe-body.has-preview .fe-list-region {
+    flex: 0 0 33%;                    /* top 1/3 when preview is open */
+    border-bottom: 1px solid #e5e7eb;
 }
-.fe-section-title i {
-    color: #94a3b8;
-    width: 14px;
-    font-size: 13px;
-}
-.fe-section-title .fe-count {
-    margin-left: auto;
-    background: #eef2f7;
-    color: #475569;
-    padding: 1px 8px;
-    border-radius: 10px;
-    font-size: 10px;
-    letter-spacing: 0.3px;
-}
+.fe-list-region::-webkit-scrollbar { width: 6px; }
+.fe-list-region::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+.fe-list-region::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
-/* Vertical divider between columns (replaces the previous horizontal one) */
-.fe-divider {
-    width: 1px;
-    height: auto;
-    align-self: stretch;
-    background: linear-gradient(180deg, transparent, #e2e8f0 20%, #e2e8f0 80%, transparent);
-    margin: 6px 0;
-    flex-shrink: 0;
-}
-
+/* --- File list container (same markup for grid vs list) -------- */
 .fe-file-list {
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    overflow-y: auto;             /* column-local scroll */
-    flex: 1 1 auto;
-    min-height: 0;
-    padding-right: 2px;
+    gap: 4px;
 }
-/* Subtle column scrollbars */
-.fe-file-list::-webkit-scrollbar { width: 6px; }
-.fe-file-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-.fe-file-list::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+.view-grid .fe-file-list {
+    display: grid;
+    /* Fully responsive: auto-fill keeps column tracks stable as the panel is
+       resized, no hardcoded count. minmax(80px, 1fr) -> 2 cols @ 200px,
+       3 @ 300px, 4 @ 400px, etc. Cards fill the whole cell via width: 100%. */
+    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+    gap: 6px;
+    width: 100%;
+    margin: 0;
+    padding: 0 6px;             /* tiny inset so cards don't touch the scrollbar */
+}
+
+/* --- File item (subtle gray card) ------------------------------ */
 .fe-file-item {
     display: flex;
     align-items: center;
     gap: 8px;
     width: 100%;
-    padding: 7px 8px;
-    border: none;
-    background: transparent;
-    border-radius: 6px;
+    padding: 8px 10px;
+    border: 1px solid transparent;
+    background: #f5f5f5;
+    border-radius: 8px;
     cursor: pointer;
     text-align: left;
     color: #1e293b;
-    transition: background 0.12s ease;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.05s ease;
     font-family: inherit;
+    overflow: hidden;
 }
 .fe-file-item:hover {
-    background: rgba(99, 102, 241, 0.08);
+    background: #ebebeb;
+    border-color: #d1d5db;
 }
+.fe-file-item.active {
+    background: #e0e7ff;
+    border-color: #a5b4fc;
+}
+.fe-file-item:active { transform: scale(0.99); }
 .fe-file-item:focus-visible {
-    outline: 2px solid rgba(99, 102, 241, 0.4);
-    outline-offset: -1px;
+    outline: 2px solid rgba(99, 102, 241, 0.45);
+    outline-offset: 1px;
 }
 .fe-file-item > i.fa {
     width: 16px;
     flex-shrink: 0;
-    color: #64748b;
-    font-size: 13px;
+    color: #94a3b8;     /* gray (was #6366f1 indigo per user request) */
+    font-size: 14px;
 }
 .fe-file-name {
     flex: 1 1 auto;
@@ -1870,93 +1904,139 @@ ul {
     color: #94a3b8;
     white-space: nowrap;
 }
+
+/* Grid view — stack icon + name vertically. Card scales down gracefully:
+   icon shrinks slightly + smaller padding so 90px-min cells stay readable. */
+.view-grid .fe-file-item {
+    flex-direction: column;
+    align-items: center;          /* center icon and label inside narrow cells */
+    text-align: center;
+    padding: 10px 8px;
+    min-height: 72px;
+    gap: 4px;
+}
+.view-grid .fe-file-item > i.fa {
+    font-size: 22px;
+    width: auto;
+}
+.view-grid .fe-file-name {
+    font-size: 12px;
+    /* Truncate long filenames with ellipsis instead of wrapping. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.25;
+    text-align: center;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;               /* allow grid cell to shrink + trigger ellipsis */
+}
+.view-grid .fe-file-meta {
+    font-size: 9.5px;
+    text-align: center;
+    width: 100%;
+}
+
 .fe-empty-mini {
     font-size: 12px;
     color: #94a3b8;
-    padding: 8px 4px;
+    padding: 12px 8px;
     font-style: italic;
+    text-align: center;
 }
 
-/* Refresh button (injected into the panel header by JS) */
-.fe-refresh-btn {
+/* --- Uploads folder (collapsible row at TOP of list) ----------- */
+.fe-folder { margin-bottom: 6px; }
+.fe-folder-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 10px;
+    background: #f5f5f5;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    cursor: pointer;
+    font-family: inherit;
+    color: #1e293b;
+    text-align: left;
+    transition: background 0.12s ease;
+}
+.fe-folder-header:hover { background: #ebebeb; }
+.fe-folder-chevron {
+    color: #94a3b8;
+    transition: transform 0.15s ease;
+    font-size: 10px;
+    width: 10px;
+}
+.fe-folder.open .fe-folder-chevron { transform: rotate(90deg); }
+.fe-folder-icon { color: #f59e0b; width: 14px; font-size: 13px; }
+.fe-folder-label { flex: 1; font-size: 13px; font-weight: 600; }
+.fe-folder-header .fe-count {
+    margin-left: auto;
+    background: #e5e7eb;
+    color: #475569;
+    padding: 1px 7px;
+    border-radius: 9px;
+    font-size: 10px;
+}
+.fe-folder-children { display: none; margin-top: 4px; padding-left: 4px; }
+.fe-folder.open .fe-folder-children { display: flex; flex-direction: column; gap: 3px; }
+/* In grid view, fold children become single rows for readability */
+.view-grid .fe-folder { grid-column: 1 / -1; }
+.fe-indent { margin-left: 18px; background: #fafafa; }
+
+/* --- Header tool buttons (refresh + view toggle) --------------- */
+.fe-refresh-btn,
+.fe-view-toggle {
     background: none;
     border: none;
     cursor: pointer;
-    padding: 6px 9px;
-    border-radius: 6px;
+    padding: 6px 8px;
+    border-radius: 5px;
     color: #475569;
-    font-size: 13px;
+    font-size: 12px;
     line-height: 1;
     transition: background 0.12s ease, color 0.12s ease;
-    margin-right: 2px;
 }
-.fe-refresh-btn:hover {
+.fe-refresh-btn:hover,
+.fe-view-toggle:hover {
     background: rgba(99, 102, 241, 0.10);
     color: #4338ca;
 }
-.fe-refresh-btn:active { transform: scale(0.96); }
+.fe-refresh-btn:active,
+.fe-view-toggle:active { transform: scale(0.96); }
 .fe-refresh-btn:disabled { opacity: 0.5; cursor: wait; }
-.fe-refresh-btn.spinning i {
-    animation: fe-spin 0.7s linear;
-}
+.fe-refresh-btn.spinning i { animation: fe-spin 0.7s linear; }
 @keyframes fe-spin {
     from { transform: rotate(0deg); }
     to   { transform: rotate(360deg); }
 }
 
-/* Empty state should span both columns when there are no files at all.
-   When the body becomes flex-row, the empty-state div is the only child →
-   center it across the full panel. */
-#file-explorer .fe-body > .fe-empty-state {
-    flex: 1 1 100%;
-    align-self: center;
-    justify-self: center;
-}
-
-/* --- Preview modal --- */
-.fe-preview-modal {
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    animation: fe-fade-in 0.15s ease-out;
-}
-.fe-preview-backdrop {
-    position: absolute;
-    inset: 0;
-    background: rgba(15, 23, 42, 0.55);
-    backdrop-filter: blur(2px);
-}
-.fe-preview-card {
-    position: relative;
-    background: #ffffff;
-    border-radius: 12px;
-    width: min(82vw, 1100px);
-    height: min(85vh, 800px);
+/* --- Inline preview region (bottom 2/3 when open) -------------- */
+.fe-preview-region {
+    flex: 1 1 67%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
+    background: #fafbfc;
     overflow: hidden;
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
-    animation: fe-card-rise 0.18s ease-out;
+    animation: fe-fade-in 0.15s ease-out;
 }
-.fe-preview-header {
+.fe-preview-toolbar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
-    border-bottom: 1px solid #e2e8f0;
-    background: #f8fafc;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    flex-shrink: 0;
 }
-.fe-preview-header i.fa {
-    color: #64748b;
-    font-size: 14px;
-}
+.fe-preview-toolbar i.fa { color: #94a3b8; font-size: 13px; }
 .fe-preview-name {
     flex: 1 1 auto;
+    font-size: 12.5px;
     font-weight: 600;
-    font-size: 13.5px;
     color: #1e293b;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1968,59 +2048,270 @@ ul {
     background: none;
     border: none;
     cursor: pointer;
-    padding: 6px 8px;
-    border-radius: 6px;
+    padding: 5px 8px;
+    border-radius: 5px;
     color: #475569;
     text-decoration: none;
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1;
+    transition: background 0.1s ease, color 0.1s ease;
 }
-.fe-preview-dl:hover,
-.fe-preview-close:hover {
-    background: rgba(99, 102, 241, 0.1);
-    color: #4338ca;
-}
-.fe-preview-body {
+.fe-preview-dl:hover  { background: rgba(99,102,241,.12); color: #4338ca; }
+.fe-preview-close:hover { background: rgba(239,68,68,.12); color: #b91c1c; }
+.fe-preview-dl:disabled { opacity: .5; cursor: wait; }
+
+.fe-preview-content {
     flex: 1 1 auto;
     overflow: auto;
-    padding: 14px;
-    background: #fafbfc;
+    padding: 12px;
 }
-.fe-preview-loading {
-    color: #94a3b8;
-    font-size: 13px;
-    font-style: italic;
-}
+.fe-preview-loading { color: #94a3b8; font-size: 12px; font-style: italic; }
+.fe-preview-muted   { color: #94a3b8; font-size: 12px; padding: 8px; }
 .fe-preview-img {
     max-width: 100%;
     max-height: 100%;
     display: block;
     margin: 0 auto;
     border-radius: 4px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    box-shadow: 0 2px 6px rgba(0,0,0,.06);
 }
 .fe-preview-iframe {
     width: 100%;
     height: 100%;
     border: 0;
     background: white;
-    border-radius: 6px;
+    border-radius: 4px;
 }
 .fe-preview-pre {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", monospace;
-    font-size: 12px;
+    font-size: 11.5px;
     white-space: pre-wrap;
     word-break: break-word;
     margin: 0;
     color: #1e293b;
     line-height: 1.5;
 }
+.fe-preview-mono { font-size: 11px; line-height: 1.35; }
+.fe-preview-unsupported { text-align: center; padding: 32px 16px; color: #64748b; }
+.fe-preview-unsupported i.fa { font-size: 36px; color: #cbd5e1; margin-bottom: 12px; }
+.fe-preview-unsupported p { margin: 0 0 6px 0; font-weight: 600; color: #475569; }
+.fe-preview-unsupported code {
+    background: #eef2f7; padding: 1px 6px; border-radius: 4px; font-size: 12px;
+}
+.fe-preview-unsupported span { font-size: 12px; color: #94a3b8; }
 
 @keyframes fe-fade-in {
     from { opacity: 0; }
     to   { opacity: 1; }
 }
-@keyframes fe-card-rise {
-    from { opacity: 0; transform: translateY(8px) scale(0.98); }
-    to   { opacity: 1; transform: translateY(0)    scale(1);    }
+
+/* =============================================================
+   Attach button popup menu (Upload File / Folder / From Uploaded
+   / Cloud) + Workspace file picker modal for Option 3.
+   Pure additive: no existing rule touched.
+   ============================================================= */
+
+.attach-menu {
+    position: absolute;
+    z-index: 10000;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
+    padding: 4px;
+    min-width: 240px;
+    max-width: 90vw;
+    animation: am-fade-up 0.12s ease-out;
+    user-select: none;
+}
+.attach-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    border: none;
+    background: transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    color: #1e293b;
+    font-size: 13.5px;
+    text-align: left;
+    font-family: inherit;
+    line-height: 1.2;
+    transition: background 0.1s ease;
+}
+.attach-menu-item:hover { background: #f1f5f9; }
+.attach-menu-item:focus-visible {
+    outline: 2px solid rgba(99, 102, 241, 0.45);
+    outline-offset: -1px;
+}
+.attach-menu-item i.fa { width: 16px; text-align: center; color: #6366f1; font-size: 14px; }
+.attach-menu-item .am-label { flex: 1; }
+.attach-menu-item .am-badge {
+    margin-left: auto;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    padding: 2px 6px;
+    border-radius: 9px;
+    background: #fef3c7;
+    color: #92400e;
+}
+.attach-menu-item[disabled] {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+.attach-menu-item[disabled]:hover { background: transparent; }
+
+@keyframes am-fade-up {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* --- Workspace picker modal (Option 3) --- */
+.attach-picker-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 10001;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: am-fade-up 0.15s ease-out;
+}
+.attach-picker-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.45);
+}
+.attach-picker-card {
+    position: relative;
+    background: #ffffff;
+    border-radius: 12px;
+    width: min(90vw, 520px);
+    height: min(80vh, 600px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+}
+.attach-picker-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    flex-shrink: 0;
+}
+.attach-picker-title { flex: 1; font-weight: 600; font-size: 14px; color: #1e293b; }
+.attach-picker-close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: #475569;
+    font-size: 14px;
+}
+.attach-picker-close:hover { background: rgba(239, 68, 68, 0.12); color: #b91c1c; }
+.attach-picker-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 8px 12px;
+}
+.attach-picker-body::-webkit-scrollbar { width: 6px; }
+.attach-picker-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+.attach-picker-empty {
+    color: #94a3b8;
+    text-align: center;
+    padding: 40px 16px;
+    font-size: 13px;
+    font-style: italic;
+}
+.attach-picker-group-title {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #64748b;
+    padding: 10px 4px 6px 4px;
+}
+.attach-picker-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid transparent;
+    background: #f5f5f5;
+    border-radius: 8px;
+    cursor: pointer;
+    text-align: left;
+    color: #1e293b;
+    transition: background 0.1s ease;
+    margin-bottom: 3px;
+    font-family: inherit;
+    font-size: 13px;
+}
+.attach-picker-item:hover { background: #ebebeb; }
+.attach-picker-item.selected {
+    background: #e0e7ff;
+    border-color: #a5b4fc;
+}
+.attach-picker-item input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    cursor: pointer;
+    accent-color: #6366f1;
+}
+.attach-picker-item i.fa { color: #94a3b8; width: 16px; font-size: 13px; }
+.attach-picker-item .api-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+.attach-picker-item .api-meta {
+    font-size: 10.5px;
+    color: #94a3b8;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.attach-picker-footer {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    border-top: 1px solid #e5e7eb;
+    background: #fafbfc;
+    flex-shrink: 0;
+}
+.attach-picker-count { font-size: 12px; color: #64748b; }
+.attach-picker-actions { margin-left: auto; display: flex; gap: 6px; }
+.attach-picker-btn {
+    padding: 7px 14px;
+    border-radius: 6px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #475569;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.1s ease;
+}
+.attach-picker-btn:hover { background: #f1f5f9; }
+.attach-picker-btn-primary {
+    border-color: #6366f1;
+    background: #6366f1;
+    color: #ffffff;
+}
+.attach-picker-btn-primary:hover { background: #4f46e5; }
+.attach-picker-btn-primary:disabled {
+    background: #cbd5e1;
+    border-color: #cbd5e1;
+    cursor: not-allowed;
 }

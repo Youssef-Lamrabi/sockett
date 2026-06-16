@@ -490,14 +490,44 @@ async function setSessionModelAuto() {
   notify('success', `Model set to ${model}`);
 }
 
+// ---------- URL <-> session sync (frontend only, history.pushState) ----------
+function _setSessionInUrl(sid) {
+  if (!sid) return;
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('session') === String(sid)) return;
+    url.searchParams.set('session', String(sid));
+    history.pushState({ sid: String(sid) }, '', url.toString());
+  } catch (_) { /* ignore */ }
+}
+function _getSessionFromUrl() {
+  try { return new URL(window.location.href).searchParams.get('session'); }
+  catch (_) { return null; }
+}
+// Browser back/forward should swap the visible session
+window.addEventListener('popstate', async (e) => {
+  const sid = (e.state && e.state.sid) || _getSessionFromUrl();
+  if (!sid) return;
+  if (typeof markSessionActive === 'function') markSessionActive(String(sid));
+  try { await loadSessionMessages(sid); await loadSessionDetails(sid); } catch (_) {}
+});
+
 async function loadSessions(andOpen = false, loadMessages = true) {
   const res = await fetch('/api/sessions', { headers: { ...api.headers() } });
   if (!res.ok) return;
   const data = await res.json(); sessionsCache = data || [];
   renderSessionsList();
   if (loadMessages && sessionsCache.length) {
-    const sid = String(sessionsCache[0].id);
+    // If the URL already carries ?session=N and it exists, open THAT one
+    // instead of the most-recent. Falls back to the first session otherwise.
+    let sid = _getSessionFromUrl();
+    if (!sid || !sessionsCache.find(s => String(s.id) === String(sid))) {
+      sid = String(sessionsCache[0].id);
+    } else {
+      sid = String(sid);
+    }
     markSessionActive(sid);
+    _setSessionInUrl(sid);
     await loadSessionMessages(sid);
     await loadSessionDetails(sid);
   }
@@ -521,9 +551,13 @@ function renderSessionsList() {
     append(list, `
       <div class="session-item ${activeClass}" data-sid="${s.id}">
         <div class="open">
-          <div class="title">${escapeHtml(title)}</div>
+          <div class="title" title="Double-click to rename">${escapeHtml(title)}</div>
           <div class="meta">${escapeHtml(model)}</div>
         </div>
+        <button class="session-del icon" type="button"
+                aria-label="Delete chat" title="Delete chat">
+          <i class="fa fa-trash" aria-hidden="true"></i>
+        </button>
       </div>
     `);
   });
@@ -533,21 +567,173 @@ function renderSessionsList() {
     item.addEventListener('click', () => {
       list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
       item.classList.add('active');
+      // Sync URL so refresh / bookmark / share keeps the same session
+      _setSessionInUrl(item.dataset.sid);
     });
   });
 
-  // open + load history
+  // open + load history (with a small delay so dblclick on the title can
+  // cancel it before it fires — otherwise the chat opens + drawer closes
+  // on the first click of a dblclick, and rename never triggers).
+  const SINGLE_CLICK_DELAY = 230;
+  const _sessionClickTimers = new Map();
   list.querySelectorAll('.session-item .open').forEach(btn => {
     btn.addEventListener('click', async (e) => {
-      e.stopPropagation(); closeSessionsDrawer();
-      list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
-      btn.parentElement.classList.add('active');
-      await loadSessionMessages(btn.parentElement.dataset.sid);
-      await loadSessionDetails(btn.parentElement.dataset.sid);
-      notify('info', 'Chat opened');
+      // If the user is editing the title inline (contenteditable), don't open
+      if (e.target?.classList?.contains('editing')) return;
+      // Ignore the *second* click of a dblclick (detail=2). The first click
+      // (detail=1) is scheduled below with a timer that gets cancelled by
+      // dblclick handler.
+      if (e.detail >= 2) { e.stopPropagation(); return; }
+
+      const sid = btn.parentElement.dataset.sid;
+      // Cancel any pending open for the same session (double-fire safety)
+      if (_sessionClickTimers.has(sid)) {
+        clearTimeout(_sessionClickTimers.get(sid));
+        _sessionClickTimers.delete(sid);
+      }
+      e.stopPropagation();
+      const tid = setTimeout(async () => {
+        _sessionClickTimers.delete(sid);
+        closeSessionsDrawer();
+        list.querySelectorAll('.session-item').forEach(x => x.classList.remove('active'));
+        btn.parentElement.classList.add('active');
+        _setSessionInUrl(sid);
+        await loadSessionMessages(sid);
+        await loadSessionDetails(sid);
+        notify('info', 'Chat opened');
+      }, SINGLE_CLICK_DELAY);
+      _sessionClickTimers.set(sid, tid);
     });
   });
 
+  // Double-click on title → inline rename (Enter saves, Escape cancels, blur saves).
+  // Cancels any pending single-click "open" timer for the same session so the
+  // chat doesn't open under the rename editor.
+  list.querySelectorAll('.session-item .title').forEach(titleEl => {
+    titleEl.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const sid = titleEl.closest('.session-item')?.dataset?.sid;
+      if (sid && _sessionClickTimers.has(sid)) {
+        clearTimeout(_sessionClickTimers.get(sid));
+        _sessionClickTimers.delete(sid);
+      }
+      _enableInlineRename(titleEl);
+    });
+    // Belt-and-braces: also stop the SECOND click of a dblclick from bubbling
+    // up to the .open ancestor (in case the dblclick listener fires later).
+    titleEl.addEventListener('click', (e) => {
+      if (e.detail >= 2) { e.stopPropagation(); }
+    });
+  });
+
+  // Delete button → confirm → DELETE → notify with name → refresh.
+  // Notification is shown BEFORE the heavy loadSessions reload so the user
+  // always sees confirmation, even if the subsequent reload is slow or fails.
+  list.querySelectorAll('.session-item .session-del').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const item = btn.closest('.session-item');
+      const sid = item?.dataset?.sid;
+      const name = item?.querySelector('.title')?.textContent?.trim() || 'Chat';
+      if (!sid) return;
+      if (!window.confirm(`Delete chat "${name}" ? This cannot be undone.`)) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/sessions/${sid}`, {
+          method: 'DELETE',
+          headers: { ...api.headers() }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        btn.disabled = false;
+        notify('error', `Failed to delete: ${err?.message || err}`, 4500);
+        return;
+      }
+      // Toast FIRST — longer timeout so it persists across the reload
+      notify('success', `Chat "${name}" deleted`, 4500);
+      // If we just deleted the active session, clean the URL
+      try {
+        if (_getSessionFromUrl() === String(sid)) {
+          history.replaceState({}, '', '/dashboard');
+        }
+      } catch {}
+      // Defer the reload by one tick so the toast actually paints first
+      setTimeout(() => { loadSessions(false, true).catch(() => {}); }, 50);
+    });
+  });
+}
+
+// ---- Inline title rename helper (Enter saves, Esc cancels, blur saves) ----
+async function _renameSessionApi(sid, newTitle) {
+  const res = await fetch(`/api/sessions/${sid}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...api.headers() },
+    body: JSON.stringify({ title: newTitle })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+function _enableInlineRename(titleEl) {
+  if (titleEl.classList.contains('editing')) return;
+  const original = titleEl.textContent;
+  const item = titleEl.closest('.session-item');
+  const sid = item?.dataset?.sid;
+  if (!sid) return;
+  titleEl.classList.add('editing');
+  titleEl.setAttribute('contenteditable', 'true');
+  titleEl.spellcheck = false;
+  titleEl.focus();
+  // Select all the text so user can just type to overwrite
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(titleEl);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {}
+
+  let committed = false;
+  const cleanup = () => {
+    titleEl.removeAttribute('contenteditable');
+    titleEl.classList.remove('editing');
+    titleEl.removeEventListener('keydown', onKey);
+    titleEl.removeEventListener('blur', onBlur);
+  };
+  const commit = async () => {
+    if (committed) return; committed = true;
+    const newTitle = (titleEl.textContent || '').trim();
+    cleanup();
+    if (!newTitle || newTitle === original) {
+      titleEl.textContent = original;
+      return;
+    }
+    try {
+      const data = await _renameSessionApi(sid, newTitle);
+      titleEl.textContent = data?.title || newTitle;
+      // Update local cache so re-render doesn't revert
+      const cached = sessionsCache.find(x => String(x.id) === String(sid));
+      if (cached) cached.title = data?.title || newTitle;
+      notify('success', `Renamed to "${data?.title || newTitle}"`);
+    } catch (err) {
+      titleEl.textContent = original;
+      notify('error', `Rename failed: ${err?.message || err}`);
+    }
+  };
+  const cancel = () => {
+    if (committed) return; committed = true;
+    titleEl.textContent = original;
+    cleanup();
+  };
+  function onKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  }
+  function onBlur() { commit(); }
+  titleEl.addEventListener('keydown', onKey);
+  titleEl.addEventListener('blur', onBlur);
 }
 
 /* -------------------------- Uploads ------------------------------------- */
@@ -1057,6 +1243,20 @@ function boot() {
   // also scroll when renderers signal that logs changed
   window.addEventListener('logs:changed', () => scrollLogsSmooth());
 
+  // Auto-open workspace panel when agent produces a file (detected via OBSERVE block)
+  window.addEventListener('workspace:file-detected', () => {
+    const contentArea = el('content-area');
+    const feEl = el('file-explorer');
+    const feBtn = el('btn-file-explorer');
+    if (!contentArea || contentArea.classList.contains('fe-open')) return; // already open
+    contentArea.classList.add('fe-open');
+    feEl?.setAttribute('aria-hidden', 'false');
+    feBtn?.classList.add('active');
+    feBtn?.setAttribute('aria-expanded', 'true');
+    // Refresh file list with a short delay so the server has time to flush the file
+    try { window.refreshWorkspaceSoon?.(600); } catch { }
+  });
+
   // Stop button
   el('stop')?.addEventListener('click', (e) => { e.preventDefault(); stopRun(); });
   // ESC to stop
@@ -1100,6 +1300,10 @@ function boot() {
       feEl?.setAttribute('aria-hidden', 'true');
       feBtn?.classList.remove('active');
       feBtn?.setAttribute('aria-expanded', 'false');
+      // CRITICAL: clear any inline width set during the resize drag —
+      // otherwise it overrides the CSS rule that collapses #file-explorer
+      // to width:0 when .fe-open is removed (panel stays visible until refresh).
+      if (feEl) feEl.style.width = '';
     }
 
     feBtn?.addEventListener('click', () => {
@@ -1111,34 +1315,67 @@ function boot() {
     });
     feCloseBtn?.addEventListener('click', closeFE);
 
-    // Inject a small refresh button into the workspace header (no HTML change)
-    (function injectRefreshBtn() {
+    // Inject view-toggle + refresh buttons into the workspace header
+    // (no HTML change — injected once, idempotent).
+    (function injectHeaderTools() {
       const header = document.querySelector('#file-explorer .fe-header');
       const closeBtn = document.getElementById('fe-close');
       if (!header || !closeBtn) return;
-      if (document.getElementById('fe-refresh')) return; // idempotent
-      const btn = document.createElement('button');
-      btn.id = 'fe-refresh';
-      btn.type = 'button';
-      btn.className = 'icon fe-refresh-btn';
-      btn.title = 'Refresh workspace';
-      btn.setAttribute('aria-label', 'Refresh workspace');
-      btn.innerHTML = '<i class="fa fa-sync-alt" aria-hidden="true"></i>';
-      closeBtn.parentNode.insertBefore(btn, closeBtn);
-      btn.addEventListener('click', () => {
-        if (btn.disabled) return;
-        btn.disabled = true;
-        btn.classList.add('spinning');
-        // Force-refresh bypasses the signature cache by resetting it
-        try { _wsCurrentSig = ''; } catch {}
-        Promise.resolve(refreshWorkspaceFiles())
-          .finally(() => {
-            setTimeout(() => {
-              btn.classList.remove('spinning');
-              btn.disabled = false;
-            }, 450);
-          });
-      });
+
+      // --- View toggle (grid <-> list) ---
+      if (!document.getElementById('fe-view-toggle')) {
+        const viewBtn = document.createElement('button');
+        viewBtn.id = 'fe-view-toggle';
+        viewBtn.type = 'button';
+        viewBtn.className = 'icon fe-view-toggle';
+        const updateBtn = () => {
+          const m = _wsGetViewMode();
+          viewBtn.title = m === 'grid' ? 'Switch to list view' : 'Switch to grid view';
+          viewBtn.setAttribute('aria-label', viewBtn.title);
+          // Show the icon of the OTHER view (i.e. what you'd switch to)
+          viewBtn.innerHTML = m === 'grid'
+            ? '<i class="fa fa-list" aria-hidden="true"></i>'
+            : '<i class="fa fa-th" aria-hidden="true"></i>';
+        };
+        updateBtn();
+        viewBtn.addEventListener('click', () => {
+          const next = _wsGetViewMode() === 'grid' ? 'list' : 'grid';
+          _wsSetViewMode(next);
+          updateBtn();
+          // Re-apply class on existing list region (cheap repaint, no fetch)
+          const region = document.querySelector('#file-explorer .fe-list-region');
+          if (region) {
+            region.classList.remove('view-grid', 'view-list');
+            region.classList.add(`view-${next}`);
+          }
+        });
+        closeBtn.parentNode.insertBefore(viewBtn, closeBtn);
+      }
+
+      // --- Refresh ---
+      if (!document.getElementById('fe-refresh')) {
+        const btn = document.createElement('button');
+        btn.id = 'fe-refresh';
+        btn.type = 'button';
+        btn.className = 'icon fe-refresh-btn';
+        btn.title = 'Refresh workspace';
+        btn.setAttribute('aria-label', 'Refresh workspace');
+        btn.innerHTML = '<i class="fa fa-sync-alt" aria-hidden="true"></i>';
+        closeBtn.parentNode.insertBefore(btn, closeBtn);
+        btn.addEventListener('click', () => {
+          if (btn.disabled) return;
+          btn.disabled = true;
+          btn.classList.add('spinning');
+          try { _wsCurrentSig = ''; } catch {}
+          Promise.resolve(refreshWorkspaceFiles())
+            .finally(() => {
+              setTimeout(() => {
+                btn.classList.remove('spinning');
+                btn.disabled = false;
+              }, 450);
+            });
+        });
+      }
     })();
 
     // Drag the splitter bar to resize the workspace panel
@@ -1165,7 +1402,11 @@ function boot() {
         feSplitter.style.transition = '';
         document.body.style.userSelect = '';
         const w = feEl.offsetWidth;
+        // Persist the new width via the CSS var, then CLEAR the inline width
+        // set during the drag — so a later closeFE() can collapse the panel
+        // back to width:0 via CSS without being blocked by inline style.
         contentArea.style.setProperty('--fe-col', w + 'px');
+        feEl.style.width = '';
         localStorage.setItem('fe_width', w + 'px');
       });
       const savedW = localStorage.getItem('fe_width');
@@ -1248,9 +1489,24 @@ function _wsIconForFile(name) {
 function _wsEscHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-function _wsFileItemHtml(f) {
+function _wsGetViewMode() {
+  return localStorage.getItem('fe_view_mode') === 'list' ? 'list' : 'grid';
+}
+function _wsSetViewMode(mode) {
+  localStorage.setItem('fe_view_mode', (mode === 'list') ? 'list' : 'grid');
+}
+function _wsGetUploadsOpen() {
+  return localStorage.getItem('fe_uploads_open') !== '0';   // default: open
+}
+function _wsSetUploadsOpen(open) {
+  localStorage.setItem('fe_uploads_open', open ? '1' : '0');
+}
+
+// File item renderer — same markup for both view modes; CSS handles layout
+function _wsFileItemHtml(f, opts = {}) {
+  const indent = opts.indent ? ' fe-indent' : '';
   return `
-    <button class="fe-file-item" type="button"
+    <button class="fe-file-item${indent}" type="button"
             data-path="${_wsEscHtml(f.rel_path)}"
             title="${_wsEscHtml(f.rel_path)}">
       <i class="fa ${_wsIconForFile(f.name)}" aria-hidden="true"></i>
@@ -1260,7 +1516,28 @@ function _wsFileItemHtml(f) {
   `;
 }
 
-let _wsCurrentSig = '';   // signature of last-rendered list, to avoid unnecessary repaint
+// Collapsible "Uploads" folder shown at the TOP of the file list when the
+// session has uploaded files. Click toggles indented children visibility.
+function _wsUploadsFolderHtml(uploads) {
+  const isOpen = _wsGetUploadsOpen();
+  const children = uploads.map(f => _wsFileItemHtml(f, { indent: true })).join('');
+  return `
+    <div class="fe-folder${isOpen ? ' open' : ''}" data-folder="uploads">
+      <button class="fe-folder-header" type="button" aria-expanded="${isOpen ? 'true' : 'false'}">
+        <i class="fa fa-chevron-right fe-folder-chevron" aria-hidden="true"></i>
+        <i class="fa fa-folder fe-folder-icon" aria-hidden="true"></i>
+        <span class="fe-folder-label">Uploads</span>
+        <span class="fe-count">${uploads.length}</span>
+      </button>
+      <div class="fe-folder-children" role="group">
+        ${children}
+      </div>
+    </div>
+  `;
+}
+
+let _wsCurrentSig = '';            // signature of last-rendered list (anti-flicker)
+let _wsPreviewedPath = null;       // path of file currently shown in inline preview
 async function refreshWorkspaceFiles() {
   const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
   const body = document.querySelector('#file-explorer .fe-body');
@@ -1277,7 +1554,7 @@ async function refreshWorkspaceFiles() {
     const generated = Array.isArray(data?.generated) ? data.generated : [];
     const sig = JSON.stringify([uploads.map(f => [f.rel_path, f.size, f.mtime]),
                                  generated.map(f => [f.rel_path, f.size, f.mtime])]);
-    if (sig === _wsCurrentSig) return;   // nothing changed, skip repaint to avoid flicker
+    if (sig === _wsCurrentSig) return;
     _wsCurrentSig = sig;
     _wsRenderLists(body, uploads, generated);
   } catch (err) {
@@ -1286,100 +1563,133 @@ async function refreshWorkspaceFiles() {
 }
 function _wsRenderEmpty(body, hint = '') {
   _wsCurrentSig = '';
+  // Preserve the preview region even when list becomes empty
+  const previewRegion = body.querySelector('.fe-preview-region');
   body.innerHTML = `
-    <div class="fe-empty-state">
-      <i class="fa fa-folder-o" aria-hidden="true"></i>
-      <p>No files yet</p>
-      <span>${_wsEscHtml(hint || 'Files generated by the agent during this session will appear here')}</span>
+    <div class="fe-list-region view-${_wsGetViewMode()}">
+      <div class="fe-empty-state">
+        <i class="fa fa-folder-o" aria-hidden="true"></i>
+        <p>No files yet</p>
+        <span>${_wsEscHtml(hint || 'Files generated by the agent during this session will appear here')}</span>
+      </div>
     </div>
   `;
+  if (previewRegion) body.appendChild(previewRegion);
+  body.classList.toggle('has-preview', !!previewRegion);
 }
+
+/*
+   New layout — single Generated list takes full height by default. When a
+   user clicks a file, the body splits 1/3 (list) + 2/3 (preview inline).
+   If the session has uploads, a collapsible Uploads folder appears at the
+   TOP of the list (NOT as a separate section, just an entry).
+*/
 function _wsRenderLists(body, uploads, generated) {
+  // Snapshot the existing preview region (if any) so the refresh doesn't kill it
+  const existingPreview = body.querySelector('.fe-preview-region');
+
   if (uploads.length === 0 && generated.length === 0) {
     _wsRenderEmpty(body);
     return;
   }
+  const view = _wsGetViewMode();
+  const uploadsHtml = uploads.length ? _wsUploadsFolderHtml(uploads) : '';
+  const generatedHtml = generated.length
+    ? generated.map(f => _wsFileItemHtml(f)).join('')
+    : '<div class="fe-empty-mini">No outputs yet — run a step to generate files</div>';
+
   body.innerHTML = `
-    <div class="fe-section" data-kind="uploads">
-      <div class="fe-section-title">
-        <i class="fa fa-cloud-upload-alt" aria-hidden="true"></i>
-        <span>Uploaded</span>
-        <span class="fe-count">${uploads.length}</span>
-      </div>
+    <div class="fe-list-region view-${view}">
       <div class="fe-file-list">
-        ${uploads.length
-          ? uploads.map(_wsFileItemHtml).join('')
-          : '<div class="fe-empty-mini">No uploads yet</div>'}
-      </div>
-    </div>
-    <div class="fe-divider" aria-hidden="true"></div>
-    <div class="fe-section" data-kind="generated">
-      <div class="fe-section-title">
-        <i class="fa fa-cogs" aria-hidden="true"></i>
-        <span>Generated</span>
-        <span class="fe-count">${generated.length}</span>
-      </div>
-      <div class="fe-file-list">
-        ${generated.length
-          ? generated.map(_wsFileItemHtml).join('')
-          : '<div class="fe-empty-mini">No outputs yet — run a step to generate files</div>'}
+        ${uploadsHtml}
+        ${generatedHtml}
       </div>
     </div>
   `;
+  if (existingPreview) body.appendChild(existingPreview);
+  body.classList.toggle('has-preview', !!existingPreview);
+
+  // Wire file items
   body.querySelectorAll('.fe-file-item').forEach(btn => {
     btn.addEventListener('click', () => openFilePreview(btn.dataset.path));
+    if (btn.dataset.path === _wsPreviewedPath) btn.classList.add('active');
   });
+
+  // Wire uploads folder collapse/expand
+  const folder = body.querySelector('.fe-folder[data-folder="uploads"]');
+  if (folder) {
+    folder.querySelector('.fe-folder-header').addEventListener('click', () => {
+      const nowOpen = !folder.classList.contains('open');
+      folder.classList.toggle('open', nowOpen);
+      folder.querySelector('.fe-folder-header').setAttribute('aria-expanded', nowOpen ? 'true' : 'false');
+      _wsSetUploadsOpen(nowOpen);
+    });
+  }
 }
 
-/* --- Preview modal (text / image / iframe) ----------------------------- */
+/* --- Inline preview (split panel: top 1/3 list, bottom 2/3 preview) ----- */
 function openFilePreview(relPath) {
   const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
   if (!sid || !relPath) return;
+  const body = document.querySelector('#file-explorer .fe-body');
+  if (!body) return;
   const url = `/api/sessions/${sid}/files/raw?path=${encodeURIComponent(relPath)}`;
-
-  // Build modal
   const baseName = relPath.split('/').pop() || 'download';
-  const modal = document.createElement('div');
-  modal.className = 'fe-preview-modal';
-  modal.setAttribute('role', 'dialog');
-  modal.setAttribute('aria-label', `Preview ${relPath}`);
-  modal.innerHTML = `
-    <div class="fe-preview-backdrop"></div>
-    <div class="fe-preview-card">
-      <div class="fe-preview-header">
-        <i class="fa ${_wsIconForFile(relPath)}" aria-hidden="true"></i>
-        <span class="fe-preview-name">${_wsEscHtml(relPath)}</span>
-        <button class="fe-preview-dl icon" type="button"
-                title="Download" aria-label="Download file">
-          <i class="fa fa-download" aria-hidden="true"></i>
-        </button>
-        <button class="fe-preview-close icon" type="button" aria-label="Close preview">✕</button>
-      </div>
-      <div class="fe-preview-body"><div class="fe-preview-loading">Loading…</div></div>
+
+  // Find or build the preview region (kept as a stable sibling of the list)
+  let region = body.querySelector('.fe-preview-region');
+  if (!region) {
+    region = document.createElement('div');
+    region.className = 'fe-preview-region';
+    body.appendChild(region);
+  }
+  region.innerHTML = `
+    <div class="fe-preview-toolbar">
+      <i class="fa ${_wsIconForFile(relPath)}" aria-hidden="true"></i>
+      <span class="fe-preview-name" title="${_wsEscHtml(relPath)}">${_wsEscHtml(baseName)}</span>
+      <button class="fe-preview-dl icon" type="button"
+              title="Download" aria-label="Download file">
+        <i class="fa fa-download" aria-hidden="true"></i>
+      </button>
+      <button class="fe-preview-close icon" type="button"
+              title="Close preview" aria-label="Close preview">✕</button>
     </div>
+    <div class="fe-preview-content"><div class="fe-preview-loading">Loading…</div></div>
   `;
-  document.body.appendChild(modal);
 
-  const close = () => { modal.remove(); document.removeEventListener('keydown', escHandler); };
-  function escHandler(e) { if (e.key === 'Escape') close(); }
-  modal.querySelector('.fe-preview-close').addEventListener('click', close);
-  modal.querySelector('.fe-preview-backdrop').addEventListener('click', close);
-  document.addEventListener('keydown', escHandler);
+  body.classList.add('has-preview');
+  _wsPreviewedPath = relPath;
 
-  // Robust download: fetch with Bearer header → blob → trigger client-side
-  // download. This works regardless of cookie state and forces the correct
-  // filename (browsers ignore "download" attr for cross-origin or 401 cases).
-  modal.querySelector('.fe-preview-dl').addEventListener('click', () => {
+  // Highlight the active file in the list (if visible)
+  body.querySelectorAll('.fe-file-item.active').forEach(el => el.classList.remove('active'));
+  const activeBtn = body.querySelector(`.fe-file-item[data-path="${CSS.escape(relPath)}"]`);
+  if (activeBtn) activeBtn.classList.add('active');
+
+  // Wire close + download
+  region.querySelector('.fe-preview-close').addEventListener('click', closeInlinePreview);
+  region.querySelector('.fe-preview-dl').addEventListener('click', () => {
     _wsDownloadFile(url, baseName).catch(err => {
       try { notify('error', `Download failed: ${err?.message || err}`); } catch {}
     });
   });
 
-  _wsLoadPreviewContent(url, relPath, modal.querySelector('.fe-preview-body'));
+  _wsLoadPreviewContent(url, relPath, region.querySelector('.fe-preview-content'));
+}
+
+function closeInlinePreview() {
+  const body = document.querySelector('#file-explorer .fe-body');
+  if (!body) return;
+  // Revoke any blob URL the preview was using to avoid memory leaks
+  try { _wsRevokeActiveBlobUrl?.(); } catch {}
+  const region = body.querySelector('.fe-preview-region');
+  if (region) region.remove();
+  body.classList.remove('has-preview');
+  _wsPreviewedPath = null;
+  body.querySelectorAll('.fe-file-item.active').forEach(el => el.classList.remove('active'));
 }
 
 async function _wsDownloadFile(url, filename) {
-  const btn = document.querySelector('.fe-preview-modal .fe-preview-dl');
+  const btn = document.querySelector('#file-explorer .fe-preview-dl');
   if (btn) btn.disabled = true;
   try {
     const res = await fetch(url, { headers: { ...api.headers() } });
@@ -1399,38 +1709,174 @@ async function _wsDownloadFile(url, filename) {
     if (btn) btn.disabled = false;
   }
 }
-async function _wsLoadPreviewContent(url, relPath, container) {
-  const ext = (relPath || '').split('.').pop().toLowerCase();
-  const imgExt = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp']);
-  const iframeExt = new Set(['pdf', 'html', 'htm']);
+// Track blob URLs created for preview so we can revoke them on next preview
+// (each new openFilePreview replaces the previous URL — no memory leak).
+let _wsActiveBlobUrl = null;
+function _wsRevokeActiveBlobUrl() {
+  if (_wsActiveBlobUrl) {
+    try { URL.revokeObjectURL(_wsActiveBlobUrl); } catch {}
+    _wsActiveBlobUrl = null;
+  }
+}
 
-  if (imgExt.has(ext)) {
-    container.innerHTML = `<img class="fe-preview-img" src="${url}" alt="${_wsEscHtml(relPath)}" />`;
-    return;
-  }
-  if (iframeExt.has(ext)) {
-    container.innerHTML = `<iframe class="fe-preview-iframe" src="${url}" sandbox="allow-same-origin"></iframe>`;
-    return;
-  }
-  // Default: text-like — fetch as bytes, decode UTF-8 with replacement, cap at 2 MB
-  try {
+async function _wsLoadPreviewContent(url, relPath, container) {
+  // Always revoke the previous preview's blob URL before showing a new one
+  _wsRevokeActiveBlobUrl();
+
+  const ext = (relPath || '').split('.').pop().toLowerCase();
+  const imgExt    = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico']);
+  const pdfExt    = new Set(['pdf']);
+  const htmlExt   = new Set(['html', 'htm']);
+  // Extended text whitelist — covers most bioinformatics text outputs.
+  // Catch-all (last branch) also tries decoding as text for any other ext.
+  const textExt   = new Set([
+    'txt', 'tsv', 'csv', 'json', 'log', 'md', 'yaml', 'yml', 'xml',
+    'bed', 'gff', 'gff3', 'vcf', 'sam', 'paf', 'maf', 'gtf',
+    'tab', 'tabular', 'tree', 'nwk', 'newick',
+    'report', 'kreport', 'out', 'err', 'stats', 'summary', 'ini', 'cfg', 'conf',
+    'sh', 'py', 'r', 'pl', 'js', 'css', 'fai', 'tsv.gz' // last is a hint
+  ]);
+  const fastaExt  = new Set(['fasta', 'fa', 'fna', 'faa', 'pep', 'cds', 'rna', 'fastq', 'fq']);
+
+  // Helper: fetch with auth + return blob URL (bypasses backend's
+  // Content-Disposition: attachment which prevents iframes/images from
+  // rendering URLs directly when the response carries that header).
+  async function _fetchAsBlobUrl() {
     const res = await fetch(url, { headers: { ...api.headers() } });
-    if (!res.ok) {
-      container.innerHTML = `<div class="muted">Failed to load (HTTP ${res.status}).</div>`;
-      return;
-    }
-    const buf = await res.arrayBuffer();
-    const TEXT_CAP = 2 * 1024 * 1024;
-    const slice = buf.byteLength > TEXT_CAP ? buf.slice(0, TEXT_CAP) : buf;
-    const dec = new TextDecoder('utf-8', { fatal: false });
-    let text = dec.decode(slice);
-    if (buf.byteLength > TEXT_CAP) {
-      text += `\n\n--- truncated (file is ${_wsHumanSize(buf.byteLength)} total) — use download ---`;
-    }
-    container.innerHTML = `<pre class="fe-preview-pre">${_wsEscHtml(text)}</pre>`;
-  } catch (e) {
-    container.innerHTML = `<div class="muted">Cannot preview: ${_wsEscHtml(e?.message || 'error')}</div>`;
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const bUrl = URL.createObjectURL(blob);
+    _wsActiveBlobUrl = bUrl;
+    return { bUrl, blob };
   }
+
+  // --- Images: use blob URL (works regardless of Content-Disposition) ---
+  if (imgExt.has(ext)) {
+    try {
+      const { bUrl } = await _fetchAsBlobUrl();
+      container.innerHTML = `<img class="fe-preview-img" src="${bUrl}" alt="${_wsEscHtml(relPath)}" />`;
+    } catch (e) {
+      container.innerHTML = `<div class="fe-preview-muted">Cannot load image: ${_wsEscHtml(e?.message || 'error')}</div>`;
+    }
+    return;
+  }
+
+  // --- PDF: blob URL → browser native viewer (referrer scrubbed) ---
+  if (pdfExt.has(ext)) {
+    try {
+      const { bUrl } = await _fetchAsBlobUrl();
+      container.innerHTML = `<iframe class="fe-preview-iframe"
+        src="${bUrl}#toolbar=1"
+        referrerpolicy="no-referrer"></iframe>`;
+    } catch (e) {
+      container.innerHTML = `<div class="fe-preview-muted">Cannot load PDF: ${_wsEscHtml(e?.message || 'error')}</div>`;
+    }
+    return;
+  }
+
+  // --- HTML: blob URL with strict sandbox + no-referrer ---
+  // Reason for blob: <iframe src=URL> would receive Content-Disposition:
+  // attachment from the backend FileResponse and the browser would refuse
+  // to render it. Blob URLs are local and have no such header.
+  //
+  // External-URL safety: many bioinformatics HTML reports (Krona, fastp,
+  // MultiQC) embed external <a href> links and <img src> to CDNs/sites
+  // like genoml.io, github.com, etc. With sandbox="" (no token), the
+  // iframe is a unique origin; links cannot navigate the parent, scripts
+  // and forms are blocked. referrerpolicy="no-referrer" ensures no leak.
+  // We also prepend a CSP meta tag to the served HTML so the browser
+  // refuses to fetch ANY external resource, eliminating the "hallucinated
+  // URL" appearance entirely (only locally inlined content renders).
+  if (htmlExt.has(ext)) {
+    try {
+      const res = await fetch(url, { headers: { ...api.headers() } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const rawHtml = await res.text();
+      const cspMeta = '<meta http-equiv="Content-Security-Policy" '
+        + 'content="default-src \'none\'; '
+        + 'img-src data: blob:; '
+        + 'style-src \'unsafe-inline\' data:; '
+        + 'font-src data:; '
+        + 'media-src data: blob:; '
+        + 'frame-ancestors \'none\'; '
+        + 'form-action \'none\';">';
+      // Inject CSP at the very top of <head> if present, else before <html>
+      let safeHtml;
+      if (/<head\b[^>]*>/i.test(rawHtml)) {
+        safeHtml = rawHtml.replace(/<head\b[^>]*>/i, m => m + cspMeta);
+      } else {
+        safeHtml = '<!doctype html><html><head>' + cspMeta + '</head><body>' + rawHtml + '</body></html>';
+      }
+      const blob = new Blob([safeHtml], { type: 'text/html' });
+      const bUrl = URL.createObjectURL(blob);
+      _wsActiveBlobUrl = bUrl;
+      container.innerHTML = `<iframe class="fe-preview-iframe"
+        src="${bUrl}"
+        sandbox=""
+        referrerpolicy="no-referrer"></iframe>`;
+    } catch (e) {
+      container.innerHTML = `<div class="fe-preview-muted">Cannot load HTML: ${_wsEscHtml(e?.message || 'error')}</div>`;
+    }
+    return;
+  }
+
+  // --- Text-like + FASTA (and catch-all fallback for unknown ext) ---
+  const treatAsText = textExt.has(ext) || fastaExt.has(ext);
+  const isFasta = fastaExt.has(ext);
+
+  if (treatAsText || ext === '' || ext.length > 8) {
+    // Plain text + FASTA + unknown extensions (most bioinfo files are text).
+    try {
+      const res = await fetch(url, { headers: { ...api.headers() } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = await res.arrayBuffer();
+
+      // Binary heuristic: if first 1024 bytes contain >5% non-printable
+      // chars (excluding common whitespace) AND ext was unknown, abort to
+      // the unsupported branch. This protects from rendering BAM/BGZ bytes.
+      if (!treatAsText) {
+        const head = new Uint8Array(buf.slice(0, 1024));
+        let nonPrint = 0;
+        for (const b of head) {
+          if (b < 9 || (b > 13 && b < 32 && b !== 27) || b === 127) nonPrint++;
+        }
+        if (head.length > 0 && nonPrint / head.length > 0.05) {
+          throw new Error('binary');
+        }
+      }
+
+      const TEXT_CAP = 2 * 1024 * 1024;
+      const slice = buf.byteLength > TEXT_CAP ? buf.slice(0, TEXT_CAP) : buf;
+      let text = new TextDecoder('utf-8', { fatal: false }).decode(slice);
+
+      if (isFasta) {
+        const lines = text.split('\n');
+        const LINE_CAP = 200;
+        if (lines.length > LINE_CAP) {
+          text = lines.slice(0, LINE_CAP).join('\n') +
+                 `\n\n--- showing first ${LINE_CAP} lines of ${lines.length} (full file ${_wsHumanSize(buf.byteLength)}) ---`;
+        }
+        container.innerHTML = `<pre class="fe-preview-pre fe-preview-mono">${_wsEscHtml(text)}</pre>`;
+        return;
+      }
+      if (buf.byteLength > TEXT_CAP) {
+        text += `\n\n--- truncated (file is ${_wsHumanSize(buf.byteLength)} total) — use download ---`;
+      }
+      container.innerHTML = `<pre class="fe-preview-pre">${_wsEscHtml(text)}</pre>`;
+      return;
+    } catch (e) {
+      // Fall through to "unsupported" message below
+    }
+  }
+
+  // --- Unsupported / binary format → instruct user to use download button ---
+  container.innerHTML = `
+    <div class="fe-preview-unsupported">
+      <i class="fa ${_wsIconForFile(relPath)}" aria-hidden="true"></i>
+      <p>Preview not available for <code>.${_wsEscHtml(ext || 'unknown')}</code> files</p>
+      <span>Click the download button (⬇) to save the file.</span>
+    </div>
+  `;
 }
 
 /* --- Auto-refresh helpers (debounced; only acts when panel is open) ---- */
@@ -1682,3 +2128,292 @@ function initSplitter() {
     const w = left.offsetWidth; localStorage.setItem('sidebar_w', String(w));
   });
 }
+
+/* =========================================================================
+   Attach button popup menu — 4 options (Upload File / Folder / From
+   Uploaded / Cloud). Pure additive: existing uploadFile() untouched.
+   ========================================================================= */
+
+async function _amUploadOneFile(f) {
+    if (!f) return;
+    const rec = {
+        id: uid(),
+        name: f.name,
+        type: f.type || '',
+        size: f.size || 0,
+        localUrl: URL.createObjectURL(f),
+        serverPath: null,
+        status: 'uploading'
+    };
+    pendingUploads.push(rec);
+    renderAttachDock();
+    try {
+        const form = new FormData();
+        form.append('file', f);
+        const res = await fetch('/api/upload', { method: 'POST', headers: { ...api.headers() }, body: form });
+        if (!res.ok) throw new Error(await res.text() || 'Upload failed');
+        const data = await res.json();
+        rec.serverPath = data?.path || null;
+        rec.status = 'ready';
+        try { window.refreshWorkspaceSoon?.(300); } catch {}
+    } catch (err) {
+        console.error(err);
+        rec.status = 'error';
+        notify('error', `Upload failed: ${f.name}`);
+    } finally {
+        renderAttachDock();
+    }
+}
+
+async function _amUploadFileList(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    for (const f of files) {
+        if (f.name === '.DS_Store' || f.name.startsWith('._')) continue;
+        await _amUploadOneFile(f);
+    }
+    notify('success', `Uploaded ${files.length} file${files.length > 1 ? 's' : ''}`);
+}
+
+function _amGetFolderInput() {
+    let inp = document.getElementById('attach-folder-input');
+    if (inp) return inp;
+    inp = document.createElement('input');
+    inp.id = 'attach-folder-input';
+    inp.type = 'file';
+    inp.setAttribute('webkitdirectory', '');
+    inp.setAttribute('directory', '');
+    inp.setAttribute('mozdirectory', '');
+    inp.multiple = true;
+    inp.style.display = 'none';
+    inp.addEventListener('change', (e) => {
+        const files = e.target.files;
+        if (files && files.length) _amUploadFileList(files);
+        e.target.value = '';
+    });
+    document.body.appendChild(inp);
+    return inp;
+}
+
+let _amMenuEl = null;
+function _amCloseMenu() {
+    if (_amMenuEl) { _amMenuEl.remove(); _amMenuEl = null; }
+    document.removeEventListener('keydown', _amEscHandler);
+    document.removeEventListener('mousedown', _amOutsideHandler, true);
+}
+function _amEscHandler(e) { if (e.key === 'Escape') _amCloseMenu(); }
+function _amOutsideHandler(e) {
+    if (!_amMenuEl) return;
+    if (_amMenuEl.contains(e.target)) return;
+    if (e.target.closest('.upload')) return;
+    _amCloseMenu();
+}
+
+function _amShowMenu(anchorEl) {
+    _amCloseMenu();
+    const menu = document.createElement('div');
+    menu.className = 'attach-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'Attachment options');
+    menu.innerHTML = `
+        <button class="attach-menu-item" type="button" data-action="upload-file" role="menuitem">
+            <i class="fa fa-paperclip" aria-hidden="true"></i>
+            <span class="am-label">Upload File</span>
+        </button>
+        <button class="attach-menu-item" type="button" data-action="upload-folder" role="menuitem">
+            <i class="fa fa-folder-open" aria-hidden="true"></i>
+            <span class="am-label">Upload Folder</span>
+        </button>
+        <button class="attach-menu-item" type="button" data-action="from-workspace" role="menuitem">
+            <i class="fa fa-list-ul" aria-hidden="true"></i>
+            <span class="am-label">Select from Uploaded Files</span>
+        </button>
+        <button class="attach-menu-item" type="button" data-action="from-cloud" role="menuitem" disabled aria-disabled="true">
+            <i class="fa fa-cloud" aria-hidden="true"></i>
+            <span class="am-label">Import from Cloud Storage</span>
+            <span class="am-badge">Soon</span>
+        </button>
+    `;
+    document.body.appendChild(menu);
+
+    const rect = anchorEl.getBoundingClientRect();
+    const menuW = menu.offsetWidth || 240;
+    const menuH = menu.offsetHeight || 200;
+    const margin = 8;
+    let left = rect.left;
+    if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
+    if (left < 8) left = 8;
+    let top = rect.top - menuH - margin;
+    if (top < 8) top = rect.bottom + margin;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+
+    _amMenuEl = menu;
+
+    menu.addEventListener('click', (e) => {
+        const btn = e.target.closest('.attach-menu-item');
+        if (!btn || btn.disabled) return;
+        const action = btn.dataset.action;
+        _amCloseMenu();
+        if (action === 'upload-file') {
+            const inp = document.getElementById('file-input');
+            if (inp) {
+                inp.value = '';
+                // Arm the label bypass so our intercept lets THIS click through
+                _amBypassLabelOnce = true;
+                inp.click();
+                // Safety: clear bypass after 1s in case the click never reached the label
+                setTimeout(() => { _amBypassLabelOnce = false; }, 1000);
+            }
+        } else if (action === 'upload-folder') {
+            const inp = _amGetFolderInput();
+            inp.value = '';
+            inp.click();
+        } else if (action === 'from-workspace') {
+            _amOpenWorkspacePicker();
+        } else if (action === 'from-cloud') {
+            notify('info', 'Cloud import — coming soon');
+        }
+    });
+
+    document.addEventListener('keydown', _amEscHandler);
+    setTimeout(() => document.addEventListener('mousedown', _amOutsideHandler, true), 0);
+}
+
+// One-shot bypass flag set by menu actions that need to programmatically
+// trigger the native file picker (Option 1: Upload File). Without it, the
+// inp.click() event bubbles to the label and our preventDefault cancels
+// the picker before it opens — Upload File silently does nothing.
+let _amBypassLabelOnce = false;
+
+function _amInstallLabelIntercept() {
+    const label = document.querySelector('#composer label.upload');
+    if (!label || label.dataset.amWired === '1') return;
+    label.dataset.amWired = '1';
+    label.addEventListener('click', (e) => {
+        if (_amBypassLabelOnce) {
+            _amBypassLabelOnce = false;
+            return;  // let the native label → input click forwarding happen
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        if (_amMenuEl) { _amCloseMenu(); return; }
+        _amShowMenu(label);
+    });
+}
+
+async function _amOpenWorkspacePicker() {
+    const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
+    if (!sid) { notify('info', 'Open a chat session first.'); return; }
+
+    const modal = document.createElement('div');
+    modal.className = 'attach-picker-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-label', 'Select files from workspace');
+    modal.innerHTML = `
+        <div class="attach-picker-backdrop"></div>
+        <div class="attach-picker-card">
+            <div class="attach-picker-header">
+                <i class="fa fa-folder-open" aria-hidden="true"></i>
+                <span class="attach-picker-title">Select from session files</span>
+                <button class="attach-picker-close" type="button" aria-label="Close">✕</button>
+            </div>
+            <div class="attach-picker-body">
+                <div class="attach-picker-empty">Loading…</div>
+            </div>
+            <div class="attach-picker-footer">
+                <span class="attach-picker-count">0 selected</span>
+                <div class="attach-picker-actions">
+                    <button class="attach-picker-btn" type="button" data-act="cancel">Cancel</button>
+                    <button class="attach-picker-btn attach-picker-btn-primary" type="button" data-act="confirm" disabled>Attach</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const close = () => { modal.remove(); document.removeEventListener('keydown', escHandler); };
+    function escHandler(e) { if (e.key === 'Escape') close(); }
+    modal.querySelector('.attach-picker-close').addEventListener('click', close);
+    modal.querySelector('.attach-picker-backdrop').addEventListener('click', close);
+    modal.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    document.addEventListener('keydown', escHandler);
+
+    try {
+        const res = await fetch(`/api/sessions/${sid}/files`, { headers: { ...api.headers() } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const uploads = Array.isArray(data?.uploads) ? data.uploads : [];
+        const generated = Array.isArray(data?.generated) ? data.generated : [];
+        const runDir = data?.run_dir || '';
+        _amRenderPickerList(modal, uploads, generated, runDir, close);
+    } catch (e) {
+        const body = modal.querySelector('.attach-picker-body');
+        body.innerHTML = `<div class="attach-picker-empty">Failed to load files (${_wsEscHtml(e?.message || 'error')}).</div>`;
+    }
+}
+
+function _amRenderPickerList(modal, uploads, generated, runDir, closeFn) {
+    const body = modal.querySelector('.attach-picker-body');
+    if (uploads.length === 0 && generated.length === 0) {
+        body.innerHTML = `<div class="attach-picker-empty">No files in this session yet.</div>`;
+        return;
+    }
+    const sectionHtml = (title, list) => list.length === 0 ? '' : `
+        <div class="attach-picker-group-title">${title} (${list.length})</div>
+        ${list.map(f => `
+            <label class="attach-picker-item" data-rel="${_wsEscHtml(f.rel_path)}">
+                <input type="checkbox" />
+                <i class="fa ${_wsIconForFile(f.name)}" aria-hidden="true"></i>
+                <span class="api-name" title="${_wsEscHtml(f.rel_path)}">${_wsEscHtml(f.name)}</span>
+                <span class="api-meta">${_wsEscHtml(_wsHumanSize(f.size))}</span>
+            </label>
+        `).join('')}
+    `;
+    body.innerHTML = sectionHtml('Generated', generated) + sectionHtml('Uploaded', uploads);
+
+    const countEl = modal.querySelector('.attach-picker-count');
+    const confirmBtn = modal.querySelector('[data-act="confirm"]');
+    const refreshCount = () => {
+        const n = body.querySelectorAll('input[type="checkbox"]:checked').length;
+        countEl.textContent = `${n} selected`;
+        confirmBtn.disabled = (n === 0);
+    };
+    body.querySelectorAll('.attach-picker-item').forEach(item => {
+        const cb = item.querySelector('input[type="checkbox"]');
+        item.addEventListener('change', () => {
+            item.classList.toggle('selected', cb.checked);
+            refreshCount();
+        });
+    });
+
+    confirmBtn.addEventListener('click', () => {
+        const checked = Array.from(body.querySelectorAll('input[type="checkbox"]:checked'))
+            .map(cb => cb.closest('.attach-picker-item'));
+        let added = 0;
+        for (const item of checked) {
+            const rel = item.dataset.rel;
+            if (!rel) continue;
+            const fullPath = runDir
+                ? `${runDir.replace(/\/+$/, '')}/${rel}`
+                : `/tmp/run-${getCurrentSessionId()}/${rel}`;
+            const baseName = rel.split('/').pop() || rel;
+            if (pendingUploads.some(u => u.serverPath === fullPath)) continue;
+            pendingUploads.push({
+                id: uid(),
+                name: baseName,
+                type: '',
+                size: 0,
+                localUrl: null,
+                serverPath: fullPath,
+                status: 'ready'
+            });
+            added++;
+        }
+        renderAttachDock();
+        if (added > 0) notify('success', `Attached ${added} file${added > 1 ? 's' : ''}`);
+        closeFn();
+    });
+}
+
+window.addEventListener('DOMContentLoaded', () => { _amInstallLabelIntercept(); });

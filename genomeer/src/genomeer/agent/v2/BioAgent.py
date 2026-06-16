@@ -134,6 +134,7 @@ class BioAgent:
         artifacts_prefix: str = "/api/v1/artifacts",
         interaction_mode: str = "auto",
         bio_hint_llm: Any = None,
+        user_name: str | None = None,
     ):
         """
         Agent initalization
@@ -223,6 +224,20 @@ class BioAgent:
 
         # Optional secondary LLM for biological domain hints (bio_hint node)
         self.bio_hint_llm = bio_hint_llm
+
+        # User identity — used by the QA node to address the user by first
+        # name in greetings. Falls back to empty string when unknown.
+        self.user_name = (user_name or "").strip()
+        # Best-effort first-name extraction (handles "Lamrabi Youssef",
+        # "youssef.lamrabi", "youssef_lamrabi", etc.)
+        _fn = ""
+        if self.user_name:
+            import re as _re_un
+            _tok = _re_un.split(r"[\s._\-]+", self.user_name)
+            _fn = (_tok[0] if _tok else "").strip()
+            if _fn:
+                _fn = _fn[0].upper() + _fn[1:]
+        self.user_first_name = _fn
 
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds
@@ -896,9 +911,15 @@ class BioAgent:
             route_hint = state["manifest"].get("route_hint")
             payload = state["manifest"].get("qa_payload","")
             last_prompt = state["last_prompt"]
+            # User identity directive — addresses the user by first name when
+            # known (e.g. "Hi Lamrabi!"). The QA prompt itself has the greeting
+            # template; this just gives the LLM the name to substitute.
+            _user_ctx = (
+                f"USER_FIRST_NAME: {self.user_first_name}\n" if getattr(self, "user_first_name", "") else ""
+            )
             msgs = [
-                self.system_prompt, 
-                HumanMessage(content=instructions.QA_PROMPT.format(
+                self.system_prompt,
+                HumanMessage(content=_user_ctx + instructions.QA_PROMPT.format(
                     history=history
                 ))
             ]

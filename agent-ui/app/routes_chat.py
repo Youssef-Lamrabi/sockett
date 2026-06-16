@@ -83,6 +83,9 @@ def _mk_agent_for_user(db: Session, user: User, model_name: str, interaction_mod
         auto_start_artifacts=False,
         interaction_mode=interaction_mode,
         bio_hint_llm=bio_hint_llm,
+        # Pass the user's display name so the QA node can address them by
+        # name in greetings ("Hi <first_name>!"). Falls back to email-prefix.
+        user_name=(user.name or (user.email or "").split("@")[0] or None),
     )
     return agent
 
@@ -380,6 +383,58 @@ def cancel_run(session_id: int, user: User = Depends(get_current_user)):
         ev.set()
         return {"ok": True, "canceled": True}
     return {"ok": True, "canceled": False}
+
+
+# ─── Rename a session (PATCH for an idempotent partial update) ──────────────
+class SessionTitleUpdate(BaseModel):
+    title: str
+
+    @field_validator("title")
+    @classmethod
+    def _v_title(cls, v):
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("title must be non-empty")
+        # Soft cap to avoid runaway titles
+        return v[:200]
+
+
+@router.patch("/sessions/{session_id}")
+def rename_session(
+    session_id: int,
+    body: SessionTitleUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    sess = db.query(ChatSession).filter(
+        ChatSession.id == session_id, ChatSession.user_id == user.id
+    ).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sess.title = body.title
+    db.commit()
+    return {"id": sess.id, "title": sess.title}
+
+
+# ─── Delete a session (cascade: messages + logs via SQLA relationship) ──────
+@router.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    sess = db.query(ChatSession).filter(
+        ChatSession.id == session_id, ChatSession.user_id == user.id
+    ).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    deleted_title = sess.title or "Chat"
+    # Cancel any in-flight run and evict the cached agent for this session
+    try: cancel_and_evict(user.id, session_id)
+    except Exception: pass
+    db.delete(sess)
+    db.commit()
+    return {"ok": True, "id": session_id, "title": deleted_title}
 
 @router.post("/upload")
 async def upload(file: UploadFile = File(...), user: User = Depends(get_current_user)):

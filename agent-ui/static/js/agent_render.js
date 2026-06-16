@@ -1173,6 +1173,13 @@ export function renderAssistantEvent(evt) {
     if (['EXECUTE', 'OBSERVE', 'LOGS', 'SUBSCRIBE', 'THINK'].includes(tag)) {
       const body = raw.replace(/^<[^>]+>/, '').replace(/<\/[^>]+>$/, '');
       renderCollapsibleLog(tag, body);
+      if (tag === 'OBSERVE') {
+        // Fire if the observation mentions any file path (absolute or relative with extension)
+        const hasFilePath = /(?:\/[\w.\-/]+\.[\w]{1,10}|[\w.\-]+\/[\w.\-]+\.[\w]{1,10})/i.test(body);
+        if (hasFilePath) {
+          window.dispatchEvent(new CustomEvent('workspace:file-detected'));
+        }
+      }
       return;
     }
 
