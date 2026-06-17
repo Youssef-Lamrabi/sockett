@@ -3118,6 +3118,36 @@ class BioAgent:
             _is_127 = bool(_exit_code_m and _exit_code_m.group(1) == "127")
             _tnf_match = _TOOL_NOT_FOUND_RX.search(last_result or "")
 
+            # ── DATA-FILE GUARD (fix faux-positif fail-fast) ───────────────────
+            # The tool-not-found regex also matches a plain Python
+            # FileNotFoundError on a DATA file, e.g.
+            #   FileNotFoundError: [Errno 2] No such file or directory: '/tmp/run-89/ecoli.fna'
+            # That is a RECOVERABLE code bug (wrong filename — e.g. the script
+            # expected ecoli.fna but ncbi-genome-download wrote
+            # GCF_000005845.2_*.fna.gz), NOT a missing CLI executable. Treating
+            # it as tool-not-found wrongly kills the pipeline to QA with no
+            # retry. If the captured token is a data file (inside the run dir
+            # or with a data extension), drop the match so the normal
+            # exit_code!=0 HARD BLOCK below handles it (repair/retry).
+            # Kill-switch: GENOMEER_TNF_DATAFILE_GUARD=0 restores legacy.
+            if (
+                _tnf_match
+                and os.environ.get("GENOMEER_TNF_DATAFILE_GUARD", "1") != "0"
+            ):
+                _captured_tok = next((g for g in _tnf_match.groups() if g), "")
+                if _captured_tok and self._is_data_file_token(
+                    _captured_tok, state.get("run_temp_dir", "")
+                ):
+                    self._log(
+                        "FAIL-FAST GUARD",
+                        body=(
+                            f"token={_captured_tok!r} is a DATA file, not a missing "
+                            "tool — routing to normal repair instead of QA"
+                        ),
+                        node=node,
+                    )
+                    _tnf_match = None
+
             # Mapping of common bioinfo tools → readily-available alternatives.
             # Used to give the user actionable suggestions instead of just saying
             # "tool missing". Conservative: only well-known fallbacks.
@@ -4692,6 +4722,50 @@ class BioAgent:
                 })
         return files
 
+    # Data-file extensions that, when seen in a FileNotFoundError, mean the
+    # generated code referenced a missing DATA artifact (a recoverable bug to
+    # repair) — NOT a missing CLI executable. Executable script extensions
+    # (.py/.sh/.pl/.r/.rb) are deliberately EXCLUDED so that a genuinely
+    # missing tool like `spades.py` still fast-fails.
+    _DATA_FILE_EXTS = (
+        ".fna", ".fa", ".fasta", ".ffn", ".faa", ".frn", ".fastq", ".fq", ".fas",
+        ".gz", ".bz2", ".xz", ".zip",
+        ".bam", ".sam", ".cram", ".bai", ".crai", ".fai", ".dict",
+        ".vcf", ".bcf", ".bed", ".gff", ".gff3", ".gtf", ".gbk", ".gbff",
+        ".tsv", ".csv", ".txt", ".json", ".tab", ".xlsx",
+        ".html", ".pdf", ".png", ".svg", ".jpg",
+        ".report", ".out", ".kraken", ".krona", ".depth", ".paf", ".mpileup",
+        ".dmnd", ".mmi", ".idx", ".nwk", ".tree", ".treefile", ".aln", ".sto", ".hmm",
+        ".log", ".npz", ".pkl", ".h5", ".npy", ".rds", ".biom", ".qza", ".qzv",
+    )
+
+    def _is_data_file_token(self, tok: str, run_dir: str = "") -> bool:
+        """Decide whether a token captured by the 'tool not found' regex is a
+        DATA FILE (recoverable → repair) rather than a missing CLI executable
+        (terminal → fail-fast to QA).
+
+        A token is treated as a DATA file when EITHER:
+          (1) it points inside the ephemeral run/working dir (/tmp/, /run-, or
+              the current run_temp_dir) — tools never live there, they live in
+              the conda envs; OR
+          (2) it ends with a known data-file extension (see _DATA_FILE_EXTS).
+
+        Returns False for bare executable names (e.g. 'spades.py', 'samtools',
+        'emapper.py') so genuine missing-tool errors still fast-fail.
+        """
+        if not tok:
+            return False
+        t = tok.strip().strip("'\"")
+        low = t.lower()
+        # (1) located in the ephemeral working directory → it's data, not a tool
+        if "/tmp/" in low or "/run-" in low:
+            return True
+        rd = (run_dir or "").rstrip("/").lower()
+        if rd and rd in low:
+            return True
+        # (2) recognised data extension → data, not an executable
+        return low.endswith(self._DATA_FILE_EXTS)
+
     def _write_workspace_status_file(self, state):
         """Persist per-file step-ownership map to .genomeer_file_status.json
         in the current run dir, so the workspace UI (routes_chat) can filter
@@ -5183,21 +5257,57 @@ class BioAgent:
         re.M | re.I,
     )
 
-    def _bio_hint_brief(self, query: str, role: str, max_chars: int = 400, timeout_s: int = 12) -> str:
+    @staticmethod
+    def _has_hallucinated_number(text: str, grounding: str) -> bool:
+        """Deterministic backstop for the bio_hint 8B (Apertus-8B).
+
+        Empirical evaluation showed the model FABRICATES numeric values even
+        when the prompt forbids it (it invented '98%', 'N50 4->16kb', etc.),
+        and it ignores soft 'no numbers' / 'output NONE' instructions. So we
+        enforce a HARD rule in code: any numeric token in the output that does
+        NOT appear verbatim in the grounding text is treated as a
+        hallucination → caller rejects the whole output.
+
+        Implementation: extract decimal numbers from output; each must appear
+        in the grounding string (so '91.46' from the data is allowed; a
+        fabricated '98' is not). Tool-name digits (Kraken2, MetaBAT2, Bowtie2,
+        bin1…) are stripped first so they are NOT mistaken for fabricated
+        numbers — they are alpha-word+digit tokens, not metrics. Fabricated
+        versions like 'v1.2.9' survive (single leading letter) and are caught.
+        """
+        import re as _re
+        # Strip alpha-word(2+)+digit(1-2) tokens: Kraken2, MetaBAT2, bin1, minimap2…
+        _stripped = _re.sub(r"\b[A-Za-z]{2,}\d{1,2}\b", " ", text or "")
+        # Numbers not glued to a letter (avoids residual tool-name digits).
+        nums = _re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?", _stripped)
+        if not nums:
+            return False
+        g = grounding or ""
+        return any(n not in g for n in nums)
+
+    def _bio_hint_brief(self, query: str, role: str, max_chars: int = 400, timeout_s: int = 45) -> str:
         """Get a SHORT, safe biological-context note from the secondary
-        bio_hint LLM. Returns "" if disabled, empty query, garbage output,
-        or LLM error. Never raises.
+        bio_hint LLM (Apertus-8B). Returns "" if disabled, empty query,
+        garbage output, hallucinated numbers, or LLM error. Never raises.
 
         role: "planner" | "finalizer" — selects the prompt template.
 
+        Design is driven by an empirical evaluation of the 8B model:
+          - It hallucinates numbers aggressively → prompts FORBID numbers and a
+            deterministic post-filter (_has_hallucinated_number) rejects any
+            output with a numeric token absent from the grounding query.
+          - It ignores soft 'NONE'/char-limit instructions → we rely on the
+            hard filter + char cap, not on the model's compliance.
+          - It is only safe at temperature 0 (stable, no confabulation) → we
+            bind temperature=0.
+          - Cold-start latency exceeds 12s → default timeout is 45s (matches
+            the pre_gen _call_8b budget that never timed out).
+
         Guards:
           - kill-switch env var GENOMEER_BIO_HINT_EXTEND=0 -> return ""
-          - bio_hint_llm absent -> return ""
-          - empty/short query -> return ""
-          - LLM exception -> return ""
-          - LLM timeout (concurrent.futures) -> return ""
-          - output contains code/XML/imports -> return ""
-          - output is hard-capped to max_chars
+          - bio_hint_llm absent / empty query / exception / timeout -> ""
+          - output contains code/XML/imports -> ""
+          - output contains a hallucinated number -> ""
         """
         if not getattr(self, "bio_hint_llm", None):
             return ""
@@ -5207,39 +5317,51 @@ class BioAgent:
         if len(q) < 3:
             return ""
 
+        # Few-shot, causal-framed prompts (eval-proven to extract the 8B's
+        # workflow knowledge while suppressing numeric hallucination). The
+        # examples are GENERIC so the model does not parrot them (few-shot
+        # bleed). The deterministic _has_hallucinated_number filter is the
+        # backstop for any number that slips through; DeepSeek cross-checks the
+        # advisory content for the rare "clean-but-wrong" case.
         if role == "finalizer":
             sys_prompt = (
-                "You are a metagenomics knowledge assistant.\n"
-                "Given PIPELINE RESULTS below, write 2-3 SHORT biological INTERPRETATION "
-                "bullets. Each bullet: ONE sentence, MAX 100 characters, factual.\n"
-                "STRICT RULES:\n"
-                "- No code, no commands, no tool flags.\n"
-                "- No XML tags, no <EXECUTE>, no <next:>.\n"
-                "- No greetings, no preamble like 'Sure!' or 'Here are'.\n"
-                "- Output ONLY the bullets, prefixed with '- '.\n"
-                "- If you cannot say anything factual, output exactly: NONE\n\n"
-                f"PIPELINE RESULTS:\n{q}"
+                "You are a metagenomics expert. Explain the biological or technical MECHANISM "
+                "behind the results below, and ONE downstream implication. Mechanism only — do "
+                "NOT judge quality or restate metrics.\n\n"
+                "EXAMPLE (imitate this exact format and style):\n"
+                "Results: a sequencing-based step produced a partial output for one community member\n"
+                "- Mechanism: shallow coverage of that member fragments its assembly, limiting completeness.\n"
+                "- Implication: deeper sequencing or a long-read protocol would recover it.\n\n"
+                "RULES: output ONLY '- ' bullets (Mechanism, Implication). NO numbered lists. NO "
+                "numbers, percentages, versions, or invented values. If the RESULTS do not match "
+                "the example case, ignore the example and reason from the RESULTS.\n\n"
+                f"RESULTS:\n{q}"
             )
         else:  # planner
             sys_prompt = (
-                "You are a metagenomics knowledge assistant.\n"
-                "Given the USER REQUEST below, list 3-5 SHORT biological CONSIDERATIONS as bullets.\n"
-                "Each bullet: ONE sentence, MAX 80 characters, factual.\n"
-                "Focus on: which class of tool fits, common pitfalls, expected data quality.\n"
-                "STRICT RULES:\n"
-                "- Do NOT propose a plan. Do NOT enumerate steps.\n"
-                "- No code, no commands, no tool flags.\n"
-                "- No XML tags, no <EXECUTE>, no <next:>.\n"
-                "- No greetings, no preamble.\n"
-                "- Output ONLY the bullets, prefixed with '- '.\n"
-                "- If you cannot say anything factual, output exactly: NONE\n\n"
-                f"USER REQUEST:\n{q}"
+                "You are a metagenomics WORKFLOW expert. For the request below, give the 2-3 most "
+                "critical methodological gotchas or failure modes that determine whether this "
+                "workflow succeeds — each with its cause.\n\n"
+                "EXAMPLE (imitate this exact format and style):\n"
+                "Request: a generic assemble-then-bin workflow\n"
+                "- Coverage must be computed from reads mapped to the assembly, not to references, or bin profiles are biased.\n"
+                "- Low-abundance members yield fragmented bins because shallow coverage breaks assembly contiguity.\n\n"
+                "RULES: output ONLY '- ' bullets, one methodological rule each. NO numbered lists. "
+                "NO numbers, percentages, versions, or predictions about this dataset. Established "
+                "methodology only. If the request does not match the example, ignore the example.\n\n"
+                f"REQUEST:\n{q}"
             )
+
+        # temperature=0 → deterministic, minimises confabulation (eval-proven).
+        try:
+            _llm = self.bio_hint_llm.bind(temperature=0)
+        except Exception:
+            _llm = self.bio_hint_llm
 
         try:
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(lambda: self.bio_hint_llm.invoke([HumanMessage(content=sys_prompt)]))
+                fut = ex.submit(lambda: _llm.invoke([HumanMessage(content=sys_prompt)]))
                 resp = fut.result(timeout=timeout_s)
             text = (getattr(resp, "content", str(resp)) or "").strip()
         except Exception as e:
@@ -5250,6 +5372,15 @@ class BioAgent:
             return ""
         if self._BIO_HINT_REJECT_RX.search(text):
             self._log("BIO_HINT_BRIEF_REJECT", body=f"{role}: garbage shape (code/XML)", node="bio_hint_brief")
+            return ""
+        # HARD numeric backstop: reject any output that invents a number not in
+        # the grounding. For the planner role the grounding is the user request.
+        if self._has_hallucinated_number(text, q):
+            self._log(
+                "BIO_HINT_BRIEF_REJECT",
+                body=f"{role}: hallucinated number not present in grounding",
+                node="bio_hint_brief",
+            )
             return ""
         out = text[:max_chars].rstrip()
         self._log("BIO_HINT_BRIEF_OK", body=f"{role}: {len(out)} chars", node="bio_hint_brief")

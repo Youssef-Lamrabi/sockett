@@ -62,24 +62,44 @@ _REJECT_PATTERNS = re.compile(
 )
 
 # ── Prompts aligned with the 8B's training distribution ──────────────────────
+# NOTE: prompts deliberately FORBID numbers. An empirical evaluation of the
+# Apertus-8B model showed it fabricates numeric values (invented N50, %,
+# coverage) and ignores soft constraints; it is only safe in a qualitative,
+# number-free mode at temperature 0. A deterministic post-filter
+# (_has_hallucinated_number) enforces this in code, not by trusting the model.
+# FEW-SHOT prompts. An empirical evaluation of Apertus-8B showed that:
+#   - few-shot examples are the strongest lever to suppress numeric
+#     hallucination (it pattern-matches the example's number-free style);
+#   - a CAUSAL framing ("purpose / mechanism / why") plays to its fine-tuned
+#     strength, whereas a DESCRIPTIVE framing ("interpret / summarize") makes
+#     it invert facts and fabricate values;
+#   - soft "no numbers" instructions alone are ignored → the deterministic
+#     _has_hallucinated_number filter is the real backstop.
+# The example is kept GENERIC so the model does not parrot it (few-shot bleed).
 _PROMPT_PRE_GEN = (
-    "In metagenomics bioinformatics, for the following pipeline step, briefly explain:\n"
-    "- Why this step matters and what it should produce\n"
-    "- Common biological or computational pitfalls and why they happen\n"
-    "- Important considerations about the data at this stage\n\n"
-    "Step: {step_title}\n\n"
-    "Write 3-5 sentences. Focus on biological reasoning. Do not write code."
+    "You are a metagenomics domain expert. For the pipeline step below, give its biological "
+    "PURPOSE and ONE common pitfall — mechanism only.\n\n"
+    "EXAMPLE (imitate this exact format and style):\n"
+    "Step: Trim reads with a quality trimmer\n"
+    "- Purpose: removes adapters and low-quality bases so downstream assembly is not corrupted by sequencing errors.\n"
+    "- Pitfall: over-aggressive quality cutoffs discard real data and reduce usable coverage.\n\n"
+    "RULES: output ONLY two '- ' bullets (Purpose, Pitfall), one clause each, established "
+    "mechanism only. NO numbered lists. NO numbers, percentages, versions, or predictions "
+    "about this specific dataset. Do NOT write code.\n\n"
+    "Step: {step_title}"
 )
 
 _PROMPT_DEBUG = (
-    "A bioinformatics pipeline step has failed. Based on your knowledge of "
-    "metagenomics tools and common errors, briefly explain:\n"
-    "- The most likely biological or computational cause of this failure\n"
-    "- What type of issue typically produces this error pattern\n"
-    "- Whether this suggests a data quality problem or a tool configuration problem\n\n"
+    "You are a metagenomics domain expert. A pipeline step failed. Give the most likely CAUSE "
+    "(mechanism) and whether it is a data-quality or a tool-configuration problem.\n\n"
+    "EXAMPLE (imitate this exact format and style):\n"
+    "Step: Map reads to an assembly; Error: index not found\n"
+    "- Cause: the aligner index was not built before mapping, so the reference could not be loaded.\n"
+    "- Type: tool-configuration problem (missing prerequisite step), not data quality.\n\n"
+    "RULES: output ONLY two '- ' bullets (Cause, Type), one clause each. NO numbered lists. "
+    "NO numbers, percentages, versions, or predictions. Do NOT write code.\n\n"
     "Step that failed: {step_title}\n"
-    "Error observed: {error_summary}\n\n"
-    "Write 3-5 sentences focused on the underlying cause. Do not write code."
+    "Error observed: {error_summary}"
 )
 
 
@@ -166,7 +186,10 @@ class BioHintNode:
         raw_output = self._call_8b(prompt_text, node)
 
         # ── Validate & clean ──────────────────────────────────────────────────
-        validated = self._validate(raw_output)
+        # Grounding = the step title (+ error in debug mode). Any number in the
+        # output that is not present here is treated as a hallucination.
+        _grounding = step_title + (("\n" + error_summary) if is_debug else "")
+        validated = self._validate(raw_output, grounding=_grounding)
 
         if validated:
             manifest["bio_hint"] = validated
@@ -205,8 +228,15 @@ class BioHintNode:
         try:
             messages = [HumanMessage(content=prompt)]
 
+            # temperature=0 → deterministic, minimises confabulation (the 8B
+            # was shown to be stable and number-free only at temp 0).
+            try:
+                _llm = self.llm.bind(temperature=0)
+            except Exception:
+                _llm = self.llm
+
             def _invoke() -> str:
-                resp = self.llm.invoke(messages)
+                resp = _llm.invoke(messages)
                 return getattr(resp, "content", str(resp)) or ""
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -228,7 +258,27 @@ class BioHintNode:
             )
             return ""
 
-    def _validate(self, text: str) -> str:
+    @staticmethod
+    def _has_hallucinated_number(text: str, grounding: str) -> bool:
+        """Deterministic backstop: True if the output contains a numeric token
+        that does NOT appear in the grounding text (= fabricated). The 8B was
+        shown to invent numbers despite explicit 'no numbers' instructions, so
+        we enforce it in code. Tokens genuinely present in the grounding (e.g.
+        a '1000' from '--min-contig-len 1000' in the step title) are allowed.
+
+        Tool-name digits (Kraken2, MetaBAT2, Bowtie2, bin1…) are stripped first
+        so they are not mistaken for fabricated metrics; fabricated versions
+        like 'v1.2.9' survive and are caught.
+        """
+        # Strip alpha-word(2+)+digit(1-2) tokens (tool names / bin labels).
+        stripped = re.sub(r"\b[A-Za-z]{2,}\d{1,2}\b", " ", text or "")
+        nums = re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?", stripped)
+        if not nums:
+            return False
+        g = grounding or ""
+        return any(n not in g for n in nums)
+
+    def _validate(self, text: str, grounding: str = "") -> str:
         """
         Validate and clean 8B output.
 
@@ -236,10 +286,13 @@ class BioHintNode:
         Rejection criteria:
           • Too short (< 20 chars)
           • Contains code blocks, YAML, or structured data markers
+          • Contains a hallucinated number absent from `grounding`
         """
         if not text or len(text.strip()) < 20:
             return ""
         if _REJECT_PATTERNS.search(text.strip()):
+            return ""
+        if self._has_hallucinated_number(text, grounding):
             return ""
         return text.strip()[: self.MAX_OUTPUT_CHARS]
 

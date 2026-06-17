@@ -122,6 +122,30 @@ class StateGraphHelper:
         text = re.sub(r"<\s*/\s*execute\s*>", "</EXECUTE>", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*execute\b([^>]*)>", lambda m: "<EXECUTE" + m.group(1) + ">", text, flags=re.IGNORECASE)
 
+        # Markdown-fence handling. Models leak ```python ... ``` fences in TWO ways,
+        # both of which otherwise render as a raw black code block IN THE CHAT
+        # (instead of the collapsible logs panel):
+        #   (A) a proper <EXECUTE> block WRAPPED inside a ```fence``` — the
+        #       leftover fence markers leak; or
+        #   (B) NO <EXECUTE> tag at all, code only inside a ```fence```.
+        if "<EXECUTE" in text.upper():
+            # Case (A): strip standalone fence lines (```python / ``` on their
+            # own line). The real content stays inside the <EXECUTE> block.
+            text = re.sub(r"(?m)^[ \t]*```[a-zA-Z0-9]*[ \t]*$", "", text)
+        else:
+            # Case (B): convert the markdown fence into a proper, balanced
+            # <EXECUTE>...</EXECUTE> block.
+            _mf = re.search(r"```(python|py|bash|sh|r|)[ \t]*\n(.*?)```", text, re.S | re.I)
+            if _mf:
+                _lang = {"python": "PY", "py": "PY", "bash": "BASH", "sh": "BASH",
+                         "r": "R", "": "PY"}.get(_mf.group(1).lower(), "PY")
+                _body = _mf.group(2).strip()
+                # Avoid a duplicate #!LANG header if the body already starts with one.
+                if re.match(r"^\s*#!\s*(PY|BASH|R|CLI)\b", _body, re.IGNORECASE):
+                    text = f"<EXECUTE>\n{_body}\n</EXECUTE>"
+                else:
+                    text = f"<EXECUTE>\n#!{_lang}\n{_body}\n</EXECUTE>"
+
         # kkeep only up to the first closing tag
         end = text.upper().find("</EXECUTE>")
         if end == -1:

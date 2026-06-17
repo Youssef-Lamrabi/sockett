@@ -69,7 +69,10 @@ description = [
             "Single-end: megahit -r reads.fastq.gz -o output_dir. "
             "Output: output_dir/final.contigs.fa — assembled contigs FASTA. "
             "Key options: --k-min 21 --k-max 141 --k-step 10 for complex communities; "
-            "--min-contig-len 500 to discard very short contigs before downstream steps."
+            "--min-contig-len 500 to discard very short contigs before downstream steps. "
+            "THREADS: use -t N (e.g. -t 4) — MEGAHIT does NOT accept '--threads' "
+            "(it raises 'option --threads not recognized'). Also do NOT use '--num-cpu-threads'; "
+            "the correct flag is the short form -t."
         ),
         "required_parameters": [
             {"name": "output_dir", "type": "str", "description": "Output directory (must not exist)."},
