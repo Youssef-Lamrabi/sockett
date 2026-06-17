@@ -903,6 +903,40 @@ function emitTextNow(text) {
   else appendAssistantMarkdown(text);
 }
 
+/* --------- Per-step status summary -> simple chat phrase (display) -------- */
+// Turns the verbose backend status summary into a clean one-liner for the chat.
+// SAFETY: only rewrites text that clearly IS a per-step status summary; any
+// other content is returned untouched so nothing legitimate is ever swallowed.
+function _cleanStepStatusLine(text, status) {
+  const s0 = String(text || '').trim();
+  const isDone = /done|success|complete|finish|succeed/i.test(status);
+  const isBlocked = /block|fail|error/i.test(status);
+
+  // Recognised status-summary signatures (the only shapes we rewrite).
+  const looksLikeSummary =
+    !s0 ||
+    /^\[(validator|gate|observer|security block)\]/i.test(s0) ||
+    /\(score\s*=/i.test(s0) ||
+    /^(step done|exit code|python exception|tool not installed)/i.test(s0) ||
+    /execution (failed|produced no output)|treated as failure|all steps complete/i.test(s0);
+
+  if (!looksLikeSummary) return text;          // leave anything else untouched
+
+  if (isDone) return '✅ Step executed successfully';
+
+  if (isBlocked) {
+    const reason = s0
+      .replace(/\[(?:validator|gate|observer|security block)\]\s*:?\s*/ig, '')
+      .replace(/\(score\s*=\s*[0-9.]+\)/ig, '')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/^[-–—\s]+/, '')
+      .trim()
+      .slice(0, 160);
+    return reason ? `❌ Step failed — ${reason}` : '❌ Step failed';
+  }
+  return text;
+}
+
 /* --------------- INLINE tag processing (strict in-order) ---------------- */
 function processInlineSystemTagsInOrder(text = "") {
   let rest = String(text);
@@ -955,8 +989,28 @@ function processInlineSystemTagsInOrder(text = "") {
     rest = after;
   }
 
-  // 3) STATUS chips -> logs only (remove from chat)
-  rest = rest.replace(/<\s*status\s*:\s*([^>]+)>/ig, (_m, v) => { renderStatusBox(v); if (/^done$/i.test(String(v || '').trim())) clearLiveSpinner(); return ''; });
+  // 3) STATUS chips -> logs only (remove from chat). Capture the status type so
+  //    the trailing per-step summary can be reduced to a clean one-line phrase.
+  let _stepStatus = '';
+  rest = rest.replace(/<\s*status\s*:\s*([^>]+)>/ig, (_m, v) => {
+    const val = String(v || '').trim();
+    _stepStatus = val.toLowerCase();
+    renderStatusBox(val);
+    if (/^done$/i.test(val)) clearLiveSpinner();
+    return '';
+  });
+
+  // 3b) Reduce the per-step status summary to a simple human phrase for the CHAT.
+  //     Backend emits e.g. "<STATUS:done>\n[validator] fastp: 100% reads kept
+  //     (score=1.00)" or "<STATUS:blocked>\nExit code 1 — execution failed".
+  //     Users want a clean "✅ Step executed successfully" / "❌ Step failed —
+  //     <reason>" without validator/score noise. Display-only: the full detail
+  //     stays in the Tool/Logs pane and in the final report (observations are
+  //     untouched on the backend). Only recognised status summaries are
+  //     rewritten — arbitrary content is never altered.
+  if (_stepStatus) {
+    rest = _cleanStepStatusLine(rest, _stepStatus);
+  }
 
   // 4) NEXT -> logs only (remove from chat)
   rest = rest.replace(/<\s*next\s*:[^>]+>/ig, (full) => { renderNextCardFromRaw(full); return ''; });

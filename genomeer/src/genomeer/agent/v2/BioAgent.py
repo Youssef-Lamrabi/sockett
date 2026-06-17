@@ -2414,6 +2414,25 @@ class BioAgent:
                                 "Rewrite the ENTIRE code fixing ALL quote conflicts."
                             )
 
+                # Layer-2 organism/tool-fit guard (deterministic): catch a
+                # prokaryote-only annotator (Prokka/Prodigal) generated for a
+                # eukaryotic genome BEFORE it runs (wrong biology + hours of
+                # runtime). Reuses this bounded retry budget, so it can never
+                # loop forever — if still wrong after retries, we proceed.
+                if _retry_reason is None and code and not is_diagnostic:
+                    _orgfit_ctx = (state.get("last_prompt") or "")
+                    try:
+                        _pl = state.get("plan") or []
+                        _ci = state.get("current_idx", 0)
+                        if 0 <= _ci < len(_pl):
+                            _orgfit_ctx += "\n" + str(_pl[_ci].get("title", ""))
+                    except Exception:
+                        pass
+                    _orgfit = self._prokaryote_tool_eukaryote_mismatch(code, _orgfit_ctx)
+                    if _orgfit:
+                        _retry_reason = _orgfit
+                        self._log("ORGANISM_FIT GUARD", body="prokaryote tool on eukaryote → forcing 6-frame ORF scan", node=node)
+
                 if _retry_reason is None:
                     break  # code is valid — stop retrying
 
@@ -4690,8 +4709,19 @@ class BioAgent:
         """
         files = []
         try:
-            for root, _, entries in os.walk(temp_dir):
+            for root, dirs, entries in os.walk(temp_dir):
+                # Prune hidden/cache directories so counts match the Workspace UI
+                # (which hides them). Avoids descending into .cache/__pycache__/etc.
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d != "__pycache__"
+                ]
                 for entry in sorted(entries):
+                    # Skip hidden files (incl. the internal .genomeer_file_status.json
+                    # sidecar). The Workspace UI hides dotfiles too, so excluding them
+                    # here keeps every file count consistent (observer / artifacts / UI).
+                    if entry.startswith("."):
+                        continue
                     p = os.path.join(root, entry)
                     if os.path.isfile(p):
                         rel_path = os.path.relpath(p, temp_dir)
@@ -4765,6 +4795,50 @@ class BioAgent:
             return True
         # (2) recognised data extension → data, not an executable
         return low.endswith(self._DATA_FILE_EXTS)
+
+    # ── Layer-2 deterministic organism/tool-fit guard ─────────────────────────
+    # Prokka & Prodigal are PROKARYOTE-ONLY annotators. Running them on a
+    # eukaryotic genome (plant/animal/fungus) yields biologically wrong results
+    # (prokaryotic gene model, no introns) and pathological runtimes. This guard
+    # catches that exact mismatch deterministically.
+    _PROKARYOTE_ONLY_TOOLS = re.compile(r"\b(prokka|prodigal)\b", re.IGNORECASE)
+    # NARROW eukaryote signals: specific organism names + genome-scoped phrases.
+    # Deliberately NOT bare 'plant'/'animal'/'fungal' so metagenome / microbiome
+    # prompts (where Prokka is perfectly valid) never trigger a false positive.
+    _EUKARYOTE_SIGNALS = re.compile(
+        r"\b(arabidopsis|homo\s+sapiens|human\s+genome|mus\s+musculus|mouse\s+genome|"
+        r"drosophila|danio\s+rerio|caenorhabditis|c\.\s*elegans|saccharomyces|"
+        r"s\.\s*cerevisiae|candida\s+albicans|aspergillus|cryptococcus|zea\s+mays|"
+        r"oryza\s+sativa|chlamydomonas|plasmodium|eukaryot|plant\s+genome|"
+        r"fungal\s+genome|animal\s+genome)\b",
+        re.IGNORECASE,
+    )
+
+    def _prokaryote_tool_eukaryote_mismatch(self, code: str, context_text: str):
+        """Return a corrective instruction string if the generated CODE uses a
+        prokaryote-only annotator (Prokka/Prodigal) while the task CONTEXT names
+        a clearly EUKARYOTIC organism; else None.
+
+        Narrow by design (specific eukaryote names) so metagenome/microbiome
+        steps — where Prokka is valid — never trigger. Kill-switch:
+        GENOMEER_ORGANISM_FIT_GUARD=0.
+        """
+        if os.environ.get("GENOMEER_ORGANISM_FIT_GUARD", "1") == "0":
+            return None
+        if not code or not self._PROKARYOTE_ONLY_TOOLS.search(code):
+            return None
+        if not self._EUKARYOTE_SIGNALS.search(context_text or ""):
+            return None
+        return (
+            "ORGANISM/TOOL MISMATCH: the target genome is a EUKARYOTE but your code uses "
+            "Prokka/Prodigal, which are PROKARYOTE-ONLY (bacteria/archaea) and produce "
+            "biologically WRONG results on eukaryotes (they assume no introns) and run for hours. "
+            "Rewrite WITHOUT Prokka or Prodigal. To identify ORFs, use a plain Python SIX-FRAME "
+            "ORF scan: read the FASTA, for each sequence scan all 6 reading frames (3 forward + "
+            "3 reverse-complement), split each translated frame on stop codons, keep ORFs whose "
+            "length is >= a minimum (e.g. 100 aa), and record their lengths. Use only Biopython "
+            "or the standard library — no external annotation tool."
+        )
 
     def _write_workspace_status_file(self, state):
         """Persist per-file step-ownership map to .genomeer_file_status.json

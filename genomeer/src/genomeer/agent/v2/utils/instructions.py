@@ -231,6 +231,19 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "Download genome and index it" -> 1 step
   Only split when steps are genuinely independent (e.g., download then separately assemble).
 - Name tools explicitly when obvious (e.g., "ncbi-genome-download", "samtools", "prodigal").
+- TOOL-FIT PRINCIPLE (choose the RIGHT approach — NOT just the nearest tool):
+  A specialized tool is appropriate ONLY when it matches BOTH the task AND the organism/data.
+  * Simple computational tasks — find/scan ORFs, GC content, sequence lengths, format
+    conversion, filtering, counting, basic plotting — are PLAIN PYTHON (Biopython / standard
+    library), NOT specialized annotation tools. Plan them as a single Python step, e.g.
+    "Scan all six reading frames for ORFs with a Python script and plot the length distribution".
+  * ORGANISM FIT: Prokka and Prodigal are for PROKARYOTES ONLY (bacteria / archaea). NEVER use
+    them on EUKARYOTES (plants, animals, fungi — e.g. Arabidopsis, human, mouse, Drosophila,
+    yeast): they assume a prokaryotic gene model (no introns) and produce BIOLOGICALLY WRONG
+    results. For a eukaryotic genome, use a eukaryote annotator, or for "identify ORFs" use a
+    plain six-frame ORF scan in Python.
+  * If NO registered tool fits the task or the organism, WRITE PLAIN PYTHON — do not force the
+    closest specialized tool just because it exists in the inventory.
 - Mention key inputs/outputs (paths/IDs/file names) when known.
 - Don't ask the user questions here; missing inputs will be handled by the Input Guard later.
 - DO NOT include a final step about summarizing results, producing a report, or creating downloadable links.
@@ -495,6 +508,13 @@ First line: #!PY (default) | #!R | #!BASH | #!CLI
 No text, no markdown, no comments outside the block. Never omit </EXECUTE>.
 
 SPECIAL ALWAYS-TRUE RULES:
+⚠ ORGANISM / TOOL FIT: Prokka and Prodigal are PROKARYOTE-ONLY (bacteria/archaea). If the genome
+  is a EUKARYOTE (plant/animal/fungus — e.g. Arabidopsis, human, mouse, Drosophila, yeast), do
+  NOT run Prokka/Prodigal — they give biologically WRONG results (prokaryotic gene model, no
+  introns). For "identify / find ORFs" on ANY organism, prefer a plain SIX-FRAME ORF SCAN in
+  Python (translate all 6 frames, split on stop codons, keep ORFs ≥ a min length) — it needs no
+  external tool and is correct for eukaryotes. Only use a specialized annotation tool when it
+  truly fits the task AND the organism; otherwise write plain Python.
 ⚠ PRODIGAL: ALWAYS include -f gff. Without it the output is native Genbank format — not GFF.
   GFF parsers will find 0 CDS. This applies to every mode: -p meta, -p single, -p ab initio.
   WRONG : ["prodigal", "-i", fa, "-a", prot, "-o", gff, "-p", "single"]
