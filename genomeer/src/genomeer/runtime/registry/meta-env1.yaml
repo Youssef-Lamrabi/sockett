@@ -29,9 +29,12 @@ dependencies:
 
   # ── Assembly ─────────────────────────────────────────────────────────────
   - megahit                # run_megahit  → megahit (de-novo metagenomic assembler)
+  - spades                 # spades.py / metaspades.py (SPAdes assembler, incl. metagenome mode)
 
   # ── Read mapping ─────────────────────────────────────────────────────────
   - minimap2               # run_minimap2 → minimap2 (fast read mapping, coverage for binning)
+  - bowtie2                # bowtie2 + bowtie2-build (short-read aligner, host decontamination)
+  - bwa                    # bwa mem (short-read aligner)
 
   # ── Binning ──────────────────────────────────────────────────────────────
   - metabat2               # run_metabat2 → metabat2 + jgi_summarize_bam_contig_depths
@@ -66,15 +69,49 @@ dependencies:
   - nonpareil              # nonpareil → sequencing depth / diversity estimation
 
   # ── COMMENTÉ — nécessite grandes bases de données externes ────────────────
-  # - eggnog-mapper        # emapper.py → functional annotation (needs 50GB+ DB)
+  # These tools ARE registered in the framework (tool descriptions exist) but are
+  # left UNINSTALLED on purpose: each needs a multi-GB external database. The
+  # planner correctly gates them ("tool not installed" → QA). Uncomment + install
+  # only after provisioning the matching DB.
+  # Tier 1+2 DB tools — INSTALLED MANUALLY via pip into meta-env1 (do NOT add as conda deps):
+  #   * eggnog-mapper 2.1.13: `pip install --no-deps eggnog-mapper` (its biopython==1.76 pin fails
+  #     to build on py3.12; uses existing biopython). DB v5.0.2 at /home/workshop/eggnog_db —
+  #     downloaded MANUALLY from http://eggnog5.embl.de (the tool's hardcoded eggnogdb.embl.de is
+  #     DEAD/DNS-fails). Run: emapper.py -i <faa> -o <pfx> --data_dir /home/workshop/eggnog_db -m diamond.
+  #   * antismash 8.0.4: `pip install https://dl.secondarymetabolites.org/releases/8.0.4/antismash-8.0.4.tar.gz`
+  #     (NOT on PyPI). DB at /home/workshop/antismash_db via download-antismash-databases. Binary deps
+  #     (prodigal/diamond/hmmer/fasttree/blast/muscle/glimmerhmm) already present; only hmmpfam2(hmmer2)
+  #     missing (optional). Run: antismash --databases /home/workshop/antismash_db --genefinding-tool prodigal.
+  #   * metaphlan 4.2.4: `pip install metaphlan`; DB at /home/workshop/metaphlan_db via
+  #     `metaphlan --install --db_dir <dir>` (flag is --db_dir, NOT --bowtie2db in 4.2.x).
+  #   * kraken2 STANDARD-8 (bacteria+archaea+viral+human, 8GB) at /home/workshop/kraken2_standard8
+  #     (REPLACES old viral-only DB; includes bracken kmer_distrib). BioAgent.py kraken2/bracken
+  #     injection path updated to this dir.
+  #   NOTE: antismash pulled biopython 1.81 + numpy 2.2.5 — verified all tools still work.
   # - humann               # humann → pathway analysis (needs multiple large DBs)
-  # - antismash            # antismash → biosynthetic gene clusters (complex setup)
-  # - genomad              # genomad → virus/plasmid detection (needs large DB)
-  # - run-dbcan            # run_dbcan.py → CAZyme annotation (needs large DB)
-  # - r-base>=4.2
-  # - bioconductor-phyloseq
-  # - r-ggplot2
-  # - r-vegan
+  # genomad + dbcan — INSTALLED MANUALLY via pip into meta-env1 (do NOT add as conda deps):
+  #   * genomad 1.12.0: `pip install genomad`; DB (~1.6 GB) at /home/workshop/genomad_db via
+  #     `genomad download-database /home/workshop`. Run: genomad end-to-end --cleanup --splits 8
+  #     <in.fna> <out> /home/workshop/genomad_db (run via meta-env1).
+  #   * dbcan 5.2.9: `pip install dbcan`; binary is `run_dbcan` (NOT run_dbcan.py); v5 uses
+  #     subcommands. DB at /home/workshop/dbcan_db via `run_dbcan database --db_dir ...`.
+  #     Run: run_dbcan CAZyme_annotation --mode protein --input_raw_data <faa> --output_dir <out>
+  #     --db_dir /home/workshop/dbcan_db. Note: dbcan pinned pandas<3 (3.0.3->2.2.3) and
+  #     pyhmmer 0.11 — verified RGI/checkm2/genomad/amrfinder/pharokka still work.
+  # - gtdbtk               # gtdbtk → MAG taxonomy (needs ~80GB GTDB release DB) — NOT installed
+  # AMR DB-search tools — INSTALLED MANUALLY (do NOT add as conda deps: the meta-env1
+  # solver hangs). Both verified working (detect blaKPC-2 on K. pneumoniae HS11286):
+  #   * rgi 6.0.8 (CARD v4.0.1): pip install git+https://github.com/arpcard/rgi.git ;
+  #     CARD loaded globally via `rgi load --card_json /home/workshop/card_db/card.json`.
+  #     Run with -g PYRODIGAL (external prodigal crashes); threads flag is -n.
+  #   * amrfinder 4.2.7 (NCBI DB 2026-05-15): NCBI precompiled binary at
+  #     /home/workshop/amrfinder/, symlinked/wrapped into bin (wrapper sets
+  #     LD_LIBRARY_PATH=<env>/lib for GLIBCXX_3.4.32+); DB at /home/workshop/amrfinder/data.
+  # - ncbi-amrfinderplus   # (manual binary install — see above; NOT via conda)
+  # - rgi                  # (manual pip-from-git install — see above; NOT via conda)
+  # R amplicon stack (dada2/phyloseq/vegan/ggplot2) lives in the SEPARATE
+  # amplicon-env1 (see registry/amplicon-env1.yaml) — kept out of meta-env1 to
+  # avoid Bioconductor dependency conflicts with this CLI stack.
 
   - pip:
     - ncbi-genome-download   # ncbi-genome-download CLI (genome download from NCBI RefSeq/GenBank)
@@ -84,3 +121,5 @@ dependencies:
     - lightgbm
     - keras
     - tensorflow-cpu         # checkm2 inference engine (CPU sufficient, avoids CUDA conflict with torch)
+    - multiqc                # run_multiqc → aggregate QC reports (pip: conda solver hangs in this env)
+    - InSilicoSeq            # run_insilicoseq → iss (amplicon/shotgun read simulator; pip alt to grinder)

@@ -84,7 +84,7 @@
                 <span class="prompt-card-desc">Identify ARGs using CARD database and report per-sample profiles</span>
               </button>
               <button class="prompt-card"
-                data-prompt="I have 16S rRNA V4 amplicon paired-end reads (Illumina 250 bp) from 12 soil samples across 3 elevation zones in the Alps (4 replicates each: 1000 m, 2000 m, 3000 m — replace with your own samples and metadata if available; simulate reads from 30 mock ASVs using grinder if needed). Import into QIIME 2 and denoise with DADA2 (--p-trunc-len-f 230 --p-trunc-len-r 200). Classify ASVs against the SILVA 138 database (--p-confidence 0.7). Compute alpha diversity metrics (Shannon, observed features, Faith's PD, Pielou's evenness) and beta diversity (Bray-Curtis, weighted and unweighted UniFrac). Generate PCoA plots colored by elevation zone and run PERMANOVA to test whether elevation significantly explains community differences (999 permutations).">
+                data-prompt="I have 16S rRNA V4 amplicon paired-end reads from 12 soil samples across 3 elevation zones (4 replicates each: 1000m, 2000m, 3000m). Simulate the reads with wgsim from a few bacterial 16S references if none are provided. Denoise with DADA2 to infer ASVs, assign taxonomy against SILVA 138, compute alpha diversity (Shannon, observed) and beta diversity (Bray-Curtis), generate a PCoA plot colored by elevation zone, and run PERMANOVA (999 permutations) to test whether elevation explains community differences.">
                 <span class="prompt-card-icon"><i class="fa fa-bar-chart" aria-hidden="true"></i></span>
                 <span class="prompt-card-title">Diversity Analysis</span>
                 <span class="prompt-card-desc">Alpha (Shannon/Chao1) &amp; beta diversity (Bray-Curtis) with PCoA</span>
@@ -95,15 +95,85 @@
                 <span class="prompt-card-title">Viral Metagenomics</span>
                 <span class="prompt-card-desc">Detect phage contigs with VirSorter2/VIBRANT and annotate hosts</span>
               </button>
-              <button class="prompt-card"
+              <div><hr></div>
+              <div><hr></div>
+              <div><hr></div>
+              <button class="prompt-card"  style="background-color: #85ff8545;"
                 data-prompt="Download the complete Escherichia coli reference genome and its corresponding GFF3 annotation file from NCBI. Use the GFF annotations to identify and separate coding regions from non-coding/intergenic regions, then extract the nucleotide sequences for each category. For both coding and non-coding sequences, compute overlapping k-mer frequency distributions for k = 2, 3, and 4,5,6, including both raw counts and normalized frequencies. Generate publication-quality visualizations that compare coding and non-coding regions side by side for each k-mer size, using consistent scales to facilitate direct comparison. In addition to the frequency distributions, calculate nucleotide composition statistics, identify the most enriched and depleted k-mers in coding regions relative to non-coding regions, and quantify these differences using appropriate statistical measures. Produce comparative bar plots, heatmaps, and summary tables, and save all intermediate results and figures. Finally, provide a biological interpretation of the observed patterns, discussing codon usage bias, sequence composition differences, and the extent to which k-mer distributions can distinguish coding from non-coding DNA in the E. coli genome.">
-                <span class="prompt-card-title">Quick Test (FOR DEV PURPOSE)</span>
+                <span class="prompt-card-title">Quick Test: (FOR DEV PURPOSE)</span>
+              </button>
+              <button class="prompt-card" style="background-color: #ff858545;"
+                data-prompt="You are given a paired-end shotgun metagenomic dataset (2 x 150 bp reads, ~15 GB) from a deep-sea hydrothermal vent sediment sample collected at 2,400m depth (https://www.ncbi.nlm.nih.gov/bioproject/PRJNA288120). The sample is expected to harbor novel archaeal lineages and potential dark matter taxa (phyla with no cultivated representatives). Your mission is to reconstruct, classify, and functionally annotate as many high-quality MAGs (Metagenome-Assembled Genomes) as possible, with a specific focus on identifying novel biosynthetic gene clusters (BGCs) related to sulfur metabolism and thermophilic adaptation, and then predict the ecological roles of the dominant uncultured lineages in the vent biogeochemical cycle. Walk me through every decision you make, justify each tool choice, and flag every point where results could be artifactual.">
+                <span class="prompt-card-title">Hard Test: Reasoning capablity</span>
+              </button>
+              <button class="prompt-card" style="background-color: #ffd88545;"
+                data-prompt="You have received 6 metagenomic time-series samples from a hydrothermal vent field collected over 18 months, each with matching geochemical measurements (H₂S, CH₄, temperature, pH, dissolved O₂). The vent field experienced an unmapped seismic event between timepoints T3 and T4 that caused a partial collapse of one vent chimney.
+Your dataset has the following known technical problems you must account for before any biology:
+
+T2 sample was stored at −20°C instead of −80°C for 3 weeks before DNA extraction → RNA degradation profile leaked into DNA-seq library
+T4 and T5 were extracted with a different kit (PowerSoil vs. PowerSoil Pro) introducing extraction bias toward gram-positive cell walls
+T1 coverage is 4× while all others are 40–80× — it was a failed sequencing run that wasn't flagged
+T6 has ~12% human DNA contamination from a field accident during sampling
+One binning run produced a MAG with 98% completeness and 0% contamination that GTDB-Tk cannot place within any known phylum with confidence — its 16S rRNA gene (if present) doesn't match anything in SILVA at >75% identity
+
+Your mission:
+
+Design a normalization strategy that allows fair comparison across all 6 timepoints given the technical artifacts above — justify every statistical choice and explain what you cannot recover
+Track the population dynamics of the 5 most abundant lineages across the time series and determine which ones responded to the seismic event vs. geochemical shifts — distinguish ecological succession from technical noise
+For the unclassifiable MAG: determine if it is (a) a genuine novel phylum, (b) a chimeric bin, (c) a highly divergent member of a known lineage, or (d) a non-cellular genetic element — lay out the exact analytical decision tree with expected outputs at each branch
+Build a sulfur cycle metabolic model from the MAGs and predict which organisms are syntrophic partners — then identify which predicted syntrophic interactions are thermodynamically favorable given the measured geochemical conditions at each timepoint
+Estimate the in situ replication rates (using iRep or DEMIC) of key taxa and explain why your estimates at T1 and T2 are statistically unreliable and what you would report in a paper vs. what you would silently discard">
+                <span class="prompt-card-title">Extrem Hard Test: Pushing Boundaries</span>
               </button>
             </div>
           </div>
         </div>
         <div class="composer-wrapper">
           <div class="composer-toolbar">
+            <!-- <div id="exec-mode-wrap" class="exec-mode-wrap">
+              <button id="btn-exec-mode" class="fe-trigger" type="button" title="Execution mode"
+                aria-label="Execution mode" aria-haspopup="true" aria-expanded="false">
+                <i class="fa fa-diagram-project" aria-hidden="true"></i>
+                <span>Mode: <b id="exec-mode-label">Go as you go</b></span>
+              </button>
+              <div id="exec-mode-menu" class="exec-mode-menu" role="menu" hidden>
+                <button class="exec-mode-item active" role="menuitemradio" aria-checked="true"
+                        data-mode="go_as_you_go" type="button">
+                  Go as you go <span class="exec-mode-hint">(default)</span>
+                </button>
+                <button class="exec-mode-item" role="menuitemradio" aria-checked="false"
+                        data-mode="snakemake" type="button" disabled>
+                  Snakemake <span class="exec-mode-hint">(soon)</span>
+                </button>
+                <button class="exec-mode-item" role="menuitemradio" aria-checked="false"
+                        data-mode="nextflow" type="button" disabled>
+                  Nextflow <span class="exec-mode-hint">(soon)</span>
+                </button>
+              </div>
+            </div> -->
+            <div id="exec-mode-wrap" class="exec-mode-wrap">
+              <button id="btn-exec-mode" class="fe-trigger" type="button" title="Workflow mode"
+                aria-label="Workflow mode" aria-haspopup="true" aria-expanded="false">
+                <i class="fa fa-diagram-project" aria-hidden="true"></i>
+                <span>Workflow: <b id="exec-mode-label">CodeAsWeGo</b></span>
+                <i class="fa fa-chevron-down" style="font-size:11px;opacity:.5" aria-hidden="true"></i>
+              </button>
+              <div id="exec-mode-menu" class="exec-mode-menu" role="menu" hidden>
+                <button class="exec-mode-item active" role="menuitemradio" aria-checked="true" data-mode="workflow"
+                  type="button">
+                  CodeAsWeGo <span class="exec-mode-hint">(default)</span>
+                </button>
+                <div class="exec-mode-divider"></div>
+                <button class="exec-mode-item" role="menuitemradio" aria-checked="false" data-mode="snakemake"
+                  type="button" disabled>
+                  Snakemake <span class="exec-mode-hint">(soon)</span>
+                </button>
+                <button class="exec-mode-item" role="menuitemradio" aria-checked="false" data-mode="nextflow"
+                  type="button" disabled>
+                  Nextflow <span class="exec-mode-hint">(soon)</span>
+                </button>
+              </div>
+            </div>
             <button id="btn-file-explorer" class="fe-trigger" title="Agent Workspace"
               aria-label="Toggle agent workspace" aria-expanded="false">
               <i class="fa fa-folder-open" aria-hidden="true"></i>

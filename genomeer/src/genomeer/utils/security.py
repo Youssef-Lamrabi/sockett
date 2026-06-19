@@ -342,12 +342,14 @@ def check_python_code(code: str) -> Tuple[bool, str]:
                 if isinstance(func, ast.Name):
                     func_name = func.id
                 elif isinstance(func, ast.Attribute):
-                    # Check for builtins.eval, builtins.exec etc
+                    # Only flag the dangerous BUILTINS when accessed via builtins/__builtins__
+                    # (e.g. builtins.eval). Do NOT flag object METHODS that merely share the
+                    # name — re.compile(), pandas df.eval(), etc. are safe and extremely common.
+                    # (Previously `else: func_name = func.attr` blocked re.compile() → constant
+                    # false-positive SECURITY BLOCKs that stalled pipelines.)
                     if isinstance(func.value, ast.Name) and func.value.id in ("builtins", "__builtins__"):
                         func_name = func.attr
-                    else:
-                        func_name = func.attr
-                
+
                 if func_name in ("eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr", "breakpoint"):
                     reason = f"[SECURITY BLOCK] Forbidden AST call detected: {func_name}()"
                     return False, reason

@@ -1,0 +1,24 @@
+name: amplicon-env1
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Amplicon 16S / 18S / ITS marker-gene stack.
+  # Installed in a SEPARATE, ISOLATED env so its R / Bioconductor dependency
+  # tree never conflicts with the meta-env1 CLI bioinfo stack (megahit,
+  # kraken2, samtools, ...). Routed automatically: code using DADA2 / phyloseq
+  # R signals resolves to amplicon-env1 (see structured_output._resolve_env_from_code).
+
+  # ── ASV inference (denoising) ──────────────────────────────────────────────
+  - bioconductor-dada2=1.38.0      # DADA2 → filterAndTrim, learnErrors, dada, mergePairs,
+                                   #         makeSequenceTable, removeBimeraDenovo, assignTaxonomy
+  # Biostrings + ShortRead + GenomicAlignments come in as DADA2 dependencies.
+
+  # ── Diversity / community stats ────────────────────────────────────────────
+  - bioconductor-phyloseq=1.54.0   # phyloseq → alpha (Shannon/Simpson/Chao1) + beta diversity, ordination (PCoA/NMDS)
+  - r-vegan                        # vegan    → PERMANOVA (adonis2), Bray-Curtis, ecological stats
+  - r-ggplot2                      # plotting (histograms, ordination, bar plots)
+
+  # Taxonomy reference (downloaded separately, not a conda package):
+  #   db/silva/silva_nr99_v138.1_train_set.fa.gz   (SILVA 138.1, ~130 MB)
+  #   used by DADA2 assignTaxonomy(); env var/path passed at runtime.

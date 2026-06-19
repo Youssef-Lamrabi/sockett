@@ -43,6 +43,11 @@ _CLI_TOOL_BINARIES = {
     "checkm2": "checkm2",
     # ── Taxonomic classification ──────────────────────────────────────────────
     "kraken2": "kraken2",
+    "metaphlan": "metaphlan",
+    "metaphlan4": "metaphlan",
+    "esearch": "esearch",
+    "efetch": "efetch",
+    "query_ncbi_entrez": "esearch",
     "kaiju": "kaiju",
     "sylph": "sylph",
     # ── Gene prediction / annotation ──────────────────────────────────────────
@@ -55,7 +60,8 @@ _CLI_TOOL_BINARIES = {
     "antismash": "antismash",
     "genomad": "genomad",
     "abricate": "abricate",
-    "dbcan": "run_dbcan.py",
+    "dbcan": "run_dbcan",
+    "run_dbcan": "run_dbcan",
     "pharokka": "pharokka.py",
     # ── AMR / Resistance ──────────────────────────────────────────────────────
     "amrfinder": "amrfinder",
@@ -66,6 +72,9 @@ _CLI_TOOL_BINARIES = {
     # ── Community / stats ─────────────────────────────────────────────────────
     "lefse": "lefse_run.py",
     "nonpareil": "nonpareil",
+    # ── QC aggregation / read simulation (pip-installed in meta-env1) ──────────
+    "multiqc": "multiqc",
+    "insilicoseq": "iss",
 }
 
 # ─── Multi-env bin path discovery ─────────────────────────────────────────
@@ -85,6 +94,7 @@ _KNOWN_ENV_BINS = [
     _ENVS_DIR / "meta-env1" / "bin",        # bioinfo CLI stack (seqkit, prokka, kraken2, ...)
     _ENVS_DIR / "bio-agent-env1" / "bin",   # generic python env (uvicorn host)
     _ENVS_DIR / "btools_env_py310" / "bin", # HLA stack (cnvkit, OptiType, ...)
+    _ENVS_DIR / "amplicon-env1" / "bin",    # amplicon 16S R stack (DADA2, phyloseq, vegan)
 ]
 
 def _which_in_envs(exe: str) -> bool:

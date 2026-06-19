@@ -278,10 +278,18 @@ async function loadSessionMessages(sid) {
       // left pane: final assistant text
       renderAssistantMarkdownStatic(m.content);
 
-      // right pane: replay saved tool/log blocks (if any)
+      // replay saved blocks. CHAT CARDS (Step Execution / Missing / Next) go through the
+      // SAME renderer as the live stream so a refresh looks identical to live (fixes the
+      // "UI changes / cards disappear after reload" bug). The rest are right-pane logs.
       const savedLogs = m.logs || [];
+      const _CHAT_CARD = new Set(['RUNNING', 'DESCRIPTION', 'MISSING', 'NEXT']);
       for (const L of savedLogs) {
-        renderLogBlock(String(L.tag || '').toUpperCase(), L.body || '');
+        const _t = String(L.tag || '').toUpperCase();
+        if (_CHAT_CARD.has(_t)) {
+          renderAssistantEvent({ type: 'block', tag: _t, text: L.body || '' });
+        } else {
+          renderLogBlock(_t, L.body || '');
+        }
       }
       // remove any spinner visuals (history is not "live")
       // light-touch way: drop a terminal status which also clears spinners
@@ -467,6 +475,13 @@ async function createSession(focusAfter = false) {
   await loadSessions(false, false);
   markSessionActive(String(data.id));
 
+  // FIX (new-chat bug 1+2): point the URL at the NEW session id. Without this,
+  // ?session= still held the PREVIOUS session, so a page refresh read the old
+  // id back from the URL and reopened the old chat (and rendered its messages —
+  // which looked like "the text changed after refresh"). Syncing the URL here
+  // makes a refresh correctly reopen the freshly created session.
+  _setSessionInUrl(String(data.id));
+
   // Clear any previous chat content and show the empty state
   clearChat();
 
@@ -509,7 +524,7 @@ window.addEventListener('popstate', async (e) => {
   const sid = (e.state && e.state.sid) || _getSessionFromUrl();
   if (!sid) return;
   if (typeof markSessionActive === 'function') markSessionActive(String(sid));
-  try { await loadSessionMessages(sid); await loadSessionDetails(sid); } catch (_) {}
+  try { await loadSessionMessages(sid); await loadSessionDetails(sid); } catch (_) { }
 });
 
 async function loadSessions(andOpen = false, loadMessages = true) {
@@ -659,9 +674,9 @@ function renderSessionsList() {
         if (_getSessionFromUrl() === String(sid)) {
           history.replaceState({}, '', '/dashboard');
         }
-      } catch {}
+      } catch { }
       // Defer the reload by one tick so the toast actually paints first
-      setTimeout(() => { loadSessions(false, true).catch(() => {}); }, 50);
+      setTimeout(() => { loadSessions(false, true).catch(() => { }); }, 50);
     });
   });
 }
@@ -693,7 +708,7 @@ function _enableInlineRename(titleEl) {
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
-  } catch {}
+  } catch { }
 
   let committed = false;
   const cleanup = () => {
@@ -766,7 +781,7 @@ async function uploadFile() {
     rec.status = 'ready';
     notify('success', `Uploaded: ${f.name}`);
     // Workspace hook: file just landed on the server; refresh if panel is open
-    try { window.refreshWorkspaceSoon?.(300); } catch {}
+    try { window.refreshWorkspaceSoon?.(300); } catch { }
   } catch (err) {
     console.error(err);
     rec.status = 'error';
@@ -971,7 +986,7 @@ async function send() {
             // means a step finished and may have produced new files. Debounced
             // and no-op when the panel is closed.
             if (evt.type === 'block' || evt.type === 'done') {
-              try { window.refreshWorkspaceSoon?.(); } catch {}
+              try { window.refreshWorkspaceSoon?.(); } catch { }
             }
 
             renderAssistantEvent(evt);
@@ -1023,7 +1038,7 @@ async function send() {
   currentChatController = null;
   // Workspace hook: final refresh at end of stream (covers files produced by
   // the finalizer node that may arrive after the last streamed block).
-  try { window.refreshWorkspaceSoon?.(500); } catch {}
+  try { window.refreshWorkspaceSoon?.(500); } catch { }
 }
 
 // Render a simple assistant bubble (no typing effect, safe HTML)
@@ -1413,8 +1428,8 @@ function boot() {
           const next = _wsGetShowMode() === 'success' ? 'all' : 'success';
           _wsSetShowMode(next);
           // Force re-fetch: clear signature so refresh always re-renders
-          try { _wsCurrentSig = ''; } catch {}
-          refreshWorkspaceFiles().catch(() => {});
+          try { _wsCurrentSig = ''; } catch { }
+          refreshWorkspaceFiles().catch(() => { });
         });
         _wsUpdateShowToggleUi();
       }
@@ -1433,7 +1448,7 @@ function boot() {
           if (btn.disabled) return;
           btn.disabled = true;
           btn.classList.add('spinning');
-          try { _wsCurrentSig = ''; } catch {}
+          try { _wsCurrentSig = ''; } catch { }
           Promise.resolve(refreshWorkspaceFiles())
             .finally(() => {
               setTimeout(() => {
@@ -1443,6 +1458,56 @@ function boot() {
             });
         });
       }
+
+      // --- Search bar (filter files by name) — injected once, below the header ---
+      if (!document.getElementById('fe-search')) {
+        const inner = document.querySelector('#file-explorer .fe-inner');
+        if (inner && header) {
+          const wrap = document.createElement('div');
+          wrap.className = 'fe-search-wrap';
+          wrap.innerHTML =
+            '<i class="fa fa-search fe-search-ico" aria-hidden="true"></i>' +
+            '<input id="fe-search" type="text" class="fe-search-input" ' +
+            'placeholder="Filter files by name…" autocomplete="off" spellcheck="false" />';
+          header.insertAdjacentElement('afterend', wrap);
+          wrap.querySelector('#fe-search')
+            .addEventListener('input', (e) => _wsApplySearchFilter(e.target.value));
+        }
+      }
+    })();
+
+    // --- Execution mode dropdown (Go as you go = default; Snakemake/Nextflow greyed placeholders) ---
+    (function wireExecMode() {
+      const wrap = document.getElementById('exec-mode-wrap');
+      const modeBtn = document.getElementById('btn-exec-mode');
+      const menu = document.getElementById('exec-mode-menu');
+      const label = document.getElementById('exec-mode-label');
+      if (!wrap || !modeBtn || !menu || menu.dataset.wired) return;
+      menu.dataset.wired = '1';
+
+      const closeMenu = () => { menu.classList.remove('open'); wrap.classList.remove('open'); };
+      const openMenu = () => { menu.classList.add('open'); wrap.classList.add('open'); };
+
+      modeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        menu.classList.contains('open') ? closeMenu() : openMenu(); // ← fixed
+      });
+
+      document.addEventListener('click', (e) => { if (!wrap.contains(e.target)) closeMenu(); });
+
+      menu.querySelectorAll('.exec-mode-item').forEach(item => {
+        item.addEventListener('click', () => {
+          if (item.disabled) return;
+          menu.querySelectorAll('.exec-mode-item').forEach(i => {
+            i.classList.remove('active'); i.setAttribute('aria-checked', 'false');
+          });
+          item.classList.add('active'); item.setAttribute('aria-checked', 'true');
+          if (label) label.textContent = item.dataset.mode === 'workflow'
+            ? 'CodeAsWeGo' : item.textContent.trim();
+          try { localStorage.setItem('exec_mode', item.dataset.mode); } catch { }
+          closeMenu();
+        });
+      });
     })();
 
     // Drag the splitter bar to resize the workspace panel
@@ -1612,6 +1677,54 @@ function _wsUploadsFolderHtml(uploads) {
   `;
 }
 
+// ── Folder grouping for generated files ──────────────────────────────────────
+// Generated files carry a rel_path (e.g. "quast_output/report.tsv"). Files that
+// live in a sub-folder are shown grouped under a collapsible folder; loose files
+// (no "/" in rel_path) stay flat, as before. Open/closed state per folder is
+// persisted (default = open).
+function _wsCollapsedFolders() {
+  try { return new Set(JSON.parse(localStorage.getItem('ws_folder_collapsed') || '[]')); }
+  catch { return new Set(); }
+}
+function _wsFolderOpen(path) { return !_wsCollapsedFolders().has(path); }
+function _wsSetFolderOpen(path, open) {
+  const s = _wsCollapsedFolders();
+  if (open) s.delete(path); else s.add(path);
+  try { localStorage.setItem('ws_folder_collapsed', JSON.stringify([...s])); } catch {}
+}
+// Split generated files into {root: [...], folders: Map(folderPath -> [files])}.
+function _wsGroupByFolder(generated) {
+  const root = [];
+  const folders = new Map();
+  for (const f of generated) {
+    const rp = String(f.rel_path || f.name || '');
+    const idx = rp.lastIndexOf('/');
+    if (idx === -1) { root.push(f); continue; }
+    const folder = rp.slice(0, idx);
+    if (!folders.has(folder)) folders.set(folder, []);
+    folders.get(folder).push(f);
+  }
+  return { root, folders };
+}
+// Collapsible folder for generated files (mirrors the Uploads folder markup/CSS).
+function _wsGenFolderHtml(folderPath, files) {
+  const isOpen = _wsFolderOpen(folderPath);
+  const children = files.map(f => _wsFileItemHtml(f, { indent: true })).join('');
+  return `
+    <div class="fe-folder${isOpen ? ' open' : ''}" data-folder="gen:${_wsEscHtml(folderPath)}">
+      <button class="fe-folder-header" type="button" aria-expanded="${isOpen ? 'true' : 'false'}">
+        <i class="fa fa-chevron-right fe-folder-chevron" aria-hidden="true"></i>
+        <i class="fa fa-folder fe-folder-icon" aria-hidden="true"></i>
+        <span class="fe-folder-label" title="${_wsEscHtml(folderPath)}">${_wsEscHtml(folderPath)}</span>
+        <span class="fe-count">${files.length}</span>
+      </button>
+      <div class="fe-folder-children" role="group">
+        ${children}
+      </div>
+    </div>
+  `;
+}
+
 let _wsCurrentSig = '';            // signature of last-rendered list (anti-flicker)
 let _wsPreviewedPath = null;       // path of file currently shown in inline preview
 let _wsLastHiddenCount = 0;        // generated files filtered out by show=success
@@ -1623,7 +1736,7 @@ async function refreshWorkspaceFiles() {
   try {
     const showMode = _wsGetShowMode();
     const res = await fetch(`/api/sessions/${sid}/files?show=${encodeURIComponent(showMode)}`,
-                            { headers: { ...api.headers() } });
+      { headers: { ...api.headers() } });
     if (!res.ok) {
       _wsRenderEmpty(body, `Unable to load workspace (${res.status})`);
       return;
@@ -1634,8 +1747,8 @@ async function refreshWorkspaceFiles() {
     _wsLastHiddenCount = Number(data?.hidden_count || 0);
     // Signature includes hidden_count so toggling show=success<->all forces re-render.
     const sig = JSON.stringify([uploads.map(f => [f.rel_path, f.size, f.mtime]),
-                                 generated.map(f => [f.rel_path, f.size, f.mtime]),
-                                 showMode, _wsLastHiddenCount]);
+    generated.map(f => [f.rel_path, f.size, f.mtime]),
+      showMode, _wsLastHiddenCount]);
     if (sig === _wsCurrentSig) return;
     _wsCurrentSig = sig;
     _wsRenderLists(body, uploads, generated);
@@ -1712,9 +1825,18 @@ function _wsRenderLists(body, uploads, generated) {
   }
   const view = _wsGetViewMode();
   const uploadsHtml = uploads.length ? _wsUploadsFolderHtml(uploads) : '';
-  const generatedHtml = generated.length
-    ? generated.map(f => _wsFileItemHtml(f)).join('')
-    : '<div class="fe-empty-mini">No outputs yet — run a step to generate files</div>';
+  let generatedHtml;
+  if (generated.length) {
+    // Group files by their folder; files in sub-folders show under collapsible
+    // folders, loose files (no folder) stay flat. Folders first, then loose files.
+    const { root, folders } = _wsGroupByFolder(generated);
+    const foldersHtml = [...folders.keys()].sort()
+      .map(k => _wsGenFolderHtml(k, folders.get(k))).join('');
+    const rootHtml = root.map(f => _wsFileItemHtml(f)).join('');
+    generatedHtml = foldersHtml + rootHtml;
+  } else {
+    generatedHtml = '<div class="fe-empty-mini">No outputs yet — run a step to generate files</div>';
+  }
 
   body.innerHTML = `
     <div class="fe-list-region view-${view}">
@@ -1726,6 +1848,7 @@ function _wsRenderLists(body, uploads, generated) {
   `;
   if (existingPreview) body.appendChild(existingPreview);
   body.classList.toggle('has-preview', !!existingPreview);
+  if (existingPreview) _wsEnsurePreviewSplitter(body);  // re-insert drag handle after re-render
 
   // Wire file items
   body.querySelectorAll('.fe-file-item').forEach(btn => {
@@ -1733,16 +1856,35 @@ function _wsRenderLists(body, uploads, generated) {
     if (btn.dataset.path === _wsPreviewedPath) btn.classList.add('active');
   });
 
-  // Wire uploads folder collapse/expand
-  const folder = body.querySelector('.fe-folder[data-folder="uploads"]');
-  if (folder) {
-    folder.querySelector('.fe-folder-header').addEventListener('click', () => {
+  // Wire ALL folder collapse/expand (Uploads + generated sub-folders)
+  body.querySelectorAll('.fe-folder').forEach(folder => {
+    const hdr = folder.querySelector('.fe-folder-header');
+    if (!hdr) return;
+    hdr.addEventListener('click', () => {
       const nowOpen = !folder.classList.contains('open');
       folder.classList.toggle('open', nowOpen);
-      folder.querySelector('.fe-folder-header').setAttribute('aria-expanded', nowOpen ? 'true' : 'false');
-      _wsSetUploadsOpen(nowOpen);
+      hdr.setAttribute('aria-expanded', nowOpen ? 'true' : 'false');
+      const key = folder.dataset.folder || '';
+      if (key === 'uploads') _wsSetUploadsOpen(nowOpen);
+      else if (key.startsWith('gen:')) _wsSetFolderOpen(key.slice(4), nowOpen);
     });
-  }
+  });
+
+  // Re-apply the current search filter (the list was just re-rendered)
+  const _sb = document.getElementById('fe-search');
+  if (_sb && _sb.value) _wsApplySearchFilter(_sb.value);
+}
+
+// Filter the rendered file items by name (display-only; does not refetch).
+function _wsApplySearchFilter(query) {
+  const term = String(query || '').trim().toLowerCase();
+  const body = document.querySelector('#file-explorer .fe-body');
+  if (!body) return;
+  body.querySelectorAll('.fe-file-item').forEach(it => {
+    const name = (it.querySelector('.fe-file-name')?.textContent
+      || it.getAttribute('data-path') || '').toLowerCase();
+    it.style.display = (!term || name.includes(term)) ? '' : 'none';
+  });
 }
 
 /* --- Inline preview (split panel: top 1/3 list, bottom 2/3 preview) ----- */
@@ -1776,6 +1918,7 @@ function openFilePreview(relPath) {
   `;
 
   body.classList.add('has-preview');
+  _wsEnsurePreviewSplitter(body);
   _wsPreviewedPath = relPath;
 
   // Highlight the active file in the list (if visible)
@@ -1787,7 +1930,7 @@ function openFilePreview(relPath) {
   region.querySelector('.fe-preview-close').addEventListener('click', closeInlinePreview);
   region.querySelector('.fe-preview-dl').addEventListener('click', () => {
     _wsDownloadFile(url, baseName).catch(err => {
-      try { notify('error', `Download failed: ${err?.message || err}`); } catch {}
+      try { notify('error', `Download failed: ${err?.message || err}`); } catch { }
     });
   });
 
@@ -1798,13 +1941,60 @@ function closeInlinePreview() {
   const body = document.querySelector('#file-explorer .fe-body');
   if (!body) return;
   // Revoke any blob URL the preview was using to avoid memory leaks
-  try { _wsRevokeActiveBlobUrl?.(); } catch {}
+  try { _wsRevokeActiveBlobUrl?.(); } catch { }
   const region = body.querySelector('.fe-preview-region');
   if (region) region.remove();
+  const sp = body.querySelector('.fe-hsplitter');
+  if (sp) sp.remove();
+  const list = body.querySelector('.fe-list-region');
+  if (list) list.style.flex = '';   // restore default sizing
   body.classList.remove('has-preview');
   _wsPreviewedPath = null;
   body.querySelectorAll('.fe-file-item.active').forEach(el => el.classList.remove('active'));
 }
+
+// Draggable horizontal splitter between the file list (top) and the preview
+// (bottom) so the user can resize the preview height. Display-only.
+let _wsHSplitDrag = null;
+function _wsEnsurePreviewSplitter(body) {
+  const preview = body.querySelector('.fe-preview-region');
+  const list = body.querySelector('.fe-list-region');
+  if (!preview || !list) return;
+  let sp = body.querySelector('.fe-hsplitter');
+  if (!sp) {
+    sp = document.createElement('div');
+    sp.className = 'fe-hsplitter';
+    sp.setAttribute('role', 'separator');
+    sp.setAttribute('aria-orientation', 'horizontal');
+    sp.title = 'Drag to resize preview';
+    sp.addEventListener('mousedown', (e) => {
+      _wsHSplitDrag = {
+        list,
+        startY: e.clientY,
+        startH: list.getBoundingClientRect().height,
+        bodyH: body.getBoundingClientRect().height,
+      };
+      document.body.style.userSelect = 'none';
+      sp.classList.add('dragging');
+      e.preventDefault();
+    });
+  }
+  // Ensure order: list, splitter, preview
+  body.insertBefore(sp, preview);
+}
+// Global drag handlers (attached once at load — no per-open accumulation)
+window.addEventListener('mousemove', (e) => {
+  if (!_wsHSplitDrag) return;
+  let h = _wsHSplitDrag.startH + (e.clientY - _wsHSplitDrag.startY);
+  h = Math.max(60, Math.min(_wsHSplitDrag.bodyH - 100, h));  // clamp
+  _wsHSplitDrag.list.style.flex = '0 0 ' + h + 'px';
+});
+window.addEventListener('mouseup', () => {
+  if (!_wsHSplitDrag) return;
+  _wsHSplitDrag = null;
+  document.body.style.userSelect = '';
+  document.querySelectorAll('.fe-hsplitter.dragging').forEach(s => s.classList.remove('dragging'));
+});
 
 async function _wsDownloadFile(url, filename) {
   const btn = document.querySelector('#file-explorer .fe-preview-dl');
@@ -1820,7 +2010,7 @@ async function _wsDownloadFile(url, filename) {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => {
-      try { document.body.removeChild(a); } catch {}
+      try { document.body.removeChild(a); } catch { }
       URL.revokeObjectURL(blobUrl);
     }, 200);
   } finally {
@@ -1832,7 +2022,7 @@ async function _wsDownloadFile(url, filename) {
 let _wsActiveBlobUrl = null;
 function _wsRevokeActiveBlobUrl() {
   if (_wsActiveBlobUrl) {
-    try { URL.revokeObjectURL(_wsActiveBlobUrl); } catch {}
+    try { URL.revokeObjectURL(_wsActiveBlobUrl); } catch { }
     _wsActiveBlobUrl = null;
   }
 }
@@ -1842,19 +2032,19 @@ async function _wsLoadPreviewContent(url, relPath, container) {
   _wsRevokeActiveBlobUrl();
 
   const ext = (relPath || '').split('.').pop().toLowerCase();
-  const imgExt    = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico']);
-  const pdfExt    = new Set(['pdf']);
-  const htmlExt   = new Set(['html', 'htm']);
+  const imgExt = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico']);
+  const pdfExt = new Set(['pdf']);
+  const htmlExt = new Set(['html', 'htm']);
   // Extended text whitelist — covers most bioinformatics text outputs.
   // Catch-all (last branch) also tries decoding as text for any other ext.
-  const textExt   = new Set([
+  const textExt = new Set([
     'txt', 'tsv', 'csv', 'json', 'log', 'md', 'yaml', 'yml', 'xml',
     'bed', 'gff', 'gff3', 'vcf', 'sam', 'paf', 'maf', 'gtf',
     'tab', 'tabular', 'tree', 'nwk', 'newick',
     'report', 'kreport', 'out', 'err', 'stats', 'summary', 'ini', 'cfg', 'conf',
     'sh', 'py', 'r', 'pl', 'js', 'css', 'fai', 'tsv.gz' // last is a hint
   ]);
-  const fastaExt  = new Set(['fasta', 'fa', 'fna', 'faa', 'pep', 'cds', 'rna', 'fastq', 'fq']);
+  const fastaExt = new Set(['fasta', 'fa', 'fna', 'faa', 'pep', 'cds', 'rna', 'fastq', 'fq']);
 
   // Helper: fetch with auth + return blob URL (bypasses backend's
   // Content-Disposition: attachment which prevents iframes/images from
@@ -1972,7 +2162,7 @@ async function _wsLoadPreviewContent(url, relPath, container) {
         const LINE_CAP = 200;
         if (lines.length > LINE_CAP) {
           text = lines.slice(0, LINE_CAP).join('\n') +
-                 `\n\n--- showing first ${LINE_CAP} lines of ${lines.length} (full file ${_wsHumanSize(buf.byteLength)}) ---`;
+            `\n\n--- showing first ${LINE_CAP} lines of ${lines.length} (full file ${_wsHumanSize(buf.byteLength)}) ---`;
         }
         container.innerHTML = `<pre class="fe-preview-pre fe-preview-mono">${_wsEscHtml(text)}</pre>`;
         return;
@@ -2003,7 +2193,7 @@ function refreshWorkspaceSoon(delay = 800) {
   const open = document.getElementById('content-area')?.classList.contains('fe-open');
   if (!open) return;
   clearTimeout(_wsDebounceTimer);
-  _wsDebounceTimer = setTimeout(() => { refreshWorkspaceFiles().catch(() => {}); }, delay);
+  _wsDebounceTimer = setTimeout(() => { refreshWorkspaceFiles().catch(() => { }); }, delay);
 }
 // Expose globally so other modules can trigger refreshes without imports
 window.refreshWorkspaceFiles = refreshWorkspaceFiles;
@@ -2253,87 +2443,87 @@ function initSplitter() {
    ========================================================================= */
 
 async function _amUploadOneFile(f) {
-    if (!f) return;
-    const rec = {
-        id: uid(),
-        name: f.name,
-        type: f.type || '',
-        size: f.size || 0,
-        localUrl: URL.createObjectURL(f),
-        serverPath: null,
-        status: 'uploading'
-    };
-    pendingUploads.push(rec);
+  if (!f) return;
+  const rec = {
+    id: uid(),
+    name: f.name,
+    type: f.type || '',
+    size: f.size || 0,
+    localUrl: URL.createObjectURL(f),
+    serverPath: null,
+    status: 'uploading'
+  };
+  pendingUploads.push(rec);
+  renderAttachDock();
+  try {
+    const form = new FormData();
+    form.append('file', f);
+    const res = await fetch('/api/upload', { method: 'POST', headers: { ...api.headers() }, body: form });
+    if (!res.ok) throw new Error(await res.text() || 'Upload failed');
+    const data = await res.json();
+    rec.serverPath = data?.path || null;
+    rec.status = 'ready';
+    try { window.refreshWorkspaceSoon?.(300); } catch { }
+  } catch (err) {
+    console.error(err);
+    rec.status = 'error';
+    notify('error', `Upload failed: ${f.name}`);
+  } finally {
     renderAttachDock();
-    try {
-        const form = new FormData();
-        form.append('file', f);
-        const res = await fetch('/api/upload', { method: 'POST', headers: { ...api.headers() }, body: form });
-        if (!res.ok) throw new Error(await res.text() || 'Upload failed');
-        const data = await res.json();
-        rec.serverPath = data?.path || null;
-        rec.status = 'ready';
-        try { window.refreshWorkspaceSoon?.(300); } catch {}
-    } catch (err) {
-        console.error(err);
-        rec.status = 'error';
-        notify('error', `Upload failed: ${f.name}`);
-    } finally {
-        renderAttachDock();
-    }
+  }
 }
 
 async function _amUploadFileList(fileList) {
-    const files = Array.from(fileList || []);
-    if (!files.length) return;
-    for (const f of files) {
-        if (f.name === '.DS_Store' || f.name.startsWith('._')) continue;
-        await _amUploadOneFile(f);
-    }
-    notify('success', `Uploaded ${files.length} file${files.length > 1 ? 's' : ''}`);
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  for (const f of files) {
+    if (f.name === '.DS_Store' || f.name.startsWith('._')) continue;
+    await _amUploadOneFile(f);
+  }
+  notify('success', `Uploaded ${files.length} file${files.length > 1 ? 's' : ''}`);
 }
 
 function _amGetFolderInput() {
-    let inp = document.getElementById('attach-folder-input');
-    if (inp) return inp;
-    inp = document.createElement('input');
-    inp.id = 'attach-folder-input';
-    inp.type = 'file';
-    inp.setAttribute('webkitdirectory', '');
-    inp.setAttribute('directory', '');
-    inp.setAttribute('mozdirectory', '');
-    inp.multiple = true;
-    inp.style.display = 'none';
-    inp.addEventListener('change', (e) => {
-        const files = e.target.files;
-        if (files && files.length) _amUploadFileList(files);
-        e.target.value = '';
-    });
-    document.body.appendChild(inp);
-    return inp;
+  let inp = document.getElementById('attach-folder-input');
+  if (inp) return inp;
+  inp = document.createElement('input');
+  inp.id = 'attach-folder-input';
+  inp.type = 'file';
+  inp.setAttribute('webkitdirectory', '');
+  inp.setAttribute('directory', '');
+  inp.setAttribute('mozdirectory', '');
+  inp.multiple = true;
+  inp.style.display = 'none';
+  inp.addEventListener('change', (e) => {
+    const files = e.target.files;
+    if (files && files.length) _amUploadFileList(files);
+    e.target.value = '';
+  });
+  document.body.appendChild(inp);
+  return inp;
 }
 
 let _amMenuEl = null;
 function _amCloseMenu() {
-    if (_amMenuEl) { _amMenuEl.remove(); _amMenuEl = null; }
-    document.removeEventListener('keydown', _amEscHandler);
-    document.removeEventListener('mousedown', _amOutsideHandler, true);
+  if (_amMenuEl) { _amMenuEl.remove(); _amMenuEl = null; }
+  document.removeEventListener('keydown', _amEscHandler);
+  document.removeEventListener('mousedown', _amOutsideHandler, true);
 }
 function _amEscHandler(e) { if (e.key === 'Escape') _amCloseMenu(); }
 function _amOutsideHandler(e) {
-    if (!_amMenuEl) return;
-    if (_amMenuEl.contains(e.target)) return;
-    if (e.target.closest('.upload')) return;
-    _amCloseMenu();
+  if (!_amMenuEl) return;
+  if (_amMenuEl.contains(e.target)) return;
+  if (e.target.closest('.upload')) return;
+  _amCloseMenu();
 }
 
 function _amShowMenu(anchorEl) {
-    _amCloseMenu();
-    const menu = document.createElement('div');
-    menu.className = 'attach-menu';
-    menu.setAttribute('role', 'menu');
-    menu.setAttribute('aria-label', 'Attachment options');
-    menu.innerHTML = `
+  _amCloseMenu();
+  const menu = document.createElement('div');
+  menu.className = 'attach-menu';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', 'Attachment options');
+  menu.innerHTML = `
         <button class="attach-menu-item" type="button" data-action="upload-file" role="menuitem">
             <i class="fa fa-paperclip" aria-hidden="true"></i>
             <span class="am-label">Upload File</span>
@@ -2352,50 +2542,50 @@ function _amShowMenu(anchorEl) {
             <span class="am-badge">Soon</span>
         </button>
     `;
-    document.body.appendChild(menu);
+  document.body.appendChild(menu);
 
-    const rect = anchorEl.getBoundingClientRect();
-    const menuW = menu.offsetWidth || 240;
-    const menuH = menu.offsetHeight || 200;
-    const margin = 8;
-    let left = rect.left;
-    if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
-    if (left < 8) left = 8;
-    let top = rect.top - menuH - margin;
-    if (top < 8) top = rect.bottom + margin;
-    menu.style.left = `${left}px`;
-    menu.style.top = `${top}px`;
+  const rect = anchorEl.getBoundingClientRect();
+  const menuW = menu.offsetWidth || 240;
+  const menuH = menu.offsetHeight || 200;
+  const margin = 8;
+  let left = rect.left;
+  if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
+  if (left < 8) left = 8;
+  let top = rect.top - menuH - margin;
+  if (top < 8) top = rect.bottom + margin;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
 
-    _amMenuEl = menu;
+  _amMenuEl = menu;
 
-    menu.addEventListener('click', (e) => {
-        const btn = e.target.closest('.attach-menu-item');
-        if (!btn || btn.disabled) return;
-        const action = btn.dataset.action;
-        _amCloseMenu();
-        if (action === 'upload-file') {
-            const inp = document.getElementById('file-input');
-            if (inp) {
-                inp.value = '';
-                // Arm the label bypass so our intercept lets THIS click through
-                _amBypassLabelOnce = true;
-                inp.click();
-                // Safety: clear bypass after 1s in case the click never reached the label
-                setTimeout(() => { _amBypassLabelOnce = false; }, 1000);
-            }
-        } else if (action === 'upload-folder') {
-            const inp = _amGetFolderInput();
-            inp.value = '';
-            inp.click();
-        } else if (action === 'from-workspace') {
-            _amOpenWorkspacePicker();
-        } else if (action === 'from-cloud') {
-            notify('info', 'Cloud import — coming soon');
-        }
-    });
+  menu.addEventListener('click', (e) => {
+    const btn = e.target.closest('.attach-menu-item');
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.action;
+    _amCloseMenu();
+    if (action === 'upload-file') {
+      const inp = document.getElementById('file-input');
+      if (inp) {
+        inp.value = '';
+        // Arm the label bypass so our intercept lets THIS click through
+        _amBypassLabelOnce = true;
+        inp.click();
+        // Safety: clear bypass after 1s in case the click never reached the label
+        setTimeout(() => { _amBypassLabelOnce = false; }, 1000);
+      }
+    } else if (action === 'upload-folder') {
+      const inp = _amGetFolderInput();
+      inp.value = '';
+      inp.click();
+    } else if (action === 'from-workspace') {
+      _amOpenWorkspacePicker();
+    } else if (action === 'from-cloud') {
+      notify('info', 'Cloud import — coming soon');
+    }
+  });
 
-    document.addEventListener('keydown', _amEscHandler);
-    setTimeout(() => document.addEventListener('mousedown', _amOutsideHandler, true), 0);
+  document.addEventListener('keydown', _amEscHandler);
+  setTimeout(() => document.addEventListener('mousedown', _amOutsideHandler, true), 0);
 }
 
 // One-shot bypass flag set by menu actions that need to programmatically
@@ -2405,30 +2595,30 @@ function _amShowMenu(anchorEl) {
 let _amBypassLabelOnce = false;
 
 function _amInstallLabelIntercept() {
-    const label = document.querySelector('#composer label.upload');
-    if (!label || label.dataset.amWired === '1') return;
-    label.dataset.amWired = '1';
-    label.addEventListener('click', (e) => {
-        if (_amBypassLabelOnce) {
-            _amBypassLabelOnce = false;
-            return;  // let the native label → input click forwarding happen
-        }
-        e.preventDefault();
-        e.stopPropagation();
-        if (_amMenuEl) { _amCloseMenu(); return; }
-        _amShowMenu(label);
-    });
+  const label = document.querySelector('#composer label.upload');
+  if (!label || label.dataset.amWired === '1') return;
+  label.dataset.amWired = '1';
+  label.addEventListener('click', (e) => {
+    if (_amBypassLabelOnce) {
+      _amBypassLabelOnce = false;
+      return;  // let the native label → input click forwarding happen
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    if (_amMenuEl) { _amCloseMenu(); return; }
+    _amShowMenu(label);
+  });
 }
 
 async function _amOpenWorkspacePicker() {
-    const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
-    if (!sid) { notify('info', 'Open a chat session first.'); return; }
+  const sid = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId() : null;
+  if (!sid) { notify('info', 'Open a chat session first.'); return; }
 
-    const modal = document.createElement('div');
-    modal.className = 'attach-picker-modal';
-    modal.setAttribute('role', 'dialog');
-    modal.setAttribute('aria-label', 'Select files from workspace');
-    modal.innerHTML = `
+  const modal = document.createElement('div');
+  modal.className = 'attach-picker-modal';
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-label', 'Select files from workspace');
+  modal.innerHTML = `
         <div class="attach-picker-backdrop"></div>
         <div class="attach-picker-card">
             <div class="attach-picker-header">
@@ -2448,36 +2638,36 @@ async function _amOpenWorkspacePicker() {
             </div>
         </div>
     `;
-    document.body.appendChild(modal);
+  document.body.appendChild(modal);
 
-    const close = () => { modal.remove(); document.removeEventListener('keydown', escHandler); };
-    function escHandler(e) { if (e.key === 'Escape') close(); }
-    modal.querySelector('.attach-picker-close').addEventListener('click', close);
-    modal.querySelector('.attach-picker-backdrop').addEventListener('click', close);
-    modal.querySelector('[data-act="cancel"]').addEventListener('click', close);
-    document.addEventListener('keydown', escHandler);
+  const close = () => { modal.remove(); document.removeEventListener('keydown', escHandler); };
+  function escHandler(e) { if (e.key === 'Escape') close(); }
+  modal.querySelector('.attach-picker-close').addEventListener('click', close);
+  modal.querySelector('.attach-picker-backdrop').addEventListener('click', close);
+  modal.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  document.addEventListener('keydown', escHandler);
 
-    try {
-        const res = await fetch(`/api/sessions/${sid}/files`, { headers: { ...api.headers() } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const uploads = Array.isArray(data?.uploads) ? data.uploads : [];
-        const generated = Array.isArray(data?.generated) ? data.generated : [];
-        const runDir = data?.run_dir || '';
-        _amRenderPickerList(modal, uploads, generated, runDir, close);
-    } catch (e) {
-        const body = modal.querySelector('.attach-picker-body');
-        body.innerHTML = `<div class="attach-picker-empty">Failed to load files (${_wsEscHtml(e?.message || 'error')}).</div>`;
-    }
+  try {
+    const res = await fetch(`/api/sessions/${sid}/files`, { headers: { ...api.headers() } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const uploads = Array.isArray(data?.uploads) ? data.uploads : [];
+    const generated = Array.isArray(data?.generated) ? data.generated : [];
+    const runDir = data?.run_dir || '';
+    _amRenderPickerList(modal, uploads, generated, runDir, close);
+  } catch (e) {
+    const body = modal.querySelector('.attach-picker-body');
+    body.innerHTML = `<div class="attach-picker-empty">Failed to load files (${_wsEscHtml(e?.message || 'error')}).</div>`;
+  }
 }
 
 function _amRenderPickerList(modal, uploads, generated, runDir, closeFn) {
-    const body = modal.querySelector('.attach-picker-body');
-    if (uploads.length === 0 && generated.length === 0) {
-        body.innerHTML = `<div class="attach-picker-empty">No files in this session yet.</div>`;
-        return;
-    }
-    const sectionHtml = (title, list) => list.length === 0 ? '' : `
+  const body = modal.querySelector('.attach-picker-body');
+  if (uploads.length === 0 && generated.length === 0) {
+    body.innerHTML = `<div class="attach-picker-empty">No files in this session yet.</div>`;
+    return;
+  }
+  const sectionHtml = (title, list) => list.length === 0 ? '' : `
         <div class="attach-picker-group-title">${title} (${list.length})</div>
         ${list.map(f => `
             <label class="attach-picker-item" data-rel="${_wsEscHtml(f.rel_path)}">
@@ -2488,50 +2678,50 @@ function _amRenderPickerList(modal, uploads, generated, runDir, closeFn) {
             </label>
         `).join('')}
     `;
-    body.innerHTML = sectionHtml('Generated', generated) + sectionHtml('Uploaded', uploads);
+  body.innerHTML = sectionHtml('Generated', generated) + sectionHtml('Uploaded', uploads);
 
-    const countEl = modal.querySelector('.attach-picker-count');
-    const confirmBtn = modal.querySelector('[data-act="confirm"]');
-    const refreshCount = () => {
-        const n = body.querySelectorAll('input[type="checkbox"]:checked').length;
-        countEl.textContent = `${n} selected`;
-        confirmBtn.disabled = (n === 0);
-    };
-    body.querySelectorAll('.attach-picker-item').forEach(item => {
-        const cb = item.querySelector('input[type="checkbox"]');
-        item.addEventListener('change', () => {
-            item.classList.toggle('selected', cb.checked);
-            refreshCount();
-        });
+  const countEl = modal.querySelector('.attach-picker-count');
+  const confirmBtn = modal.querySelector('[data-act="confirm"]');
+  const refreshCount = () => {
+    const n = body.querySelectorAll('input[type="checkbox"]:checked').length;
+    countEl.textContent = `${n} selected`;
+    confirmBtn.disabled = (n === 0);
+  };
+  body.querySelectorAll('.attach-picker-item').forEach(item => {
+    const cb = item.querySelector('input[type="checkbox"]');
+    item.addEventListener('change', () => {
+      item.classList.toggle('selected', cb.checked);
+      refreshCount();
     });
+  });
 
-    confirmBtn.addEventListener('click', () => {
-        const checked = Array.from(body.querySelectorAll('input[type="checkbox"]:checked'))
-            .map(cb => cb.closest('.attach-picker-item'));
-        let added = 0;
-        for (const item of checked) {
-            const rel = item.dataset.rel;
-            if (!rel) continue;
-            const fullPath = runDir
-                ? `${runDir.replace(/\/+$/, '')}/${rel}`
-                : `/tmp/run-${getCurrentSessionId()}/${rel}`;
-            const baseName = rel.split('/').pop() || rel;
-            if (pendingUploads.some(u => u.serverPath === fullPath)) continue;
-            pendingUploads.push({
-                id: uid(),
-                name: baseName,
-                type: '',
-                size: 0,
-                localUrl: null,
-                serverPath: fullPath,
-                status: 'ready'
-            });
-            added++;
-        }
-        renderAttachDock();
-        if (added > 0) notify('success', `Attached ${added} file${added > 1 ? 's' : ''}`);
-        closeFn();
-    });
+  confirmBtn.addEventListener('click', () => {
+    const checked = Array.from(body.querySelectorAll('input[type="checkbox"]:checked'))
+      .map(cb => cb.closest('.attach-picker-item'));
+    let added = 0;
+    for (const item of checked) {
+      const rel = item.dataset.rel;
+      if (!rel) continue;
+      const fullPath = runDir
+        ? `${runDir.replace(/\/+$/, '')}/${rel}`
+        : `/tmp/run-${getCurrentSessionId()}/${rel}`;
+      const baseName = rel.split('/').pop() || rel;
+      if (pendingUploads.some(u => u.serverPath === fullPath)) continue;
+      pendingUploads.push({
+        id: uid(),
+        name: baseName,
+        type: '',
+        size: 0,
+        localUrl: null,
+        serverPath: fullPath,
+        status: 'ready'
+      });
+      added++;
+    }
+    renderAttachDock();
+    if (added > 0) notify('success', `Attached ${added} file${added > 1 ? 's' : ''}`);
+    closeFn();
+  });
 }
 
 window.addEventListener('DOMContentLoaded', () => { _amInstallLabelIntercept(); });

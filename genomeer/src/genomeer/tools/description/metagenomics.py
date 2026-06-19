@@ -261,8 +261,11 @@ description = [
         "name": "run_kraken2",
         "description": (
             "[CLI Tool][TIMEOUT: 3600s] Kraken2: ultrafast taxonomic classification using exact k-mer matches. "
-            "Requires a Kraken2 database (--db). "
-            "Command: kraken2 --db kraken2_db --threads N --output output.kraken "
+            "AVAILABLE in meta-env1. The STANDARD-8 database (bacteria + archaea + viral + human, capped 8GB) "
+            "is installed at /home/workshop/kraken2_standard8 — use that as --db (this REPLACES the old "
+            "viral-only DB; bacterial reads now classify properly). Bracken kmer_distrib files (50-300mers) "
+            "are in the SAME dir, so bracken works against the same --db. "
+            "Command: kraken2 --db /home/workshop/kraken2_standard8 --threads N --output output.kraken "
             "--report report.txt --gzip-compressed reads.fastq.gz. "
             "Paired-end: add --paired reads_1.fastq reads_2.fastq."
         ),
@@ -346,10 +349,17 @@ description = [
     {
         "name": "run_eggnog",
         "description": (
-            "[CLI Tool][TIMEOUT: 1800s] EggNOG-mapper: functional annotation via orthology. "
+            "[CLI Tool][TIMEOUT: 1800s] EggNOG-mapper v2.1.13: functional annotation via orthology. "
             "Maps proteins to eggNOG OGs → COG categories, GO terms, KEGG pathways, EC numbers. "
-            "Command: emapper.py -i proteins.faa -o output_prefix --cpu N --data_dir eggnog_data/. "
-            "Requires eggnog database (download with download_eggnog_data.py)."
+            "AVAILABLE in meta-env1; eggNOG DB v5.0.2 installed at /home/workshop/eggnog_db (do NOT "
+            "download it). EXACT command (run via meta-env1): "
+            "emapper.py -i <proteins.faa> -o <output_prefix> --cpu N --data_dir /home/workshop/eggnog_db "
+            "--output_dir <out_dir> -m diamond --sensmode fast. (-m diamond uses the installed "
+            "eggnog_proteins.dmnd; needs a PROTEIN FASTA — use Prokka/Prodigal .faa.) "
+            "SPEED: emapper defaults to --sensmode sensitive which is SLOW (many diamond index passes over "
+            "the 5M-protein DB); ALWAYS pass --sensmode fast (do NOT add --dmnd_algo ctg — it conflicts with "
+            "fast mode's --iterate and aborts). Expect a few minutes regardless (5M-protein DB). "
+            "Outputs <output_prefix>.emapper.annotations (TSV)."
         ),
         "required_parameters": [
             {"name": "proteins_faa", "type": "str"},
@@ -417,10 +427,12 @@ description = [
     {
         "name": "run_antismash",
         "description": (
-            "[CLI Tool][TIMEOUT: 3600s] antiSMASH: antibiotic and secondary metabolite biosynthetic "
-            "gene cluster (BGC) detection. Full genome or metagenomic contigs input. "
-            "Command: antismash --taxon bacteria --output-dir output_dir --genefinding-tool prodigal "
-            "--cpus N contigs.fna. "
+            "[CLI Tool][TIMEOUT: 3600s] antiSMASH v8.0.4: antibiotic and secondary metabolite biosynthetic "
+            "gene cluster (BGC) detection. Full genome or metagenomic contigs input. AVAILABLE in meta-env1; "
+            "databases installed at /home/workshop/antismash_db (do NOT download them). EXACT command "
+            "(run via meta-env1): antismash --taxon bacteria --output-dir <output_dir> --genefinding-tool "
+            "prodigal --cpus N --databases /home/workshop/antismash_db <contigs.fna>. "
+            "(Use --genefinding-tool prodigal for a raw FASTA; omit it if the input is annotated GenBank.) "
             "Outputs HTML report + regions.js with detected BGC types (NRPS, PKS, terpene, etc.)."
         ),
         "required_parameters": [
@@ -441,10 +453,13 @@ description = [
     {
         "name": "run_genomad",
         "description": (
-            "[CLI Tool][TIMEOUT: 1800s] geNomad: identification of viruses and plasmids in metagenomes. "
-            "Uses neural network classifiers. "
-            "Command: genomad end-to-end --cleanup --splits 8 contigs.fna output_dir genomad_db/. "
-            "Outputs virus_summary.tsv and plasmid_summary.tsv with scores and gene annotations."
+            "[CLI Tool][TIMEOUT: 1800s] geNomad v1.12.0: identification of viruses and plasmids in "
+            "metagenomes/genomes (neural-network classifiers). AVAILABLE in meta-env1; database already "
+            "installed at /home/workshop/genomad_db (do NOT download it). EXACT command (run via meta-env1): "
+            "genomad end-to-end --cleanup --splits 8 <contigs.fna> <output_dir> /home/workshop/genomad_db. "
+            "(--splits 8 keeps memory low; positional args are INPUT OUTPUT DATABASE in that order.) "
+            "Outputs in <output_dir>: *_summary/<name>_virus_summary.tsv and *_summary/<name>_plasmid_summary.tsv "
+            "with scores + gene annotations. Use genomad for virus/plasmid detection instead of asking the user."
         ),
         "required_parameters": [
             {"name": "contigs_fasta", "type": "str"},
@@ -465,7 +480,13 @@ description = [
             "[CLI Tool][TIMEOUT: 300s] ABRicate: mass screening of contigs for antimicrobial resistance "
             "and virulence genes. Databases: resfinder, card, ncbi, argannot, vfdb, plasmidfinder, ecoh. "
             "Command: abricate --db resfinder --minid 80 --mincov 80 contigs.fna > results.tsv. "
-            "Multi-database: run abricate multiple times and merge with abricate --summary."
+            "Multi-database: run abricate multiple times and merge with abricate --summary. "
+            "INTERPRETATION: flag last-resort resistance by GENE-NAME family (carbapenemase: "
+            "KPC/NDM/OXA-48/VIM/IMP/GES...; colistin: mcr-1..mcr-10; vancomycin: vanA/B/...), NOT by a "
+            "substring of CARD's drug_class — efflux/porin/regulator genes (KpnG/H, OmpK37, marA, ramA, "
+            "acrAB) carry a 'carbapenem' annotation but are INTRINSIC, not acquired carbapenemases. "
+            "When merging DBs, de-duplicate gene names (the same gene appears under different aliases) "
+            "before reporting a distinct-gene total."
         ),
         "required_parameters": [
             {"name": "contigs_fasta", "type": "str"},
@@ -534,10 +555,14 @@ description = [
     {
         "name": "run_dbcan",
         "description": (
-            "[CLI Tool][TIMEOUT: 600s] dbCAN: Carbohydrate-Active enZyme (CAZyme) annotation. "
-            "Three tools in one: HMMER (dbCAN HMM db), DIAMOND (CAZy db), Hotpep. "
-            "Command: run_dbcan.py proteins.faa protein --out_dir output_dir --db_dir db/ --tools hmmer diamond. "
-            "Outputs: overview.txt with CAZyme family assignments and confidence."
+            "[CLI Tool][TIMEOUT: 600s] dbCAN v5.2.9: Carbohydrate-Active enZyme (CAZyme) annotation. "
+            "AVAILABLE in meta-env1; database already installed at /home/workshop/dbcan_db (do NOT "
+            "download it). The binary is 'run_dbcan' (NOT 'run_dbcan.py'); v5 uses SUBCOMMANDS. "
+            "EXACT command for protein CAZyme annotation (run via meta-env1): "
+            "run_dbcan CAZyme_annotation --mode protein --input_raw_data <proteins.faa> "
+            "--output_dir <out> --db_dir /home/workshop/dbcan_db. "
+            "(--mode is one of protein|prok|meta; for a genome/contigs use --mode prok and pass the .fna.) "
+            "Output: <out>/overview.tsv with CAZyme family assignments (HMMER+dbCAN_sub+DIAMOND consensus)."
         ),
         "required_parameters": [
             {"name": "proteins_faa", "type": "str"},
@@ -579,11 +604,16 @@ description = [
     {
         "name": "run_phyloseq",
         "description": (
-            "[R Package][TIMEOUT: 300s] Phyloseq: R package for microbiome data analysis. "
-            "Alpha diversity (Shannon, Simpson, Chao1), beta diversity (Bray-Curtis, UniFrac), "
-            "ordination (PCoA, NMDS), differential abundance, visualization. "
-            "Use with subprocess.run(['Rscript', '-e', '...R code...']). "
-            "Input: OTU/ASV table TSV + taxonomy TSV + optional metadata TSV."
+            "[R Package][TIMEOUT: 300s] Phyloseq + vegan: microbiome community analysis in R. "
+            "Run via Rscript in the amplicon-env1 env (same env as DADA2). "
+            "Alpha diversity (Shannon, Simpson, Chao1), beta diversity (Bray-Curtis, "
+            "weighted/unweighted UniFrac), ordination (PCoA, NMDS), differential abundance, "
+            "visualization. PERMANOVA — test whether a metadata factor (e.g. elevation, treatment) "
+            "significantly explains community differences — uses vegan::adonis2(dist ~ factor, "
+            "data=meta, permutations=999) on the beta-diversity distance matrix; report R2 and "
+            "p-value. Input: OTU/ASV table TSV + taxonomy TSV + sample metadata TSV (with the "
+            "grouping column). Emit the code as a PURE R block (first line `#!R`) — the executor "
+            "runs it with Rscript inside amplicon-env1 automatically (no Python wrapper)."
         ),
         "required_parameters": [
             {"name": "otu_table", "type": "str", "description": "OTU/ASV count table TSV (features x samples)."},
@@ -593,12 +623,14 @@ description = [
             {"name": "tax_table", "type": "str", "default": None,
              "description": "Taxonomy table TSV."},
             {"name": "metadata", "type": "str", "default": None,
-             "description": "Sample metadata TSV."},
+             "description": "Sample metadata TSV (required for PERMANOVA grouping factor)."},
             {"name": "analysis", "type": "list",
              "default": ["alpha_diversity", "beta_diversity", "ordination"],
-             "description": "Analyses to run."},
+             "description": "Analyses: alpha_diversity, beta_diversity, ordination, permanova."},
+            {"name": "permanova_factor", "type": "str", "default": None,
+             "description": "Metadata column to test with PERMANOVA (vegan::adonis2)."},
         ],
-        "returns": "dict(alpha_div_tsv, beta_div_tsv, ordination_plot, summary)",
+        "returns": "dict(alpha_div_tsv, beta_div_tsv, ordination_plot, permanova_tsv, summary)",
     },
     {
         "name": "run_lefse",
@@ -623,32 +655,13 @@ description = [
     },
 
     # ── BIN DEREPLICATION ─────────────────────────────────────────────────────
-    {
-        "name": "run_das_tool",
-        "description": (
-            "[CLI Tool][TIMEOUT: 3600s] DAS_Tool: bin dereplication and refinement from multiple binners. "
-            "Takes scaffold-to-bin files from several binners and outputs a non-redundant, high-quality bin set. "
-            "Command: DAS_Tool -i bins1,bins2 -l binner1,binner2 -c contigs.fna -o output_prefix "
-            "--threads N --search_engine diamond --write_bins. "
-            "Outputs _DASTool_summary.tsv and _DASTool_bins/ with refined FASTA files."
-        ),
-        "required_parameters": [
-            {"name": "bins_dirs", "type": "list",
-             "description": "List of directories containing per-binner bin FASTA files."},
-            {"name": "contigs_fasta", "type": "str", "description": "Assembled contigs FASTA."},
-            {"name": "output_dir", "type": "str"},
-        ],
-        "optional_parameters": [
-            {"name": "labels", "type": "list", "default": None,
-             "description": "Labels for each binner (same length as bins_dirs). Auto-generated if None."},
-            {"name": "db_path", "type": "str", "default": None,
-             "description": "Path to DAS_Tool database directory."},
-            {"name": "search_engine", "type": "str", "default": "diamond",
-             "description": "Search engine: diamond or blast."},
-            {"name": "threads", "type": "int", "default": 4},
-        ],
-        "returns": "dict(summary_tsv, bins_dir, bin_count, output_dir, returncode, stdout, stderr)",
-    },
+    # DAS_Tool DISABLED for now (not installed — needs R deps + diamond/prodigal,
+    # heavy dependency tree). Re-enable by restoring this entry + installing it.
+    # {
+    #     "name": "run_das_tool",
+    #     "description": "[CLI Tool] DAS_Tool: bin dereplication/refinement from multiple binners.",
+    #     ... (full schema removed; reinstate when installed)
+    # },
 
     # ── ABUNDANCE RE-ESTIMATION ───────────────────────────────────────────────
     {
@@ -681,12 +694,12 @@ description = [
     {
         "name": "run_metaphlan4",
         "description": (
-            "[CLI Tool][TIMEOUT: 3600s] MetaPhlAn 4: marker-gene based taxonomic profiling of metagenomes. "
-            "Uses clade-specific marker genes (mpa_vJan21 or later database). "
-            "Command: metaphlan reads.fastq --input_type fastq --nproc N "
-            "--output_file profile.tsv --bowtie2out reads.bowtie2.bz2 -t rel_ab_w_read_stats. "
-            "Paired reads: comma-separate as 'r1.fastq,r2.fastq'. "
-            "Produces species-level relative abundance profile."
+            "[CLI Tool][TIMEOUT: 3600s] MetaPhlAn 4.2.4: marker-gene taxonomic profiling. "
+            "NOT AVAILABLE YET — the binary is installed but its ~20GB database is NOT downloaded "
+            "(deferred for disk space). DO NOT use metaphlan: it will fail with a missing-DB error. "
+            "For taxonomic profiling / 'what organisms are in this sample' from shotgun reads, use "
+            "run_kraken2 instead (Standard-8 DB IS installed) — optionally followed by bracken for "
+            "species-level relative abundance."
         ),
         "required_parameters": [
             {"name": "reads", "type": "list",
@@ -789,11 +802,22 @@ description = [
     {
         "name": "run_rgi",
         "description": (
-            "[INTERNAL API — DO NOT IMPORT IN GENERATED SCRIPTS] "
-            "[CLI Tool][TIMEOUT: 1800s] RGI (Resistance Gene Identifier): AMR gene prediction against CARD. "
-            "NOT AVAILABLE IN EXECUTION ENVIRONMENTS — requires CARD database download ('rgi load'). "
-            "Verify installation with 'which rgi' before use. "
-            "Consider using abricate as a lightweight alternative that requires no database setup."
+            "[CLI Tool][TIMEOUT: 1800s] RGI (Resistance Gene Identifier) v6.0.8: AMR gene prediction "
+            "against the CARD database (installed: CARD v4.0.1, already loaded globally — do NOT run "
+            "'rgi load'). AVAILABLE in meta-env1. Prefer RGI over abricate when the user explicitly asks "
+            "for RGI / CARD / 'perfect and strict' calls or wants resistance MECHANISM + AMR gene family. "
+            "EXACT command (run via meta-env1 so diamond/blast are on PATH): "
+            "rgi main -i <genome.fna> -o <out_prefix> -t contig --clean -n <threads> -g PYRODIGAL -a DIAMOND. "
+            "CRITICAL: use -g PYRODIGAL (the external prodigal path crashes with a missing .temp.draft "
+            "FileNotFoundError); threads flag is -n (NOT --num_threads). NEVER pass --local: CARD is "
+            "loaded GLOBALLY, so --local makes RGI look for ./localDB/card.json (which does NOT exist) "
+            "and fails with \"No such file or directory: localDB/card.json\". Do NOT run 'rgi load' "
+            "either (already done). Perfect+Strict are reported by "
+            "default; add --include_loose only if low-confidence hits are wanted. "
+            "Output: <out_prefix>.txt (TSV) + <out_prefix>.json. Key columns: 'Best_Hit_ARO' (gene), "
+            "'Cut_Off' (Perfect/Strict/Loose), 'Drug Class', 'Resistance Mechanism', 'AMR Gene Family'. "
+            "Flag true last-resort carbapenemases by gene-name family (KPC/NDM/OXA-48/VIM/IMP/GES), NOT by "
+            "a 'carbapenem' substring in Drug Class (efflux/porin genes carry that annotation but are intrinsic)."
         ),
         "required_parameters": [
             {"name": "input_fasta", "type": "str",
@@ -814,12 +838,26 @@ description = [
     {
         "name": "run_amrfinder",
         "description": (
-            "[INTERNAL API — DO NOT IMPORT IN GENERATED SCRIPTS] "
-            "[CLI Tool][TIMEOUT: 600s] NCBI AMRFinderPlus: identification of AMR, stress, and virulence genes. "
-            "NOT AVAILABLE IN EXECUTION ENVIRONMENTS — amrfinder requires a separate database installation "
-            "('amrfinder --update') and is rarely present. If amrfinder is needed, verify it is installed "
-            "first with 'which amrfinder', then call via subprocess.run(['amrfinder', ...]). "
-            "Consider using abricate as a lightweight alternative (bundled databases, no setup required)."
+            "[CLI Tool][TIMEOUT: 1800s] NCBI AMRFinderPlus v4.2.7: identification of AMR, stress, and "
+            "virulence genes against the curated NCBI AMR database (already installed + updated — do NOT "
+            "run 'amrfinder -u'). AVAILABLE in meta-env1. Prefer AMRFinderPlus over abricate when the user "
+            "explicitly asks for AMRFinderPlus / the NCBI AMR database, or wants point-mutation detection. "
+            "EXACT command (run via meta-env1) on a GENOME FASTA (nucleotide): "
+            "amrfinder -n <genome.fna> -o <out.tsv> --plus --threads <n> [--organism Klebsiella_pneumoniae]. "
+            "Use -p <proteins.faa> instead of -n for a protein FASTA. --plus adds stress/virulence genes; "
+            "--organism <Name> enables species point-mutation calls (allowed names include Klebsiella_pneumoniae, "
+            "Escherichia, Salmonella, Acinetobacter_baumannii, Staphylococcus_aureus — omit if unsupported). "
+            "Output TSV EXACT column names (v4.2.7 — use these VERBATIM, they were renamed from older "
+            "versions): 'Element symbol' (the gene name, e.g. blaCTX-M-14 — NOT 'Gene symbol'), "
+            "'Element name' (description), 'Type' (AMR/VIRULENCE/STRESS — NOT 'Element type'), 'Subtype', "
+            "'Class' (drug class), 'Subclass', 'Method'. Filter AMR rows with df['Type']=='AMR' (the gene "
+            "is df['Element symbol']). Flag last-resort carbapenemases by gene-name family "
+            "(blaKPC/blaNDM/blaOXA-48/blaVIM/blaIMP). "
+            "CRITICAL when merging with RGI: AMRFinderPlus output is ALREADY curated and high-confidence "
+            "— it has NO 'Cut_Off'/'Perfect/Strict' column. NEVER drop AMRFinder hits by an RGI-style "
+            "confidence filter, and NEVER look for columns named 'Gene symbol' or 'Element type' (they do "
+            "NOT exist → you get 0 genes). Real bug: AMRFinder produced 32 hits but the parser used the "
+            "wrong column names and reported 0. Include every AMR-typed row."
         ),
         "required_parameters": [
             {"name": "proteins_faa", "type": "str",
@@ -858,5 +896,81 @@ description = [
              "description": "Number of query reads for estimation."},
         ],
         "returns": "dict(npo_file, coverage_estimate, redundancy, summary)",
+    },
+    {
+        "name": "run_dada2",
+        "description": (
+            "[R Package][TIMEOUT: 3600s] DADA2: amplicon (16S/18S/ITS) denoising — infers exact "
+            "amplicon sequence variants (ASVs) from paired-end Illumina reads. Emit the code as a "
+            "PURE R block (first line `#!R`, NOT a Python wrapper) — the executor runs it with "
+            "Rscript inside amplicon-env1 automatically. "
+            "Pipeline in R: library(dada2); filterAndTrim(fwd, filtF, rev, filtR, truncLen=c(F,R), "
+            "maxEE=c(2,2), truncQ=2, rm.phix=TRUE); learnErrors(); dada(); mergePairs(); "
+            "makeSequenceTable(); removeBimeraDenovo(); assignTaxonomy(seqtab, 'silva_nr99_*_train_set.fa.gz'). "
+            "Outputs: ASV table TSV + taxonomy TSV (feed into run_phyloseq for diversity/PERMANOVA). "
+            "DADA2 is for AMPLICON marker-gene reads ONLY — never for shotgun metagenomes or whole genomes. "
+            "CRITICAL: paired R1/R2 must OVERLAP for mergePairs — simulate/use a SHORT amplicon "
+            "(~250-400 bp V-region, NOT full-length 16S ~1500 bp), else merging yields 0 ASVs."
+        ),
+        "required_parameters": [
+            {"name": "reads_fwd", "type": "str", "description": "Forward (R1) FASTQ path(s)."},
+            {"name": "reads_rev", "type": "str", "description": "Reverse (R2) FASTQ path(s)."},
+            {"name": "output_dir", "type": "str", "description": "Directory for ASV table + taxonomy outputs."},
+        ],
+        "optional_parameters": [
+            {"name": "trunc_len_f", "type": "int", "default": 0,
+             "description": "Truncate forward reads at this length (0 = no truncation)."},
+            {"name": "trunc_len_r", "type": "int", "default": 0,
+             "description": "Truncate reverse reads at this length."},
+            {"name": "silva_train_set", "type": "str", "default": None,
+             "description": "Path to SILVA train-set fasta.gz for assignTaxonomy (optional)."},
+        ],
+        "returns": "dict(asv_table_tsv, taxonomy_tsv, track_reads_tsv, summary)",
+    },
+    {
+        "name": "run_multiqc",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] MultiQC: aggregate QC reports from many tools "
+            "(FastQC, fastp, Kraken2, QUAST, samtools, Bowtie2, ...) into ONE interactive HTML. "
+            "Command: multiqc <input_dir> -o <output_dir>. Run AFTER QC/mapping steps to "
+            "summarize all per-sample reports at once. Output: multiqc_report.html + data dir."
+        ),
+        "required_parameters": [
+            {"name": "input_dir", "type": "str", "description": "Directory containing tool logs/reports to scan."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [],
+        "returns": "dict(report_html, data_dir, summary)",
+    },
+    {
+        "name": "run_insilicoseq",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] InSilicoSeq (iss): modern read simulator for amplicon and "
+            "shotgun Illumina data — the recommended way to simulate test reads (replaces grinder). "
+            "REQUIRED when the simulated reads will feed DADA2: iss produces realistic per-base "
+            "quality scores, whereas wgsim's flat/uniform quality makes DADA2 learnErrors fail "
+            "('Error matrix is NULL'). For any DADA2/amplicon test data, use iss, NOT wgsim. "
+            "COVERAGE: --n_reads is TOTAL reads — for an ASSEMBLY task size it for ~50x depth "
+            "(n_reads ≈ 50 * genome_bp / read_len; e.g. ~1.6M for a 5 Mb genome), NOT a fixed 200k "
+            "(~6x → fragmented assembly). "
+            "Command: iss generate --genomes refs.fa --n_reads 100000 --model miseq "
+            "--output out_prefix --cpus 4. Produces out_prefix_R1.fastq + out_prefix_R2.fastq "
+            "(paired-end) with realistic error models. Use --abundance to set community proportions. "
+            "For 16S amplicon test data, give 16S reference sequences as --genomes. "
+            "(For simple whole-genome shotgun, wgsim also works.)"
+        ),
+        "required_parameters": [
+            {"name": "genomes", "type": "str", "description": "Reference FASTA to simulate reads from."},
+            {"name": "output_prefix", "type": "str", "description": "Output prefix (produces <prefix>_R1/_R2.fastq)."},
+        ],
+        "optional_parameters": [
+            {"name": "n_reads", "type": "int", "default": 100000},
+            {"name": "model", "type": "str", "default": "miseq",
+             "description": "Error model: miseq, hiseq, novaseq, or a custom model file."},
+            {"name": "abundance", "type": "str", "default": None,
+             "description": "Abundance distribution (uniform, lognormal, ...) or a file."},
+            {"name": "cpus", "type": "int", "default": 4},
+        ],
+        "returns": "dict(reads_r1, reads_r2, abundance_tsv, summary)",
     },
 ]

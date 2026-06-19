@@ -85,7 +85,7 @@ class ParsedExecuteBlock(BaseModel):
         # INCONS-03: panhumanpy_env is declared in registry/index.yaml but was
         # missing here, causing all LLM-generated code targeting it to be silently
         # re-routed to bio-agent-env1 (missing scanpy → ImportError at runtime).
-        VALID_ENVS = {"bio-agent-env1", "meta-env1", "btools_env_py310", "panhumanpy_env"}
+        VALID_ENVS = {"bio-agent-env1", "meta-env1", "btools_env_py310", "panhumanpy_env", "amplicon-env1"}
         if v and v not in VALID_ENVS:
             return None   # env inconnu → laisser le résolveur décider
         return v
@@ -173,9 +173,24 @@ def _get_meta_signals() -> set:
         return set()
 
 
+# DADA2 / phyloseq amplicon (16S) R stack lives in its own isolated env
+# (amplicon-env1) so its Bioconductor dependencies never collide with the
+# meta-env1 CLI bioinfo stack. These R signals route code there.
+_AMPLICON_SIGNALS = (
+    "library(dada2)", "library(phyloseq)", "require(dada2)", "require(phyloseq)",
+    "dada2::", "phyloseq::",
+    "filterandtrim", "learnerrors", "removebimeradenovo", "assigntaxonomy",
+    "makesequencetable", "mergepairs", "collapseno",
+)
+
+
 def _resolve_env_from_code(code: str) -> str:
     """Déduit l'environnement micromamba depuis le contenu du code."""
     code_lower = (code or "").lower()
+    # Amplicon R stack first (most specific).
+    for sig in _AMPLICON_SIGNALS:
+        if sig in code_lower:
+            return "amplicon-env1"
     for signal in _get_meta_signals():
         if signal.lower() in code_lower:
             return "meta-env1"

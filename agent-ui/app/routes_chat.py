@@ -305,13 +305,18 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                                     inner = re.sub(r"</[^>]+>$", "", inner).strip()
                                     if inner: assistant_parts.append(inner)
                                 
-                                # Save loggable blocks for history
-                                # These are the ones your right panel renderer understands.
-                                LOGGABLE = {"EXECUTE","OBSERVE","LOGS","THINK","STATUS","NEXT"}
+                                # Save blocks for history replay. Two groups:
+                                #  - right-pane logs (EXECUTE/OBSERVE/LOGS/THINK/STATUS): store inner text.
+                                #  - left-pane CHAT CARDS (RUNNING/DESCRIPTION/MISSING/NEXT): store the
+                                #    RAW tagged text so the frontend rebuilds the SAME cards on refresh.
+                                #    Fixes the "UI changes / Step+Missing cards disappear after reload" bug,
+                                #    and NEXT→Unknown (NEXT was being stripped of its <next:..> wrapper so
+                                #    the chip could no longer parse the target node).
+                                LOGGABLE = {"EXECUTE","OBSERVE","LOGS","THINK","STATUS","NEXT",
+                                            "RUNNING","DESCRIPTION","MISSING"}
                                 if tag in LOGGABLE:
                                     raw = evt.get("text") or ""
-                                    body_txt = raw
-                                    if tag in {"EXECUTE","OBSERVE","LOGS","THINK","NEXT"}:
+                                    if tag in {"EXECUTE","OBSERVE","LOGS","THINK"}:
                                         # store inner content only (no <TAG> wrappers)
                                         body_txt = re.sub(r"^<[^>]+>", "", raw)
                                         body_txt = re.sub(r"</[^>]+>$", "", body_txt).strip()
@@ -319,6 +324,10 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                                         # normalize to 'running|done|...' without angle brackets
                                         m = re.search(r"<\s*status\s*:\s*([^>]+)>", raw, flags=re.I)
                                         body_txt = (m.group(1) if m else raw).strip()
+                                    else:
+                                        # NEXT / RUNNING / DESCRIPTION / MISSING → keep RAW tagged text
+                                        # so the frontend can replay them through the live card renderer.
+                                        body_txt = raw
                                     saved_logs.append({"tag": tag, "body": body_txt})
 
                         except Exception:

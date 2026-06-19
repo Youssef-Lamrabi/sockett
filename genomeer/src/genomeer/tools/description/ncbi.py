@@ -41,5 +41,32 @@ description = [
             {"name": "timeout_sec", "type": "int", "default": 1800, "description": "Subprocess timeout in seconds."}
         ],
         "returns": "dict(ok, cmd, stdout, stderr, output_folder, downloaded_files, decompressed_files, note)"
+    },
+    {
+        "name": "query_ncbi_entrez",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] NCBI Entrez Direct (esearch/efetch/esummary) — METADATA LOOKUP & "
+            "VERIFICATION (NOT a downloader; for genome FASTA use ncbi-genome-download). AVAILABLE in "
+            "meta-env1 and bio-agent-env1. Use it to RESOLVE and VERIFY before/around downloads — this "
+            "prevents wrong-organism and hallucinated-accession failures. Run via subprocess as a shell pipe. "
+            "Key recipes (validated):\n"
+            "  * BioProject -> RUN accessions (SRR/ERR), REQUIRED to download SRA reads from a PRJNA/PRJEB: \n"
+            "      esearch -db sra -query 'PRJNA288120' | efetch -format runinfo\n"
+            "    (CSV; column 1 = Run accession, e.g. SRR2090128. Parse the Run column, then download each run.)\n"
+            "  * Verify an assembly accession's ORGANISM (confirm species before analysis): \n"
+            "      esearch -db assembly -query 'GCF_000240185.1' | esummary | grep -o '<Organism>[^<]*'\n"
+            "  * Taxonomy / lineage for a name: esearch -db taxonomy -query 'Klebsiella pneumoniae' | efetch -format xml.\n"
+            "NOTES: needs network (eutils.ncbi.nlm.nih.gov); edirect sometimes prints a transient "
+            "'SSL unexpected eof' then retries and still returns results — re-run once on empty output. "
+            "Do NOT hit eutils with raw urllib/requests (rate-limited) — use esearch/efetch which handle retries."
+        ),
+        "required_parameters": [
+            {"name": "db", "type": "str", "description": "Entrez database: sra, assembly, taxonomy, nuccore, bioproject, biosample."},
+            {"name": "query", "type": "str", "description": "Accession, BioProject ID, organism name, or query term."},
+        ],
+        "optional_parameters": [
+            {"name": "format", "type": "str", "default": "runinfo", "description": "efetch -format (runinfo, xml, docsum, acc) or esummary."},
+        ],
+        "returns": "dict(ok, cmd, stdout, stderr)"
     }
 ]

@@ -961,7 +961,8 @@ button.primary {
 /* --- Delete + rename UI (injected per session-item) ----------------------- */
 .session-item .open {
     flex: 1 1 auto;
-    min-width: 0;       /* allow title to truncate */
+    min-width: 0;
+    /* allow title to truncate */
 }
 
 .session-item .session-del {
@@ -977,15 +978,19 @@ button.primary {
     opacity: 0;
     transition: opacity .14s ease, background .12s ease, color .12s ease;
 }
+
 .session-item:hover .session-del,
 .session-item.active .session-del,
 .session-item:focus-within .session-del {
-    opacity: 1;             /* reveal trash icon only on hover/focus */
+    opacity: 1;
+    /* reveal trash icon only on hover/focus */
 }
+
 .session-item .session-del:hover {
     background: rgba(239, 68, 68, 0.12);
     color: #b91c1c;
 }
+
 .session-item .session-del:disabled {
     opacity: 0.4;
     cursor: wait;
@@ -1334,7 +1339,8 @@ h2 {
     cursor: not-allowed;
 }
 
-#composer input[type=file]:disabled~i, .upload:has(input:disabled) {
+#composer input[type=file]:disabled~i,
+.upload:has(input:disabled) {
     opacity: .45;
     cursor: not-allowed;
     pointer-events: none;
@@ -1808,7 +1814,8 @@ ul {
     padding: 0;
     overflow: hidden;
     display: flex;
-    flex-direction: column;            /* top: list, bottom: preview when open */
+    flex-direction: column;
+    /* top: list, bottom: preview when open */
     /* Override the legacy .fe-body rule above which had align-items/justify-content
        set to "center" — that was shrinking .fe-list-region to its content width and
        leaving ~150px of empty white space on the right when the panel is wide. */
@@ -1828,13 +1835,25 @@ ul {
        (no side margins). Vertical padding kept for breathing room. */
     padding: 8px 0;
 }
+
 #file-explorer .fe-body.has-preview .fe-list-region {
-    flex: 0 0 33%;                    /* top 1/3 when preview is open */
+    flex: 0 0 33%;
+    /* top 1/3 when preview is open */
     border-bottom: 1px solid #e5e7eb;
 }
-.fe-list-region::-webkit-scrollbar { width: 6px; }
-.fe-list-region::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-.fe-list-region::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+.fe-list-region::-webkit-scrollbar {
+    width: 6px;
+}
+
+.fe-list-region::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 3px;
+}
+
+.fe-list-region::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+}
 
 /* --- File list container (same markup for grid vs list) -------- */
 .fe-file-list {
@@ -1842,6 +1861,7 @@ ul {
     flex-direction: column;
     gap: 4px;
 }
+
 .view-grid .fe-file-list {
     display: grid;
     /* Fully responsive: auto-fill keeps column tracks stable as the panel is
@@ -1851,7 +1871,20 @@ ul {
     gap: 6px;
     width: 100%;
     margin: 0;
-    padding: 0 6px;             /* tiny inset so cards don't touch the scrollbar */
+    padding: 0 6px;
+    /* tiny inset so cards don't touch the scrollbar */
+}
+
+/* In grid view, a folder must NOT be squished into a single grid cell — it spans
+   the whole row, and ITS files lay out in their own grid (side by side), just like
+   the loose files. (Fix: folder files were stacking vertically in grid mode.) */
+.view-grid .fe-file-list > .fe-folder {
+    grid-column: 1 / -1;
+}
+.view-grid .fe-folder.open .fe-folder-children {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+    gap: 6px;
 }
 
 /* --- File item (subtle gray card) ------------------------------ */
@@ -1871,25 +1904,34 @@ ul {
     font-family: inherit;
     overflow: hidden;
 }
+
 .fe-file-item:hover {
     background: #ebebeb;
     border-color: #d1d5db;
 }
+
 .fe-file-item.active {
     background: #e0e7ff;
     border-color: #a5b4fc;
 }
-.fe-file-item:active { transform: scale(0.99); }
+
+.fe-file-item:active {
+    transform: scale(0.99);
+}
+
 .fe-file-item:focus-visible {
     outline: 2px solid rgba(99, 102, 241, 0.45);
     outline-offset: 1px;
 }
-.fe-file-item > i.fa {
+
+.fe-file-item>i.fa {
     width: 16px;
     flex-shrink: 0;
-    color: #94a3b8;     /* gray (was #6366f1 indigo per user request) */
+    color: #94a3b8;
+    /* gray (was #6366f1 indigo per user request) */
     font-size: 14px;
 }
+
 .fe-file-name {
     flex: 1 1 auto;
     font-size: 13px;
@@ -1898,6 +1940,7 @@ ul {
     white-space: nowrap;
     min-width: 0;
 }
+
 .fe-file-meta {
     flex-shrink: 0;
     font-size: 10.5px;
@@ -1909,16 +1952,19 @@ ul {
    icon shrinks slightly + smaller padding so 90px-min cells stay readable. */
 .view-grid .fe-file-item {
     flex-direction: column;
-    align-items: center;          /* center icon and label inside narrow cells */
+    align-items: center;
+    /* center icon and label inside narrow cells */
     text-align: center;
     padding: 10px 8px;
     min-height: 72px;
     gap: 4px;
 }
-.view-grid .fe-file-item > i.fa {
+
+.view-grid .fe-file-item>i.fa {
     font-size: 22px;
     width: auto;
 }
+
 .view-grid .fe-file-name {
     font-size: 12px;
     /* Truncate long filenames with ellipsis instead of wrapping. */
@@ -1929,8 +1975,10 @@ ul {
     text-align: center;
     width: 100%;
     max-width: 100%;
-    min-width: 0;               /* allow grid cell to shrink + trigger ellipsis */
+    min-width: 0;
+    /* allow grid cell to shrink + trigger ellipsis */
 }
+
 .view-grid .fe-file-meta {
     font-size: 9.5px;
     text-align: center;
@@ -1946,7 +1994,10 @@ ul {
 }
 
 /* --- Uploads folder (collapsible row at TOP of list) ----------- */
-.fe-folder { margin-bottom: 6px; }
+.fe-folder {
+    margin-bottom: 6px;
+}
+
 .fe-folder-header {
     display: flex;
     align-items: center;
@@ -1962,16 +2013,34 @@ ul {
     text-align: left;
     transition: background 0.12s ease;
 }
-.fe-folder-header:hover { background: #ebebeb; }
+
+.fe-folder-header:hover {
+    background: #ebebeb;
+}
+
 .fe-folder-chevron {
     color: #94a3b8;
     transition: transform 0.15s ease;
     font-size: 10px;
     width: 10px;
 }
-.fe-folder.open .fe-folder-chevron { transform: rotate(90deg); }
-.fe-folder-icon { color: #f59e0b; width: 14px; font-size: 13px; }
-.fe-folder-label { flex: 1; font-size: 13px; font-weight: 600; }
+
+.fe-folder.open .fe-folder-chevron {
+    transform: rotate(90deg);
+}
+
+.fe-folder-icon {
+    color: #f59e0b;
+    width: 14px;
+    font-size: 13px;
+}
+
+.fe-folder-label {
+    flex: 1;
+    font-size: 13px;
+    font-weight: 600;
+}
+
 .fe-folder-header .fe-count {
     margin-left: auto;
     background: #e5e7eb;
@@ -1980,11 +2049,28 @@ ul {
     border-radius: 9px;
     font-size: 10px;
 }
-.fe-folder-children { display: none; margin-top: 4px; padding-left: 4px; }
-.fe-folder.open .fe-folder-children { display: flex; flex-direction: column; gap: 3px; }
+
+.fe-folder-children {
+    display: none;
+    margin-top: 4px;
+    padding-left: 4px;
+}
+
+.fe-folder.open .fe-folder-children {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
 /* In grid view, fold children become single rows for readability */
-.view-grid .fe-folder { grid-column: 1 / -1; }
-.fe-indent { margin-left: 18px; background: #fafafa; }
+.view-grid .fe-folder {
+    grid-column: 1 / -1;
+}
+
+.fe-indent {
+    margin-left: 18px;
+    background: #fafafa;
+}
 
 /* --- Header tool buttons (refresh + view toggle) --------------- */
 .fe-refresh-btn,
@@ -1999,18 +2085,35 @@ ul {
     line-height: 1;
     transition: background 0.12s ease, color 0.12s ease;
 }
+
 .fe-refresh-btn:hover,
 .fe-view-toggle:hover {
     background: rgba(99, 102, 241, 0.10);
     color: #4338ca;
 }
+
 .fe-refresh-btn:active,
-.fe-view-toggle:active { transform: scale(0.96); }
-.fe-refresh-btn:disabled { opacity: 0.5; cursor: wait; }
-.fe-refresh-btn.spinning i { animation: fe-spin 0.7s linear; }
+.fe-view-toggle:active {
+    transform: scale(0.96);
+}
+
+.fe-refresh-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+.fe-refresh-btn.spinning i {
+    animation: fe-spin 0.7s linear;
+}
+
 @keyframes fe-spin {
-    from { transform: rotate(0deg); }
-    to   { transform: rotate(360deg); }
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 /* --- Inline preview region (bottom 2/3 when open) -------------- */
@@ -2023,6 +2126,7 @@ ul {
     overflow: hidden;
     animation: fe-fade-in 0.15s ease-out;
 }
+
 .fe-preview-toolbar {
     display: flex;
     align-items: center;
@@ -2032,7 +2136,12 @@ ul {
     background: #f9fafb;
     flex-shrink: 0;
 }
-.fe-preview-toolbar i.fa { color: #94a3b8; font-size: 13px; }
+
+.fe-preview-toolbar i.fa {
+    color: #94a3b8;
+    font-size: 13px;
+}
+
 .fe-preview-name {
     flex: 1 1 auto;
     font-size: 12.5px;
@@ -2043,6 +2152,7 @@ ul {
     white-space: nowrap;
     min-width: 0;
 }
+
 .fe-preview-dl,
 .fe-preview-close {
     background: none;
@@ -2056,25 +2166,49 @@ ul {
     line-height: 1;
     transition: background 0.1s ease, color 0.1s ease;
 }
-.fe-preview-dl:hover  { background: rgba(99,102,241,.12); color: #4338ca; }
-.fe-preview-close:hover { background: rgba(239,68,68,.12); color: #b91c1c; }
-.fe-preview-dl:disabled { opacity: .5; cursor: wait; }
+
+.fe-preview-dl:hover {
+    background: rgba(99, 102, 241, .12);
+    color: #4338ca;
+}
+
+.fe-preview-close:hover {
+    background: rgba(239, 68, 68, .12);
+    color: #b91c1c;
+}
+
+.fe-preview-dl:disabled {
+    opacity: .5;
+    cursor: wait;
+}
 
 .fe-preview-content {
     flex: 1 1 auto;
     overflow: auto;
     padding: 12px;
 }
-.fe-preview-loading { color: #94a3b8; font-size: 12px; font-style: italic; }
-.fe-preview-muted   { color: #94a3b8; font-size: 12px; padding: 8px; }
+
+.fe-preview-loading {
+    color: #94a3b8;
+    font-size: 12px;
+    font-style: italic;
+}
+
+.fe-preview-muted {
+    color: #94a3b8;
+    font-size: 12px;
+    padding: 8px;
+}
+
 .fe-preview-img {
     max-width: 100%;
     max-height: 100%;
     display: block;
     margin: 0 auto;
     border-radius: 4px;
-    box-shadow: 0 2px 6px rgba(0,0,0,.06);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, .06);
 }
+
 .fe-preview-iframe {
     width: 100%;
     height: 100%;
@@ -2082,6 +2216,7 @@ ul {
     background: white;
     border-radius: 4px;
 }
+
 .fe-preview-pre {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", monospace;
     font-size: 11.5px;
@@ -2091,18 +2226,50 @@ ul {
     color: #1e293b;
     line-height: 1.5;
 }
-.fe-preview-mono { font-size: 11px; line-height: 1.35; }
-.fe-preview-unsupported { text-align: center; padding: 32px 16px; color: #64748b; }
-.fe-preview-unsupported i.fa { font-size: 36px; color: #cbd5e1; margin-bottom: 12px; }
-.fe-preview-unsupported p { margin: 0 0 6px 0; font-weight: 600; color: #475569; }
-.fe-preview-unsupported code {
-    background: #eef2f7; padding: 1px 6px; border-radius: 4px; font-size: 12px;
+
+.fe-preview-mono {
+    font-size: 11px;
+    line-height: 1.35;
 }
-.fe-preview-unsupported span { font-size: 12px; color: #94a3b8; }
+
+.fe-preview-unsupported {
+    text-align: center;
+    padding: 32px 16px;
+    color: #64748b;
+}
+
+.fe-preview-unsupported i.fa {
+    font-size: 36px;
+    color: #cbd5e1;
+    margin-bottom: 12px;
+}
+
+.fe-preview-unsupported p {
+    margin: 0 0 6px 0;
+    font-weight: 600;
+    color: #475569;
+}
+
+.fe-preview-unsupported code {
+    background: #eef2f7;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.fe-preview-unsupported span {
+    font-size: 12px;
+    color: #94a3b8;
+}
 
 @keyframes fe-fade-in {
-    from { opacity: 0; }
-    to   { opacity: 1; }
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
 }
 
 /* =============================================================
@@ -2124,6 +2291,7 @@ ul {
     animation: am-fade-up 0.12s ease-out;
     user-select: none;
 }
+
 .attach-menu-item {
     display: flex;
     align-items: center;
@@ -2141,13 +2309,27 @@ ul {
     line-height: 1.2;
     transition: background 0.1s ease;
 }
-.attach-menu-item:hover { background: #f1f5f9; }
+
+.attach-menu-item:hover {
+    background: #f1f5f9;
+}
+
 .attach-menu-item:focus-visible {
     outline: 2px solid rgba(99, 102, 241, 0.45);
     outline-offset: -1px;
 }
-.attach-menu-item i.fa { width: 16px; text-align: center; color: #6366f1; font-size: 14px; }
-.attach-menu-item .am-label { flex: 1; }
+
+.attach-menu-item i.fa {
+    width: 16px;
+    text-align: center;
+    color: #6366f1;
+    font-size: 14px;
+}
+
+.attach-menu-item .am-label {
+    flex: 1;
+}
+
 .attach-menu-item .am-badge {
     margin-left: auto;
     font-size: 9.5px;
@@ -2158,15 +2340,26 @@ ul {
     background: #fef3c7;
     color: #92400e;
 }
+
 .attach-menu-item[disabled] {
     opacity: 0.55;
     cursor: not-allowed;
 }
-.attach-menu-item[disabled]:hover { background: transparent; }
+
+.attach-menu-item[disabled]:hover {
+    background: transparent;
+}
 
 @keyframes am-fade-up {
-    from { opacity: 0; transform: translateY(4px); }
-    to   { opacity: 1; transform: translateY(0); }
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 
 /* --- Workspace picker modal (Option 3) --- */
@@ -2179,11 +2372,13 @@ ul {
     justify-content: center;
     animation: am-fade-up 0.15s ease-out;
 }
+
 .attach-picker-backdrop {
     position: absolute;
     inset: 0;
     background: rgba(15, 23, 42, 0.45);
 }
+
 .attach-picker-card {
     position: relative;
     background: #ffffff;
@@ -2195,6 +2390,7 @@ ul {
     overflow: hidden;
     box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
 }
+
 .attach-picker-header {
     display: flex;
     align-items: center;
@@ -2204,7 +2400,14 @@ ul {
     background: #f9fafb;
     flex-shrink: 0;
 }
-.attach-picker-title { flex: 1; font-weight: 600; font-size: 14px; color: #1e293b; }
+
+.attach-picker-title {
+    flex: 1;
+    font-weight: 600;
+    font-size: 14px;
+    color: #1e293b;
+}
+
 .attach-picker-close {
     background: none;
     border: none;
@@ -2214,14 +2417,27 @@ ul {
     color: #475569;
     font-size: 14px;
 }
-.attach-picker-close:hover { background: rgba(239, 68, 68, 0.12); color: #b91c1c; }
+
+.attach-picker-close:hover {
+    background: rgba(239, 68, 68, 0.12);
+    color: #b91c1c;
+}
+
 .attach-picker-body {
     flex: 1 1 auto;
     overflow-y: auto;
     padding: 8px 12px;
 }
-.attach-picker-body::-webkit-scrollbar { width: 6px; }
-.attach-picker-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+.attach-picker-body::-webkit-scrollbar {
+    width: 6px;
+}
+
+.attach-picker-body::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 3px;
+}
+
 .attach-picker-empty {
     color: #94a3b8;
     text-align: center;
@@ -2229,6 +2445,7 @@ ul {
     font-size: 13px;
     font-style: italic;
 }
+
 .attach-picker-group-title {
     font-size: 10.5px;
     font-weight: 700;
@@ -2237,6 +2454,7 @@ ul {
     color: #64748b;
     padding: 10px 4px 6px 4px;
 }
+
 .attach-picker-item {
     display: flex;
     align-items: center;
@@ -2254,11 +2472,16 @@ ul {
     font-family: inherit;
     font-size: 13px;
 }
-.attach-picker-item:hover { background: #ebebeb; }
+
+.attach-picker-item:hover {
+    background: #ebebeb;
+}
+
 .attach-picker-item.selected {
     background: #e0e7ff;
     border-color: #a5b4fc;
 }
+
 .attach-picker-item input[type="checkbox"] {
     width: 16px;
     height: 16px;
@@ -2266,7 +2489,13 @@ ul {
     cursor: pointer;
     accent-color: #6366f1;
 }
-.attach-picker-item i.fa { color: #94a3b8; width: 16px; font-size: 13px; }
+
+.attach-picker-item i.fa {
+    color: #94a3b8;
+    width: 16px;
+    font-size: 13px;
+}
+
 .attach-picker-item .api-name {
     flex: 1;
     overflow: hidden;
@@ -2274,12 +2503,14 @@ ul {
     white-space: nowrap;
     min-width: 0;
 }
+
 .attach-picker-item .api-meta {
     font-size: 10.5px;
     color: #94a3b8;
     white-space: nowrap;
     flex-shrink: 0;
 }
+
 .attach-picker-footer {
     display: flex;
     align-items: center;
@@ -2289,8 +2520,18 @@ ul {
     background: #fafbfc;
     flex-shrink: 0;
 }
-.attach-picker-count { font-size: 12px; color: #64748b; }
-.attach-picker-actions { margin-left: auto; display: flex; gap: 6px; }
+
+.attach-picker-count {
+    font-size: 12px;
+    color: #64748b;
+}
+
+.attach-picker-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+}
+
 .attach-picker-btn {
     padding: 7px 14px;
     border-radius: 6px;
@@ -2303,13 +2544,21 @@ ul {
     font-family: inherit;
     transition: background 0.1s ease;
 }
-.attach-picker-btn:hover { background: #f1f5f9; }
+
+.attach-picker-btn:hover {
+    background: #f1f5f9;
+}
+
 .attach-picker-btn-primary {
     border-color: #6366f1;
     background: #6366f1;
     color: #ffffff;
 }
-.attach-picker-btn-primary:hover { background: #4f46e5; }
+
+.attach-picker-btn-primary:hover {
+    background: #4f46e5;
+}
+
 .attach-picker-btn-primary:disabled {
     background: #cbd5e1;
     border-color: #cbd5e1;
@@ -2337,12 +2586,14 @@ ul {
     transition: background 0.15s ease, transform 0.05s ease;
     cursor: pointer;
 }
+
 .msg.assistant .bubble a[href="#open-workspace"]:hover,
 .msg.assistant .bubble a[data-action="open-workspace"]:hover {
     background: #4f46e5;
     color: #ffffff;
     text-decoration: none;
 }
+
 .msg.assistant .bubble a[href="#open-workspace"]:active,
 .msg.assistant .bubble a[data-action="open-workspace"]:active {
     transform: translateY(1px);
@@ -2355,15 +2606,19 @@ ul {
 .fe-show-toggle {
     position: relative;
 }
+
 .fe-show-toggle.active {
     color: #4f46e5;
     background: rgba(79, 70, 229, 0.12);
 }
+
 .fe-show-toggle.filter-off {
-    color: #9ca3af;       /* gray-400 — "filter disabled, showing all" */
+    color: #9ca3af;
+    /* gray-400 — "filter disabled, showing all" */
     background: transparent;
     opacity: 0.85;
 }
+
 .fe-show-toggle .fe-show-badge {
     position: absolute;
     top: 2px;
@@ -2379,10 +2634,213 @@ ul {
     line-height: 14px;
     text-align: center;
 }
+
 .fe-show-toggle .fe-show-eye {
     position: absolute;
     bottom: 2px;
     right: 2px;
     font-size: 9px;
-    color: #9ca3af;       /* matches dimmed state */
+    color: #9ca3af;
+    /* matches dimmed state */
+}
+
+/* ─── Execution-mode dropdown (next to Workspace button) ──────────────────── */
+.exec-mode-wrap {
+    position: relative;
+    display: inline-block;
+}
+
+.exec-mode-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    min-width: 210px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+    padding: 6px;
+    z-index: 1000;
+}
+
+.exec-mode-menu[hidden] {
+    display: none;
+}
+
+.exec-mode-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    padding: 8px 10px;
+    font-size: 13px;
+    color: #1f2937;
+    cursor: pointer;
+}
+
+.exec-mode-item:hover:not(:disabled) {
+    background: #eef2ff;
+}
+
+.exec-mode-item.active {
+    background: #eef2ff;
+    color: #4f46e5;
+    font-weight: 600;
+}
+
+.exec-mode-item:disabled {
+    color: #9ca3af;
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.exec-mode-hint {
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+/* ─── Workspace search bar (filter files by name) ─────────────────────────── */
+.fe-search-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid #eef0f3;
+    background: #fafbfc;
+    flex: 0 0 auto;
+}
+
+.fe-search-ico {
+    color: #94a3b8;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.fe-search-input {
+    flex: 1 1 auto;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+    outline: none;
+    background: #ffffff;
+    color: #1f2937;
+}
+
+.fe-search-input:focus {
+    border-color: #4f46e5;
+}
+
+/* ─── Resizable preview: horizontal drag handle (list <-> preview) ────────── */
+.fe-hsplitter {
+    flex: 0 0 7px;
+    height: 7px;
+    cursor: ns-resize;
+    background: #eef0f3;
+    border-top: 1px solid #e5e7eb;
+    border-bottom: 1px solid #e5e7eb;
+    position: relative;
+}
+
+.fe-hsplitter::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 36px;
+    height: 3px;
+    border-radius: 2px;
+    background: #cbd5e1;
+}
+
+.fe-hsplitter:hover,
+.fe-hsplitter.dragging {
+    background: #e0e7ff;
+}
+
+.fe-hsplitter:hover::before,
+.fe-hsplitter.dragging::before {
+    background: #4f46e5;
+}
+
+.exec-mode-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    top: auto;
+    left: 0;
+    min-width: 210px;
+    background: #ffffff;
+    /* solid white, no transparency */
+    border: 1.5px solid rgba(0, 0, 0, 0.15);
+    border-radius: 12px;
+    padding: 5px;
+    z-index: 9999;
+    /* high enough to sit above everything */
+    box-shadow: 0 -4px 6px rgba(0, 0, 0, 0.04),
+        0 -12px 32px rgba(0, 0, 0, 0.18);
+    /* layered shadow for depth */
+    display: none;
+}
+
+.exec-mode-menu.open {
+    display: block;
+}
+
+.exec-mode-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 9px 12px;
+    /* slightly more padding */
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--color-text-primary);
+    background: transparent;
+    border: none;
+    border-radius: var(--border-radius-md);
+    cursor: pointer;
+    text-align: left;
+    box-sizing: border-box;
+}
+
+.exec-mode-item:hover:not(:disabled) {
+    background: var(--color-background-secondary);
+}
+
+.exec-mode-item.active {
+    background: var(--color-background-secondary);
+    font-weight: 500;
+    color: var(--color-text-primary);
+}
+
+.exec-mode-item:disabled {
+    color: var(--color-text-tertiary);
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.exec-mode-divider {
+    height: 1px;
+    background: var(--color-border-tertiary);
+    margin: 4px 0;
+}
+
+
+/* dark mode */
+@media (prefers-color-scheme: dark) {
+    .exec-mode-menu {
+        background: #2a2a2a;
+        border-color: rgba(255, 255, 255, 0.12);
+    }
+}
+
+.exec-mode-menu.open {
+    display: block;
 }

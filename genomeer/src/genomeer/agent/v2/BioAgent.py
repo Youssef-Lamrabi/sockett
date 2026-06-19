@@ -1025,10 +1025,13 @@ class BioAgent:
                 }
 
             # otherwise go check inputs
-            # Display step number = current_idx + manifest.step_offset + 1
-            # so chronological order is preserved across multi-turn sessions.
-            _disp_offset = int((state.get("manifest") or {}).get("step_offset", 0) or 0)
-            _disp_step = idx + _disp_offset + 1
+            # Display step number = current_idx + 1 — 1-based and PER PLAN.
+            # This MUST match the plan preview, which numbers steps "1. 2. 3."
+            # per plan (see _maybe_pause "Proposed steps"). Previously this added
+            # a cross-turn manifest.step_offset, so execution showed e.g. "Step 5"
+            # while the plan said "Step 1" → the current step looked like a brand
+            # new one instead of the first. Per-plan numbering keeps both aligned.
+            _disp_step = idx + 1
             self._log("EXIT NODE", body=f"all_done=False\ncurrent_idx={idx}\ndisp_step={_disp_step}\nnext_step=input_guard", node=node)
             return {
                 "current_idx": idx,
@@ -1782,7 +1785,7 @@ class BioAgent:
                 )
 
             # Kraken2 taxonomic classification injection
-            # The Kraken2 DB on this server is pre-installed at /mnt/nfs/llmhub/kraken2_db.
+            # The Kraken2 DB on this server is pre-installed at /home/workshop/kraken2_standard8.
             # DO NOT scan random filesystem paths for it — the path is fixed.
             if any(k in _step_title_ctx for k in ("kraken2", "kraken ", "taxonomic class", "taxonom",
                                                    "classify reads", "read classif")):
@@ -1794,7 +1797,7 @@ class BioAgent:
                     "\n"
                     "  import os, subprocess, sys\n"
                     "  # Resolve DB path: env var first, then the known server location.\n"
-                    "  KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/mnt/nfs/llmhub/kraken2_db'\n"
+                    "  KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/home/workshop/kraken2_standard8'\n"
                     "  if not (os.path.exists(os.path.join(KRAKEN2_DB, 'hash.k2d'))\n"
                     "          and os.path.exists(os.path.join(KRAKEN2_DB, 'opts.k2d'))\n"
                     "          and os.path.exists(os.path.join(KRAKEN2_DB, 'taxo.k2d'))):\n"
@@ -1847,7 +1850,7 @@ class BioAgent:
                     "  print(f'top3 species: {top3}')\n"
                     "\n"
                     "  WRONG: searching /usr/local/share/kraken2/database — that path does NOT exist here\n"
-                    "  WRONG: looping over a candidate list and exiting if none match — DB IS at /mnt/nfs/llmhub/kraken2_db\n"
+                    "  WRONG: looping over a candidate list and exiting if none match — DB IS at /home/workshop/kraken2_standard8\n"
                     "  WRONG: calling 'kraken2-build --download-library' — DB is pre-installed, do not build\n"
                     "  WRONG: classified_reads += int(parts[1])  → sums reads_in_clade across rows → 5-10x over-count\n"
                     "         (because clade counts are HIERARCHICAL: root, Viruses, Riboviria all carry same reads)\n"
@@ -1863,7 +1866,7 @@ class BioAgent:
                     "Use the SAME Kraken2 DB path as the Kraken2 step (it's required to be the same DB used to classify).\n"
                     "\n"
                     "  import os, subprocess, sys\n"
-                    "  KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/mnt/nfs/llmhub/kraken2_db'\n"
+                    "  KRAKEN2_DB = os.environ.get('KRAKEN2_DEFAULT_DB') or '/home/workshop/kraken2_standard8'\n"
                     "  kraken_report = os.path.join(run_dir, 'kraken2.report')\n"
                     "  bracken_out   = os.path.join(run_dir, 'bracken_species.tsv')\n"
                     "\n"
@@ -2085,9 +2088,14 @@ class BioAgent:
             # Bare `fastq-dump SRR...` without prefetch first → empty files
             # Forces ENA direct (wget) as primary path, prefetch+fasterq-dump as fallback
             if any(k in _step_title_ctx for k in ("sra ", "srr", "fastq-dump", "fasterq-dump",
-                                                   "ena ", "download.*reads", "download reads",
+                                                   "ena ", "download reads",
                                                    "download paired", "illumina reads",
-                                                   "metagenomic reads", "miseq reads")):
+                                                   "metagenomic reads", "miseq reads",
+                                                   # broaden: vague "obtain reads from SRA/BioProject" steps
+                                                   "via sra", "from sra", "sra accession", "bioproject",
+                                                   "prjna", "prjeb", "obtain the reads",
+                                                   "obtain the paired", "download the reads",
+                                                   "retrieve the reads", "paired-end reads")):
                 _injections.append(
                     "THIS STEP DOWNLOADS SRA READS.\n"
                     "DO NOT call `fastq-dump SRR...` directly — it produces empty files when run\n"
@@ -2506,6 +2514,7 @@ class BioAgent:
             _TIMEOUT_3600_KW = ("assemble", "assembly", "spades", "megahit", "flye", "scaffold",
                                 "de novo", "kraken2", "kraken", "semibin", "concoct", "maxbin",
                                 "binning", "antismash", "bgc", "biosynthetic",
+                                "metaphlan", "marker-gene", "marker gene",
                                 # annotation / classification / profiling are slow inference steps
                                 "annotate", "annotation", "classify reads", "taxonomic classif",
                                 "taxonomic profil", "reads profile", "metagenomic profil")
@@ -2513,7 +2522,12 @@ class BioAgent:
                                 "genome download", "checkm2", "checkm", "bin quality",
                                 "bin completeness", "bin contamination",
                                 "eggnog", "diamond", "emapper",
-                                "kaiju", "genomad", "pharokka")
+                                "kaiju", "genomad", "pharokka",
+                                # AMR DB-search tools (CARD/NCBI): install present, but
+                                # rgi (diamond/blast) and amrfinder (tblastn/blastn+hmmer)
+                                # take 1-3 min on a genome — the old 600s default was too short.
+                                "rgi", "amrfinder", "amrfinderplus",
+                                "resistance gene identifier", "card database", "card v")
             _TIMEOUT_600_KW  = ("hmmer", "hmmscan", "quast", "dbcan", "nonpareil", "sylph")
             if any(k in _step_ctx for k in _TIMEOUT_7200_KW):
                 _step_timeout = 7200
@@ -2564,15 +2578,22 @@ class BioAgent:
             current_env  = state.get("env_name", "bio-agent-env1")
             pending_code = state.get("pending_code") or state.get("diagnostic_code") or ""
             resolved_env = _resolve_env_from_code(pending_code)
-            env_name = (
-                "meta-env1"
-                if resolved_env == "meta-env1" or current_env == "meta-env1"
-                else "bio-agent-env1"
-            )
+            # No-downgrade rule generalised to ALL specialized envs (meta-env1,
+            # amplicon-env1, …): once a specialized env is selected, keep it and
+            # never silently fall back to bio-agent-env1. Priority: the env the
+            # generated code resolves to, else the already-selected specialized
+            # env, else the generic python env.
+            _SPECIALIZED_ENVS = {"meta-env1", "amplicon-env1", "btools_env_py310", "panhumanpy_env"}
+            if resolved_env in _SPECIALIZED_ENVS:
+                env_name = resolved_env
+            elif current_env in _SPECIALIZED_ENVS:
+                env_name = current_env
+            else:
+                env_name = "bio-agent-env1"
             if env_name != current_env:
                 self._log(
-                    "ENV NO-DOWNGRADE",
-                    body=f"keeping meta-env1 (resolved={resolved_env}, state={current_env})",
+                    "ENV SELECT",
+                    body=f"env={env_name} (resolved={resolved_env}, prev={current_env})",
                     node="ensure_env",
                 )
 
@@ -2725,31 +2746,72 @@ class BioAgent:
                 _sec_ok, _sec_reason = check_python_code(code)
 
             if not _sec_ok:
+                # CIRCUIT BREAKER (fix for infinite security-block loop): the security
+                # check runs BEFORE execution, so it previously bypassed retry_counts
+                # entirely — generator -> SECURITY BLOCK -> generator -> ... forever
+                # whenever the LLM kept emitting the same forbidden pattern (e.g. a
+                # diagnostics probe using __import__()). Count blocks against the step's
+                # retry budget and STOP (route to QA) once exhausted.
+                _sec_idx = int(state.get("current_idx", 0) or 0)
+                _sec_rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items()
+                           if str(k).isdigit()}
+                _sec_rc[_sec_idx] = _sec_rc.get(_sec_idx, 0) + 1
                 self._log(
                     "SECURITY BLOCK",
-                    body=f"WARNING: {_sec_reason}\nCode preview (first 300 chars): {code[:300]}",
+                    body=(f"WARNING: {_sec_reason}\n"
+                          f"attempt={_sec_rc[_sec_idx]}/{self.MAX_STEP_RETRIES}\n"
+                          f"Code preview (first 300 chars): {code[:300]}"),
                     node=node,
                 )
+                if _sec_rc[_sec_idx] > self.MAX_STEP_RETRIES:
+                    # Give up — do NOT loop forever. Terminal route to QA.
+                    _cap_manifest = self._clean_manifest(state.get("manifest") or {})
+                    _cap_manifest["route_hint"] = "diagnostics_cap"
+                    _cap_manifest["qa_payload"] = (
+                        f"This step could not be completed: the generated code was rejected by the "
+                        f"security checker {_sec_rc[_sec_idx]} times in a row "
+                        f"(last reason: {_sec_reason}). STOP — do NOT keep retrying and do NOT "
+                        f"fabricate results. Report this honestly and suggest the user rephrase or "
+                        f"simplify this step."
+                    )
+                    self._log("SECURITY BLOCK CAP",
+                              body=f"step {_sec_idx} blocked {_sec_rc[_sec_idx]}x → QA (loop stopped)",
+                              node=node)
+                    return {
+                        "next_step":   "qa",
+                        "last_result": f"[SECURITY BLOCK x{_sec_rc[_sec_idx]}] {_sec_reason}",
+                        "manifest":    _cap_manifest,
+                        "retry_counts": _sec_rc,
+                        "messages": [AIMessage(content=(
+                            f"<STATUS:blocked>\nSecurity checker repeatedly rejected the generated "
+                            f"code ({_sec_rc[_sec_idx]} attempts) — stopping to avoid an infinite "
+                            f"loop.\nReason: {_sec_reason}"
+                        ))],
+                    }
                 _sec_manifest = self._clean_manifest(state.get("manifest") or {})
                 _sec_manifest["repair_feedback"] = (
-                    f"SECURITY_BLOCK: The generated code was rejected by the security checker.\n"
+                    f"SECURITY_BLOCK (attempt {_sec_rc[_sec_idx]}/{self.MAX_STEP_RETRIES}): the "
+                    f"generated code was rejected by the security checker.\n"
                     f"Reason: {_sec_reason}\n"
-                    f"Rewrite the code avoiding the dangerous pattern entirely.\n"
-                    f"MANDATORY FIXES:\n"
-                    f"1. NEVER use subprocess.run(..., shell=True) — always pass a list of args:\n"
+                    f"Rewrite to AVOID EXACTLY that pattern. Common fixes:\n"
+                    f"1. NEVER use __import__(), eval(), exec(), compile(), getattr/setattr/delattr, "
+                    f"or importlib for DYNAMIC import — use a plain `import module` statement.\n"
+                    f"2. To inspect or run a CLI tool, just call "
+                    f"subprocess.run(['tool', '--help'], capture_output=True, text=True) — "
+                    f"do NOT introspect it with __import__/getattr.\n"
+                    f"3. NEVER use subprocess.run(..., shell=True) or os.system() — pass a list of args:\n"
                     f"   WRONG : subprocess.run('seqkit stats -a file > out.tsv', shell=True)\n"
                     f"   RIGHT : res = subprocess.run(['seqkit', 'stats', '-a', fasta_path],\n"
                     f"               capture_output=True, text=True, check=True)\n"
                     f"           with open(output_tsv, 'w') as f: f.write(res.stdout)\n"
-                    f"2. NEVER use os.system() — replace with subprocess.run(list_of_args).\n"
-                    f"3. NEVER use eval() or exec().\n"
-                    f"For shell redirection (>): capture stdout with capture_output=True and write to file manually."
+                    f"For shell redirection (>): capture stdout with capture_output=True and write the file manually."
                 )
-                _sec_manifest["repair_step_idx"] = state.get("current_idx", 0)
+                _sec_manifest["repair_step_idx"] = _sec_idx
                 return {
                     "next_step":   "generator",
                     "last_result": f"[SECURITY BLOCK] {_sec_reason}",
                     "manifest":    _sec_manifest,
+                    "retry_counts": _sec_rc,
                     "messages": [AIMessage(content=(
                         f"<STATUS:blocked>\n[SECURITY BLOCK] Code rejected before execution.\n"
                         f"Reason: {_sec_reason}"
@@ -4156,12 +4218,29 @@ class BioAgent:
                     node=node,
                 )
 
+            # ─── STEP -> FILE -> CONTENT ledger (root-cause fix for ambiguous
+            # final interpretation: tells the finalizer exactly which file each
+            # step produced + the file's real content, so it never guesses which
+            # file holds a result nor drops results that were written to files
+            # but not echoed to stdout). Dynamic/deterministic; bounded size.
+            try:
+                _results_ledger = self._build_results_ledger(observations, temp_dir)
+            except Exception as _le:
+                self._log("RESULTS_LEDGER_ERROR", body=str(_le), node=node)
+                _results_ledger = "(ledger unavailable)"
+            self._log(
+                "RESULTS_LEDGER",
+                body=f"{len(_results_ledger)} chars of step->file->content mapping",
+                node=node,
+            )
+
             msgs = [
                 SystemMessage(content=_finalizer_system_prompt),
                 HumanMessage(content=instructions.FINALIZER_CTX_PROMPT.format(
                     user_goal=state.get("last_prompt"),
                     plan=state.get("plan"),
                     observation=observations,
+                    results_ledger=_results_ledger,
                     artifacts=_artifacts_for_llm
                 ))
             ]
@@ -4679,6 +4758,141 @@ class BioAgent:
         for k in ("route_hint", "qa_payload", "resume_to", "pause_kind"):
             m.pop(k, None)
         return m
+
+    def _build_results_ledger(
+        self,
+        observations: list,
+        temp_dir: str,
+        *,
+        max_preview_files: int = 14,
+        max_chars_per_file: int = 1400,
+        total_budget: int = 14000,
+        preview_size_cap: int = 24576,   # 24 KB — only preview small text result files
+    ) -> str:
+        """Deterministic STEP -> PRODUCED-FILE -> CONTENT ledger for the finalizer.
+
+        ROOT-CAUSE FIX (final-report interpretability). In a multi-step pipeline
+        every step drops files into the run dir, but the finalizer previously saw
+        only (a) per-step stdout and (b) a flat CUMULATIVE file list. It had no
+        way to know *which* file a given step produced, nor which file holds a
+        given result, so the final biological interpretation had to GUESS among
+        (often 100+) files — and got it wrong, or silently dropped results that
+        were written to files but never printed to stdout (e.g. abricate hits).
+        A static filename map fails because tool output names vary per run.
+
+        This builds, dynamically and deterministically:
+          - per step, the NEW files it produced — set-diff of the consecutive
+            ``files_snapshot`` lists the observer already records, and
+          - for small text result files (tsv/txt/csv/json/log/report/...), a HEAD
+            preview of the ACTUAL current content read from disk.
+
+        The finalizer can then attribute every result to the exact producing
+        step/file and read real values straight from the file — no guessing, no
+        reliance on the tool having echoed its result to stdout. Bounded by
+        ``total_budget`` chars so it never blows the context window.
+        """
+        if not observations:
+            return "(no step observations recorded)"
+
+        import os as _os
+
+        TEXT_EXT = {
+            ".txt", ".tsv", ".csv", ".tab", ".tabular", ".stats", ".stat",
+            ".json", ".log", ".report", ".summary", ".out", ".md",
+            ".yaml", ".yml", ".bed", ".gff", ".gff3", ".vcf",
+        }
+
+        def _human(nbytes) -> str:
+            n = float(nbytes or 0)
+            for unit in ("B", "KB", "MB", "GB"):
+                if n < 1024 or unit == "GB":
+                    return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+                n /= 1024
+            return f"{int(nbytes)} B"
+
+        lines: list = []
+        budget_left = total_budget
+        previewed = 0
+        prev_names: set = set()
+
+        obs_sorted = sorted(
+            [o for o in observations if isinstance(o, dict)],
+            key=lambda o: o.get("step_idx", 0),
+        )
+
+        for obs in obs_sorted:
+            snap = obs.get("files_snapshot") or []
+            cur = {
+                f["name"]: f
+                for f in snap
+                if isinstance(f, dict) and f.get("name")
+            }
+            new_names = [n for n in cur if n not in prev_names]
+            prev_names |= set(cur.keys())
+
+            idx = obs.get("step_idx", "?")
+            title = (obs.get("title") or "").strip()
+            status = obs.get("status") or "?"
+            lines.append(f'── STEP {idx}: "{title}" [{status}]')
+
+            if not new_names:
+                lines.append("   produced files: (none new)")
+                continue
+
+            # Rank result-type files first so the preview budget is spent on the
+            # meaningful outputs (summaries/reports/tables) before raw dumps.
+            def _rank(name):
+                base = _os.path.basename(name).lower()
+                ext = _os.path.splitext(name)[1].lower()
+                score = 0
+                if any(k in base for k in (
+                    "summary", "report", "result", "stats", "metric",
+                    "abundance", "table", "count", "annotation",
+                )):
+                    score -= 2
+                if ext in TEXT_EXT:
+                    score -= 1
+                return (score, name)
+
+            new_sorted = sorted(new_names, key=_rank)
+            flist = ", ".join(
+                f"{n} ({_human(cur[n].get('size_bytes'))})"
+                for n in new_sorted[:40]
+            )
+            if len(new_sorted) > 40:
+                flist += ", …"
+            lines.append(f"   produced files: {flist}")
+
+            for name in new_sorted:
+                if previewed >= max_preview_files or budget_left <= 0:
+                    break
+                ext = _os.path.splitext(name)[1].lower()
+                size = int(cur[name].get("size_bytes", 0) or 0)
+                if ext not in TEXT_EXT or size == 0 or size > preview_size_cap:
+                    continue
+                abs_p = _os.path.join(temp_dir or "", name)
+                try:
+                    with open(abs_p, "r", errors="replace") as fh:
+                        content = fh.read(max_chars_per_file + 1)
+                except Exception:
+                    continue
+                if not content.strip():
+                    continue
+                truncated = len(content) > max_chars_per_file
+                content = content[:max_chars_per_file]
+                chunk = content + ("\n…(truncated)" if truncated else "")
+                budget_left -= len(chunk)
+                previewed += 1
+                lines.append(f"   ▼ {name}:")
+                for ln in chunk.splitlines():
+                    lines.append(f"       {ln}")
+
+        if previewed == 0:
+            lines.append(
+                "\n(No small text result files were available to preview; "
+                "rely on per-step stdout above.)"
+            )
+        return "\n".join(lines) if lines else "(no produced files recorded)"
 
     def _build_file_registry(self, temp_dir: str) -> dict:
         """Fix 2 — Build {ext: [basename, ...]} from current run_dir contents.
@@ -5249,7 +5463,7 @@ class BioAgent:
             |
             (?P<standalone>                              # Standalone tags
             <
-                (?P<solo>STATUS:[^>]+|OK\s*/\s*|NEXT:[^>]+)
+                (?P<solo>STATUS:[^>]+|OK\s*/\s*|NEXT:[^>]+|RUNNING[^>]*)
             \s*>
             )
             """,

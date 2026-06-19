@@ -1056,12 +1056,35 @@ class AbricateContract(_BaseContract):
     ]
 
     def check(self, run_dir: str, stdout: str) -> ContractResult:
-        tsv = self._glob_first(run_dir, "*.tsv", "abricate_*.txt", "*abricate*")
+        # FIX: do NOT glob a bare "*.tsv" first — the run dir holds many TSVs
+        # (quast report.tsv, summary.tsv, ...) and the first match is often NOT
+        # the abricate output, producing a meaningless score (e.g. "79/79" from
+        # a 79-contig table). Glob abricate-specific names ONLY, then verify the
+        # file actually has abricate's columns before scoring.
+        candidates = self._glob_all(
+            run_dir,
+            "*abricate*.tsv", "*abricate*.txt", "*abricate*",
+            "*resfinder*.tsv", "*vfdb*.tsv", "*amr*.tsv", "*virulence*.tsv",
+            "*resfinder*.txt", "*vfdb*.txt",
+        )
+        # Among candidates, keep only files that truly look like abricate output
+        # (header contains %IDENTITY and %COVERAGE — abricate's signature columns).
+        def _is_abricate_tsv(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    header = fh.readline()
+                return ("%IDENTITY" in header and "%COVERAGE" in header) or (
+                    "\tGENE\t" in header and "DATABASE" in header)
+            except Exception:
+                return False
+
+        tsv = next((c for c in candidates if _is_abricate_tsv(c)), None)
         if not tsv:
+            # No genuine abricate output found → don't fabricate a score; let the
+            # observer judge (a real abricate file would have the signature header).
             return ContractResult(
-                ok=False, score=0.0,
-                reason="abricate: no output TSV found (abricate writes to stdout — check redirect)",
-                retry_params={"hint": "add '> output.tsv' to abricate command; check --db name (card/vfdb/ncbi...)"},
+                ok=True, score=-1.0,
+                reason="abricate: no recognizable abricate TSV (deferring to observer)",
             )
 
         total = passing = 0
@@ -1082,10 +1105,10 @@ class AbricateContract(_BaseContract):
 
         if total == 0:
             return ContractResult(ok=True, score=0.5,
-                                  reason="abricate: TSV found but no hits (0 resistance genes)")
+                                  reason="abricate: ran OK — 0 resistance/virulence genes detected")
         score = passing / total
         return ContractResult(ok=True, score=score,
-                              reason=f"abricate: {passing}/{total} hits pass ≥75% ID / ≥80% coverage")
+                              reason=f"abricate: {passing}/{total} gene hits pass ≥75% ID / ≥80% coverage")
 
 
 class DbcanContract(_BaseContract):

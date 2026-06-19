@@ -47,6 +47,10 @@ envs:
       - run_MaxBin2.pl
       - checkm2
       - kraken2
+      - metaphlan
+      - esearch
+      - efetch
+      - esummary
       - sylph
       - kaiju
       - kaiju2table
@@ -60,6 +64,9 @@ envs:
       - antismash
       - genomad
       - abricate
+      - rgi
+      - amrfinder
+      - amrfinder_update
       - seqkit
       - fastqc
       - fastp
@@ -88,19 +95,27 @@ envs:
       - blastn
       - bracken
       - bbduk.sh
-      - run_dbcan.py
+      - run_dbcan
       - pharokka.py
       - lefse_format_input.py
       - lefse_run.py
       - lefse_plot_res.py
       - nonpareil
       - Rscript
+      - multiqc
+      - iss
+      - spades.py
+      - metaspades.py
+      - bowtie2
+      - bowtie2-build
+      - bwa
     provides_py:
       - biopython
       - numpy
       - pandas
       - matplotlib
       - scipy
+      - InSilicoSeq
     provides_r: []
 
   - name: btools_env_py310
@@ -120,3 +135,18 @@ envs:
       - cnvkit
       - rich
     provides_r: []
+
+  - name: amplicon-env1
+    description: "Amplicon 16S/18S/ITS marker-gene stack: DADA2 (ASV inference) + phyloseq/vegan (alpha/beta diversity, PERMANOVA). Isolated R 4.5 / Bioconductor env, kept separate from meta-env1 to avoid dependency conflicts."
+    spec: "amplicon-env1.yaml"
+    python: "n/a"   # R-based env (R 4.5.3); routed via DADA2/phyloseq code signals
+    provides_bins:
+      - Rscript
+      - R
+    provides_py: []
+    provides_r:
+      - dada2
+      - phyloseq
+      - vegan
+      - ggplot2
+      - Biostrings

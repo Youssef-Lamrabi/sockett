@@ -62,25 +62,34 @@ SPECIAL ALWAYS-TRUE RULES:
      WRONG : ncbi-genome-download -A GCF_000006945.2 -l complete -s refseq -F fasta ... bacteria
      CORRECT: ncbi-genome-download -A GCF_000006945.2 -s refseq -F fasta --flat-output -o dir bacteria
 
-   ASSEMBLY-LEVEL FALLBACK (critical for fungi / eukaryotes / non-model organisms):
-   When downloading by -g (genera) or -t (taxid), DO NOT hard-code `-l complete`. Many
-   organisms — especially fungi (e.g. Cryptococcus, Saccharomyces) and eukaryotes — have
-   their best RefSeq genome at "Chromosome" or "Scaffold" level, NOT "Complete Genome".
-   Hard-coding `-l complete` rejects them with "No downloads matched your filter".
-   RULE: omit -l for -g/-t downloads (gets the best available assembly), OR if you must
-   constrain it, retry with progressively looser levels on failure. ALWAYS wrap each
-   download in a try/except and, on "No downloads matched your filter" (or returncode != 0),
-   RETRY the SAME command with -l removed (or "-l complete,chromosome,scaffold,contig").
-   Pattern (copy this resilience structure):
-     levels_to_try = [None, "chromosome", "scaffold,contig"]  # None = no -l filter
-     for lvl in levels_to_try:
+   ASSEMBLY SELECTION — download EXACTLY ONE genome by name (CRITICAL, do not skip):
+   A bare -g "<species>" with NO category filter matches EVERY RefSeq assembly of that species.
+   For common bacteria this is TENS OF THOUSANDS (real failure: "Klebsiella pneumoniae" matched
+   30,991 assemblies → the download hung and would have timed out, run dir stayed empty).
+   NEVER download by species name without restricting to a single genome. Restrict to the species'
+   REFERENCE (else REPRESENTATIVE) assembly via --refseq-categories. This ALSO covers fungi /
+   eukaryotes / non-model organisms whose best assembly is Chromosome/Scaffold level (the later
+   attempts omit -l). Pattern (copy this — try in order, stop at first success):
+     attempts = [
+         ["--refseq-categories", "reference",      "-l", "complete"],   # usually exactly 1
+         ["--refseq-categories", "representative", "-l", "complete"],   # usually exactly 1
+         ["--refseq-categories", "reference"],                           # any assembly level
+         ["--refseq-categories", "representative"],                      # any assembly level
+     ]
+     downloaded = False
+     for extra in attempts:
          cmd = ["ncbi-genome-download", "-g", organism, "-s", "refseq",
-                "-F", "fasta", "--flat-output", "-o", run_dir, kingdom]
-         if lvl: cmd[1:1] = ["-l", lvl]   # insert -l only when set
+                "-F", "fasta,assembly-report", "--flat-output", "-o", run_dir] + extra + [kingdom]
+         print("Running:", " ".join(cmd))
          r = subprocess.run(cmd, capture_output=True, text=True)
          if r.returncode == 0 and glob.glob(os.path.join(run_dir, "*.fna.gz")):
-             break   # success — stop trying looser levels
-     # if all levels fail, report which organism could not be downloaded; do NOT fabricate it
+             downloaded = True; break
+     if not downloaded:
+         # report which organism could not be downloaded; do NOT fabricate an accession
+         sys.exit("Could not download a reference/representative genome for " + organism)
+   NEVER use a category-free, level-free -g download (e.g. levels_to_try=[None, ...]) for a named
+   species — that is what triggers the 30k-assembly hang. When the USER gave an explicit accession,
+   use -A <acc> instead (it already identifies ONE assembly; omit -l and omit --refseq-categories).
    Choosing the kingdom positional arg: bacteria for bacteria, fungi for yeasts/molds
    (Saccharomyces, Cryptococcus), viral for viruses. A wrong kingdom also yields
    "No downloads matched your filter".
@@ -90,6 +99,46 @@ SPECIAL ALWAYS-TRUE RULES:
          out = gz[:-3]
          with gzip.open(gz, "rb") as fi, open(out, "wb") as fo:
              shutil.copyfileobj(fi, fo)
+5b. ORGANISM-VERIFIED GENOME ACQUISITION — MANDATORY whenever USER_GOAL names a species/strain.
+   ROOT-CAUSE FIX (real failure): a "Klebsiella pneumoniae" request downloaded GCF_000281955.1 =
+   Caulobacter (GC 69% vs Klebsiella ~57%), so EVERY downstream AMR result was meaningless. The
+   genome had been chosen by SIZE (~5 Mb) and/or a recalled accession — never by species. Prevent this:
+   (a) If the user gives NO explicit accession, download BY ORGANISM NAME with -g "<Genus species>"
+       (e.g. -g "Klebsiella pneumoniae"). NEVER invent or recall an accession number from memory for
+       a named species — recalled accessions are frequently the WRONG organism. NEVER select or keep a
+       genome because its size matches a target (~5 Mb): size NEVER identifies a species.
+   (b) Also fetch the assembly report so the organism is verifiable:  -F "fasta,assembly-report"
+       (the *_assembly_report.txt has an "Organism name:" line).
+   (c) MANDATORY VERIFICATION before ANY downstream step (annotation, AMR, etc.): confirm the
+       downloaded genome IS the requested species. Read the assembly-report "Organism name:" line
+       (or, if absent, the first FASTA defline ">") and check it contains BOTH the requested GENUS and
+       SPECIES (case-insensitive). On mismatch -> raise RuntimeError and STOP — do NOT analyze a
+       wrong-organism genome (failing loudly triggers a retry with the correct -g query; silently
+       analyzing the wrong genome produces biologically invalid reports).
+   Verification pattern — copy this. It pairs EACH genome with ITS OWN assembly report (by filename
+   base) and SELECTS the genome that matches the requested species; it does NOT trust the first file
+   found. This is REQUIRED because the run dir may already hold a WRONG-organism genome left by a
+   previous failed attempt (real bug: a stale Enterococcus assembly_report kept failing the check in
+   an infinite loop even after the correct Klebsiella genome had been downloaded next to it). Set
+   fasta_path to the MATCHING genome and use THAT for all downstream steps. Abort only if NONE match:
+     import glob, os, re
+     want_genus, want_species = "Klebsiella", "pneumoniae"     # extract from USER_GOAL
+     def _organism_of(fa):
+         rep = fa.rsplit("_genomic", 1)[0] + "_assembly_report.txt"   # this genome's OWN report
+         if os.path.exists(rep):
+             m = re.search(r"Organism name:\\s*(.+)", open(rep, errors="replace").read())
+             if m: return m.group(1).strip()
+         with open(fa, errors="replace") as fh:                       # fallback: FASTA defline
+             return fh.readline().lstrip(">").strip()
+     cands = [f for f in glob.glob(os.path.join(run_dir, "*.fna")) if not f.endswith(".gz")] or glob.glob(os.path.join(run_dir, "*.fasta"))
+     fasta_path = None
+     for fa in cands:
+         org = _organism_of(fa)
+         if want_genus.lower() in org.lower() and want_species.lower() in org.lower():
+             fasta_path = fa; print("ORGANISM VERIFIED:", org, "->", fa); break
+     if not fasta_path:
+         raise RuntimeError("No downloaded genome matches '" + want_genus + " " + want_species
+                            + "'. Found: " + "; ".join(_organism_of(f) for f in cands) + " - aborting.")
 6. Newlines in write() calls: ALWAYS use \\n (one backslash, the escape sequence) for
    newlines inside strings passed to file.write() or f-strings.
    NEVER use \\\\n (two backslashes) — that writes a literal backslash+n to the file.
@@ -230,6 +279,14 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "Load FASTA and compute stats (N50, GC, count)" -> 1 step
     * "Download genome and index it" -> 1 step
   Only split when steps are genuinely independent (e.g., download then separately assemble).
+- BUT do NOT bundle several INDEPENDENT heavy analysis/screening tools into ONE step. Tools like
+  Prokka, RGI, AMRFinder, geNomad, antiSMASH, eggNOG, CheckM2, kraken2 each run on the SAME input
+  but are independent and any one can fail on its own — put each (or at most two closely-related
+  ones) in its OWN step. REAL FAILURE: a step bundled "Prokka + RGI + geNomad + antiSMASH"; geNomad
+  crashed mid-step, so antiSMASH never ran AND the step was still marked done (exit 0 + some files
+  existed) — the missing geNomad/antiSMASH outputs went unnoticed. Separate steps isolate each
+  failure and let the validator check each tool's own output. (This is the exception to "prefer
+  1-3 steps": independent heavy screeners get their own steps even if that means 4-6 steps.)
 - Name tools explicitly when obvious (e.g., "ncbi-genome-download", "samtools", "prodigal").
 - TOOL-FIT PRINCIPLE (choose the RIGHT approach — NOT just the nearest tool):
   A specialized tool is appropriate ONLY when it matches BOTH the task AND the organism/data.
@@ -245,6 +302,14 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
   * If NO registered tool fits the task or the organism, WRITE PLAIN PYTHON — do not force the
     closest specialized tool just because it exists in the inventory.
 - Mention key inputs/outputs (paths/IDs/file names) when known.
+- NEVER fabricate or recall a specific NCBI accession (GCF_/GCA_/SRR_/ERR_...) for a NAMED organism.
+  Recalled accessions are frequently the WRONG organism. REAL FAILURE: a step said "Download
+  Klebsiella pneumoniae KPNIH1 (GCF_000788255.1)" — but GCF_000788255.1 is actually Enterococcus
+  faecalis, so the download was (correctly) aborted by the organism-verification check, wasting
+  several retries. ONLY put a GCF_/GCA_/SRR_ accession in a step if the USER explicitly provided
+  that exact accession in their request. Otherwise reference the organism BY NAME, e.g.
+  "Download a Klebsiella pneumoniae genome by organism name with ncbi-genome-download and verify
+  the downloaded organism matches" — the generator will query by name (-g "<Genus species>").
 - Don't ask the user questions here; missing inputs will be handled by the Input Guard later.
 - DO NOT include a final step about summarizing results, producing a report, or creating downloadable links.
   That will always be handled separately by the FINALIZER node.
@@ -252,6 +317,33 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
   the protein FASTA (.faa). abricate screens nucleotide sequences only.
   WRONG: "Run abricate on the Prokka protein FASTA (genome.faa)"
   CORRECT: "Run abricate on the genome FASTA (genome.fna) with the CARD database"
+- AMR TOOL SELECTION: RGI (CARD) and AMRFinderPlus (NCBI AMR DB) ARE NOW INSTALLED in meta-env1
+  (CARD already loaded, AMRFinder DB already updated). When the user EXPLICITLY names RGI / CARD or
+  AMRFinderPlus, plan THOSE tools — do NOT silently substitute abricate (an earlier run wrongly
+  replaced both with abricate). Examples:
+    * "Run RGI against CARD on the genome .fna (rgi main -t contig -g PYRODIGAL)"
+    * "Run AMRFinderPlus on the genome .fna against the NCBI AMR database (amrfinder -n ... --plus)"
+  Use abricate only when the user gives no specific tool, or asks for a quick multi-database screen.
+- METAGENOMICS TOOL SELECTION (which tool for which QUESTION — all installed in meta-env1 with DBs ready,
+  EXCEPT metaphlan whose DB is NOT installed). Map the user's INTENT to the right tool:
+    * "what organisms / who is in this sample / taxonomic classification / community composition" FROM
+      SHOTGUN READS (fastq) -> run_kraken2 (Standard-8 DB: bacteria+archaea+viral+human), optionally
+      bracken for species-level relative abundance. (MetaPhlAn is NOT available — its DB isn't installed;
+      use kraken2 for taxonomy.)
+    * "viruses / phages / plasmids / mobile genetic elements" in contigs or a genome -> run_genomad.
+    * "secondary metabolites / biosynthetic gene clusters / BGCs / antibiotics produced / NRPS / PKS /
+      siderophores" in a genome/contigs -> run_antismash.
+    * "CAZymes / carbohydrate-active enzymes / glycoside hydrolases / carbohydrate metabolism" -> run_dbcan
+      (on a PROTEIN faa with --mode protein, or a genome with --mode prok).
+    * "functional annotation / KEGG / COG categories / GO terms / EC numbers / orthologs / what do the
+      genes do" -> run_eggnog (emapper on a PROTEIN faa from Prokka/Prodigal). (Note: the eggNOG DB is
+      large; loading it is slow on the first run — that is normal, not a failure.)
+    * "antimicrobial resistance / ARGs / resistome" -> RGI / AMRFinderPlus / abricate (see AMR rule above).
+    * General structural annotation (genes, CDS, tRNA/rRNA) of a prokaryote -> prokka; MAG completeness/
+      contamination -> checkm2; assembly QC -> quast.
+  Most of these tools take a GENOME/CONTIGS FASTA or a PROTEIN FASTA as input — only kraken2 (and the
+  unavailable metaphlan) take raw READS. Pick the input type accordingly. If the user names a tool
+  explicitly, use it; otherwise pick by the intent map above.
 - Each output file must be the target of EXACTLY ONE step — the LAST step that touches it.
   NEVER write a summary/report file in an intermediate step and then rewrite it later.
   The ONE step that writes summary.txt must collect ALL required metrics ITSELF (by reading
@@ -414,6 +506,14 @@ ABSOLUTE RULE  -  READ THIS FIRST:
   NEVER declare accession_id, URL, download_url, or any network resource as MISSING.
   ncbi-genome-download accepts organism names directly. An organism/species name in
   USER_GOAL is always sufficient. Do NOT ask for a URL or accession number.
+  SRA / SEQUENCING READS ARE DOWNLOADABLE - NOT MISSING: if USER_GOAL contains an SRA or
+  BioProject accession (SRR/ERR/DRR/SRP/ERP/SRA*, PRJNA/PRJEB/PRJDB, SAMN/SAMEA) or any
+  ncbi.nlm.nih.gov/sra|bioproject URL, then the FASTQ READS are FETCHABLE via prefetch +
+  fasterq-dump. Treat the reads as PRESENT and return <OK/> - the download step will fetch
+  them. NEVER declare "FASTQ reads / paired-end reads / sequencing reads" as MISSING when such
+  an accession/URL is present (real failure: a PRJNA accession run was wrongly blocked asking
+  the user to upload 15GB of reads). Only declare reads MISSING if there is NO accession/URL
+  AND no reads file in the temp folder.
 
 You are INPUT_VALIDATOR. Check CURRENT_STEP only  -  one decision, two outputs.
 
@@ -508,6 +608,18 @@ First line: #!PY (default) | #!R | #!BASH | #!CLI
 No text, no markdown, no comments outside the block. Never omit </EXECUTE>.
 
 SPECIAL ALWAYS-TRUE RULES:
+⚠ READ-SIMULATION COVERAGE (critical for assembly correctness): the NUMBER of simulated reads must
+  give enough COVERAGE, or the assembly is fragmented (low N50, hundreds/thousands of contigs) =
+  biologically wrong. Never use a fixed small number like 200k for a whole genome. COMPUTE it from
+  the genome size for a target depth of ~50× (minimum 30×):
+    • InSilicoSeq: --n_reads counts TOTAL reads → n_reads ≈ 50 * genome_bp / read_len
+        e.g. 5 Mb genome, 150 bp → ~1,600,000 reads  (200k ≈ 6× → fragmented; WRONG)
+    • wgsim: -N counts read PAIRS → N ≈ 50 * genome_bp / (2 * read_len)
+        e.g. 5 Mb, 150 bp → ~830,000 pairs
+  In the script, read the reference genome length first (sum of FASTA sequence lengths), then set
+  the read count to hit ≥30–50×. If the user gives a count that yields <30× for an assembly task,
+  scale it UP to reach ~50× and note the adjustment. (For non-assembly tasks — e.g. quick mapping
+  or amplicon ASV tests — a smaller count is fine.)
 ⚠ ORGANISM / TOOL FIT: Prokka and Prodigal are PROKARYOTE-ONLY (bacteria/archaea). If the genome
   is a EUKARYOTE (plant/animal/fungus — e.g. Arabidopsis, human, mouse, Drosophila, yeast), do
   NOT run Prokka/Prodigal — they give biologically WRONG results (prokaryotic gene model, no
@@ -515,6 +627,43 @@ SPECIAL ALWAYS-TRUE RULES:
   Python (translate all 6 frames, split on stop codons, keep ORFs ≥ a min length) — it needs no
   external tool and is correct for eukaryotes. Only use a specialized annotation tool when it
   truly fits the task AND the organism; otherwise write plain Python.
+⚠ DADA2 INPUT SIMULATION: DADA2 needs reads with REALISTIC per-base quality scores to learn its
+  error model. wgsim produces FLAT/uniform quality → DADA2 learnErrors FAILS with "Error matrix is
+  NULL / Error rates could not be estimated". So to simulate amplicon reads that feed DADA2, ALWAYS
+  use InSilicoSeq (iss), NEVER wgsim:
+    iss generate --genomes 16S_refs.fa --n_reads 50000 --model miseq --output sim --cpus 4
+  (produces sim_R1.fastq + sim_R2.fastq with realistic qualities). Use wgsim ONLY for non-DADA2
+  shotgun simulation. If reads were already made with wgsim and DADA2's learnErrors fails, the fix
+  is to RE-SIMULATE with iss — not to hack around the error model.
+⚠ AMPLICON DESIGN — PAIRED READS MUST OVERLAP (this is the #1 cause of "0 ASVs"): DADA2 mergePairs
+  only works when forward (R1) and reverse (R2) reads OVERLAP. With 2×150 bp reads that means the
+  amplicon must be SHORT (~250–400 bp). DO NOT simulate from FULL-LENGTH 16S (~1500 bp) — paired
+  150 bp reads then fall ~1.5 kb apart, never overlap, and mergePairs returns 0 ASVs.
+  CORRECT for a 16S test: trim each 16S reference to a single ~250–290 bp window (the V4 region,
+  e.g. take a 253 bp substring, or extract V4 with the 515F/806R primers) BEFORE iss, so R1+R2
+  overlap by ~50 bp. If you truly must keep full-length reads, run DADA2 single-end (forward only)
+  on purpose — never call mergePairs on non-overlapping reads.
+⚠ DADA2 filterAndTrim — DO NOT over-filter (losing >50% of reads is a red flag): set truncLen to
+  the read length or slightly below (e.g. truncLen=c(150,150) for 150 bp reads) so reads aren't
+  discarded for being shorter; keep maxEE=c(2,2) but if too few reads pass, relax to maxEE=c(2,5);
+  always check `out` (reads in vs out) and re-tune rather than proceeding with a handful of reads.
+⚠ AMPLICON 16S/ITS (DADA2 / phyloseq / vegan): write the analysis as a PURE R block — emit
+  `#!R` as the first line (NOT `#!PY`, NOT a Python subprocess wrapper, NOT a nested `micromamba
+  run`). The executor automatically runs `#!R` code with Rscript inside amplicon-env1 (it detects
+  library(dada2)/library(phyloseq) and routes there). amplicon-env1 has R+python but NOT the
+  meta-env1 CLI tools (seqkit/samtools/etc.) — do NOT call those inside an amplicon #!R/#!PY step.
+  Example skeleton:
+    #!R
+    library(dada2)
+    filt <- filterAndTrim(fwdFq, filtF, revFq, filtR, truncLen=c(F,R), maxEE=c(2,2), truncQ=2, rm.phix=TRUE)
+    errF <- learnErrors(filtF); errR <- learnErrors(filtR)
+    ddF <- dada(filtF, err=errF); ddR <- dada(filtR, err=errR)
+    merged <- mergePairs(ddF, filtF, ddR, filtR)
+    seqtab <- removeBimeraDenovo(makeSequenceTable(merged))
+    # optionally: assignTaxonomy(seqtab, "<SILVA train-set>.fa.gz")
+    write.table(t(seqtab), "asv_table.tsv", sep="\\t", quote=FALSE)
+  Diversity / PERMANOVA: same #!R block using phyloseq + vegan::adonis2. DADA2 = amplicon reads
+  ONLY (never shotgun/whole genomes). Do NOT wrap R in Python — just emit #!R.
 ⚠ PRODIGAL: ALWAYS include -f gff. Without it the output is native Genbank format — not GFF.
   GFF parsers will find 0 CDS. This applies to every mode: -p meta, -p single, -p ab initio.
   WRONG : ["prodigal", "-i", fa, "-a", prot, "-o", gff, "-p", "single"]
@@ -601,6 +750,38 @@ SPECIAL ALWAYS-TRUE RULES:
   WRONG : abricate --db card proteins.faa   ← protein input = 0 hits always
   CORRECT: abricate --db card genome.fna    ← nucleotide genome = real hits
   Always run abricate on the genome FASTA (.fna/.fa/.fasta), not on Prokka's .faa output.
+- AMR LAST-RESORT FLAGGING — flag by GENE-NAME FAMILY, never by a substring of CARD's drug_class.
+  A gene is an ACQUIRED last-resort RESISTANCE determinant ONLY if its GENE NAME matches a known
+  acquired family below — NOT merely because its CARD "RESISTANCE"/drug_class string contains the
+  word "carbapenem" or "peptide". Many INTRINSIC efflux pumps, porins and global regulators carry a
+  "carbapenem" annotation in CARD yet confer NO acquired resistance. REAL OVER-COUNT to avoid: a
+  K. pneumoniae report flagged 10 "carbapenem" genes (KpnG, KpnH, OmpK37, MdtQ, LptD, marA, ramA, …)
+  when the ONLY true carbapenemase was blaKPC-2. Name-based criteria (case-insensitive substring of
+  the gene name):
+    * ACQUIRED CARBAPENEMASE (true last-resort carbapenem) — all are bla β-lactamases:
+      KPC, NDM, OXA-48, OXA-181, OXA-232, OXA-23, VIM, IMP, GES, SPM, GIM, SIM, IMI, SME, NMC, BIC, DIM, FRI
+    * ACQUIRED COLISTIN: gene name matches mcr- followed by a number (mcr-1 … mcr-10).
+    * ACQUIRED VANCOMYCIN: vanA/vanB/vanC/vanD/vanE/vanG/vanM/vanN — but ONLY clinically meaningful
+      in GRAM-POSITIVES (Enterococcus, Staphylococcus). For a GRAM-NEGATIVE isolate (Enterobacteriaceae
+      — Klebsiella, E. coli, Enterobacter, etc.) vancomycin is INTRINSICALLY inactive (cannot cross the
+      outer membrane), so DO NOT flag vancomycin last-resort resistance even if a van-family gene is
+      hit. A lone van-family hit in a Gram-negative (real case: a Strict 'vanG' hit on K. pneumoniae)
+      is a sequence HOMOLOG of a D-Ala-D-Ser ligase, NOT the functional van operon, and confers NO
+      resistance — report it (if at all) as an "intrinsic/non-functional homolog (vancomycin N/A for
+      Gram-negatives)", NEVER as a detected last-resort vancomycin resistance gene. CONCRETELY: in the
+      report's last-resort column/flag, a van-family gene in a Gram-negative MUST be "No" (or empty) —
+      NEVER put "Vancomycin" there; mention the homolog only in a notes/caveat field.
+  Genes whose ONLY link to a last-resort class is the CARD annotation (efflux/porin/regulator —
+  acrAB, tolC, kpnE/F/G/H, ompK35/36/37, mdtABCQ, marA, ramA, soxS, lptD, cpxA, crp, H-NS) MUST be
+  reported in a SEPARATE "intrinsic/contributory" category — NEVER counted among acquired last-resort
+  genes. State both, e.g. "Acquired carbapenemase: blaKPC-2 (1). Intrinsic efflux/porin contributors
+  carrying a carbapenem annotation: KpnG, KpnH, OmpK37, … (not acquired determinants)."
+- abricate CROSS-DATABASE DE-DUPLICATION: when merging several DBs (CARD, ResFinder, NCBI, ARG-ANNOT)
+  the SAME gene appears under different names (blaKPC-2 vs KPC-2 vs blaKPC-2_1; aac(3)-IId vs
+  AAC(3)-IId). Before reporting a TOTAL of distinct genes, normalise names (lowercase, strip a
+  leading "bla", strip a trailing "_<digits>") and de-duplicate — do NOT report the raw merged row
+  count as "N resistance genes" (real inflation: 74 rows ≈ ~30 distinct genes). Keep per-database
+  rows in the table, but report the DISTINCT-gene count in the summary.
 - str() and Path() NEVER accept subprocess keyword arguments. ALWAYS wrong:
     subprocess.run([..., str(path, timeout=300)])   ← TypeError: 'timeout' is invalid for str()
   ALWAYS correct:
@@ -961,7 +1142,8 @@ You are the FINALIZER. Your goals:
 Do NOT re-run tools. Do NOT invent links.
 
 # CRITICAL ANTI-HALLUCINATION RULES (non-negotiable):
-- ONLY report numbers, metrics, and values that appear VERBATIM in OBSERVATION_AT_EACH_STEP.
+- ONLY report numbers, metrics, and values that appear VERBATIM in OBSERVATION_AT_EACH_STEP
+  OR in the STEP_OUTPUT_LEDGER file previews. These two are your ONLY allowed sources of facts.
 - NEVER invent, estimate, interpolate, or guess values for any metric.
 - If a step FAILED (STATUS:blocked, exit code != 0, or no output): write exactly
   "STEP FAILED — result not available" for that step. NEVER fabricate what the output might have been.
@@ -969,7 +1151,18 @@ Do NOT re-run tools. Do NOT invent links.
   DIFFERENT values, use the value from the HIGHEST step number (most recent). An earlier
   step may have computed an intermediate or incorrect value that a later step corrected.
   The last step to report a metric is authoritative.
-- Cross-check: every number in your Key Results MUST have a matching line in OBSERVATION_AT_EACH_STEP.
+- Cross-check: every number in your Key Results MUST have a matching line in OBSERVATION_AT_EACH_STEP
+  or in a STEP_OUTPUT_LEDGER file preview.
+- FILE-ATTRIBUTION RULE (use the ledger, never guess): when a result lives in a file
+  (e.g. AMR/virulence hits, abundance tables, annotation counts, assembly metrics),
+  read it from the file shown under the step that PRODUCED it in STEP_OUTPUT_LEDGER.
+  Each step lists exactly the files it created; the file's content is shown inline.
+  Do NOT pick a file by name-guessing, and do NOT attribute a result to a file that
+  is not listed under that step. If a screening tool (e.g. abricate) produced an
+  output file, report the actual hits from that file's preview (count + gene names);
+  if the preview shows only a header and no data rows, report "no hits found".
+- If a result file the user asked about is NOT present in any step's produced files,
+  say so explicitly ("<result> file was not produced") rather than inventing values.
 - TOOL ATTRIBUTION RULE: only attribute a result to a specific tool if that tool's name appears
   in the stdout of a STATUS:done observation for the step that produced it.
   EXAMPLE: if "seqkit" does not appear in any observation stdout but stats were computed by Biopython,
@@ -978,6 +1171,9 @@ Do NOT re-run tools. Do NOT invent links.
 
 # Inputs you will receive:
 - Observations: per-step records {step_idx, title, status, summary, stdout?}
+- STEP_OUTPUT_LEDGER: per-step list of the files that step produced, with an inline
+  preview of each small text result file's actual content (the authoritative
+  step->file->content map for attributing results).
 - Artifact manifest: [{key, display_name, mime_type, size_bytes, download_url}]
 - Run info: run_id, temp directory, etc.
 
@@ -1019,8 +1215,15 @@ INITAL_USER_GOAL: `{user_goal}`
 PLAN: 
 {plan}
 
-OBSERVATION_AT_EACH_STEP: 
+OBSERVATION_AT_EACH_STEP:
 {observation}
+
+STEP_OUTPUT_LEDGER (AUTHORITATIVE map of which step produced which file + the
+file's ACTUAL content — use this to attribute every result to the correct file,
+and to read values that were written to files but NOT printed to stdout. When a
+result must come from a file, use ONLY the file listed under the step that
+produced it; never guess which file holds a result):
+{results_ledger}
 
 ARTIFACTS:
 {artifacts}
