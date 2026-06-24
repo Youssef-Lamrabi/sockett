@@ -1034,4 +1034,171 @@ description = [
         ],
         "returns": "dict(reads_r1, reads_r2, abundance_tsv, summary)",
     },
+    {
+        "name": "run_coverm",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] CoverM: fast per-genome/MAG and per-contig coverage & "
+            "RELATIVE ABUNDANCE from short reads or pre-made BAMs. This is the standard way to "
+            "quantify how abundant each MAG/genome is across one or MANY samples — the basis for "
+            "comparative and time-series metagenomics (cross-sample abundance tables). "
+            "TWO MODES: "
+            "(1) per-genome/MAG abundance — "
+            "coverm genome --coupled S1_R1.fq S1_R2.fq [S2_R1.fq S2_R2.fq ...] "
+            "--genome-fasta-directory bins_dir -x fa -m relative_abundance -t 4 -o abundance.tsv ; "
+            "(2) per-contig coverage — "
+            "coverm contig --coupled R1.fq R2.fq --reference contigs.fa -m mean -t 4 -o contig_cov.tsv . "
+            "Use pre-made sorted BAMs with --bam-files a.bam b.bam instead of --coupled to avoid re-mapping. "
+            "Methods (-m): relative_abundance, mean, covered_fraction, count, tpm, rpkm, trimmed_mean. "
+            "For a multi-sample table pass MULTIPLE --coupled R1 R2 pairs (or multiple --bam-files); "
+            "output TSV columns are one per sample, rows are genomes/contigs. "
+            "Does NOT modify reads. Single static binary in meta-env1 (no database needed)."
+        ),
+        "required_parameters": [
+            {"name": "mode", "type": "str",
+             "description": "'genome' (per-MAG relative abundance) or 'contig' (per-contig coverage)."},
+            {"name": "output_path", "type": "str",
+             "description": "Path for the output coverage/abundance TSV."},
+        ],
+        "optional_parameters": [
+            {"name": "coupled_reads", "type": "list", "default": None,
+             "description": "Flat list of paired FASTQ files R1 R2 [R1 R2 ...]; one pair per sample for multi-sample tables."},
+            {"name": "bam_files", "type": "list", "default": None,
+             "description": "Pre-made sorted BAM files (alternative to coupled_reads; skips re-mapping)."},
+            {"name": "genome_fasta_directory", "type": "str", "default": None,
+             "description": "Directory of MAG/genome FASTAs (genome mode). Use with extension below."},
+            {"name": "extension", "type": "str", "default": "fa",
+             "description": "FASTA extension in the genome directory (genome mode), e.g. fa or fasta."},
+            {"name": "reference", "type": "str", "default": None,
+             "description": "Contigs/reference FASTA (contig mode)."},
+            {"name": "method", "type": "str", "default": "relative_abundance",
+             "description": "Coverage metric: relative_abundance|mean|covered_fraction|count|tpm|rpkm|trimmed_mean."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(output_path, summary)",
+    },
+    {
+        "name": "run_irep",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] iRep: estimates the in-situ REPLICATION RATE (index of "
+            "replication, iRep value) of a genome/MAG from the coverage skew between origin and "
+            "terminus of replication. A higher iRep means more cells were actively replicating when "
+            "the sample was taken (growth-activity proxy). "
+            "Command: iRep -f genome.fa [genome2.fa ...] -s reads_vs_genome.sam [sample2.sam ...] "
+            "-o out_prefix -t 4 . Inputs: (a) one or more genome/MAG FASTAs, (b) a SAM file per sample "
+            "of reads mapped to THAT genome (bowtie2/bwa SAM, NOT BAM). Writes out_prefix.tsv with the "
+            "iRep value per genome per sample plus a PDF plot. "
+            "RELIABILITY CAVEATS (report them): iRep needs a fairly COMPLETE genome (>=75%), LOW "
+            "contamination, and EVEN coverage of >=5x; results from coverage <5x, highly fragmented "
+            "bins, or degraded/biased libraries are statistically UNRELIABLE and should be flagged, "
+            "not reported as growth rates. Runs inside meta-env1. "
+            "INVOKE AS A CLI via subprocess (e.g. subprocess.run(['iRep','-f',...,'-s',...,'-o',...])) — "
+            "do NOT `import iRep`/`import irep` in Python: it lives in an isolated venv and is NOT "
+            "importable from the run environment."
+        ),
+        "required_parameters": [
+            {"name": "genome_fastas", "type": "list",
+             "description": "List of genome/MAG FASTA paths to estimate replication for."},
+            {"name": "sam_files", "type": "list",
+             "description": "List of SAM files (reads mapped to the genome), one per sample. SAM, not BAM."},
+            {"name": "output_prefix", "type": "str",
+             "description": "Output prefix for the .tsv table and .pdf plot."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "min_coverage", "type": "float", "default": 5.0,
+             "description": "Minimum mean coverage to trust an iRep value; below this, flag as unreliable."},
+        ],
+        "returns": "dict(output_prefix, summary)",
+    },
+    {
+        "name": "run_mob_recon",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] MOB-suite (mob_recon): reconstructs PLASMIDS from a genome "
+            "assembly and predicts their MOBILITY. For each contig it decides chromosome vs plasmid, "
+            "groups plasmid contigs into individual plasmids, and reports replicon type (Inc group), "
+            "relaxase/MOB type, mate-pair formation markers and a predicted_mobility label "
+            "(conjugative | mobilizable | non-mobilizable). This is the tool to answer 'is this AMR/"
+            "resistance gene carried on a MOBILE plasmid?' — cross the AMR gene's contig id with "
+            "mob_recon's contig_report.txt to see if that contig is plasmid-borne and conjugative. "
+            "Command: mob_recon -i assembly.fasta -o out_dir -n 4 [--force]. "
+            "Outputs in out_dir: contig_report.txt (per-contig chromosome/plasmid + cluster), "
+            "mobtyper_results.txt (per-plasmid mobility/replicon/relaxase), and plasmid_*.fasta. "
+            "Input is a genome/MAG assembly FASTA (best on a fairly complete isolate or bin). "
+            "Needs mash + blast (present) and the MOB-suite DB (mob_init). Runs in meta-env1. "
+            "INVOKE AS A CLI via subprocess (e.g. subprocess.run(['mob_recon','-i',...,'-o',...])) — "
+            "do NOT `import mob_suite` in Python: it lives in an isolated venv and is NOT importable "
+            "from the run environment."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str",
+             "description": "Genome/MAG assembly FASTA to reconstruct plasmids from."},
+            {"name": "output_dir", "type": "str",
+             "description": "Output directory (contig_report.txt, mobtyper_results.txt, plasmid_*.fasta)."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "force", "type": "bool", "default": True,
+             "description": "Overwrite the output directory if it already exists (-f)."},
+        ],
+        "returns": "dict(output_dir, contig_report, mobtyper_results, summary)",
+    },
+    {
+        "name": "run_mob_typer",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] MOB-suite (mob_typer): types a SINGLE already-isolated plasmid "
+            "FASTA for mobility (conjugative | mobilizable | non-mobilizable), replicon/Inc type, "
+            "relaxase (MOB) cluster, predicted host range and size. Use when you already have a plasmid "
+            "sequence (e.g. a plasmid contig from geNomad or mob_recon) and only need its mobility/typing. "
+            "Command: mob_typer --infile plasmid.fasta --out_file mobtyper_report.txt -n 4. "
+            "Needs mash + blast + the MOB-suite DB (mob_init). Runs in meta-env1. "
+            "INVOKE AS A CLI via subprocess (mob_typer --infile ... --out_file ...) — do NOT "
+            "`import mob_suite` in Python (isolated venv, not importable from the run environment)."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str", "description": "Single plasmid FASTA to type."},
+            {"name": "output_file", "type": "str", "description": "Path for the mobtyper TSV report."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(output_file, summary)",
+    },
+    {
+        "name": "run_drep",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] dRep: DEREPLICATES a set of genomes/MAGs into a "
+            "non-redundant set of representatives by genome-wide ANI clustering. Essential when you "
+            "recover MAGs from MULTIPLE samples/binners and the same organism appears several times — "
+            "dRep keeps the single best-quality representative per cluster (default species-level "
+            "threshold 95% ANI). "
+            "Command: dRep dereplicate OUT_DIR -g bins/*.fa -p 4 [--genomeInfo checkm2_quality.csv] "
+            "[-sa 0.95] [-comp 50 -con 10] . Pipeline: Mash (fast primary clustering) -> fastANI "
+            "(accurate secondary ANI) -> CheckM2 quality scoring -> picks representatives. "
+            "Outputs in OUT_DIR: dereplicated_genomes/ (the representative FASTAs), "
+            "data_tables/Cdb.csv (cluster membership) and Wdb.csv (winners). "
+            "Provide CheckM2 results via --genomeInfo to skip re-running quality. "
+            "Needs mash + fastANI + checkm2 (all present). Runs in meta-env1. "
+            "INVOKE AS A CLI via subprocess (e.g. subprocess.run(['dRep','dereplicate',...])) — "
+            "do NOT `import drep` in Python: it lives in an isolated venv and is NOT importable from "
+            "the run environment (importing raises ModuleNotFoundError)."
+        ),
+        "required_parameters": [
+            {"name": "output_dir", "type": "str",
+             "description": "dRep work/output directory (contains dereplicated_genomes/ and data_tables/)."},
+            {"name": "genomes", "type": "list",
+             "description": "List of genome/MAG FASTA paths (or a glob) to dereplicate."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "secondary_ani", "type": "float", "default": 0.95,
+             "description": "Secondary ANI threshold for dereplication (-sa); 0.95 = species level."},
+            {"name": "min_completeness", "type": "float", "default": 50.0,
+             "description": "Minimum CheckM2 completeness to keep a genome (-comp)."},
+            {"name": "max_contamination", "type": "float", "default": 10.0,
+             "description": "Maximum CheckM2 contamination to keep a genome (-con)."},
+            {"name": "genome_info", "type": "str", "default": None,
+             "description": "Optional CheckM2 quality CSV (genome,completeness,contamination) to skip re-scoring."},
+        ],
+        "returns": "dict(output_dir, dereplicated_genomes_dir, summary)",
+    },
 ]

@@ -111,5 +111,29 @@ description = [
             {"name": "max_results", "type": "int", "default": 10, "description": "Number of top results to return (pageSize)."},
         ],
         "returns": "dict(query, hit_count, results[list of {pmid, title, authors, journal, year, doi}])"
+    },
+    {
+        "name": "web_search",
+        "description": (
+            "[Web Tool][TIMEOUT: 60s] Keyless general-knowledge web lookup via the Wikipedia REST API "
+            "— use ONLY to ENRICH INTERPRETATION/REPORTS (organism background, disease/clinical context, "
+            "method definitions, ecological roles), NEVER to decide execution parameters or tool choices "
+            "(reproducibility). For biomedical LITERATURE use search_literature (Europe PMC); for "
+            "sequence/taxonomy/SRA METADATA use query_ncbi_entrez — this tool is for general context only. "
+            "Implementation (generate this with urllib, no API key): "
+            "1) search titles: GET https://en.wikipedia.org/w/api.php?action=query&list=search&"
+            "srsearch=<urlencoded query>&format=json&srlimit=3 ; "
+            "2) for the top title, GET https://en.wikipedia.org/api/rest_v1/page/summary/<title> and read "
+            "the 'extract' field for a sourced summary. Always set a User-Agent header "
+            "(e.g. 'genomeer/1.0'). Handle network errors gracefully (return empty, never crash the step). "
+            "Return the extract text + the page URL so the finalizer can cite the source."
+        ),
+        "required_parameters": [
+            {"name": "query", "type": "str", "description": "Concept/organism/disease/method to look up for context."},
+        ],
+        "optional_parameters": [
+            {"name": "max_results", "type": "int", "default": 3, "description": "Number of candidate pages to consider."},
+        ],
+        "returns": "dict(query, summary, source_url)"
     }
 ]

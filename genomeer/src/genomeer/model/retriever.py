@@ -41,6 +41,18 @@ _CLI_TOOL_BINARIES = {
     "maxbin2": "run_MaxBin2.pl",
     # ── Bin quality ───────────────────────────────────────────────────────────
     "checkm2": "checkm2",
+    # ── Coverage / abundance ──────────────────────────────────────────────────
+    "coverm": "coverm",
+    # ── Replication rate ──────────────────────────────────────────────────────
+    "irep": "iRep",
+    # ── Plasmid reconstruction / mobility ─────────────────────────────────────
+    "mob_recon": "mob_recon",
+    "mob_typer": "mob_typer",
+    "mob_suite": "mob_recon",
+    # ── MAG dereplication ─────────────────────────────────────────────────────
+    "drep": "dRep",
+    "mash": "mash",
+    "fastani": "fastANI",
     # ── Taxonomic classification ──────────────────────────────────────────────
     "kraken2": "kraken2",
     "metaphlan": "metaphlan",
