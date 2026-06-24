@@ -271,31 +271,70 @@ async function loadSessionMessages(sid) {
   const logs = el('logs'); if (logs) logs.innerHTML = '';   // reset right pane
 
   for (const m of msgs) {
+    try {
     if (m.role === 'user') {
       renderUserMessage(m.content);
     }
     else if (m.role === 'assistant') {
-      // left pane: final assistant text
-      renderAssistantMarkdownStatic(m.content);
-
-      // replay saved blocks. CHAT CARDS (Step Execution / Missing / Next) go through the
-      // SAME renderer as the live stream so a refresh looks identical to live (fixes the
-      // "UI changes / cards disappear after reload" bug). The rest are right-pane logs.
       const savedLogs = m.logs || [];
       const _CHAT_CARD = new Set(['RUNNING', 'DESCRIPTION', 'MISSING', 'NEXT']);
-      for (const L of savedLogs) {
-        const _t = String(L.tag || '').toUpperCase();
-        if (_CHAT_CARD.has(_t)) {
-          renderAssistantEvent({ type: 'block', tag: _t, text: L.body || '' });
-        } else {
-          renderLogBlock(_t, L.body || '');
+      // Does this message carry the ORDERED stream (text saved as TEXT entries)?
+      // New messages do; old ones (pre-fix) don't and fall back to legacy replay.
+      const _hasOrderedText = savedLogs.some(L => String(L.tag || '').toUpperCase() === 'TEXT');
+
+      if (_hasOrderedText) {
+        // ── ORDERED replay: reproduce the EXACT live interleaving of chat text and
+        // Step cards (fixes Step cards being dumped below the report after refresh). ──
+        let _buf = '';
+        const _flush = () => {
+          if (_buf.trim()) renderAssistantMarkdownStatic(_buf);
+          _buf = '';
+        };
+        for (const L of savedLogs) {
+          const _t = String(L.tag || '').toUpperCase();
+          const _body = L.body || '';
+          if (_t === 'TEXT') {
+            // accumulate consecutive chat text into one bubble (mirrors live grouping)
+            _buf += (_buf ? '\n\n' : '') + _body;
+          } else if (_CHAT_CARD.has(_t)) {
+            // a chat card breaks the current text bubble, exactly like live
+            _flush();
+            renderAssistantEvent({ type: 'block', tag: _t, text: _body });
+          } else {
+            // right-pane logs (EXECUTE/OBSERVE/LOGS/THINK/STATUS) — do NOT break chat flow
+            renderLogBlock(_t, _body);
+          }
+        }
+        _flush();
+      } else {
+        // ── Legacy replay (pre-fix messages): final text first, then cards. ──
+        renderAssistantMarkdownStatic(m.content);
+        for (const L of savedLogs) {
+          const _t = String(L.tag || '').toUpperCase();
+          if (_CHAT_CARD.has(_t)) {
+            renderAssistantEvent({ type: 'block', tag: _t, text: L.body || '' });
+          } else {
+            renderLogBlock(_t, L.body || '');
+          }
         }
       }
-      // remove any spinner visuals (history is not "live")
-      // light-touch way: drop a terminal status which also clears spinners
+
+      // Clear spinners by emitting the REAL final status of the run — NOT a hardcoded
+      // "done" (which wrongly showed a blocked/failed run as ✅ done after refresh).
+      // Use the last saved STATUS block's value (done / blocked / ...); default to done
+      // only if no STATUS was ever recorded.
       if (savedLogs.length) {
-        renderAssistantEvent({ type: 'block', tag: 'STATUS', text: '<status:done>' });
+        const _statuses = savedLogs.filter(L => String(L.tag || '').toUpperCase() === 'STATUS');
+        const _last = _statuses.length
+          ? String(_statuses[_statuses.length - 1].body || 'done').trim().toLowerCase()
+          : 'done';
+        renderAssistantEvent({ type: 'block', tag: 'STATUS', text: `<status:${_last}>` });
       }
+    }
+    } catch (_e) {
+      // Never let one malformed saved message abort the whole history replay
+      // (which would leave a half-rendered / blank chat after a refresh).
+      console.warn('replay: skipped a message that failed to render', _e);
     }
   }
   updateEmptyState();
@@ -1081,8 +1120,18 @@ function boot() {
   // Auth + guard
   api.setToken(localStorage.getItem('agent_token') || '');
   guardDashboard().then(async () => {
-    await refreshModelSelectFromServer(localStorage.getItem('last_model') || undefined);
-    if (!document.getElementById('model-select')?.value) {
+    const _pref = localStorage.getItem('last_model') || undefined;
+    let res = await refreshModelSelectFromServer(_pref);
+    // If the very first fetch failed (cold boot / token not ready yet), retry
+    // once quietly before nagging — avoids the false "No models configured yet"
+    // toast + auto-opening Settings when a model (e.g. the system default
+    // deepseek) actually IS configured.
+    if (!res.ok) {
+      await new Promise(r => setTimeout(r, 800));
+      res = await refreshModelSelectFromServer(_pref);
+    }
+    // Only nag when the server CONFIRMED there are genuinely zero models.
+    if (res.ok && res.count === 0) {
       notify('info', 'No models configured yet. Add one in Settings.');
       openSettings();
     }
@@ -2345,18 +2394,25 @@ async function loadModelsIntoUI() {
 
 /* Populate #model-select only from backend (system default + user models) */
 async function refreshModelSelectFromServer(preferValue) {
-  const sel = el('model-select'); if (!sel) return;
-  sel.innerHTML = '';
+  // Returns { ok, count }: ok=false means the server fetch itself failed
+  // (transient/early boot) — callers must NOT conclude "no models" from that;
+  // count is the real number of configured models when ok=true.
+  const sel = el('model-select'); if (!sel) return { ok: false, count: 0 };
   let data;
   try {
     data = await fetchModels();
   } catch (e) {
-    const opt = document.createElement('option');
-    opt.value = ''; opt.textContent = '— Select a model in Settings —';
-    opt.disabled = true; opt.selected = true; sel.appendChild(opt);
-    return;
+    // Network/auth not ready: keep whatever options are already there (don't
+    // wipe a previously good list), just show a neutral placeholder if empty.
+    if (!sel.options.length) {
+      const opt = document.createElement('option');
+      opt.value = ''; opt.textContent = '— Select a model in Settings —';
+      opt.disabled = true; opt.selected = true; sel.appendChild(opt);
+    }
+    return { ok: false, count: 0 };
   }
 
+  sel.innerHTML = '';
   const options = [];
   if (data.system_default?.model) {
     options.push({ value: data.system_default.model, label: `System: ${data.system_default.model}` });
@@ -2369,7 +2425,7 @@ async function refreshModelSelectFromServer(preferValue) {
     const opt = document.createElement('option');
     opt.value = ''; opt.textContent = '— Select a model in Settings —'; opt.disabled = true; opt.selected = true;
     sel.appendChild(opt);
-    return;
+    return { ok: true, count: 0 };
   }
 
   options.forEach(o => {
@@ -2388,6 +2444,7 @@ async function refreshModelSelectFromServer(preferValue) {
   } else if (!sel.value && options.length) {
     sel.value = options[0].value;
   }
+  return { ok: true, count: options.length };
 }
 
 /* ------------------------------ Guard ----------------------------------- */

@@ -207,8 +207,23 @@ _SPEC_HASH_SENTINEL = ".genomeer_spec_hash" # hash of spec at conda-install time
 
 
 def _spec_hash(spec_file: Path) -> str:
-    """Short SHA-256 of the spec YAML (used to detect spec changes)."""
-    return hashlib.sha256(spec_file.read_bytes()).hexdigest()[:16]
+    """Short SHA-256 of the PACKAGE SPEC (conda dependencies + pip list), NOT the raw
+    bytes. Hashing only the actual package set means comment/whitespace/doc edits to the
+    YAML do NOT change the hash and therefore do NOT trigger a needless (and slow) conda
+    re-solve via ensure_env — only genuine package additions/removals do. Falls back to a
+    byte hash if the YAML cannot be parsed."""
+    try:
+        spec = yaml.safe_load(spec_file.read_text()) or {}
+        deps = spec.get("dependencies", []) or []
+        conda_pkgs = sorted(str(d).strip() for d in deps if isinstance(d, str))
+        pip_pkgs: list[str] = []
+        for d in deps:
+            if isinstance(d, dict) and "pip" in d:
+                pip_pkgs = sorted(str(p).strip() for p in (d.get("pip") or []))
+        payload = "CONDA::" + "|".join(conda_pkgs) + "##PIP::" + "|".join(pip_pkgs)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return hashlib.sha256(spec_file.read_bytes()).hexdigest()[:16]
 
 
 def _stored_spec_hash(name: str) -> str | None:

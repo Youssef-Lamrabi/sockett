@@ -2523,6 +2523,8 @@ class BioAgent:
                                 "bin completeness", "bin contamination",
                                 "eggnog", "diamond", "emapper",
                                 "kaiju", "genomad", "pharokka",
+                                "gget", "gget virus", "viral sequence", "ncbi virus",
+                                "literature", "pubmed", "europe pmc",
                                 # AMR DB-search tools (CARD/NCBI): install present, but
                                 # rgi (diamond/blast) and amrfinder (tblastn/blastn+hmmer)
                                 # take 1-3 min on a genome — the old 600s default was too short.

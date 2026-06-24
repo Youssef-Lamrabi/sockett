@@ -62,4 +62,35 @@ description = [
         ],
         "returns": "dict(scores_tsv, n_viral_sequences, high_conf_viral, output_dir)",
     },
+    {
+        "name": "run_gget_virus",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] gget virus (gget v0.30.6): DETERMINISTIC RETRIEVAL of viral "
+            "genome sequences + GenBank metadata from the NCBI Virus database. AVAILABLE in meta-env1. "
+            "This is a DATA-RETRIEVAL tool (the viral counterpart of ncbi-genome-download); it does NOT "
+            "detect/analyze viruses — for that use geNomad/VirSorter2/CheckV on contigs. Use it to fetch "
+            "reference viral genomes for a host/lineage/region or to pull specific accessions. EXACT "
+            "command (run via meta-env1; needs network → NCBI Virus REST API): "
+            "by taxon: gget virus 'SARS-CoV-2' -o <out_dir> --nuc_completeness complete  ; "
+            "by accession(s): gget virus -a 'NC_045512.2' -o <out_dir>  (-a = --is_accession; accepts a "
+            "single accession, space-separated accessions, or a path to a one-per-line .txt). "
+            "Useful filters: --host, --min_seq_length/--max_seq_length, --geographic_location, "
+            "--min_release_date/--max_release_date, --annotated, --has_proteins, --source_database. "
+            "Outputs in <out_dir>: <name>_sequences.fasta (genomes), <name>_metadata.csv and "
+            "<name>_metadata.jsonl (per-record metadata), command_summary.txt. "
+            "NOTE: a bare taxon query with no filters can return MANY sequences — always constrain with "
+            "--nuc_completeness complete and/or length/date filters (or use -a with explicit accessions)."
+        ),
+        "required_parameters": [
+            {"name": "query", "type": "str", "description": "Virus taxon name/ID (e.g. 'zika virus', '1335626') OR, with is_accession, an accession / list / file path."},
+            {"name": "output_dir", "type": "str", "description": "Output directory."},
+        ],
+        "optional_parameters": [
+            {"name": "is_accession", "type": "bool", "default": False, "description": "Treat query as accession(s) (-a flag)."},
+            {"name": "nuc_completeness", "type": "str", "default": None, "description": "complete or partial."},
+            {"name": "host", "type": "str", "default": None, "description": "Host organism filter (e.g. 'homo sapiens')."},
+            {"name": "max_seq_length", "type": "int", "default": None, "description": "Maximum sequence length (bp) — constrain broad taxon queries."},
+        ],
+        "returns": "dict(sequences_fasta, metadata_csv, metadata_jsonl, n_sequences, output_dir)",
+    },
 ]

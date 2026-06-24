@@ -51,6 +51,7 @@ envs:
       - esearch
       - efetch
       - esummary
+      - gget
       - sylph
       - kaiju
       - kaiju2table

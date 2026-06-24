@@ -295,7 +295,15 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                             typ = (evt or {}).get("type")
                             if typ == "message":
                                 txt = (evt.get("text") or "")
-                                if txt: assistant_parts.append(txt)
+                                if txt:
+                                    assistant_parts.append(txt)
+                                    # ALSO record the chat text in saved_logs IN ORDER (tag TEXT) so
+                                    # history replay can reproduce the EXACT live interleaving of text
+                                    # and Step cards. Previously text went only into the merged
+                                    # Message.content blob while cards went into saved_logs, so on
+                                    # refresh all Step cards were dumped AFTER the whole report (they
+                                    # appeared "au dessous"). Keeping them in one ordered stream fixes that.
+                                    saved_logs.append({"tag": "TEXT", "body": txt})
                             elif typ == "block":
                                 tag = str(evt.get("tag") or "").upper()
                                 if tag in {"SOLUTION","FINAL","ANSWER","SUMMARY","REVIEW"}:
@@ -303,7 +311,10 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                                     # strip <TAG> ... </TAG>
                                     inner = re.sub(r"^<[^>]+>", "", raw)
                                     inner = re.sub(r"</[^>]+>$", "", inner).strip()
-                                    if inner: assistant_parts.append(inner)
+                                    if inner:
+                                        assistant_parts.append(inner)
+                                        # ordered chat text (same rationale as the message branch)
+                                        saved_logs.append({"tag": "TEXT", "body": inner})
                                 
                                 # Save blocks for history replay. Two groups:
                                 #  - right-pane logs (EXECUTE/OBSERVE/LOGS/THINK/STATUS): store inner text.

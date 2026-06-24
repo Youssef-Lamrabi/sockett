@@ -21,6 +21,11 @@ SPECIAL ALWAYS-TRUE RULES:
       scripts. Any `from genomeer.tools.function.ncbi import ...` will raise ModuleNotFoundError.
    b) NEVER use Bio.Entrez.efetch, urllib, requests, or any direct HTTP/HTTPS call to NCBI.
       NCBI rate-limits anonymous requests; HTTP 400/429 errors cause infinite repair loops.
+      EXCEPTION (allowed): literature search via the Europe PMC REST API
+      (https://www.ebi.ac.uk/europepmc/webservices/rest/search) using urllib IS permitted — see the
+      search_literature tool. Europe PMC is NOT NCBI E-utilities and is not rate-limited the same way.
+      Use it ONLY for the research/interpretation phase (evidence, gene/pathway context, citations),
+      never to choose pipeline parameters or data to download.
    c) NEVER use FTP to NCBI. The FTP endpoint is deprecated and will not work.
    The ONLY correct method for NCBI genome download is ncbi-genome-download CLI (see rule 5).
 2. Always ensure code is minimal, runnable, and outputs results into the provided temp directory.
@@ -90,6 +95,19 @@ SPECIAL ALWAYS-TRUE RULES:
    NEVER use a category-free, level-free -g download (e.g. levels_to_try=[None, ...]) for a named
    species — that is what triggers the 30k-assembly hang. When the USER gave an explicit accession,
    use -A <acc> instead (it already identifies ONE assembly; omit -l and omit --refseq-categories).
+   -A RESILIENCE (real bug: a multi-genome batch aborted because ONE accession was a wrong version —
+   PAO1 given as GCF_000006765.2, which does NOT exist in RefSeq; the script sys.exit'd on the first
+   failure even though the other two genomes had downloaded fine, forcing a full step retry). RULES
+   for accession downloads, ESPECIALLY in a multi-sample loop:
+     * Use the accession EXACTLY as the user wrote it. If `-A <acc>` returns "No downloads matched
+       your filter", it is usually a wrong version suffix or a GCA-vs-GCF mismatch — do NOT abort.
+     * Per-sample FALLBACK chain (try in order, stop at first success that yields a *.fna.gz):
+         1) -A <acc> (refseq)            2) -A <acc> with -s genbank
+         3) -A <base accession>.1 (retry version .1)
+         4) -g "<Genus species>" --refseq-categories reference -l complete   (rule-5a cascade)
+       Only sys.exit AFTER the whole chain fails for that one sample. NEVER let one bad accession
+       kill a batch where other samples succeeded — collect per-sample results and report which
+       sample (if any) could not be obtained.
    Choosing the kingdom positional arg: bacteria for bacteria, fungi for yeasts/molds
    (Saccharomyces, Cryptococcus), viral for viruses. A wrong kingdom also yields
    "No downloads matched your filter".
@@ -139,6 +157,16 @@ SPECIAL ALWAYS-TRUE RULES:
      if not fasta_path:
          raise RuntimeError("No downloaded genome matches '" + want_genus + " " + want_species
                             + "'. Found: " + "; ".join(_organism_of(f) for f in cands) + " - aborting.")
+   STRAIN-LEVEL matching (when the task needs to tell apart strains of the SAME species, e.g. two
+   E. coli): do NOT test the strain name as a CONTIGUOUS substring — RefSeq organism names embed
+   "str."/"substr." separators, so "K-12 MG1655" is NOT a substring of "Escherichia coli str. K-12
+   substr. MG1655" and "O157:H7 Sakai" is NOT a substring of "...O157:H7 str. Sakai" (real bug: this
+   made the verifier assign the WRONG E. coli genome to each strain). Instead, TOKENIZE: require that
+   every alphanumeric token of the wanted strain (e.g. the tokens "k-12" and "mg1655", or
+   "o157:h7" and "sakai") appears somewhere in the organism string (case-insensitive), ignoring
+   the separators "str"/"substr"/"substrain".
+   Better still, when the user gives explicit ACCESSIONS, key each genome by its GCF accession parsed
+   from the filename and skip strain-name fuzzy matching entirely.
 6. Newlines in write() calls: ALWAYS use \\n (one backslash, the escape sequence) for
    newlines inside strings passed to file.write() or f-strings.
    NEVER use \\\\n (two backslashes) — that writes a literal backslash+n to the file.
@@ -310,6 +338,13 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
   that exact accession in their request. Otherwise reference the organism BY NAME, e.g.
   "Download a Klebsiella pneumoniae genome by organism name with ncbi-genome-download and verify
   the downloaded organism matches" — the generator will query by name (-g "<Genus species>").
+- ORGANISM/ACCESSION VERIFICATION IS OFFLINE, NOT an esearch gate. Verify the organism from the
+  DOWNLOADED FASTA defline / assembly report (offline, network-independent — rule 5b). Do NOT plan a
+  step whose success depends on esearch/NCBI-Entrez and that ABORTS the pipeline if it fails — NCBI
+  E-utilities is rate-limited and routinely drops the SSL connection, so an esearch-gated step makes
+  the whole pipeline fail on a transient network hiccup (real failure: an esearch verification step
+  blocked 6× then escalated to QA when eutils was throttled). Use esearch only for tasks with no
+  offline alternative (e.g. BioProject->SRR resolution), and treat its failure as non-fatal.
 - Don't ask the user questions here; missing inputs will be handled by the Input Guard later.
 - DO NOT include a final step about summarizing results, producing a report, or creating downloadable links.
   That will always be handled separately by the FINALIZER node.
@@ -704,6 +739,10 @@ SPECIAL ALWAYS-TRUE RULES:
 - All output files must be written to run_dir (provided in context). Use os.path.join(run_dir, "filename.ext"). Never hardcode absolute paths for outputs.
 - For #!BASH scripts: $run_dir is pre-defined and the directory is pre-created by the execution harness before your script runs. Do NOT define run_dir= or call mkdir -p yourself — doing so conflicts with the harness injection.
 - NEVER use heredoc syntax (<<PY, <<EOF, <<'EOF', <<\EOF) in #!BASH scripts — it is blocked by the security checker. To run Python logic, use a separate #!PY block instead.
+- SHELL PIPES (cmd1 | cmd2, e.g. `esearch ... | efetch ...`, `any2fasta x | blastn ...`): emit them in a
+  #!BASH block — NEVER as Python subprocess.run("a | b", shell=True). shell=True is REJECTED by the
+  security checker ("subprocess with shell=True is forbidden"), and you cannot express a pipe with a
+  single list of args. So: pipes → #!BASH; single commands → subprocess.run([list]) in #!PY (no shell).
 - When a metric cannot be computed because data is genuinely missing, print a clear error and call sys.exit(1). Never silently return None or 0.
 - Never split a list concatenation across multiple lines with + at the start of a continuation line. Always use a single list literal or extend() instead.
 - NEVER import from genomeer.* in generated code. The execution environment (micromamba) does not have access to the genomeer package. Use only standard libraries and packages available in the conda environment.
@@ -722,6 +761,13 @@ SPECIAL ALWAYS-TRUE RULES:
   CORRECT: prokka --outdir prokka_out --prefix genome --force genome.fna
   This produces: prokka_out/genome.txt, prokka_out/genome.faa, prokka_out/genome.gff
   Also: NEVER create the outdir with os.makedirs() before calling Prokka — let Prokka manage it.
+- STALE OUTPUT DIR on RETRY (root cause of infinite-loop failures): several tools ABORT if their
+  output directory already EXISTS and is non-empty, and have NO --force flag — antiSMASH, megahit,
+  geNomad, QUAST. On a retry the leftover dir from the previous failed attempt re-triggers the EXACT
+  same error every time. FIX: before launching ANY such tool, clear its own previous output —
+  `import shutil; shutil.rmtree(output_dir, ignore_errors=True)` — OR use a fresh not-yet-existing
+  output path. This removes ONLY the tool's own output (created by a prior agent attempt), never user
+  data. (Prokka is the exception: it has --force, so use that instead.)
 - Prodigal ALWAYS requires -f gff to produce a real GFF file. Without -f, it writes its native
   Genbank-like format regardless of the output filename — GFF parsers will find 0 CDS features.
   This applies to ALL modes: -p meta, -p single, -p ab initio — -f gff is ALWAYS required.
@@ -911,6 +957,37 @@ SPECIAL ALWAYS-TRUE RULES:
   CORRECT: seqkit_path = os.path.join(run_dir, "seqkit_stats.tsv")
   The only exception: use glob when the filename is genuinely unknown (e.g. NCBI download
   produces "GCF_XXXXXXXX.N_*_genomic.fna" whose exact stem varies by assembly).
+- MULTI-SAMPLE COLLATION (comparative tables) — JOIN-KEY consistency (real bug: a 3-strain
+  comparative_table.tsv came out with Carbapenemase=None and BGC/CAZyme/Mechanism=N/A for ALL
+  rows even though every per-strain summary had the real values — KPC-2 for HS11286 etc. —
+  because the collation keyed rows by CONTIG ACCESSION (NC_016845.1) while the per-strain files
+  keyed by STRAIN NAME ("Klebsiella pneumoniae HS11286"), so every join missed and defaulted to
+  None/N/A). RULES when building a comparative/collation table:
+    1. Pick ONE canonical sample key used by ALL inputs (the strain name or the GCF accession) and
+       join on THAT — never mix a contig accession with a strain name. NORMALIZE the key on BOTH
+       sides before joining: strip the file extension and directory so "bin.1.fa", "bin.1", and
+       "/tmp/run/bins/bin.1.fa" all reduce to the SAME key (real bug: a MAG validation table keyed
+       species by "bin.1" but matched bin FILES "bin.1.fa" → every join returned "unknown"; use
+       e.g. os.path.splitext(os.path.basename(p))[0] consistently on both sides).
+    2. Build per-source dicts keyed by that canonical key, then for each sample fill each column
+       by explicit lookup; assert the lookups hit (if a column would be None/N/A, RE-OPEN the
+       per-strain summary file and re-read it before defaulting — a blank cell almost always means
+       the join key was wrong, not that the value is missing).
+    3. NEVER emit "None"/"N/A" for a field when the corresponding per-strain summary file on disk
+       contains the value. The collation must be a faithful merge, not a lossy re-derivation.
+- MULTI-SAMPLE LABEL<->FILE MAPPING (real bug: results attributed to the WRONG strain). When you
+  process several genomes in a loop, NEVER pair a hand-written list of strain NAMES with a list of
+  FILES by positional zip — the two lists are independently ordered (e.g. names in user order
+  [HS11286, AYE, PAO1] vs files in sorted-accession order [GCF_000006765=PAO1, GCF_000069245=AYE,
+  GCF_000240185=HS11286]) so the zip silently mislabels samples. THIS HAPPENED: antiSMASH/dbCAN
+  outputs for AYE actually ran on the PAO1 genome and vice-versa, so the comparative table swapped
+  their BGC/CAZyme counts. CORRECT: derive each sample's identity FROM the file itself — either the
+  GCF accession parsed from the filename ("_".join(basename.split("_")[:2])) or the organism read
+  from that genome's assembly_report — and key EVERY per-sample output directory and summary row by
+  that same identity. Name each tool's output dir after the accession/verified-strain of the genome
+  it ACTUALLY received, not after a loop-index label. Sanity-check: the contig IDs inside a strain's
+  output (e.g. NC_002516=PAO1, NC_010410=AYE, NC_016845=HS11286) must match the strain it is
+  labelled with.
 """
 
 GENERATOR_CTX_PROMPT="""
@@ -1161,6 +1238,17 @@ Do NOT re-run tools. Do NOT invent links.
   is not listed under that step. If a screening tool (e.g. abricate) produced an
   output file, report the actual hits from that file's preview (count + gene names);
   if the preview shows only a header and no data rows, report "no hits found".
+- ABSENCE / NEGATIVE CLAIM RULE (do NOT trust a broken collation): before stating that
+  something was NOT found (e.g. "no acquired carbapenemase", "Carbapenemase family: None",
+  "0 hits"), cross-check the PER-TOOL / PER-SAMPLE source files in the ledger (e.g. *_rgi.txt,
+  *_amrfinder.tsv, *_amr_summary.tsv, carbapenemase_comparison.tsv). A downstream
+  COLLATION/COMPARATIVE table that shows "None"/"N/A"/empty cells is NOT evidence of absence —
+  it is almost always a JOIN BUG (e.g. the collation keyed rows by contig accession while the
+  per-sample files use the strain name, so every lookup missed). If ANY source file shows a real
+  hit (e.g. KPC-2 Perfect in *_rgi.txt and blaKPC-2 in *_amrfinder.tsv), REPORT THE HIT — the
+  source files are authoritative OVER the collation table, even though the collation is a later
+  step. The "highest step number wins" rule applies to a corrected NUMERIC value of the SAME
+  metric, NOT to a collation that silently dropped data into None/N/A.
 - If a result file the user asked about is NOT present in any step's produced files,
   say so explicitly ("<result> file was not produced") rather than inventing values.
 - TOOL ATTRIBUTION RULE: only attribute a result to a specific tool if that tool's name appears

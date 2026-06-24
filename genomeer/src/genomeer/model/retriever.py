@@ -48,6 +48,8 @@ _CLI_TOOL_BINARIES = {
     "esearch": "esearch",
     "efetch": "efetch",
     "query_ncbi_entrez": "esearch",
+    "gget": "gget",
+    "run_gget_virus": "gget",
     "kaiju": "kaiju",
     "sylph": "sylph",
     # ── Gene prediction / annotation ──────────────────────────────────────────

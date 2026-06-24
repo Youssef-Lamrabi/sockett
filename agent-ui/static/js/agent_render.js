@@ -35,11 +35,25 @@ function highlightIn(el) {
 }
 
 /* ---------- Markdown (marked + DOMPurify if present; safe fallback) ---- */
+// Guard against a runaway code block painting the whole chat black ("écran
+// noir"): when a message (or a mid-stream partial, or a tag-split segment)
+// contains an OPENING ``` fence with no matching closing fence, marked wraps
+// EVERYTHING after it in one dark <pre> that fills the viewport. Balancing the
+// fence count (append a closing fence only when the count is odd) bounds the
+// code block to its real content. Balanced input is left untouched.
+function _balanceCodeFences(s) {
+  const m = String(s).match(/```/g);
+  if (m && (m.length % 2 === 1)) return s + "\n```";
+  return s;
+}
 function mdToHtml(md = "") {
-  if (window.marked?.parse) {
-    const raw = window.marked.parse(md, { breaks: true });
-    return window.DOMPurify?.sanitize ? window.DOMPurify.sanitize(raw) : raw;
-  }
+  md = _balanceCodeFences(String(md || ""));
+  try {
+    if (window.marked?.parse) {
+      const raw = window.marked.parse(md, { breaks: true });
+      return window.DOMPurify?.sanitize ? window.DOMPurify.sanitize(raw) : raw;
+    }
+  } catch (_) { /* fall through to the minimal fallback below */ }
   // minimal fallback
   let s = escapeHtml(md);
   s = s.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code.replace(/^\n+|\n+$/g, '')}</code></pre>`);
@@ -294,8 +308,21 @@ function pushAssistantChunkLive(chunk = "") {
   hideAssistantTyping();
 
   const already = liveFull + liveBuf;
-  if (chunk.startsWith(already)) {
+  let isContinuation = false;
+  if (already && chunk.startsWith(already)) {
+    // Cumulative resend of the SAME message: keep only the new tail, no separator.
     chunk = chunk.slice(already.length);
+    isContinuation = true;
+  }
+  // Boundary fix: distinct agent messages (e.g. observer "Step done." then the
+  // finalizer "## Summary ...") arrive as SEPARATE 'message' events and were
+  // being glued into one line live (so "## Summary" wasn't parsed as a heading),
+  // while history replay separated them via the server's "\n".join. Mirror that
+  // here: insert a paragraph break between two distinct messages when the buffer
+  // doesn't already end on a blank line and the new chunk doesn't start with one.
+  // Safe because stream_mode="values" yields WHOLE messages (never single tokens).
+  if (!isContinuation && already && chunk && !/\n\s*$/.test(already) && !/^\s*\n/.test(chunk)) {
+    liveBuf += "\n\n";
   }
   liveBuf += chunk;
 

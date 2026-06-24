@@ -2060,9 +2060,18 @@ class AmrFinderContract(_BaseContract):
             return ContractResult(ok=True, score=0.5,
                                   reason="amrfinder: output found, no AMR/virulence genes detected (clean genome)")
 
-        score = high_quality / total
+        # Detecting AMR/virulence genes IS a successful result. On fragmented MAG/bin or
+        # metagenome assemblies, genes are routinely split across contig boundaries →
+        # partial coverage (<90%), which is EXPECTED biology, NOT a tool failure. Scoring
+        # 0/N here (all hits partial) fell below the global validator minimum and drove a
+        # pointless 3x retry storm on binned input (each retry applying an irrelevant fix:
+        # amrfinder -u / --organism / -p protein). FLOOR the score at 0.5 whenever ANY gene
+        # is detected; reserve the higher range for complete high-confidence hits.
+        frac_hq = high_quality / total
+        score = 0.5 + 0.5 * frac_hq
         return ContractResult(ok=True, score=score,
-                              reason=f"amrfinder: {high_quality}/{total} genes with ≥90% coverage and identity")
+                              reason=f"amrfinder: {total} AMR/virulence gene(s) detected "
+                                     f"({high_quality} at ≥90% cov & id)")
 
 
 # ===========================================================================
@@ -2093,6 +2102,14 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     MetaBat2Contract(),
     # Bin quality
     CheckM2Contract(),
+    # Resistome — MUST be checked BEFORE the generic aligner contracts (Hmmer/Diamond/
+    # Eggnog) below: RGI/AMRFinder step titles mention "diamond"/"blast"/"hmmer" as their
+    # INTERNAL aligner, so first-match ordering would otherwise hand an RGI step to
+    # DiamondContract. Real bug it fixes: DiamondContract matched a "Run RGI … DIAMOND"
+    # step and its retry hints (--more-sensitive / --evalue) were applied to `rgi main`,
+    # which does not accept them → RGI crashed → 0 RGI genes.
+    RgiContract(),
+    AmrFinderContract(),
     # Functional annotation
     HmmerContract(),
     EggnogContract(),
@@ -2123,9 +2140,6 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     GtdbtkContract(),
     # Long-read polishing
     MedakaContract(),
-    # Resistome
-    RgiContract(),
-    AmrFinderContract(),
 ]
 
 

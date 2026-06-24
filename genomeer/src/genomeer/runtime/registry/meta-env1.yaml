@@ -98,6 +98,10 @@ dependencies:
   #     Run: run_dbcan CAZyme_annotation --mode protein --input_raw_data <faa> --output_dir <out>
   #     --db_dir /home/workshop/dbcan_db. Note: dbcan pinned pandas<3 (3.0.3->2.2.3) and
   #     pyhmmer 0.11 — verified RGI/checkm2/genomad/amrfinder/pharokka still work.
+  #   * gget 0.30.6 (`pip install gget`): provides `gget virus` — deterministic viral genome +
+  #     metadata retrieval from the NCBI Virus REST API (no DB to install, network-only). Run:
+  #     gget virus '<taxon>' -o <out> --nuc_completeness complete   OR   gget virus -a '<acc>' -o <out>.
+  #     Pulled ipython/jupyter/mysql-connector/psutil 7.2.2 — verified genomad/checkm2/biopython OK.
   # - gtdbtk               # gtdbtk → MAG taxonomy (needs ~80GB GTDB release DB) — NOT installed
   # AMR DB-search tools — INSTALLED MANUALLY (do NOT add as conda deps: the meta-env1
   # solver hangs). Both verified working (detect blaKPC-2 on K. pneumoniae HS11286):
