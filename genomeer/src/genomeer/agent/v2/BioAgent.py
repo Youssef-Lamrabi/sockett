@@ -222,6 +222,11 @@ class BioAgent:
         # Interaction mode
         self.interaction_mode = interaction_mode
 
+        # User-pinned tools for the CURRENT message (resolved real names, e.g. "run_coverm").
+        # Empty by default -> every pinned-tools code path is a no-op -> behaviour unchanged.
+        # Reset per message in go()/go_stream() via _set_pinned_tools().
+        self._pinned_tools = []
+
         # Optional secondary LLM for biological domain hints (bio_hint node)
         self.bio_hint_llm = bio_hint_llm
 
@@ -662,11 +667,18 @@ class BioAgent:
             # (e.g. eggNOG-mapper). Computed on-the-fly with a cheap shutil.which
             # check per-tool. Cached at module import time in retriever.py.
             _tool_inventory_block = self._available_tools_inventory_block()
+            # User-pinned tools (guarded -> empty = "" = no change to the plan).
+            _pinned_block = ""
+            if self._pinned_tools:
+                _pinned_block = ("\n\nUSER-SELECTED TOOLS: the user explicitly chose these tools — "
+                                 "build the pipeline USING them where biologically appropriate, and make "
+                                 "each one appear as a step unless it genuinely does not fit the data/task: "
+                                 + ", ".join(self._pinned_tools))
             msgs = [
                 self.system_prompt,
                 HumanMessage(content=instructions.PLANNER_PROMPT.format(
                     temp_run_dir=state.get("run_temp_dir") or "",
-                ) + (_past_templates or "") + _tool_inventory_block),
+                ) + (_past_templates or "") + _tool_inventory_block + _pinned_block),
             ]
 
             # ------ Interactive mode ------
@@ -1245,6 +1257,17 @@ class BioAgent:
                 step_query = f"{user_goal}\nCURRENT_STEP: {current_step_title}"
                 try:
                     selected_resources_names = self._prepare_resources_for_retrieval(step_query)
+                    # User-pinned tools: ALWAYS include their descriptions (bypass the semantic
+                    # filter) so the generator can call them. Guarded -> empty pin list = no-op.
+                    if self._pinned_tools:
+                        selected_resources_names = selected_resources_names or {"tools": [], "data_lake": [], "libraries": []}
+                        _have = {(t.get("name") if isinstance(t, dict) else t) for t in selected_resources_names.get("tools", [])}
+                        for _pin in self._pinned_tools:
+                            if _pin in _have:
+                                continue
+                            _d = self._resolve_pinned_tool(_pin)
+                            if _d:
+                                selected_resources_names["tools"].insert(0, _d)
                     if selected_resources_names:
                         self.update_system_prompt_with_selected_resources(selected_resources_names)
                         self._log("STEP-SCOPED RETRIEVAL", body=str(selected_resources_names), node=node)
@@ -5215,6 +5238,40 @@ class BioAgent:
                 builtins._bioagent_custom_functions = {}
             builtins._bioagent_custom_functions.update(self._custom_functions)
             
+    def _resolve_pinned_tool(self, name):
+        """Map a user-selected tool name to its module2api dict.
+        Handles the prettified display form ('fastp' -> 'run_fastp') and the raw name.
+        Returns {'name','module','description'} or None. Never raises."""
+        try:
+            if not name or not hasattr(self, "module2api"):
+                return None
+            name = str(name).strip()
+            cands = {name, "run_" + name}
+            for mod, apis in self.module2api.items():
+                for api in apis:
+                    n = api.get("name", "")
+                    if n in cands or (n.startswith("run_") and n[4:] == name):
+                        return {"name": n, "module": mod, "description": api.get("description", "")}
+        except Exception:
+            pass
+        return None
+
+    def _set_pinned_tools(self, selected_tools):
+        """Validate + store the tools the user explicitly selected for THIS message.
+        Unknown names are dropped. Empty/None -> [] (so all pinned-tools paths no-op)."""
+        self._pinned_tools = []
+        seen = set()
+        for nm in (selected_tools or []):
+            d = self._resolve_pinned_tool(nm)
+            if d and d["name"] not in seen:
+                seen.add(d["name"])
+                self._pinned_tools.append(d["name"])
+        if self._pinned_tools:
+            try:
+                self._log("PINNED TOOLS", body=", ".join(self._pinned_tools), node="driver")
+            except Exception:
+                pass
+
     def _prepare_resources_for_retrieval(self, prompt):
         """Prepare resources for retrieval and return selected resource names.
         Args:
@@ -6497,7 +6554,7 @@ class BioAgent:
         return "bio-agent-env1"
 
     # AGENT RUNNER
-    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None):
+    def go(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None, selected_tools: list[str] | None = None):
         """Execute the agent with the given prompt.
         Args:
             prompt: The user's query
@@ -6505,8 +6562,9 @@ class BioAgent:
         """
         self.critic_count = 0
         self.user_task = prompt
+        self._set_pinned_tools(selected_tools)   # reset + validate user-selected tools for this message
         thread_id = session_id or str(uuid4())
-        
+
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
         def _is_human(msg) -> bool:
             return getattr(msg, "type", "").lower() == "human"
@@ -6623,7 +6681,7 @@ class BioAgent:
 
             return self.log, last_msg_text
     
-    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None) -> Generator[dict, None, None]:
+    def go_stream(self, prompt, mode: str = "dev", attachments: list[str] | None = None, session_id: str | None = None, cancel_event: Any = None, selected_tools: list[str] | None = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
         This function returns a generator that yields each step of the agent's execution,
         allowing for real-time monitoring of the agent's progress.
@@ -6638,8 +6696,9 @@ class BioAgent:
         """
         self.critic_count = 0
         self.user_task = prompt
+        self._set_pinned_tools(selected_tools)   # reset + validate user-selected tools for this message
         thread_id = session_id or str(uuid4())
-        
+
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
         def _is_human(msg) -> bool:
             return getattr(msg, "type", "").lower() == "human"

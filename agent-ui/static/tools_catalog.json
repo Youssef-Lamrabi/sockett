@@ -1,0 +1,909 @@
+{
+ "tools": [
+  {
+   "name": "fastqc",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "FastQC: per-read quality control on raw FASTQ files.",
+   "installed": true
+  },
+  {
+   "name": "fastp",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "fastp: all-in-one FASTQ adapter trimming, quality filtering, and QC reporting.",
+   "installed": true
+  },
+  {
+   "name": "megahit",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MEGAHIT: ultra-fast de-novo metagenomic assembler.",
+   "installed": true
+  },
+  {
+   "name": "minimap2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "minimap2: fast read mapping for coverage estimation.",
+   "installed": true
+  },
+  {
+   "name": "metabat2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MetaBAT2: metagenomic binning using coverage + tetranucleotide frequency.",
+   "installed": true
+  },
+  {
+   "name": "quast",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "QUAST: Quality Assessment Tool for Genome Assemblies.",
+   "installed": true
+  },
+  {
+   "name": "semibin2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "SemiBin2: deep-learning metagenomic binning.",
+   "installed": true
+  },
+  {
+   "name": "concoct",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "CONCOCT: Clustering CONtigs with COverage and ComposiTion.",
+   "installed": true
+  },
+  {
+   "name": "maxbin2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MaxBin2: binning using marker gene sets and EM algorithm.",
+   "installed": false
+  },
+  {
+   "name": "checkm2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "CheckM2: rapid assessment of genome bin quality using ML.",
+   "installed": true
+  },
+  {
+   "name": "kraken2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Kraken2: ultrafast taxonomic classification using exact k-mer matches.",
+   "installed": true
+  },
+  {
+   "name": "sylph",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Sylph: ultrafast metagenomic profiling via ANI sketching.",
+   "installed": true
+  },
+  {
+   "name": "kaiju",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Kaiju: fast taxonomic classification using protein-level alignments.",
+   "installed": true
+  },
+  {
+   "name": "hmmer",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "HMMER: profile HMM-based protein family annotation.",
+   "installed": true
+  },
+  {
+   "name": "eggnog",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "EggNOG-mapper v2.1.13: functional annotation via orthology.",
+   "installed": true
+  },
+  {
+   "name": "diamond",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "DIAMOND: fast protein alignment (100x faster than BLAST).",
+   "installed": true
+  },
+  {
+   "name": "humann3",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "HUMAnN3: functional profiling of metagenomes and metatranscriptomes.",
+   "installed": false
+  },
+  {
+   "name": "antismash",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "antiSMASH v8.0.4: antibiotic and secondary metabolite biosynthetic gene cluster (BGC) detection.",
+   "installed": true
+  },
+  {
+   "name": "genomad",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "geNomad v1.12.0: identification of viruses and plasmids in metagenomes/genomes (neural-network classif\u2026",
+   "installed": true
+  },
+  {
+   "name": "abricate",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "ABRicate: mass screening of contigs for antimicrobial resistance and virulence genes.",
+   "installed": true
+  },
+  {
+   "name": "seqkit",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "SeqKit: ultrafast toolkit for FASTA/FASTQ manipulation.",
+   "installed": true
+  },
+  {
+   "name": "bbduk",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "BBDuk (BBTools): adapter trimming, quality filtering, contamination removal.",
+   "installed": true
+  },
+  {
+   "name": "dbcan",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "dbCAN v5.2.9: Carbohydrate-Active enZyme (CAZyme) annotation.",
+   "installed": true
+  },
+  {
+   "name": "pharokka",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Pharokka: fast phage annotation pipeline.",
+   "installed": true
+  },
+  {
+   "name": "phyloseq",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Phyloseq + vegan: microbiome community analysis in R.",
+   "installed": true
+  },
+  {
+   "name": "lefse",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "LEfSe (Linear discriminant analysis Effect Size): biomarker discovery between two or more groups.",
+   "installed": true
+  },
+  {
+   "name": "bracken",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Bracken: Bayesian re-estimation of species abundances from Kraken2 reports.",
+   "installed": true
+  },
+  {
+   "name": "metaphlan4",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MetaPhlAn 4.2.4: marker-gene taxonomic profiling.",
+   "installed": true
+  },
+  {
+   "name": "gtdbtk",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "GTDB-Tk: phylogenetic classification of MAGs against the GTDB reference tree.",
+   "installed": true
+  },
+  {
+   "name": "prokka",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Prokka: rapid prokaryote whole genome annotation.",
+   "installed": true
+  },
+  {
+   "name": "medaka",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Medaka: consensus polishing for Oxford Nanopore Technology (ONT) assemblies.",
+   "installed": true
+  },
+  {
+   "name": "rgi",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "RGI (Resistance Gene Identifier) v6.0.8: AMR gene prediction against the CARD database (installed: CAR\u2026",
+   "installed": true
+  },
+  {
+   "name": "amrfinder",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "NCBI AMRFinderPlus v4.2.7: identification of AMR, stress, and virulence genes against the curated NCBI\u2026",
+   "installed": true
+  },
+  {
+   "name": "nonpareil",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Nonpareil: metagenome coverage and sequencing effort estimation.",
+   "installed": true
+  },
+  {
+   "name": "dada2",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "DADA2: amplicon (16S/18S/ITS) denoising \u2014 infers exact amplicon sequence variants (ASVs) from paired-e\u2026",
+   "installed": true
+  },
+  {
+   "name": "multiqc",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MultiQC: aggregate QC reports from many tools (FastQC, fastp, Kraken2, QUAST, samtools, Bowtie2, ...)\u2026",
+   "installed": true
+  },
+  {
+   "name": "insilicoseq",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "InSilicoSeq (iss): modern read simulator for amplicon and shotgun Illumina data \u2014 the recommended way\u2026",
+   "installed": true
+  },
+  {
+   "name": "coverm",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "CoverM: fast per-genome/MAG and per-contig coverage & RELATIVE ABUNDANCE from short reads or pre-made\u2026",
+   "installed": true
+  },
+  {
+   "name": "irep",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "iRep: estimates the in-situ REPLICATION RATE (index of replication, iRep value) of a genome/MAG from t\u2026",
+   "installed": true
+  },
+  {
+   "name": "mob_recon",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MOB-suite (mob_recon): reconstructs PLASMIDS from a genome assembly and predicts their MOBILITY.",
+   "installed": true
+  },
+  {
+   "name": "mob_typer",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MOB-suite (mob_typer): types a SINGLE already-isolated plasmid FASTA for mobility (conjugative | mobil\u2026",
+   "installed": true
+  },
+  {
+   "name": "drep",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "dRep: DEREPLICATES a set of genomes/MAGs into a non-redundant set of representatives by genome-wide AN\u2026",
+   "installed": true
+  },
+  {
+   "name": "load_sequences",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Load FASTA/FASTQ files into lightweight line-delimited TSVs (id, seq[, qual]).",
+   "installed": true
+  },
+  {
+   "name": "write_sequences",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Write sequences to FASTA/FASTQ (optionally gz).",
+   "installed": true
+  },
+  {
+   "name": "subsample_reads",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Randomly subsample reads from FASTA/FASTQ.",
+   "installed": true
+  },
+  {
+   "name": "convert_format",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Convert FASTA<->FASTQ (dummy qualities for FASTA->FASTQ).",
+   "installed": true
+  },
+  {
+   "name": "read_quality_report",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Compute simple QC metrics (read count, avg length, GC%, Ns).",
+   "installed": true
+  },
+  {
+   "name": "trim_filter_reads",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Adapter/quality trimming (toy) and min length filter.",
+   "installed": true
+  },
+  {
+   "name": "kmer_profile",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Count k-mers across reads/contigs and write a TSV spectrum.",
+   "installed": true
+  },
+  {
+   "name": "translate_orfs",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Find ORFs and translate to proteins.",
+   "installed": true
+  },
+  {
+   "name": "gc_content_windows",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Sliding-window GC% over FASTA sequences.",
+   "installed": true
+  },
+  {
+   "name": "deduplicate_sequences",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Collapse identical sequences and output uniques.",
+   "installed": true
+  },
+  {
+   "name": "align_reads_minimap2_like",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Toy alignment wrapper that emits a placeholder BAM (replace in prod).",
+   "installed": true
+  },
+  {
+   "name": "compute_coverage",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Compute per-base/window coverage from BAM (toy: zero coverage).",
+   "installed": true
+  },
+  {
+   "name": "call_variants_simple",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Heuristic pileup-based variant calling (toy: empty VCF header).",
+   "installed": true
+  },
+  {
+   "name": "classify_reads_kmer",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Naive k-mer\u2013style taxonomic assignment against a toy DB.",
+   "installed": true
+  },
+  {
+   "name": "bin_contigs_basic",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Simple binning by length threshold (toy baseline).",
+   "installed": true
+  },
+  {
+   "name": "estimate_complexity",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Alpha diversity estimate (Shannon or richness) from assignments.",
+   "installed": true
+  },
+  {
+   "name": "contamination_screen",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Screen sequences vs contaminant reference (toy: passthrough).",
+   "installed": true
+  },
+  {
+   "name": "predict_genes_baseline",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Toy gene finder using ORFs as CDS features.",
+   "installed": true
+  },
+  {
+   "name": "annotate_functions_hmm",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Use run_prokka() or run_hmmer() instead for real functional annotation.",
+   "installed": true
+  },
+  {
+   "name": "analyze_genomic_region_overlap",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Pairwise overlap metrics for multiple region sets (pure-Python baseline).",
+   "installed": true
+  },
+  {
+   "name": "merge_regions",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Merge overlapping/adjacent intervals per chromosome.",
+   "installed": true
+  },
+  {
+   "name": "intersect_regions",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Intersect two BED-like sets with -wa/-wb/-wo behaviors (baseline).",
+   "installed": true
+  },
+  {
+   "name": "assemble_greedy_baseline",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Very simple greedy baseline assembler (toy concat).",
+   "installed": true
+  },
+  {
+   "name": "scaffold_gc_link",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Crude scaffolding (toy passthrough).",
+   "installed": true
+  },
+  {
+   "name": "multi_sample_summary_report",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Collate artifacts into a small HTML/Markdown report.",
+   "installed": true
+  },
+  {
+   "name": "plot_stackbar_taxa",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Prepare a TSV for stacked bar taxonomic composition (no plotting libs).",
+   "installed": true
+  },
+  {
+   "name": "query_ncbi_taxonomy",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the NCBI Taxonomy database via the Entrez API.",
+   "installed": true
+  },
+  {
+   "name": "query_silva_sequences",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the SILVA ribosomal RNA database \u2014 the gold standard reference for 16S (SSU) and 23S (LSU) rRNA\u2026",
+   "installed": true
+  },
+  {
+   "name": "download_silva_database",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Download the SILVA rRNA reference database (FASTA + taxonomy files) for use with Kraken2 custom databa\u2026",
+   "installed": true
+  },
+  {
+   "name": "query_gtdb_taxonomy",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the GTDB (Genome Taxonomy Database) API for phylogenomics-based taxonomy.",
+   "installed": true
+  },
+  {
+   "name": "query_card_resistance",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the CARD (Comprehensive Antibiotic Resistance Database) for resistance genes.",
+   "installed": true
+  },
+  {
+   "name": "download_card_database",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Download the CARD database (card.json) for use with RGI (Resistance Gene Identifier).",
+   "installed": true
+  },
+  {
+   "name": "query_mgnify_studies",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Search the MGnify (EBI Metagenomics Portal) for publicly available metagenomic studies.",
+   "installed": true
+  },
+  {
+   "name": "query_mgnify_samples",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Retrieve sample metadata and download links from a specific MGnify study.",
+   "installed": true
+  },
+  {
+   "name": "fetch_sra_reads",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Download raw sequencing reads from the NCBI Sequence Read Archive (SRA) using fasterq-dump for fast pa\u2026",
+   "installed": true
+  },
+  {
+   "name": "query_uniprot_proteins",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query UniProt (UniProtKB, UniRef90, UniRef50) for protein annotation information.",
+   "installed": true
+  },
+  {
+   "name": "query_kegg_pathway",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the KEGG REST API for metabolic pathway information.",
+   "installed": true
+  },
+  {
+   "name": "query_kegg_orthology",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the KEGG REST API for a KEGG Orthology (KO) entry.",
+   "installed": true
+  },
+  {
+   "name": "download_vfdb",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Download the VFDB (Virulence Factor Database) protein sequences for local virulence gene detection via\u2026",
+   "installed": true
+  },
+  {
+   "name": "query_cazy_families",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Query the CAZy (Carbohydrate-Active Enzymes) database for enzyme families.",
+   "installed": true
+  },
+  {
+   "name": "virsorter2",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "Run VirSorter2 to identify viral sequences in metagenomic contigs.",
+   "installed": true
+  },
+  {
+   "name": "checkv",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "Run CheckV to assess quality and completeness of viral genomes/contigs.",
+   "installed": true
+  },
+  {
+   "name": "deepvirfinder",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "Run DeepVirFinder for virus identification using deep learning.",
+   "installed": true
+  },
+  {
+   "name": "gget_virus",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "gget virus (gget v0.30.6): DETERMINISTIC RETRIEVAL of viral genome sequences + GenBank metadata from t\u2026",
+   "installed": true
+  },
+  {
+   "name": "annotate_celltype_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Annotate cell types based on gene markers and transferred labels using LLM.",
+   "installed": true
+  },
+  {
+   "name": "annotate_celltype_with_panhumanpy",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform cell type annotation of single-cell RNA-seq data using Panhuman Azimuth Neural Network.",
+   "installed": true
+  },
+  {
+   "name": "create_scvi_embeddings_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Create scVI and scANVI embeddings for single-cell RNA-seq data, saving the results to an AnnData object.",
+   "installed": true
+  },
+  {
+   "name": "create_harmony_embeddings_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Performs batch integration on single-cell RNA-seq data using Harmony and saves the integrated embeddings.",
+   "installed": true
+  },
+  {
+   "name": "get_uce_embeddings_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Generate UCE embeddings for single-cell RNA-seq data and map them to a reference dataset for cell type\u2026",
+   "installed": true
+  },
+  {
+   "name": "map_to_ima_interpret_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Map cell embeddings from the input dataset to the Integrated Megascale Atlas reference dataset using U\u2026",
+   "installed": true
+  },
+  {
+   "name": "get_rna_seq_archs4",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Given a gene name, fetch RNA-seq expression data showing the top K tissues with highest transcripts-pe\u2026",
+   "installed": true
+  },
+  {
+   "name": "get_gene_set_enrichment_analysis_supported_database_list",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Returns a list of supported databases for gene set enrichment analysis.",
+   "installed": true
+  },
+  {
+   "name": "gene_set_enrichment_analysis",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform enrichment analysis for a list of genes, with optional background gene set and plotting functi\u2026",
+   "installed": true
+  },
+  {
+   "name": "analyze_chromatin_interactions",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Analyze chromatin interactions from Hi-C data to identify enhancer-promoter interactions and TADs.",
+   "installed": true
+  },
+  {
+   "name": "analyze_comparative_genomics_and_haplotypes",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform comparative genomics and haplotype analysis on multiple genome samples.",
+   "installed": true
+  },
+  {
+   "name": "perform_chipseq_peak_calling_with_macs2",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform ChIP-seq peak calling using MACS2 to identify genomic regions with significant binding.",
+   "installed": true
+  },
+  {
+   "name": "find_enriched_motifs_with_homer",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Find DNA sequence motifs enriched in genomic regions using the HOMER motif discovery software.",
+   "installed": true
+  },
+  {
+   "name": "analyze_genomic_region_overlap",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Analyze overlaps between two or more sets of genomic regions.",
+   "installed": true
+  },
+  {
+   "name": "create_run",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Create a staging run to upload inputs and produce downloadable artifacts.",
+   "installed": true
+  },
+  {
+   "name": "upload_files",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Upload one or more files into a run (multipart/form-data).",
+   "installed": true
+  },
+  {
+   "name": "list_run_files",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "List files currently staged in a run directory.",
+   "installed": true
+  },
+  {
+   "name": "publish_run",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Publish selected paths (files or folders) from the run to artifact storage and get a manifest with per\u2026",
+   "installed": true
+  },
+  {
+   "name": "get_manifest",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Fetch a previously published manifest for a run.",
+   "installed": true
+  },
+  {
+   "name": "build_download_url",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Utility to build the direct download URL for a known artifact key (not needed if you already use 'down\u2026",
+   "installed": true
+  },
+  {
+   "name": "download_from_ncbi",
+   "category": "NCBI / Web",
+   "icon": "fa-globe",
+   "description": "This function is a Python wrapper around ncbi-genome-download CLI.",
+   "installed": true
+  },
+  {
+   "name": "query_ncbi_entrez",
+   "category": "NCBI / Web",
+   "icon": "fa-globe",
+   "description": "NCBI Entrez Direct (esearch/efetch/esummary) \u2014 METADATA LOOKUP & VERIFICATION (NOT a downloader; for g\u2026",
+   "installed": true
+  },
+  {
+   "name": "search_literature",
+   "category": "NCBI / Web",
+   "icon": "fa-globe",
+   "description": "Literature / scientific web search via the Europe PMC REST API (covers PubMed + PMC + preprints; no AP\u2026",
+   "installed": true
+  },
+  {
+   "name": "web_search",
+   "category": "NCBI / Web",
+   "icon": "fa-globe",
+   "description": "Keyless general-knowledge web lookup via the Wikipedia REST API \u2014 use ONLY to ENRICH INTERPRETATION/RE\u2026",
+   "installed": true
+  }
+ ],
+ "databases": [
+  {
+   "name": "kraken2",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Taxonomic read classification (bacteria/archaea/viral)",
+   "installed": true
+  },
+  {
+   "name": "eggNOG",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Orthology & functional annotation database",
+   "installed": true
+  },
+  {
+   "name": "CARD",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Antibiotic resistance gene reference (RGI)",
+   "installed": true
+  },
+  {
+   "name": "AMRFinderPlus DB",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "NCBI AMR & virulence reference",
+   "installed": true
+  },
+  {
+   "name": "antiSMASH DB",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Biosynthetic gene cluster references",
+   "installed": true
+  },
+  {
+   "name": "MOB-suite plasmids",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Plasmid reference for mobility typing",
+   "installed": true
+  },
+  {
+   "name": "dbCAN",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Carbohydrate-active enzyme (CAZyme) HMMs",
+   "installed": true
+  },
+  {
+   "name": "NCBI Taxonomy",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Taxon names & lineage lookup",
+   "installed": true
+  },
+  {
+   "name": "NCBI Entrez",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Sequence & metadata (nuccore/assembly/SRA)",
+   "installed": true
+  },
+  {
+   "name": "SILVA",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "rRNA (16S/18S/23S) reference",
+   "installed": true
+  },
+  {
+   "name": "GTDB",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Genome Taxonomy Database",
+   "installed": true
+  },
+  {
+   "name": "MGnify",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "EBI metagenomics studies & samples",
+   "installed": true
+  },
+  {
+   "name": "SRA",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Sequencing reads archive",
+   "installed": true
+  },
+  {
+   "name": "UniProt",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Protein sequences & function",
+   "installed": true
+  },
+  {
+   "name": "KEGG",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Pathways & orthology",
+   "installed": true
+  },
+  {
+   "name": "VFDB",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Virulence factor database",
+   "installed": true
+  },
+  {
+   "name": "CAZy",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Carbohydrate-active enzyme families",
+   "installed": true
+  },
+  {
+   "name": "Europe PMC",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Biomedical literature",
+   "installed": true
+  },
+  {
+   "name": "Wikipedia",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "General background context",
+   "installed": true
+  }
+ ]
+}

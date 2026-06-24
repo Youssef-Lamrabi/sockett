@@ -221,6 +221,7 @@ class ChatBody(BaseModel):
     stream: Optional[bool] = True
     interaction_mode: Optional[str] = None
     attachments: Optional[List[AttachmentIn]] = None
+    selected_tools: Optional[List[str]] = None  # tools the user pinned via the @ / Tools panel
 
 @router.post("/sessions/{session_id}/messages")
 async def chat(session_id: int, body: ChatBody, request: Request,
@@ -285,7 +286,8 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                         mode="prod",
                         attachments=attachments,
                         session_id=str(sess.id),
-                        cancel_event=cancel_event
+                        cancel_event=cancel_event,
+                        selected_tools=body.selected_tools,
                     ):
                         if cancel_event.is_set():
                             break
@@ -390,7 +392,7 @@ async def chat(session_id: int, body: ChatBody, request: Request,
         return StreamingResponse(_streamer(), media_type="application/x-ndjson")
 
     # non-stream path (unchanged)
-    log, final = agent.go(body.message, mode="prod", attachments=attachments, session_id=str(sess.id))
+    log, final = agent.go(body.message, mode="prod", attachments=attachments, session_id=str(sess.id), selected_tools=body.selected_tools)
     m_assist = Message(session_id=sess.id, role="assistant", content=final or "")
     db.add(m_assist); db.commit()
     return {"message": final}

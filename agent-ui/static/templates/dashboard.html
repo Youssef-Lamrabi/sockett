@@ -180,12 +180,32 @@ Estimate the in situ replication rates (using iRep or DEMIC) of key taxa and exp
               <span>Workspace</span>
             </button>
           </div>
+          <!-- Tools & Databases panel (opened by the Tools button or by typing @ in the chat) -->
+          <div id="tools-panel" class="tools-panel" hidden role="dialog" aria-label="Tools and databases">
+            <div class="tools-panel-head">
+              <input id="tools-panel-search" class="tools-panel-search" type="text"
+                placeholder="Search tools &amp; databases…" autocomplete="off" />
+              <button id="tools-panel-close" class="tools-panel-close" type="button" aria-label="Close">
+                <i class="fa fa-xmark" aria-hidden="true"></i>
+              </button>
+            </div>
+            <div class="tools-panel-tabs">
+              <button class="tools-tab active" data-tab="tools" type="button">Tools</button>
+              <button class="tools-tab" data-tab="databases" type="button">Databases</button>
+            </div>
+            <div id="tools-panel-list" class="tools-panel-list" aria-live="polite"></div>
+          </div>
           <div id="attach-dock" class="attach-dock" aria-live="polite"></div>
           <div id="composer">
             <label class="upload" title="Attach file" aria-label="Attach file">
               <input type="file" id="file-input" />
               <i class="fa fa-paperclip" aria-hidden="true"></i>
             </label>
+            <button id="btn-tools-panel" class="composer-tools-btn" type="button"
+              title="Tools &amp; databases (or type @)" aria-label="Browse tools and databases"
+              aria-haspopup="true" aria-expanded="false">
+              <i class="fa fa-toolbox" aria-hidden="true"></i>
+            </button>
             <textarea id="message" class="composer-textarea" placeholder="Ask anything about your genomic data…"
               rows="1" autocomplete="off" spellcheck="true"></textarea>
             <button id="send" type="button" class="button-submit" aria-label="Send message">

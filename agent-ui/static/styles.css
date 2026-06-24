@@ -2844,3 +2844,77 @@ ul {
 .exec-mode-menu.open {
     display: block;
 }
+/* ===== Tools & Databases panel (additive — opened by Tools button or "@" in chat) ===== */
+.tools-panel {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 64px;
+    width: 82%;
+    max-width: 760px;
+    max-height: 380px;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel, #fff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 12px;
+    box-shadow: var(--shadow, 0 10px 25px rgba(2,6,23,.12));
+    z-index: 60;
+    overflow: hidden;
+}
+.tools-panel[hidden] { display: none; }
+.tools-panel-head { display: flex; align-items: center; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border, #e2e8f0); }
+.tools-panel-search {
+    flex: 1; border: 1px solid var(--border, #e2e8f0); border-radius: 8px;
+    padding: 7px 10px; font-size: 13px; outline: none; background: var(--bg, #f7f9fc);
+}
+.tools-panel-search:focus { border-color: var(--accent, #2563eb); background: #fff; }
+.tools-panel-close { border: none; background: transparent; cursor: pointer; color: var(--muted, #64748b); font-size: 15px; padding: 4px 8px; }
+.tools-panel-close:hover { color: #0f172a; }
+.tools-panel-tabs { display: flex; gap: 4px; padding: 6px 8px 0; }
+.tools-tab {
+    border: none; background: transparent; cursor: pointer; font-size: 12px; font-weight: 600;
+    color: var(--muted, #64748b); padding: 6px 10px; border-radius: 8px 8px 0 0; border-bottom: 2px solid transparent;
+}
+.tools-tab.active { color: var(--accent, #2563eb); border-bottom-color: var(--accent, #2563eb); }
+.tools-tab-count { font-weight: 500; opacity: .65; font-size: 11px; }
+.tools-panel-list { overflow-y: auto; padding: 6px; }
+.tools-item {
+    display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+}
+.tools-item:hover { background: var(--bg, #f7f9fc); border-color: var(--border, #e2e8f0); }
+.tools-item-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tools-item-name { font-size: 13px; font-weight: 600; color: #0f172a; }
+.tools-item-cat { font-size: 10px; color: var(--accent, #2563eb); background: rgba(37,99,235,.08); padding: 1px 7px; border-radius: 999px; }
+.tools-item-na { font-size: 10px; color: #b45309; background: rgba(180,83,9,.10); padding: 1px 7px; border-radius: 999px; }
+.tools-item-desc { font-size: 11.5px; color: var(--muted, #64748b); line-height: 1.35; }
+.tools-empty { padding: 18px; text-align: center; color: var(--muted, #64748b); font-size: 13px; }
+
+/* compact Tools button inside the composer row (next to the paperclip) */
+.composer-tools-btn {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    cursor: pointer;
+    color: #94a3b8;
+    background: transparent;
+    border-radius: 10px;
+    font-size: 15px;
+    transition: color .15s ease, background .15s ease;
+}
+.composer-tools-btn:hover { color: var(--accent, #2563eb); background: var(--bg, #f7f9fc); }
+.composer-tools-btn[aria-expanded="true"] { color: var(--accent, #2563eb); }
+
+/* tools-item: icon column + body (Biomni-like) */
+.tools-item { flex-direction: row; align-items: flex-start; gap: 10px; }
+.tools-item-icon {
+    flex-shrink: 0; width: 28px; height: 28px; margin-top: 2px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 8px; background: rgba(37,99,235,.08); color: var(--accent, #2563eb); font-size: 13px;
+}
+.tools-item-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }

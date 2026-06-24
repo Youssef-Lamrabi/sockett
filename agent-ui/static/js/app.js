@@ -932,7 +932,9 @@ async function send() {
     mime: a.type,
     size: a.size
   }));
-  const body = JSON.stringify({ message: msg, stream: true, interaction_mode, attachments });
+  // tools pinned by the user via the @ / Tools panel (validated server-side; empty => normal behaviour)
+  const selected_tools = Array.from(new Set((msg.match(/@([A-Za-z0-9_]+)/g) || []).map(s => s.slice(1))));
+  const body = JSON.stringify({ message: msg, stream: true, interaction_mode, attachments, selected_tools });
 
   // F-6: SSE auto-reconnect — max 5 attempts, 3 s delay, visual indicator
   const SSE_MAX_RETRIES = 5;
@@ -2782,3 +2784,154 @@ function _amRenderPickerList(modal, uploads, generated, runDir, closeFn) {
 }
 
 window.addEventListener('DOMContentLoaded', () => { _amInstallLabelIntercept(); });
+
+/* ===================================================================
+ * Tools & Databases panel  (ADDITIVE — self-contained, no globals)
+ * Opened by the "Tools" toolbar button OR by typing "@" in the chat.
+ * Reads /static/tools_catalog.json. Cannot affect existing chat code.
+ * =================================================================== */
+(() => {
+  try {
+    const btn   = document.getElementById('btn-tools-panel');
+    const panel = document.getElementById('tools-panel');
+    const list  = document.getElementById('tools-panel-list');
+    const search= document.getElementById('tools-panel-search');
+    const closeB= document.getElementById('tools-panel-close');
+    const tabsW = panel ? panel.querySelector('.tools-panel-tabs') : null;
+    const msg   = document.getElementById('message');
+    const tCount= document.getElementById('tools-count');
+    const dCount= document.getElementById('db-count');
+    if (!btn || !panel || !list || !search || !msg) return;  // not on this page -> bail safely
+
+    let CATALOG = null;       // {tools:[], databases:[]}
+    let activeTab = 'tools';
+    let loaded = false;
+
+    async function ensureCatalog() {
+      if (loaded) return;
+      loaded = true;
+      try {
+        const r = await fetch('/static/tools_catalog.json', { cache: 'no-cache' });
+        CATALOG = await r.json();
+        if (tCount && CATALOG.tools)     tCount.textContent = '(' + CATALOG.tools.length + ')';
+        if (dCount && CATALOG.databases) dCount.textContent = '(' + CATALOG.databases.length + ')';
+      } catch (e) { CATALOG = { tools: [], databases: [] }; }
+    }
+
+    function render() {
+      if (!CATALOG) return;
+      const items = (activeTab === 'databases' ? CATALOG.databases : CATALOG.tools) || [];
+      const q = (search.value || '').trim().toLowerCase();
+      const filt = q ? items.filter(it =>
+        (it.name || '').toLowerCase().includes(q) ||
+        (it.category || '').toLowerCase().includes(q) ||
+        (it.description || '').toLowerCase().includes(q)) : items;
+      list.innerHTML = '';
+      if (!filt.length) {
+        const d = document.createElement('div');
+        d.className = 'tools-empty';
+        d.textContent = 'No match.';
+        list.appendChild(d);
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      filt.forEach(it => {
+        const row = document.createElement('div');
+        row.className = 'tools-item';
+        const ic = document.createElement('span');
+        ic.className = 'tools-item-icon';
+        const ii = document.createElement('i');
+        ii.className = 'fa ' + (it.icon || 'fa-flask');
+        ii.setAttribute('aria-hidden', 'true');
+        ic.appendChild(ii);
+        row.appendChild(ic);
+        const body = document.createElement('div');
+        body.className = 'tools-item-body';
+        const top = document.createElement('div');
+        top.className = 'tools-item-top';
+        const nm = document.createElement('span');
+        nm.className = 'tools-item-name';
+        nm.textContent = it.name;
+        top.appendChild(nm);
+        if (it.category) {
+          const c = document.createElement('span');
+          c.className = 'tools-item-cat';
+          c.textContent = it.category;
+          top.appendChild(c);
+        }
+        if (it.installed === false) {
+          const na = document.createElement('span');
+          na.className = 'tools-item-na';
+          na.textContent = 'not installed';
+          top.appendChild(na);
+        }
+        body.appendChild(top);
+        if (it.description) {
+          const ds = document.createElement('div');
+          ds.className = 'tools-item-desc';
+          ds.textContent = it.description;
+          body.appendChild(ds);
+        }
+        row.appendChild(body);
+        row.addEventListener('click', () => insertToken(it.name));
+        frag.appendChild(row);
+      });
+      list.appendChild(frag);
+    }
+
+    function insertToken(name) {
+      const token = '@' + name + ' ';
+      const v = msg.value || '';
+      const pos = (typeof msg.selectionStart === 'number') ? msg.selectionStart : v.length;
+      // if there's a trailing "@" just before the cursor, replace it
+      if (pos > 0 && v[pos - 1] === '@') {
+        msg.value = v.slice(0, pos - 1) + token + v.slice(pos);
+      } else {
+        msg.value = v.slice(0, pos) + token + v.slice(pos);
+      }
+      closePanel();
+      msg.focus();
+      msg.dispatchEvent(new Event('input', { bubbles: true })); // keep autosize/handlers in sync
+    }
+
+    async function openPanel() {
+      await ensureCatalog();
+      panel.hidden = false;
+      btn.setAttribute('aria-expanded', 'true');
+      render();
+      search.focus();
+    }
+    function closePanel() {
+      panel.hidden = true;
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    function togglePanel() { panel.hidden ? openPanel() : closePanel(); }
+
+    btn.addEventListener('click', (e) => { e.preventDefault(); togglePanel(); });
+    if (closeB) closeB.addEventListener('click', closePanel);
+    search.addEventListener('input', render);
+    if (tabsW) tabsW.addEventListener('click', (e) => {
+      const t = e.target.closest('.tools-tab'); if (!t) return;
+      activeTab = t.dataset.tab || 'tools';
+      tabsW.querySelectorAll('.tools-tab').forEach(x => x.classList.toggle('active', x === t));
+      search.value = ''; render(); search.focus();
+    });
+
+    // "@" in chat opens the panel — detect from the INSERTED TEXT, not e.key
+    // (layout-independent: on AZERTY/fr "@" comes via AltGr and keyup e.key is unreliable)
+    msg.addEventListener('input', () => {
+      try {
+        const p = (typeof msg.selectionStart === 'number') ? msg.selectionStart : (msg.value || '').length;
+        if (p > 0 && (msg.value || '')[p - 1] === '@') openPanel();
+      } catch (_) {}
+    });
+
+    // close on Escape / click outside
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !panel.hidden) closePanel(); });
+    document.addEventListener('click', (e) => {
+      if (panel.hidden) return;
+      if (panel.contains(e.target) || btn.contains(e.target)) return;
+      closePanel();
+    });
+  } catch (e) { /* never break the page */ console && console.warn && console.warn('tools-panel init skipped:', e); }
+})();
