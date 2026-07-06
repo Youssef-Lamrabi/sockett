@@ -713,7 +713,13 @@ description = [
             "Corrects for read length and k-mer classification biases in Kraken2 output. "
             "Requires a Bracken-built database (same as Kraken2 DB). "
             "Command: bracken -d kraken2_db -i kraken2_report.txt -o output.bracken "
-            "-w bracken_report.txt -r read_length -l S -t threshold."
+            "-w bracken_report.txt -r read_length -l S -t threshold. "
+            "CRITICAL — the `-r <read_length>` MUST match an EXISTING `database<R>mers.kmer_distrib` file "
+            "in the DB directory; Bracken kmer files exist only at BUILT lengths (for "
+            "/home/workshop/kraken2_standard8 these are 50,75,100,150,200,250,300). Do NOT pass the raw "
+            "mean read length (e.g. 200.8 -> 201 has NO file -> Bracken fails, real bug). Instead, in "
+            "Python, glob `database*mers.kmer_distrib` in the DB dir, parse the available integer R "
+            "values, and pass the one NEAREST to the mean read length (200.8 -> 200). Never hard-code 201."
         ),
         "required_parameters": [
             {"name": "kraken2_report", "type": "str",
@@ -1127,7 +1133,12 @@ description = [
             "Needs mash + blast (present) and the MOB-suite DB (mob_init). Runs in meta-env1. "
             "INVOKE AS A CLI via subprocess (e.g. subprocess.run(['mob_recon','-i',...,'-o',...])) — "
             "do NOT `import mob_suite` in Python: it lives in an isolated venv and is NOT importable "
-            "from the run environment."
+            "from the run environment. "
+            "COUNTING PLASMIDS (real bug: an agent reported 125 plasmids by parsing the cluster ID "
+            "'AC125'): the plasmid COUNT = the number of `plasmid_*.fasta` files in the output dir "
+            "(each file is exactly ONE reconstructed plasmid) — equivalently, the number of DATA rows "
+            "in mobtyper_results.txt (or distinct primary_cluster_id in contig_report.txt). NEVER "
+            "extract a number from a plasmid/cluster ID like 'AC125'/'AA114' — those are IDs, not counts."
         ),
         "required_parameters": [
             {"name": "input_fasta", "type": "str",
@@ -1171,12 +1182,19 @@ description = [
             "recover MAGs from MULTIPLE samples/binners and the same organism appears several times — "
             "dRep keeps the single best-quality representative per cluster (default species-level "
             "threshold 95% ANI). "
-            "Command: dRep dereplicate OUT_DIR -g bins/*.fa -p 4 [--genomeInfo checkm2_quality.csv] "
-            "[-sa 0.95] [-comp 50 -con 10] . Pipeline: Mash (fast primary clustering) -> fastANI "
-            "(accurate secondary ANI) -> CheckM2 quality scoring -> picks representatives. "
+            "Command: dRep dereplicate OUT_DIR -g bins/*.fa -p 4 --genomeInfo genomeInfo.csv "
+            "-sa 0.95 -comp 50 -con 10 . "
+            "CRITICAL — `--genomeInfo` IS MANDATORY here (real bug: without it dRep produced 0 "
+            "representatives): dRep's DEFAULT quality step calls CheckM v1 (`checkm`) which is NOT "
+            "installed on this machine (only CheckM2 is). So you MUST pass genome quality yourself via "
+            "`--genomeInfo genomeInfo.csv`, built from the CheckM2 quality_report.tsv of the prior step. "
+            "genomeInfo.csv MUST have the EXACT header `genome,completeness,contamination`, one row per "
+            "bin, where `genome` is the bin FILE BASENAME WITH extension (e.g. bin.1.fa) matching the "
+            "-g inputs. Build it in Python: read checkm2 quality_report.tsv (columns Name, Completeness, "
+            "Contamination), and write genome=<Name>.fa (or the actual bin filename), completeness, "
+            "contamination. Then dRep does Mash -> fastANI -> picks representatives using YOUR scores. "
             "Outputs in OUT_DIR: dereplicated_genomes/ (the representative FASTAs), "
             "data_tables/Cdb.csv (cluster membership) and Wdb.csv (winners). "
-            "Provide CheckM2 results via --genomeInfo to skip re-running quality. "
             "Needs mash + fastANI + checkm2 (all present). Runs in meta-env1. "
             "INVOKE AS A CLI via subprocess (e.g. subprocess.run(['dRep','dereplicate',...])) — "
             "do NOT `import drep` in Python: it lives in an isolated venv and is NOT importable from "
@@ -1200,5 +1218,110 @@ description = [
              "description": "Optional CheckM2 quality CSV (genome,completeness,contamination) to skip re-scoring."},
         ],
         "returns": "dict(output_dir, dereplicated_genomes_dir, summary)",
+    },
+    {
+        "name": "run_blast",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] NCBI BLAST+ 2.16 — sequence similarity search. "
+            "blastn (nucl-vs-nucl), blastp (prot-vs-prot), blastx/tblastn (translated), + makeblastdb "
+            "to build a local DB. Typical: makeblastdb -in ref.fasta -dbtype nucl -out mydb ; then "
+            "blastn -query q.fasta -db mydb -outfmt 6 -evalue 1e-5 -num_threads 4 -out hits.tsv "
+            "(outfmt 6 = tabular). Use to find homologs, verify a gene/contig identity, or screen a "
+            "custom reference. A local BLAST database is installed at /home/workshop/tools/BLAST. "
+            "Available in meta-env1."
+        ),
+        "required_parameters": [
+            {"name": "program", "type": "str", "description": "blastn | blastp | blastx | tblastn."},
+            {"name": "query", "type": "str", "description": "Query FASTA file."},
+            {"name": "db", "type": "str", "description": "BLAST database prefix (build with makeblastdb if needed)."},
+            {"name": "output", "type": "str", "description": "Output path (use -outfmt 6 for tabular)."},
+        ],
+        "optional_parameters": [
+            {"name": "evalue", "type": "str", "default": "1e-5"},
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "max_target_seqs", "type": "int", "default": 25},
+        ],
+        "returns": "dict(output, hit_count, summary)",
+    },
+    {
+        "name": "run_spades",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] SPAdes assembler — higher-accuracy assembly than MEGAHIT for "
+            "ISOLATES and small/medium metagenomes (more RAM-hungry). Use metaSPAdes for metagenomes, "
+            "plasmidSPAdes for plasmids. Command: spades.py --meta -1 R1.fq -2 R2.fq -o out_dir -t 4 "
+            "(isolate: drop --meta; plasmids: plasmidspades.py). Output: out_dir/contigs.fasta + "
+            "scaffolds.fasta. Prefer MEGAHIT for large/high-complexity metagenomes (RAM); SPAdes when "
+            "accuracy matters on a small dataset. Available in meta-env1."
+        ),
+        "required_parameters": [
+            {"name": "read1", "type": "str", "description": "R1 FASTQ."},
+            {"name": "read2", "type": "str", "description": "R2 FASTQ."},
+            {"name": "output_dir", "type": "str", "description": "Output directory (contigs.fasta inside)."},
+        ],
+        "optional_parameters": [
+            {"name": "mode", "type": "str", "default": "meta", "description": "meta | isolate | plasmid."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(contigs, scaffolds, summary)",
+    },
+    {
+        "name": "run_prodigal",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] Prodigal — fast prokaryotic gene/ORF prediction. Command: "
+            "prodigal -i contigs.fasta -a proteins.faa -d genes.fna -o genes.gff -f gff -p meta "
+            "(-p meta for metagenomes/contigs, -p single for one genome). CRITICAL: -f gff is ALWAYS "
+            "required to get a real GFF (without it prodigal writes its native Genbank-like format and "
+            "GFF parsers find 0 CDS). Outputs protein FASTA (.faa), gene nucleotide FASTA (.fna), and "
+            "GFF. Available in meta-env1."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str", "description": "Contigs/genome FASTA."},
+            {"name": "proteins_out", "type": "str", "description": "Output protein FASTA (-a)."},
+            {"name": "gff_out", "type": "str", "description": "Output GFF (-o with -f gff)."},
+        ],
+        "optional_parameters": [
+            {"name": "mode", "type": "str", "default": "meta", "description": "meta | single."},
+        ],
+        "returns": "dict(proteins, gff, orf_count)",
+    },
+    {
+        "name": "run_wgsim",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] wgsim — fast paired-end short-read SIMULATION from a reference "
+            "FASTA (for mock communities / testing). Command: wgsim -N <num_read_pairs> -1 150 -2 150 "
+            "genome.fna reads_R1.fastq reads_R2.fastq. NOTE: wgsim reads carry SYNTHETIC quality (~Phred "
+            "10-15), so a following fastp step should use --disable_quality_filtering (q20 would drop all "
+            "reads). Faster than InSilicoSeq; use iss only when realistic error models are required. "
+            "Available in meta-env1."
+        ),
+        "required_parameters": [
+            {"name": "genome_fasta", "type": "str", "description": "Reference FASTA to simulate from."},
+            {"name": "read1_out", "type": "str", "description": "Output R1 FASTQ."},
+            {"name": "read2_out", "type": "str", "description": "Output R2 FASTQ."},
+            {"name": "num_pairs", "type": "int", "description": "Number of read pairs (-N)."},
+        ],
+        "optional_parameters": [
+            {"name": "read_length", "type": "int", "default": 150},
+        ],
+        "returns": "dict(read1, read2, num_pairs)",
+    },
+    {
+        "name": "run_bedtools",
+        "description": (
+            "[CLI Tool][TIMEOUT: 600s] bedtools — genome arithmetic on intervals (BED/GFF/VCF/BAM). "
+            "Common: bedtools intersect -a A.bed -b B.bed (overlaps); bedtools merge -i sorted.bed "
+            "(collapse overlapping); bedtools genomecov -ibam in.bam -bga (per-base coverage); "
+            "bedtools getfasta -fi ref.fa -bed regions.bed (extract sequences). Use to overlap AMR/BGC "
+            "coordinates with genes, compute coverage over regions, or extract sub-sequences. "
+            "Available in meta-env1."
+        ),
+        "required_parameters": [
+            {"name": "subcommand", "type": "str", "description": "intersect | merge | genomecov | getfasta | ..."},
+            {"name": "inputs", "type": "list", "description": "Input files for the chosen subcommand (BED/GFF/BAM/FASTA)."},
+        ],
+        "optional_parameters": [
+            {"name": "output", "type": "str", "default": None, "description": "Output path (else stdout)."},
+        ],
+        "returns": "dict(output, summary)",
     },
 ]

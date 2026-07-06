@@ -870,6 +870,17 @@ function stopRun() {
   // small immediate feedback (optional)
   const stop = el('stop');
   if (stop) { stop.disabled = true; stop.setAttribute('aria-busy', 'true'); }
+  // Robust immediate cleanup: kill any leftover run Stop button / live spinner in the
+  // logs sidebar so a stopped step doesn't keep spinning (markRunInactive is a no-op
+  // when currentRun is already null).
+  try {
+    const logs = document.getElementById('logs');
+    if (logs) {
+      logs.querySelectorAll('.btn-stop-run').forEach(b => b.remove());
+      logs.querySelectorAll('.log-live').forEach(s => s.remove());
+      logs.querySelectorAll('.fa-spin').forEach(i => i.classList.remove('fa-spin'));
+    }
+  } catch { }
 }
 window.stopCurrentRun = stopRun;
 
@@ -917,7 +928,7 @@ async function send() {
     renderUserMessage(msg);
   }
   // clear composer text + dock (but keep previews alive until after we render)
-  if (textarea) { textarea.value = ''; textarea.style.height = 'auto'; textarea.focus(); }
+  if (textarea) { textarea.value = ''; textarea.style.height = 'auto'; textarea.focus(); textarea.dispatchEvent(new Event('input', { bubbles: true })); }
   pendingUploads.forEach(a => { if (a.localUrl) URL.revokeObjectURL(a.localUrl); });
   pendingUploads = [];
   renderAttachDock();
@@ -1666,19 +1677,50 @@ function _wsHumanTime(iso) {
 function _wsIconForFile(name) {
   const ext = (name || '').split('.').pop().toLowerCase();
   const map = {
+    // Sequences
     fasta: 'fa-dna', fa: 'fa-dna', fna: 'fa-dna', faa: 'fa-dna',
+    pep: 'fa-dna', cds: 'fa-dna', rna: 'fa-dna', ffn: 'fa-dna',
     fastq: 'fa-dna', fq: 'fa-dna',
-    gff: 'fa-list', gff3: 'fa-list', bed: 'fa-list', vcf: 'fa-list',
+    gbk: 'fa-dna', gb: 'fa-dna', genbank: 'fa-dna', gbff: 'fa-dna', embl: 'fa-dna',
+    // Annotations / feature tables
+    gff: 'fa-list', gff3: 'fa-list', gtf: 'fa-list', bed: 'fa-list',
+    vcf: 'fa-list', paf: 'fa-list', maf: 'fa-list', hmm: 'fa-list', biom: 'fa-list',
+    // Phylogenetic trees
+    nwk: 'fa-sitemap', newick: 'fa-sitemap', tree: 'fa-sitemap',
+    treefile: 'fa-sitemap', nex: 'fa-sitemap', nexus: 'fa-sitemap',
+    // Alignments
+    aln: 'fa-align-left', sto: 'fa-align-left', stk: 'fa-align-left',
+    msa: 'fa-align-left', phy: 'fa-align-left', phylip: 'fa-align-left',
+    // Plain text / docs
     txt: 'fa-file-alt', md: 'fa-file-alt', log: 'fa-file-alt',
+    report: 'fa-file-alt', out: 'fa-file-alt', err: 'fa-file-alt',
+    kreport: 'fa-file-alt', stats: 'fa-file-alt', summary: 'fa-file-alt',
+    // Config / structured
     json: 'fa-code', yaml: 'fa-code', yml: 'fa-code', xml: 'fa-code',
-    tsv: 'fa-table', csv: 'fa-table',
+    ini: 'fa-code', cfg: 'fa-code', conf: 'fa-code', toml: 'fa-code',
+    // Code
+    js: 'fa-file-code', ts: 'fa-file-code', py: 'fa-file-code', ipynb: 'fa-file-code',
+    sh: 'fa-file-code', bash: 'fa-file-code', r: 'fa-file-code', pl: 'fa-file-code',
+    rb: 'fa-file-code', css: 'fa-file-code', c: 'fa-file-code', cpp: 'fa-file-code',
+    // Tables / data
+    tsv: 'fa-table', csv: 'fa-table', tab: 'fa-table', tabular: 'fa-table',
+    parquet: 'fa-table', feather: 'fa-table', npy: 'fa-table', npz: 'fa-table',
+    pkl: 'fa-table', h5: 'fa-table', hdf5: 'fa-table', depth: 'fa-table', cov: 'fa-table',
+    // Web
     html: 'fa-file-code', htm: 'fa-file-code',
+    // Images
     png: 'fa-image', jpg: 'fa-image', jpeg: 'fa-image',
-    gif: 'fa-image', svg: 'fa-image', webp: 'fa-image', bmp: 'fa-image',
+    gif: 'fa-image', svg: 'fa-image', webp: 'fa-image', bmp: 'fa-image', ico: 'fa-image',
     pdf: 'fa-file-pdf',
-    zip: 'fa-file-archive', gz: 'fa-file-archive',
-    tar: 'fa-file-archive', bz2: 'fa-file-archive',
+    // Archives
+    zip: 'fa-file-archive', gz: 'fa-file-archive', tgz: 'fa-file-archive',
+    tar: 'fa-file-archive', bz2: 'fa-file-archive', xz: 'fa-file-archive',
+    // Alignments / indexes / binary DBs
     bam: 'fa-database', sam: 'fa-database', cram: 'fa-database',
+    fai: 'fa-database', bai: 'fa-database', csi: 'fa-database', tbi: 'fa-database',
+    msh: 'fa-database', k2d: 'fa-database', kmer_distrib: 'fa-database',
+    mmi: 'fa-database', bt2: 'fa-database', amb: 'fa-database', ann: 'fa-database',
+    nhr: 'fa-database', nin: 'fa-database', nsq: 'fa-database', db: 'fa-database',
   };
   return map[ext] || 'fa-file';
 }
@@ -1971,6 +2013,10 @@ function openFilePreview(relPath) {
     <div class="fe-preview-toolbar">
       <i class="fa ${_wsIconForFile(relPath)}" aria-hidden="true"></i>
       <span class="fe-preview-name" title="${_wsEscHtml(relPath)}">${_wsEscHtml(baseName)}</span>
+      <button class="fe-preview-expand icon" type="button"
+              title="Expand preview" aria-label="Expand preview">
+        <i class="fa fa-up-right-and-down-left-from-center" aria-hidden="true"></i>
+      </button>
       <button class="fe-preview-dl icon" type="button"
               title="Download" aria-label="Download file">
         <i class="fa fa-download" aria-hidden="true"></i>
@@ -1990,8 +2036,20 @@ function openFilePreview(relPath) {
   const activeBtn = body.querySelector(`.fe-file-item[data-path="${CSS.escape(relPath)}"]`);
   if (activeBtn) activeBtn.classList.add('active');
 
-  // Wire close + download
+  // Wire close + expand + download
   region.querySelector('.fe-preview-close').addEventListener('click', closeInlinePreview);
+  const expBtn = region.querySelector('.fe-preview-expand');
+  if (body.classList.contains('fe-preview-full')) {
+    const ic0 = expBtn.querySelector('i');
+    if (ic0) ic0.className = 'fa fa-down-left-and-up-right-to-center';
+    expBtn.title = 'Shrink preview';
+  }
+  expBtn.addEventListener('click', () => {
+    const on = body.classList.toggle('fe-preview-full');
+    const ic = expBtn.querySelector('i');
+    if (ic) ic.className = on ? 'fa fa-down-left-and-up-right-to-center' : 'fa fa-up-right-and-down-left-from-center';
+    expBtn.title = on ? 'Shrink preview' : 'Expand preview';
+  });
   region.querySelector('.fe-preview-dl').addEventListener('click', () => {
     _wsDownloadFile(url, baseName).catch(err => {
       try { notify('error', `Download failed: ${err?.message || err}`); } catch { }
@@ -2013,6 +2071,7 @@ function closeInlinePreview() {
   const list = body.querySelector('.fe-list-region');
   if (list) list.style.flex = '';   // restore default sizing
   body.classList.remove('has-preview');
+  body.classList.remove('fe-preview-full');
   _wsPreviewedPath = null;
   body.querySelectorAll('.fe-file-item.active').forEach(el => el.classList.remove('active'));
 }
@@ -2106,7 +2165,10 @@ async function _wsLoadPreviewContent(url, relPath, container) {
     'bed', 'gff', 'gff3', 'vcf', 'sam', 'paf', 'maf', 'gtf',
     'tab', 'tabular', 'tree', 'nwk', 'newick',
     'report', 'kreport', 'out', 'err', 'stats', 'summary', 'ini', 'cfg', 'conf',
-    'sh', 'py', 'r', 'pl', 'js', 'css', 'fai', 'tsv.gz' // last is a hint
+    'sh', 'bash', 'py', 'ipynb', 'r', 'pl', 'rb', 'js', 'ts', 'css', 'fai', 'tsv.gz',
+    // extra bioinformatics text formats
+    'gbk', 'gb', 'genbank', 'gbff', 'embl', 'aln', 'sto', 'stk', 'msa',
+    'phy', 'phylip', 'nex', 'nexus', 'hmm', 'biom', 'toml', 'ffn', 'pep', 'cds', 'depth', 'cov'
   ]);
   const fastaExt = new Set(['fasta', 'fa', 'fna', 'faa', 'pep', 'cds', 'rna', 'fastq', 'fq']);
 
@@ -2229,6 +2291,27 @@ async function _wsLoadPreviewContent(url, relPath, container) {
             `\n\n--- showing first ${LINE_CAP} lines of ${lines.length} (full file ${_wsHumanSize(buf.byteLength)}) ---`;
         }
         container.innerHTML = `<pre class="fe-preview-pre fe-preview-mono">${_wsEscHtml(text)}</pre>`;
+        return;
+      }
+      // --- Structured tabular data (TSV/CSV/tab) → render as an HTML TABLE ---
+      const _tableExt = new Set(['tsv', 'csv', 'tab', 'tabular']);
+      if (_tableExt.has(ext)) {
+        const sep = (ext === 'csv') ? ',' : '\t';
+        const splitLine = (sep === ',')
+          ? (l) => { const out = []; let cur = '', q = false; for (let i = 0; i < l.length; i++) { const c = l[i]; if (c === '"') { if (q && l[i + 1] === '"') { cur += '"'; i++; } else q = !q; } else if (c === ',' && !q) { out.push(cur); cur = ''; } else cur += c; } out.push(cur); return out; }
+          : (l) => l.split('\t');
+        const rows = text.replace(/\r/g, '').split('\n').filter(l => l.length);
+        const ROW_CAP = 1000;
+        const shown = rows.slice(0, ROW_CAP);
+        const header = splitLine(shown[0] || '');
+        const th = header.map(h => `<th>${_wsEscHtml(h)}</th>`).join('');
+        const trs = shown.slice(1).map(r => {
+          const cells = splitLine(r);
+          return '<tr>' + header.map((_, i) => `<td>${_wsEscHtml(cells[i] ?? '')}</td>`).join('') + '</tr>';
+        }).join('');
+        const note = (rows.length > ROW_CAP)
+          ? `<div class="fe-preview-muted">showing first ${ROW_CAP} of ${rows.length} rows — use download for the full file</div>` : '';
+        container.innerHTML = `<div class="fe-table-wrap"><table class="fe-preview-table"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>${note}`;
         return;
       }
       if (buf.byteLength > TEXT_CAP) {
@@ -2947,4 +3030,48 @@ window.addEventListener('DOMContentLoaded', () => { _amInstallLabelIntercept(); 
       closePanel();
     });
   } catch (e) { /* never break the page */ console && console.warn && console.warn('tools-panel init skipped:', e); }
+})();
+
+/* ===================================================================
+ * Inline @tool highlighting in the composer  (ADDITIVE, self-contained)
+ * Renders @toolname mentions in a coloured overlay behind the textarea so
+ * users can tell tools from plain text (Biomni-style). The textarea keeps ALL
+ * its behaviour; the overlay is pointer-events:none. If anything fails, the
+ * composer works normally (just uncoloured).
+ * =================================================================== */
+(() => {
+  try {
+    const ta = document.getElementById('message');
+    if (!ta || ta.dataset.hlWired) return;
+    ta.dataset.hlWired = '1';
+
+    // wrap the textarea and add a highlight layer behind it (no HTML edit needed)
+    const wrap = document.createElement('div');
+    wrap.className = 'ta-hl-wrap';
+    ta.parentNode.insertBefore(wrap, ta);
+    const hl = document.createElement('div');
+    hl.className = 'ta-hl';
+    hl.setAttribute('aria-hidden', 'true');
+    wrap.appendChild(hl);
+    wrap.appendChild(ta);
+
+    // mirror the textarea's own metrics so the overlay text aligns exactly
+    const cs = getComputedStyle(ta);
+    ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight',
+     'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'textIndent',
+     'textTransform', 'wordSpacing', 'tabSize', 'boxSizing'].forEach(p => {
+      try { hl.style[p] = cs[p]; } catch (_) {}
+    });
+
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    function render() {
+      const html = esc(ta.value).replace(/@([A-Za-z0-9_]+)/g, '<span class="ta-tok">@$1</span>');
+      hl.innerHTML = html + '\n';          // trailing newline preserves last-line height
+      hl.scrollTop = ta.scrollTop;
+    }
+    ta.addEventListener('input', render);
+    ta.addEventListener('scroll', () => { hl.scrollTop = ta.scrollTop; });
+    ta.classList.add('ta-hl-on');          // make textarea text transparent, keep caret
+    render();
+  } catch (e) { /* never break the composer */ }
 })();

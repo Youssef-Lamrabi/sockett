@@ -49,6 +49,7 @@ def _run_in_env(
     extra_env: Optional[Mapping[str, str]] = None,
     check: bool = False,
     input_text: Optional[str] = None,
+    cancel_event: Any = None,
 ) -> subprocess.CompletedProcess[str]:
     """
     Run argv inside micromamba env <env_name> and capture output.
@@ -119,15 +120,83 @@ def _run_in_env(
             raise subprocess.CalledProcessError(rc, cmd, stdout, stderr)
         return result
 
-    # Linux / macOS: plain subprocess.run is fine (OS kills the child group on kill()).
-    return subprocess.run(
+    # Linux / macOS: run in a NEW SESSION (own process group) so a user Stop or a
+    # timeout can kill the WHOLE tree (micromamba -> python -> wget/...). A plain
+    # subprocess.run() blocks and cannot be interrupted mid-run, so a long download
+    # kept running after the user clicked Stop. Output pipes are drained in threads
+    # to avoid the classic fill-the-buffer deadlock.
+    import signal as _signal, time as _time, threading as _threading
+    proc = subprocess.Popen(
         cmd,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        check=check,
-        timeout=timeout,
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
     )
+    _out_chunks: list = []
+    _err_chunks: list = []
+
+    def _drain(pipe, buf):
+        try:
+            for chunk in iter(lambda: pipe.read(65536), b""):
+                buf.append(chunk)
+        except Exception:
+            pass
+
+    _t_out = _threading.Thread(target=_drain, args=(proc.stdout, _out_chunks), daemon=True)
+    _t_err = _threading.Thread(target=_drain, args=(proc.stderr, _err_chunks), daemon=True)
+    _t_out.start(); _t_err.start()
+    if input_text is not None and proc.stdin:
+        try:
+            proc.stdin.write(input_text.encode()); proc.stdin.close()
+        except Exception:
+            pass
+
+    def _killpg():
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+            except Exception:
+                pass
+
+    _deadline = (_time.monotonic() + timeout) if timeout else None
+    _cancelled = False
+    while True:
+        try:
+            proc.wait(timeout=0.4)
+            break                      # process finished on its own
+        except subprocess.TimeoutExpired:
+            pass
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            _cancelled = True
+            _killpg()
+            break
+        if _deadline is not None and _time.monotonic() > _deadline:
+            _killpg()
+            _t_out.join(2); _t_err.join(2)
+            raise subprocess.TimeoutExpired(
+                cmd, timeout,
+                output=b"".join(_out_chunks),
+                stderr=b"".join(_err_chunks),
+            )
+
+    _t_out.join(2); _t_err.join(2)
+    stdout = b"".join(_out_chunks).decode("utf-8", errors="replace")
+    stderr = b"".join(_err_chunks).decode("utf-8", errors="replace")
+    rc = proc.returncode if proc.returncode is not None else -15
+    if _cancelled:
+        stderr = (stderr + "\n[cancelled by user]").strip()
+    result = subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+    if check and rc != 0 and not _cancelled:
+        raise subprocess.CalledProcessError(rc, cmd, stdout, stderr)
+    return result
     
 def _tail(text: str, limit: int = 20000) -> str:
     if not text:
@@ -150,7 +219,7 @@ def _format_proc_error(title: str, cmd: list[str] | str, rc: int, stdout: str, s
 # Desc: Helper function for LLM to run R code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None) -> str:
+def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None, cancel_event: Any = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     code = (code or "").strip()
     if not code: 
@@ -165,7 +234,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeou
                 ensure_env(env_name, auto_install=True, log_cb=log_cb)
             except Exception as _env_err:
                 return f"Environment '{env_name}' is not available: {_env_err}" 
-            proc = _run_in_env(env_name, ["Rscript", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env)
+            proc = _run_in_env(env_name, ["Rscript", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env, cancel_event=cancel_event)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -210,7 +279,7 @@ def run_r_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeou
 # Desc: Helper function for LLM to run bash_code code while using tools
 # TODO: This tool doesn't accept input agrs yet. To be done.
 # ------------------------------------------------------------------------------------------
-def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None) -> str:
+def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None, cancel_event: Any = None) -> str:
     os.makedirs(settings.run_dir, exist_ok=True)
     script = (script or "").strip()
     if not script: 
@@ -244,7 +313,7 @@ def run_bash_script(script: str, *, env_name: Optional[str] = None, log_cb=None,
             except Exception as _env_err:
                 return f"Environment '{env_name}' is not available: {_env_err}"
 
-            proc = _run_in_env(env_name, ["bash", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env)
+            proc = _run_in_env(env_name, ["bash", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env, cancel_event=cancel_event)
             cmd_display = proc.args if hasattr(proc, "args") else ["bash", path]
             if proc.returncode == 0:
                 return proc.stdout or ""
@@ -319,7 +388,7 @@ def run_cli_command(command: str, *, env_name: Optional[str] = None, log_cb=None
 # Function: run_python_code
 # Desc: Executes Python code inside a micromamba env if provided, otherwise in a persistent REPL.
 # ------------------------------------------------------------------------------------------
-def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None) -> str:
+def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, timeout: Optional[float] = None, extra_env: Optional[Mapping[str, str]] = None, cancel_event: Any = None) -> str:
     """
     Executes the provided Python code.
     - If env_name is provided: runs it in that micromamba env (fresh process).
@@ -342,7 +411,7 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, t
                 path = f.name
 
             try:
-                proc = _run_in_env(env_name, ["python", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env)
+                proc = _run_in_env(env_name, ["python", path], timeout=timeout or settings.timeout_seconds, extra_env=extra_env, cancel_event=cancel_event)
             except subprocess.TimeoutExpired as te:
                 cmd_display = getattr(te, "cmd", ["python", path])
                 return (

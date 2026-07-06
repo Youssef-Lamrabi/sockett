@@ -226,6 +226,9 @@ class BioAgent:
         # Empty by default -> every pinned-tools code path is a no-op -> behaviour unchanged.
         # Reset per message in go()/go_stream() via _set_pinned_tools().
         self._pinned_tools = []
+        # Cancel signal for the CURRENT message; set in go()/go_stream(), read by the
+        # executor so a Stop click kills the running subprocess tree (not just the loop).
+        self._cancel_event = None
 
         # Optional secondary LLM for biological domain hints (bio_hint node)
         self.bio_hint_llm = bio_hint_llm
@@ -2850,7 +2853,7 @@ class BioAgent:
                     out = run_with_timeout(
                         run_r_code,
                         args=[r_code],
-                        kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env},
+                        kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env, "cancel_event": getattr(self, "_cancel_event", None)},
                         timeout=timeout
                     )
                 elif (code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI")):
@@ -2859,7 +2862,7 @@ class BioAgent:
                         out = run_with_timeout(
                             run_bash_script,
                             args=[cli_command],
-                            kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env},
+                            kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env, "cancel_event": getattr(self, "_cancel_event", None)},
                             timeout=timeout
                         )
                     else:
@@ -2867,7 +2870,7 @@ class BioAgent:
                         out = run_with_timeout(
                             run_bash_script,
                             args=[bash_script],
-                            kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env},
+                            kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env, "cancel_event": getattr(self, "_cancel_event", None)},
                             timeout=timeout
                         )
                 else:
@@ -2885,7 +2888,7 @@ class BioAgent:
                     out = run_with_timeout(
                         run_python_code,
                         args=[code],
-                        kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env},
+                        kwargs={"env_name": env, "timeout": timeout, "extra_env": _extra_env, "cancel_event": getattr(self, "_cancel_event", None)},
                         timeout=timeout
                     )
 
@@ -6583,6 +6586,7 @@ class BioAgent:
         self.critic_count = 0
         self.user_task = prompt
         self._set_pinned_tools(selected_tools)   # reset + validate user-selected tools for this message
+        self._cancel_event = cancel_event        # so the executor can kill the running subprocess on Stop
         thread_id = session_id or str(uuid4())
 
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"
@@ -6717,6 +6721,7 @@ class BioAgent:
         self.critic_count = 0
         self.user_task = prompt
         self._set_pinned_tools(selected_tools)   # reset + validate user-selected tools for this message
+        self._cancel_event = cancel_event        # so the executor can kill the running subprocess on Stop
         thread_id = session_id or str(uuid4())
 
         assert mode in ("dev", "prod"), "mode must be 'dev' or 'prod'"

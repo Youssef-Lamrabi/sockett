@@ -61,7 +61,7 @@
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "MaxBin2: binning using marker gene sets and EM algorithm.",
-   "installed": false
+   "installed": true
   },
   {
    "name": "checkm2",
@@ -117,7 +117,7 @@
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "HUMAnN3: functional profiling of metagenomes and metatranscriptomes.",
-   "installed": false
+   "installed": true
   },
   {
    "name": "antismash",
@@ -292,6 +292,41 @@
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "dRep: DEREPLICATES a set of genomes/MAGs into a non-redundant set of representatives by genome-wide AN\u2026",
+   "installed": true
+  },
+  {
+   "name": "blast",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "NCBI BLAST+ 2.16 \u2014 sequence similarity search.",
+   "installed": true
+  },
+  {
+   "name": "spades",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "SPAdes assembler \u2014 higher-accuracy assembly than MEGAHIT for ISOLATES and small/medium metagenomes (mo\u2026",
+   "installed": true
+  },
+  {
+   "name": "prodigal",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Prodigal \u2014 fast prokaryotic gene/ORF prediction.",
+   "installed": true
+  },
+  {
+   "name": "wgsim",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "wgsim \u2014 fast paired-end short-read SIMULATION from a reference FASTA (for mock communities / testing).",
+   "installed": true
+  },
+  {
+   "name": "bedtools",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "bedtools \u2014 genome arithmetic on intervals (BED/GFF/VCF/BAM).",
    "installed": true
   },
   {
@@ -819,6 +854,13 @@
    "category": "Database",
    "icon": "fa-database",
    "description": "Carbohydrate-active enzyme (CAZyme) HMMs",
+   "installed": true
+  },
+  {
+   "name": "BLAST DB (local)",
+   "category": "Database",
+   "icon": "fa-database",
+   "description": "Local BLAST database at ~/tools/BLAST",
    "installed": true
   },
   {

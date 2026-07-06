@@ -877,7 +877,10 @@ function renderStatusBox(value = "") {
   const val = String(value || '').trim() || 'unknown';
   const lower = val.toLowerCase();
   let color = '#CCE6CC', border = '#9BD09B', text = '#0B6B0B', icon = 'fa-check';
-  if (['running', 'in-progress', 'busy', 'done'].includes(lower)) { color = '#CCE6CC'; border = '#9BD09B'; text = '#0B6B0B'; icon = 'fa-check'; }
+  // 'running/in-progress' is NOT 'done' — render it amber (in-progress), so a step
+  // interrupted by Stop is not shown as a green success check on reload.
+  if (['running', 'in-progress', 'busy'].includes(lower)) { color = '#FEF3C7'; border = '#FCD34D'; text = '#92400E'; icon = 'fa-hourglass-half'; }
+  if (['done', 'finished', 'complete', 'success', 'succeeded'].includes(lower)) { color = '#CCE6CC'; border = '#9BD09B'; text = '#0B6B0B'; icon = 'fa-check'; }
   if (['error', 'failed', 'fail', 'blocked'].includes(lower)) { color = '#FFE3E3'; border = '#F5B7B7'; text = '#8b0000'; icon = 'fa-times'; }
   // Canceled / stopped by the user → neutral grey (NOT a green success check).
   if (/cancel|stopped|aborted/.test(lower)) { color = '#EDEFF2'; border = '#CBD2DA'; text = '#5b6470'; icon = 'fa-ban'; }

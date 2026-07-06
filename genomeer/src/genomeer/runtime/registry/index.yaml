@@ -110,6 +110,15 @@ envs:
       - bowtie2
       - bowtie2-build
       - bwa
+      - coverm
+      - mob_recon
+      - mob_typer
+      - mob_cluster
+      - mob_init
+      - drep
+      - irep
+      - mash
+      - fastani
     provides_py:
       - biopython
       - numpy

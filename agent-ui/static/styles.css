@@ -2233,6 +2233,72 @@ ul {
     line-height: 1.35;
 }
 
+/* --- Structured tabular preview (TSV/CSV) rendered as a table ---------- */
+.fe-table-wrap {
+    overflow: auto;
+    max-width: 100%;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+}
+
+.fe-preview-table {
+    border-collapse: collapse;
+    font-size: 11.5px;
+    color: #1e293b;
+    width: max-content;
+    min-width: 100%;
+    font-variant-numeric: tabular-nums;
+}
+
+.fe-preview-table th,
+.fe-preview-table td {
+    border: 1px solid #e5e7eb;
+    padding: 4px 10px;
+    text-align: left;
+    white-space: nowrap;
+    max-width: 420px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.fe-preview-table thead th {
+    position: sticky;
+    top: 0;
+    background: #f1f5f9;
+    font-weight: 600;
+    color: #334155;
+    z-index: 1;
+}
+
+.fe-preview-table tbody tr:nth-child(even) {
+    background: #f8fafc;
+}
+
+.fe-preview-table tbody tr:hover {
+    background: #eef2ff;
+}
+
+/* --- Expanded preview: preview fills the panel, file list collapses ---- */
+.fe-preview-expand {
+    margin-left: 2px;
+}
+
+#file-explorer .fe-body.fe-preview-full .fe-list-region {
+    flex: 0 0 0;
+    height: 0;
+    min-height: 0;
+    overflow: hidden;
+    border-bottom: 0;
+}
+
+#file-explorer .fe-body.fe-preview-full .fe-hsplitter {
+    display: none;
+}
+
+#file-explorer .fe-body.fe-preview-full .fe-preview-region {
+    flex: 1 1 100%;
+}
+
 .fe-preview-unsupported {
     text-align: center;
     padding: 32px 16px;
@@ -2918,3 +2984,17 @@ ul {
     border-radius: 8px; background: rgba(37,99,235,.08); color: var(--accent, #2563eb); font-size: 13px;
 }
 .tools-item-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+
+/* ===== Inline @tool highlighting in the composer (overlay behind the textarea) ===== */
+.ta-hl-wrap { flex: 1; position: relative; display: flex; min-width: 0; }
+.ta-hl-wrap > .composer-textarea { flex: 1; position: relative; z-index: 1; }
+.composer-textarea.ta-hl-on { color: transparent; caret-color: #0f172a; }
+.ta-hl {
+    position: absolute; inset: 0; margin: 0; z-index: 0; pointer-events: none;
+    white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
+    overflow: hidden; color: #0f172a; box-sizing: border-box;
+}
+.ta-tok {
+    color: #2563eb; font-weight: 600;
+    background: rgba(37, 99, 235, .10); border-radius: 4px;
+}

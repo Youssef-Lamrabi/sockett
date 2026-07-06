@@ -811,6 +811,29 @@ SPECIAL ALWAYS-TRUE RULES:
   `import shutil; shutil.rmtree(output_dir, ignore_errors=True)` — OR use a fresh not-yet-existing
   output path. This removes ONLY the tool's own output (created by a prior agent attempt), never user
   data. (Prokka is the exception: it has --force, so use that instead.)
+- PUBLIC DATA DOWNLOAD — VERIFY the source, never trust a URL recalled from memory (real failure:
+  the agent guessed FastQC/Babraham example FASTQ URLs that are now HTTP 404, then retried
+  master->main variants of the same dead URL 3x and the whole run stalled). When fetching raw
+  reads / FASTQ / public files:
+  * READS with an SRA/ENA accession (SRR/ERR/DRR/SRP/ERP/…) OR any "download reads" task: resolve it
+    via `fasterq-dump <ACC>` (use `prefetch <ACC>` first for large runs) — the reliable canonical
+    path. Do NOT hand-write an ftp:// URL from memory.
+  * If you ONLY have a URL: HEAD-check it FIRST with `curl -sI <url>` and confirm HTTP 200 BEFORE
+    wget/urllib. NEVER download a URL you have not verified is alive.
+  * On a 404 / dead URL: do NOT retry variants of the SAME url (master<->main, http<->https). SWITCH
+    STRATEGY — resolve a real SRA/ENA accession and use fasterq-dump instead. A verified small public
+    paired-read set that works today: ENA run ERR14195204 (fasterq-dump ERR14195204).
+- GENOME by ACCESSION (GCF_/GCA_) — ncbi-genome-download SUMMARY-PARSE FALLBACK (real failure 2026-07:
+  ncbi-genome-download 0.3.3 aborts with `Invalid line length in summary file` / `'submitter' is not
+  in list` because NCBI added a column to assembly_summary.txt that the OLD parser rejects — this
+  breaks EVERY ncbi-genome-download call and NO retry of the same command fixes it). If
+  ncbi-genome-download fails that way, do NOT retry it — switch to a DIRECT deterministic FTP download
+  that needs no summary file:
+    acc = "GCF_000240185.1"; pfx, num = acc.split("_"); num = num.split(".")[0]   # -> 000240185
+    ftp_dir = f"https://ftp.ncbi.nlm.nih.gov/genomes/all/{pfx}/{num[0:3]}/{num[3:6]}/{num[6:9]}/"
+    # list ftp_dir (urllib/curl), find the dir name that STARTS WITH acc (e.g. GCF_000240185.1_ASM24018v2),
+    # then download from f"{ftp_dir}{asm}/" :  {asm}_genomic.fna.gz  AND  {asm}_assembly_report.txt
+  Confirm HTTP 200, then gunzip the .fna.gz. Deterministic, bypasses the broken summary parser.
 - Prodigal ALWAYS requires -f gff to produce a real GFF file. Without -f, it writes its native
   Genbank-like format regardless of the output filename — GFF parsers will find 0 CDS features.
   This applies to ALL modes: -p meta, -p single, -p ab initio — -f gff is ALWAYS required.
