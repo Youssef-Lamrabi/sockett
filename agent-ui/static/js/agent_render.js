@@ -134,7 +134,9 @@ function removeApproveButtonsExcept(scopeCard) {
 function markRunInactive() {
   if (!currentRun?.logsEl) return;
   const btn = currentRun.logsEl.querySelector('.btn-stop-run');
-  if (btn) btn.remove();               // fully remove (or: btn.style.display = 'none')
+  if (btn) btn.remove();                       // remove the Stop button
+  const live = currentRun.logsEl.querySelector('.log-live');
+  if (live) live.style.display = 'none';       // hide the run-card's own live spinner
   currentRun = null;
 }
 
@@ -441,7 +443,7 @@ function renderCollapsibleLog(tag, body) {
   }
 
   const preOpen = isExec
-    ? `<pre style="margin:0;white-space:pre-wrap;background:#0d1117;color:#c9d1d9;border-radius:8px;overflow:auto;"><code>`
+    ? `<pre style="margin:0;white-space:pre-wrap;background:#f6f8fa;color:#24292f;border:1px solid #e1e4e8;border-radius:8px;overflow:auto;"><code>`
     : `<pre style="margin:0;white-space:pre-wrap;"><code>`;
   const preClose = `</code></pre>`;
 
@@ -520,10 +522,18 @@ export function renderLogBlock(tag, body) {
   if (upper === 'STATUS') {
     const val = parseStatusValue(String(body || '')) || (String(body || '').trim() || '');
     const el = renderStatusBox(val);
-    setLastLogLive(el);
     const v = String(body || '').trim().toLowerCase();
-    if (/(done|finished|complete|success|succeeded|cancel(l)?ed|error|failed)/i.test(v)) {
+    const isTerminal =
+      /(done|finished|complete|success|succeeded|cancel(l)?ed|error|failed|blocked|stopped|aborted)/i.test(v);
+    if (isTerminal) {
+      // Terminal status → STOP the live spinner rather than hand it to this box.
+      // Bug fix: a "Canceled by user" status used to call setLastLogLive(), which
+      // ADDED a fa-spin spinner, so a stopped run kept looking like it was running.
+      clearLiveSpinner();
       markRunInactive();
+    } else {
+      // Still-running status → move the live spinner onto this box.
+      setLastLogLive(el);
     }
     return;
   }
@@ -869,6 +879,8 @@ function renderStatusBox(value = "") {
   let color = '#CCE6CC', border = '#9BD09B', text = '#0B6B0B', icon = 'fa-check';
   if (['running', 'in-progress', 'busy', 'done'].includes(lower)) { color = '#CCE6CC'; border = '#9BD09B'; text = '#0B6B0B'; icon = 'fa-check'; }
   if (['error', 'failed', 'fail', 'blocked'].includes(lower)) { color = '#FFE3E3'; border = '#F5B7B7'; text = '#8b0000'; icon = 'fa-times'; }
+  // Canceled / stopped by the user → neutral grey (NOT a green success check).
+  if (/cancel|stopped|aborted/.test(lower)) { color = '#EDEFF2'; border = '#CBD2DA'; text = '#5b6470'; icon = 'fa-ban'; }
 
   const div = document.createElement('div');
   div.className = 'tag-block tag-status';

@@ -40,6 +40,43 @@ class ContractResult:
     score: float          # 0.0–1.0; -1.0 = sentinel "no contract"
     reason: str
     retry_params: Optional[Dict] = field(default=None)
+    # PoC (metrics propagation): typed values the contract already extracted from
+    # run_dir, exposed as data instead of being buried in `reason` prose. Empty by
+    # default → every existing contract is unaffected until it opts in.
+    metrics: Dict = field(default_factory=dict)
+
+
+# PoC bonus — cheap dispatch telemetry (no analysis, just counters). Reset per
+# run by the caller if desired. Lets us later quantify, on real runs, how often a
+# step gets a contract vs falls to the LLM observer vs is skipped by the guard.
+DISPATCH_COUNTERS: Dict[str, int] = {"contract_hit": 0, "no_contract": 0, "guard_skip": 0}
+
+
+def format_extracted_metrics(observations: list) -> str:
+    """PoC — render observations[].metrics as an AUTHORITATIVE block for the
+    finalizer, so it can cite deterministic numbers without re-reading files.
+
+    Only steps whose contract populated `metrics` appear. Keys starting with
+    '_' (e.g. _source_file) are shown as provenance, not as metrics. Empty →
+    a clear sentinel so the finalizer knows to fall back to the raw ledger.
+    """
+    lines: List[str] = []
+    for o in observations or []:
+        if not isinstance(o, dict):
+            continue
+        m = o.get("metrics") or {}
+        if not m:
+            continue
+        title = (o.get("title") or "<step>")
+        kv = ", ".join(f"{k}={v}" for k, v in m.items() if not str(k).startswith("_"))
+        src = m.get("_source_file")
+        line = f"- {title}: {kv}"
+        if src:
+            line += f"  (source file: {src})"
+        lines.append(line)
+    if not lines:
+        return "(no deterministic metrics were extracted for this run)"
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +159,7 @@ class FastpContract(_BaseContract):
             )
 
         score = 1.0
+        metrics: Dict = {}   # PoC: typed values (same extraction, just not discarded)
         if json_path:
             try:
                 with open(json_path, encoding="utf-8") as fh:
@@ -130,6 +168,14 @@ class FastpContract(_BaseContract):
                 total_out = data["summary"]["after_filtering"]["total_reads"]
                 if total_in > 0:
                     score = total_out / total_in
+                # Same values already parsed above — stash them as data so the
+                # finalizer can cite them without re-reading fastp.json.
+                metrics = {
+                    "reads_before": total_in,
+                    "reads_after": total_out,
+                    "pct_reads_kept": round(score * 100, 2),
+                    "_source_file": os.path.basename(json_path),
+                }
             except Exception:
                 score = 0.6  # JSON present but unparseable — assume partial success
 
@@ -138,9 +184,11 @@ class FastpContract(_BaseContract):
                 ok=False, score=score,
                 reason=f"fastp: {score*100:.1f}% reads kept (threshold {self.THRESHOLD*100:.0f}%)",
                 retry_params={"hint": "lower --qualified_quality_phred (try 15) or reduce --cut_mean_quality"},
+                metrics=metrics,
             )
         return ContractResult(ok=True, score=score,
-                              reason=f"fastp: {score*100:.1f}% reads kept")
+                              reason=f"fastp: {score*100:.1f}% reads kept",
+                              metrics=metrics)
 
 
 class FastqcContract(_BaseContract):
@@ -209,9 +257,18 @@ class WgsimContract(_BaseContract):
                 retry_params={"hint": "Do NOT create empty placeholder files. Use wgsim from meta-env1 to generate real reads."},
             )
 
+        # Vague 2: expose simulated read-pair count (R1 line count / 4).
+        _metrics = {}
+        try:
+            with open(r1, encoding="utf-8", errors="replace") as fh:
+                _n_lines = sum(1 for _ in fh)
+            _metrics = {"read_pairs": _n_lines // 4}
+        except Exception:
+            _metrics = {}
         return ContractResult(
             ok=True, score=1.0,
             reason=f"wgsim: R1={r1_size//1024}KB R2={r2_size//1024}KB — reads present",
+            metrics=_metrics,
         )
 
 
@@ -246,10 +303,14 @@ class BbdukContract(_BaseContract):
             n_in  = int(m_in.group(1).replace(",", ""))
             n_out = int(m_out.group(1).replace(",", ""))
             score = n_out / n_in if n_in > 0 else 1.0
+            _metrics = {"reads_in": n_in, "reads_out": n_out,
+                        "retention_pct": round(score * 100, 2)}
         else:
             score = 0.8  # file found, can't parse ratio
+            _metrics = {}
         return ContractResult(ok=True, score=score,
-                              reason=f"bbduk: output FASTQ found (retention={score*100:.1f}%)")
+                              reason=f"bbduk: output FASTQ found (retention={score*100:.1f}%)",
+                              metrics=_metrics)
 
 
 # ===========================================================================
@@ -363,7 +424,9 @@ class Kraken2Contract(_BaseContract):
                 retry_params={"hint": "try a larger database or lower --confidence (default 0.0) to 0"},
             )
         return ContractResult(ok=True, score=score,
-                              reason=f"kraken2: {score*100:.1f}% reads classified")
+                              reason=f"kraken2: {score*100:.1f}% reads classified",
+                              metrics={"pct_classified": round(score * 100, 2),
+                                       "_source_file": _os.path.basename(report)})
 
 
 class SylphContract(_BaseContract):
@@ -409,7 +472,9 @@ class SylphContract(_BaseContract):
                                       reason="sylph: TSV found but no genome rows")
             score = min(1.0, hits / max(1, total))
             return ContractResult(ok=True, score=score,
-                                  reason=f"sylph: {hits}/{total} genomes ≥95% ANI")
+                                  reason=f"sylph: {hits}/{total} genomes ≥95% ANI",
+                                  metrics={"genomes_ge95_ani": hits, "genomes_total": total,
+                                           "_source_file": os.path.basename(tsv)})
         except Exception as e:
             return ContractResult(ok=True, score=0.5,
                                   reason=f"sylph: TSV found (parse error: {e})")
@@ -485,7 +550,9 @@ class KaijuContract(_BaseContract):
                 retry_params={"hint": "lower -m (minimum match length) from 11 to 7 for higher sensitivity"},
             )
         return ContractResult(ok=True, score=score,
-                              reason=f"kaiju: {score*100:.1f}% reads classified")
+                              reason=f"kaiju: {score*100:.1f}% reads classified",
+                              metrics={"pct_classified": round(score * 100, 2),
+                                       "_source_file": os.path.basename(kaiju_summ or kaiju_out)})
 
 
 # ===========================================================================
@@ -531,18 +598,34 @@ class AssemblyContract(_BaseContract):
                 retry_params={"hint": "lower --min-contig-len (try 200) or increase --memory"},
             )
 
-        # Parse N50 from QUAST report if present
+        # Parse N50 (+ #contigs, total length) from QUAST report if present.
+        # Vague 2: read all rows once so the finalizer gets the real assembly
+        # numbers, not just a size proxy. Score logic is unchanged (N50-driven).
         quast_report = self._glob_first(run_dir, "report.tsv", "transposed_report.tsv")
         if quast_report:
             try:
+                n50 = n_contigs = total_len = None
                 with open(quast_report, encoding="utf-8") as fh:
-                    reader = csv.reader(fh, delimiter="\t")
-                    for row in reader:
-                        if row and row[0].strip() == "N50":
+                    for row in csv.reader(fh, delimiter="\t"):
+                        if not row:
+                            continue
+                        key = row[0].strip()
+                        if key == "N50":
                             n50 = int(row[1].strip().replace(",", ""))
-                            score = min(1.0, n50 / 50_000)  # 50 kb = 1.0
-                            return ContractResult(ok=True, score=score,
-                                                  reason=f"assembly: N50={n50:,} bp")
+                        elif key in ("# contigs", "# contigs (>= 0 bp)") and n_contigs is None:
+                            n_contigs = int(row[1].strip().replace(",", ""))
+                        elif key in ("Total length", "Total length (>= 0 bp)") and total_len is None:
+                            total_len = int(row[1].strip().replace(",", ""))
+                if n50 is not None:
+                    score = min(1.0, n50 / 50_000)  # 50 kb = 1.0
+                    _m = {"n50_bp": n50, "_source_file": os.path.basename(quast_report)}
+                    if n_contigs is not None:
+                        _m["n_contigs"] = n_contigs
+                    if total_len is not None:
+                        _m["total_length_bp"] = total_len
+                    return ContractResult(ok=True, score=score,
+                                          reason=f"assembly: N50={n50:,} bp",
+                                          metrics=_m)
             except Exception:
                 pass
 
@@ -596,7 +679,8 @@ class SemiBin2Contract(_BaseContract):
 
         score = min(1.0, n_bins / 10.0)
         return ContractResult(ok=True, score=score,
-                              reason=f"semibin2: {n_bins} bin(s) produced")
+                              reason=f"semibin2: {n_bins} bin(s) produced",
+                              metrics={"n_bins": n_bins})
 
 
 class ConcoctContract(_BaseContract):
@@ -649,7 +733,8 @@ class ConcoctContract(_BaseContract):
 
         score = min(1.0, n_bins / 10.0)
         return ContractResult(ok=True, score=score,
-                              reason=f"concoct: {n_bins} cluster(s)/bin(s)")
+                              reason=f"concoct: {n_bins} cluster(s)/bin(s)",
+                              metrics={"n_bins": n_bins})
 
 
 class MaxBin2Contract(_BaseContract):
@@ -704,11 +789,14 @@ class MaxBin2Contract(_BaseContract):
         if mean_completeness is not None:
             score = min(1.0, mean_completeness / 100.0)
             return ContractResult(ok=True, score=score,
-                                  reason=f"maxbin2: {n_bins} bin(s), mean completeness={mean_completeness:.1f}%")
+                                  reason=f"maxbin2: {n_bins} bin(s), mean completeness={mean_completeness:.1f}%",
+                                  metrics={"n_bins": n_bins,
+                                           "mean_completeness": round(mean_completeness, 1)})
 
         score = min(1.0, n_bins / 10.0)
         return ContractResult(ok=True, score=score,
-                              reason=f"maxbin2: {n_bins} bin(s) found")
+                              reason=f"maxbin2: {n_bins} bin(s) found",
+                              metrics={"n_bins": n_bins})
 
 
 class MetaBat2Contract(_BaseContract):
@@ -737,7 +825,8 @@ class MetaBat2Contract(_BaseContract):
 
         score = min(1.0, len(bins) / 10.0)
         return ContractResult(ok=True, score=score,
-                              reason=f"metabat2: {len(bins)} bin(s) produced")
+                              reason=f"metabat2: {len(bins)} bin(s) produced",
+                              metrics={"n_bins": len(bins)})
 
 
 # ===========================================================================
@@ -771,19 +860,47 @@ class CheckM2Contract(_BaseContract):
 
         try:
             scores: List[float] = []
+            comps: List[float] = []
+            conts: List[float] = []
+            hq = mq = 0                       # MIMAG quality tiers
+            best = None                       # highest-completeness bin (name, comp, cont)
             with open(report, encoding="utf-8") as fh:
                 reader = csv.DictReader(fh, delimiter="\t")
                 for row in reader:
                     comp = float(row.get("Completeness", 0) or 0)
                     cont = float(row.get("Contamination", 0) or 0)
-                    scores.append(max(0.0, comp - 5.0 * cont))
+                    scores.append(max(0.0, comp - 5.0 * cont))   # score logic UNCHANGED
+                    comps.append(comp)
+                    conts.append(cont)
+                    if comp >= 90.0 and cont <= 5.0:
+                        hq += 1
+                    elif comp >= 50.0 and cont <= 10.0:
+                        mq += 1
+                    if best is None or comp > best[1]:
+                        best = (str(row.get("Name", "") or ""), comp, cont)
 
             if not scores:
                 return ContractResult(ok=True, score=0.5,
                                       reason="checkm2: report found but no bin rows")
             avg = sum(scores) / len(scores)
+            # Vague 2: expose the REAL per-run biological values instead of only the
+            # composite score. The finalizer previously had to re-read
+            # quality_report.tsv to state completeness/contamination; now it cites
+            # these directly. Score is untouched (still mean(max(0, comp-5*cont))/100).
+            metrics = {
+                "n_bins": len(scores),
+                "high_quality_bins": hq,        # MIMAG: ≥90% comp, ≤5% cont
+                "medium_quality_bins": mq,      #        ≥50% comp, ≤10% cont
+                "mean_completeness": round(sum(comps) / len(comps), 1),
+                "mean_contamination": round(sum(conts) / len(conts), 1),
+                "_source_file": os.path.basename(report),
+            }
+            if best is not None:
+                metrics["best_bin_completeness"] = round(best[1], 1)
+                metrics["best_bin_contamination"] = round(best[2], 1)
             return ContractResult(ok=True, score=min(1.0, avg / 100.0),
-                                  reason=f"checkm2: {len(scores)} bin(s), avg quality={avg:.1f}")
+                                  reason=f"checkm2: {len(scores)} bin(s), avg quality={avg:.1f}",
+                                  metrics=metrics)
         except Exception as e:
             return ContractResult(ok=True, score=0.5,
                                   reason=f"checkm2: report found (parse error: {e})")
@@ -844,7 +961,9 @@ class HmmerContract(_BaseContract):
 
         score = min(1.0, hits / 100.0)  # 100 significant hits = score 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"hmmer: {hits} hit(s) with E-value < 1e-5")
+                              reason=f"hmmer: {hits} hit(s) with E-value < 1e-5",
+                              metrics={"significant_hits": hits,
+                                       "_source_file": os.path.basename(target_file)})
 
 
 class EggnogContract(_BaseContract):
@@ -889,7 +1008,8 @@ class EggnogContract(_BaseContract):
 
         score = (annotated / total) if total > 0 else 0.5
         return ContractResult(ok=True, score=score,
-                              reason=f"eggnog: {annotated}/{total} queries annotated with COG")
+                              reason=f"eggnog: {annotated}/{total} queries annotated with COG",
+                              metrics={"queries_annotated": annotated, "queries_total": total})
 
 
 class DiamondContract(_BaseContract):
@@ -917,8 +1037,19 @@ class DiamondContract(_BaseContract):
             )
         size = os.path.getsize(out)
         score = min(1.0, size / 100_000)
+        # Vague 2: expose alignment count for tabular formats (outfmt 6 / m8);
+        # skip binary .daa where a line count is meaningless.
+        _metrics = {}
+        if out.lower().endswith((".tsv", ".m8", ".txt", ".out")):
+            try:
+                with open(out, encoding="utf-8", errors="replace") as fh:
+                    n_aln = sum(1 for ln in fh if ln.strip() and not ln.startswith("#"))
+                _metrics = {"n_alignments": n_aln, "_source_file": os.path.basename(out)}
+            except Exception:
+                _metrics = {}
         return ContractResult(ok=True, score=score,
-                              reason=f"diamond: output {size:,} bytes")
+                              reason=f"diamond: output {size:,} bytes",
+                              metrics=_metrics)
 
 
 class EggnogHumannContract(_BaseContract):
@@ -942,8 +1073,18 @@ class EggnogHumannContract(_BaseContract):
                 reason="humann3: genefamilies/pathabundance output not found",
                 retry_params={"hint": "check --output dir and --nucleotide-database / --protein-database paths"},
             )
+        # Vague 2: count quantified pathways (rows in the pathabundance table).
+        _metrics = {}
+        if pathway:
+            try:
+                with open(pathway, encoding="utf-8", errors="replace") as fh:
+                    n_paths = sum(1 for ln in fh if ln.strip() and not ln.startswith("#"))
+                _metrics = {"pathways_quantified": n_paths, "_source_file": os.path.basename(pathway)}
+            except Exception:
+                _metrics = {}
         return ContractResult(ok=True, score=1.0,
-                              reason="humann3: output tables found")
+                              reason="humann3: output tables found",
+                              metrics=_metrics)
 
 
 # ===========================================================================
@@ -981,7 +1122,8 @@ class AntismashContract(_BaseContract):
         # 0 regions = valid (no BGCs in this organism); score 0.5 as neutral
         score = min(1.0, 0.5 + n_bgc / 20.0) if n_bgc > 0 else 0.5
         return ContractResult(ok=True, score=score,
-                              reason=f"antismash: {n_bgc} BGC region(s) detected")
+                              reason=f"antismash: {n_bgc} BGC region(s) detected",
+                              metrics={"bgc_regions": n_bgc})
 
 
 class GenomadContract(_BaseContract):
@@ -1035,7 +1177,9 @@ class GenomadContract(_BaseContract):
         above_threshold = sum(1 for s in scores if s >= 0.70)
         score = min(1.0, above_threshold / max(1, len(scores)))
         return ContractResult(ok=True, score=score,
-                              reason=f"genomad: {above_threshold}/{len(scores)} seqs with score≥0.70")
+                              reason=f"genomad: {above_threshold}/{len(scores)} seqs with score≥0.70",
+                              metrics={"viral_plasmid_seqs": above_threshold,
+                                       "total_scored": len(scores)})
 
 
 class AbricateContract(_BaseContract):
@@ -1105,10 +1249,14 @@ class AbricateContract(_BaseContract):
 
         if total == 0:
             return ContractResult(ok=True, score=0.5,
-                                  reason="abricate: ran OK — 0 resistance/virulence genes detected")
+                                  reason="abricate: ran OK — 0 resistance/virulence genes detected",
+                                  metrics={"gene_hits_total": 0, "gene_hits_passing": 0,
+                                           "_source_file": os.path.basename(tsv)})
         score = passing / total
         return ContractResult(ok=True, score=score,
-                              reason=f"abricate: {passing}/{total} gene hits pass ≥75% ID / ≥80% coverage")
+                              reason=f"abricate: {passing}/{total} gene hits pass ≥75% ID / ≥80% coverage",
+                              metrics={"gene_hits_total": total, "gene_hits_passing": passing,
+                                       "_source_file": os.path.basename(tsv)})
 
 
 class DbcanContract(_BaseContract):
@@ -1154,7 +1302,8 @@ class DbcanContract(_BaseContract):
                                   reason="dbcan: overview.txt found but no gene rows")
         score = consensus / total
         return ContractResult(ok=True, score=score,
-                              reason=f"dbcan: {consensus}/{total} CAZymes predicted by ≥2 tools")
+                              reason=f"dbcan: {consensus}/{total} CAZymes predicted by ≥2 tools",
+                              metrics={"cazymes_consensus": consensus, "cazymes_total": total})
 
 
 class PharokkaContract(_BaseContract):
@@ -1201,7 +1350,8 @@ class PharokkaContract(_BaseContract):
         score = min(1.0, cds_count / 300.0) if cds_count > 0 else 0.7
         reason = (f"pharokka: {cds_count} CDS annotated" if cds_count
                   else "pharokka: GFF/GBK output found")
-        return ContractResult(ok=True, score=score, reason=reason)
+        _metrics = {"cds_annotated": cds_count} if cds_count else {}
+        return ContractResult(ok=True, score=score, reason=reason, metrics=_metrics)
 
 
 class ProdigalContract(_BaseContract):
@@ -1275,7 +1425,8 @@ class ProdigalContract(_BaseContract):
             if n_proteins is not None
             else f"prodigal: .faa found ({size:,} bytes)"
         )
-        return ContractResult(ok=True, score=score, reason=reason)
+        _metrics = {"orfs_predicted": n_proteins} if n_proteins is not None else {}
+        return ContractResult(ok=True, score=score, reason=reason, metrics=_metrics)
 
 
 class ProkkaContract(_BaseContract):
@@ -1322,7 +1473,9 @@ class ProkkaContract(_BaseContract):
         score = min(1.0, gene_count / 5000.0) if gene_count > 0 else 0.7
         reason = (f"prokka: {gene_count} CDS annotated" if gene_count
                   else "prokka: output files found")
-        return ContractResult(ok=True, score=score, reason=reason)
+        _metrics = ({"cds_annotated": gene_count, "_source_file": os.path.basename(txt)}
+                    if gene_count and txt else {})
+        return ContractResult(ok=True, score=score, reason=reason, metrics=_metrics)
 
 
 # ===========================================================================
@@ -1366,7 +1519,9 @@ class QuastContract(_BaseContract):
                     if row and row[0].strip() == "N50":
                         n50 = int(row[1].strip().replace(",", ""))
                         return ContractResult(ok=True, score=min(1.0, n50 / 50_000),
-                                              reason=f"quast: N50={n50:,} bp")
+                                              reason=f"quast: N50={n50:,} bp",
+                                              metrics={"n50_bp": n50,
+                                                       "_source_file": os.path.basename(report)})
         except Exception:
             pass
 
@@ -1445,7 +1600,8 @@ class NonpareilContract(_BaseContract):
             coverage = float(m.group(1))
             score = min(1.0, coverage)
             return ContractResult(ok=True, score=score,
-                                  reason=f"nonpareil: average coverage={coverage*100:.1f}%")
+                                  reason=f"nonpareil: average coverage={coverage*100:.1f}%",
+                                  metrics={"avg_coverage_pct": round(coverage * 100, 2)})
 
         return ContractResult(ok=True, score=0.7,
                               reason="nonpareil: .npo output found (coverage unparseable from stdout)")
@@ -1500,7 +1656,8 @@ class LefseContract(_BaseContract):
 
         score = min(1.0, biomarkers / 10.0)  # 10 biomarkers = 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"lefse: {biomarkers}/{total} features with LDA≥2.0")
+                              reason=f"lefse: {biomarkers}/{total} features with LDA≥2.0",
+                              metrics={"biomarkers": biomarkers, "features_total": total})
 
 
 class PhyloseqContract(_BaseContract):
@@ -1576,7 +1733,9 @@ class CnvkitContract(_BaseContract):
                     mean_dev = sum(vals) / len(vals)
                     score = min(1.0, mean_dev / 1.0)  # 1.0 log2 deviation = score 1.0
                     return ContractResult(ok=True, score=score,
-                                          reason=f"cnvkit: {len(vals)} bins, mean |log2|={mean_dev:.3f}")
+                                          reason=f"cnvkit: {len(vals)} bins, mean |log2|={mean_dev:.3f}",
+                                          metrics={"n_bins": len(vals),
+                                                   "mean_abs_log2": round(mean_dev, 3)})
             except Exception:
                 pass
 
@@ -1623,6 +1782,7 @@ class OptitypeContract(_BaseContract):
                     return ContractResult(
                         ok=True, score=score,
                         reason=f"optitype: {filled}/6 HLA alleles called, {reads} supporting reads",
+                        metrics={"hla_alleles_called": filled, "supporting_reads": reads},
                     )
         except Exception:
             pass
@@ -1698,11 +1858,13 @@ class DasToolContract(_BaseContract):
         if scores:
             avg = sum(scores) / len(scores)
             return ContractResult(ok=True, score=min(1.0, avg / 100.0),
-                                  reason=f"das_tool: {n_bins} bin(s) dereplicated, avg quality={avg:.1f}")
+                                  reason=f"das_tool: {n_bins} bin(s) dereplicated, avg quality={avg:.1f}",
+                                  metrics={"n_bins": n_bins})
 
         score = min(1.0, n_bins / 5.0)  # 5 high-quality bins = 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"das_tool: {n_bins} dereplicated bin(s) produced")
+                              reason=f"das_tool: {n_bins} dereplicated bin(s) produced",
+                              metrics={"n_bins": n_bins})
 
 
 # ===========================================================================
@@ -1763,7 +1925,10 @@ class BrackenContract(_BaseContract):
 
         score = min(1.0, total_taxa / 50.0)  # 50 species = 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"bracken: {total_taxa} taxon(a) estimated (Σfractions={total_fraction:.3f})")
+                              reason=f"bracken: {total_taxa} taxon(a) estimated (Σfractions={total_fraction:.3f})",
+                              metrics={"taxa_estimated": total_taxa,
+                                       "sum_fraction": round(total_fraction, 3),
+                                       "_source_file": os.path.basename(bracken_out)})
 
 
 # ===========================================================================
@@ -1829,7 +1994,8 @@ class MetaPhlAn4Contract(_BaseContract):
 
         score = min(1.0, species_count / 20.0)  # 20 species = 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"metaphlan4: {species_count} species detected")
+                              reason=f"metaphlan4: {species_count} species detected",
+                              metrics={"species_detected": species_count})
 
 
 # ===========================================================================
@@ -1891,7 +2057,9 @@ class GtdbtkContract(_BaseContract):
 
         score = reliable / total
         return ContractResult(ok=True, score=score,
-                              reason=f"gtdbtk: {reliable}/{total} genome(s) with ≥50% MSA completeness")
+                              reason=f"gtdbtk: {reliable}/{total} genome(s) with ≥50% MSA completeness",
+                              metrics={"genomes_classified": total, "genomes_reliable_msa": reliable,
+                                       "_source_file": os.path.basename(bac_summary or arc_summary)})
 
 
 # ===========================================================================
@@ -1948,7 +2116,8 @@ class MedakaContract(_BaseContract):
 
         score = min(1.0, size / 5_000_000)  # 5 Mb = 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"medaka: {seq_count} polished sequence(s), {size:,} bytes")
+                              reason=f"medaka: {seq_count} polished sequence(s), {size:,} bytes",
+                              metrics={"polished_sequences": seq_count})
 
 
 # ===========================================================================
@@ -1998,11 +2167,15 @@ class RgiContract(_BaseContract):
 
         if total == 0:
             return ContractResult(ok=True, score=0.5,
-                                  reason="rgi: output found, no AMR hits detected (clean genome or DB not loaded)")
+                                  reason="rgi: output found, no AMR hits detected (clean genome or DB not loaded)",
+                                  metrics={"amr_hits_total": 0, "amr_hits_strict_perfect": 0,
+                                           "_source_file": os.path.basename(tsv)})
 
         score = strict_perfect / total
         return ContractResult(ok=True, score=score,
-                              reason=f"rgi: {strict_perfect}/{total} hits are Strict/Perfect (high confidence)")
+                              reason=f"rgi: {strict_perfect}/{total} hits are Strict/Perfect (high confidence)",
+                              metrics={"amr_hits_total": total, "amr_hits_strict_perfect": strict_perfect,
+                                       "_source_file": os.path.basename(tsv)})
 
 
 class AmrFinderContract(_BaseContract):
@@ -2058,7 +2231,9 @@ class AmrFinderContract(_BaseContract):
 
         if total == 0:
             return ContractResult(ok=True, score=0.5,
-                                  reason="amrfinder: output found, no AMR/virulence genes detected (clean genome)")
+                                  reason="amrfinder: output found, no AMR/virulence genes detected (clean genome)",
+                                  metrics={"amr_genes_total": 0, "amr_genes_high_quality": 0,
+                                           "_source_file": os.path.basename(tsv)})
 
         # Detecting AMR/virulence genes IS a successful result. On fragmented MAG/bin or
         # metagenome assemblies, genes are routinely split across contig boundaries →
@@ -2071,7 +2246,821 @@ class AmrFinderContract(_BaseContract):
         score = 0.5 + 0.5 * frac_hq
         return ContractResult(ok=True, score=score,
                               reason=f"amrfinder: {total} AMR/virulence gene(s) detected "
-                                     f"({high_quality} at ≥90% cov & id)")
+                                     f"({high_quality} at ≥90% cov & id)",
+                              metrics={"amr_genes_total": total, "amr_genes_high_quality": high_quality,
+                                       "_source_file": os.path.basename(tsv)})
+
+
+# ===========================================================================
+# COVERAGE / ABUNDANCE / MAPPING  (new contracts — previously uncovered tools)
+# ===========================================================================
+
+class CoverMContract(_BaseContract):
+    """
+    CoverM per-genome/MAG or per-contig coverage & relative abundance.
+    Output: a TSV — first column = Genome/Contig name, remaining columns = one
+            metric value per sample (multi-sample abundance table).
+    Source: https://github.com/wwood/CoverM (methods: relative_abundance, mean,
+            covered_fraction, count, tpm, rpkm, trimmed_mean).
+    """
+    KEYWORDS = ("coverm", "relative abundance", "cross-sample abundance",
+                "mag abundance", "per-genome coverage", "per-contig coverage")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify -m method (relative_abundance|mean|covered_fraction|tpm|rpkm); add --min-covered-fraction 0",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tsv = self._glob_first(run_dir, "*abundance*.tsv", "*coverm*.tsv", "*coverage*.tsv")
+        if not tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="coverm: no coverage/abundance TSV found",
+                retry_params={"hint": "add -o <output.tsv> to the coverm command"},
+            )
+        n_features = n_samples = 0
+        try:
+            with open(tsv, encoding="utf-8") as fh:
+                header = fh.readline().rstrip("\n").split("\t")
+                n_samples = max(0, len(header) - 1)   # first column = Genome/Contig name
+                n_features = sum(1 for ln in fh if ln.strip())
+        except Exception:
+            pass
+        if n_features == 0:
+            return ContractResult(ok=True, score=0.3,
+                                  reason="coverm: TSV found but no genome/contig rows")
+        score = min(1.0, n_features / 10.0)
+        return ContractResult(ok=True, score=score,
+                              reason=f"coverm: {n_features} feature(s) x {n_samples} sample(s) quantified",
+                              metrics={"n_features": n_features, "n_samples": n_samples,
+                                       "_source_file": os.path.basename(tsv)})
+
+
+class Minimap2Contract(_BaseContract):
+    """
+    minimap2 read mapping → sorted BAM, plus (for binning) a jgi depth table.
+    Output: <out>.bam (binary) and optionally depth.txt with columns
+            contigName, contigLen, totalAvgDepth, <bam>, <bam>-var.
+    Source: minimap2 + metabat2 jgi_summarize_bam_contig_depths.
+    """
+    KEYWORDS = ("minimap2", "read mapping", "map reads", "read alignment",
+                "contig depth", "coverage depth")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify preset -ax sr|map-ont|map-pb matches the read type; sort + index the BAM (samtools index)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        bam   = self._glob_first(run_dir, "*.bam")
+        depth = self._glob_first(run_dir, "depth.txt", "*depth*.txt", "*_depth.tsv")
+        if not bam and not depth:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="minimap2: no BAM or depth file found",
+                retry_params={"hint": "pipe minimap2 output to `samtools sort -o out.bam` and index it"},
+            )
+        metrics: Dict = {}
+        if depth:
+            try:
+                n_contigs = 0
+                depths: List[float] = []
+                with open(depth, encoding="utf-8") as fh:
+                    header = fh.readline().rstrip("\n").split("\t")
+                    try:
+                        ci = header.index("totalAvgDepth")
+                    except ValueError:
+                        ci = 2
+                    for ln in fh:
+                        parts = ln.rstrip("\n").split("\t")
+                        if len(parts) <= ci:
+                            continue
+                        n_contigs += 1
+                        try:
+                            depths.append(float(parts[ci]))
+                        except ValueError:
+                            pass
+                metrics = {"n_contigs": n_contigs, "_source_file": os.path.basename(depth)}
+                if depths:
+                    metrics["mean_depth"] = round(sum(depths) / len(depths), 2)
+            except Exception:
+                metrics = {}
+        if bam:
+            size = os.path.getsize(bam)
+            return ContractResult(ok=True, score=max(0.5, min(1.0, size / 1_000_000)),
+                                  reason=f"minimap2: BAM present ({size:,} bytes)",
+                                  metrics=metrics)
+        return ContractResult(ok=True, score=0.6,
+                              reason="minimap2: depth table present (no BAM in run dir)",
+                              metrics=metrics)
+
+
+class Dada2Contract(_BaseContract):
+    """
+    DADA2 amplicon denoising → ASV table (+ taxonomy) TSV.
+    Output: an ASV table TSV (exact amplicon sequence variants) and a taxonomy TSV.
+    Source: https://benjjneb.github.io/dada2/ — ASV = exact sequence variant.
+    """
+    KEYWORDS = ("dada2", "asv", "amplicon denois", "sequence variant",
+                "denoise amplicon", "16s asv")
+    RUNTIME = "long"
+    VARIANTS = [
+        "ensure R1/R2 overlap (use a ~250-400 bp amplicon, not full-length 16S); lower truncLen / raise maxEE",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        asv = self._glob_first(run_dir, "*asv*table*.tsv", "*asv*.tsv", "*seqtab*.tsv", "*ASV*.tsv")
+        tax = self._glob_first(run_dir, "*taxonomy*.tsv", "*tax*.tsv")
+        if not asv and not tax:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="dada2: no ASV table / taxonomy TSV found",
+                retry_params={"hint": "write ASV table + taxonomy to TSV; verify mergePairs produced >0 ASVs"},
+            )
+        n_asvs = 0
+        if asv:
+            try:
+                with open(asv, encoding="utf-8") as fh:
+                    n_asvs = max(0, sum(1 for ln in fh if ln.strip()) - 1)  # minus header
+            except Exception:
+                pass
+        if asv and n_asvs == 0:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason="dada2: ASV table present but 0 ASVs (R1/R2 likely did not overlap)",
+                retry_params={"hint": "use a short overlapping amplicon; check filterAndTrim retention"},
+            )
+        score = min(1.0, n_asvs / 50.0) if n_asvs else 0.6
+        return ContractResult(ok=True, score=score,
+                              reason=(f"dada2: {n_asvs} ASV(s) inferred" if n_asvs
+                                      else "dada2: taxonomy output found"),
+                              metrics=({"n_asvs": n_asvs, "_source_file": os.path.basename(asv)}
+                                       if n_asvs else {}))
+
+
+class DrepContract(_BaseContract):
+    """
+    dRep genome/MAG dereplication → representative genomes + cluster tables.
+    Output: <out>/dereplicated_genomes/*.fa (winners); data_tables/Cdb.csv
+            (cluster membership), Wdb.csv (winners).
+    Source: https://github.com/MrOlm/drep (default species threshold 95% ANI).
+    """
+    KEYWORDS = ("drep", "dereplicate genomes", "genome dereplication",
+                "dereplicate mags", "mag dereplication", "non-redundant genomes")
+    RUNTIME = "long"
+    VARIANTS = [
+        "lower -sa (secondary ANI) below 0.95 to merge more; pass --genomeInfo checkm2 quality to skip re-QC",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        reps = self._glob_all(run_dir, "dereplicated_genomes/*.fa",
+                              "dereplicated_genomes/*.fasta", "dereplicated_genomes/*.fna")
+        cdb = self._glob_first(run_dir, "Cdb.csv", "*Cdb.csv")
+        wdb = self._glob_first(run_dir, "Wdb.csv", "*Wdb.csv")
+        if not reps and not wdb:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="drep: no dereplicated_genomes/ FASTAs or Wdb.csv found",
+                retry_params={"hint": "check OUT_DIR; ensure -g input genomes exist and pass -comp/-con filters"},
+            )
+        n_reps = len(reps)
+        if n_reps == 0 and wdb:
+            try:
+                with open(wdb, encoding="utf-8") as fh:
+                    n_reps = max(0, sum(1 for ln in fh if ln.strip()) - 1)
+            except Exception:
+                pass
+        n_clusters = None
+        if cdb:
+            try:
+                clusters = set()
+                with open(cdb, encoding="utf-8") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        c = row.get("secondary_cluster") or row.get("primary_cluster")
+                        if c:
+                            clusters.add(c)
+                n_clusters = len(clusters) or None
+            except Exception:
+                n_clusters = None
+        score = min(1.0, n_reps / 5.0) if n_reps else 0.5
+        m: Dict = {"n_representatives": n_reps}
+        if n_clusters is not None:
+            m["n_clusters"] = n_clusters
+        return ContractResult(ok=True, score=score,
+                              reason=(f"drep: {n_reps} representative genome(s)"
+                                      + (f", {n_clusters} cluster(s)" if n_clusters else "")),
+                              metrics=m)
+
+
+# ===========================================================================
+# VIROMICS  (new contracts — previously uncovered tools)
+# ===========================================================================
+
+class VirSorter2Contract(_BaseContract):
+    """
+    VirSorter2 viral-sequence identification from contigs.
+    Output: final-viral-score.tsv (seqname, <per-group scores>, max_score,
+            max_score_group, length, hallmark, viral, cellular) + final-viral-combined.fa.
+    Source: https://github.com/jiarong/VirSorter2 (default min score 0.5).
+    """
+    KEYWORDS = ("virsorter2", "virsorter", "viral sequence identification",
+                "identify viral contigs", "viral contig detection")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "lower --min-score (e.g. 0.5→0.3) or restrict --include-groups; verify the VirSorter2 DB path",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        score_tsv = self._glob_first(run_dir, "final-viral-score.tsv", "*viral-score.tsv",
+                                     "*final-viral*.tsv")
+        if not score_tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="virsorter2: final-viral-score.tsv not found",
+                retry_params={"hint": "check output dir; verify VirSorter2 database (--db-dir / setup)"},
+            )
+        n_viral = 0
+        try:
+            with open(score_tsv, encoding="utf-8") as fh:
+                n_viral = max(0, sum(1 for ln in fh if ln.strip()) - 1)  # minus header
+        except Exception:
+            pass
+        score = min(1.0, n_viral / 10.0) if n_viral else 0.4
+        return ContractResult(ok=True, score=score,
+                              reason=f"virsorter2: {n_viral} viral sequence(s) identified",
+                              metrics={"n_viral_sequences": n_viral,
+                                       "_source_file": os.path.basename(score_tsv)})
+
+
+class CheckVContract(_BaseContract):
+    """
+    CheckV viral genome quality assessment.
+    Output: quality_summary.tsv — columns contig_id, contig_length, provirus,
+            gene_count, viral_genes, host_genes, checkv_quality, miuvig_quality,
+            completeness, contamination. Source: https://bitbucket.org/berkeleylab/checkv
+    """
+    KEYWORDS = ("checkv", "viral genome quality", "viral completeness",
+                "viral quality assessment", "phage completeness")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify CheckV database path (checkv download_database); input must be viral contigs (from VirSorter2/geNomad)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        summ = self._glob_first(run_dir, "quality_summary.tsv", "*quality_summary*.tsv",
+                                "*checkv*summary*.tsv")
+        if not summ:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="checkv: quality_summary.tsv not found",
+                retry_params={"hint": "check --output dir; ensure CheckV database is downloaded"},
+            )
+        n = complete = high = 0
+        comps: List[float] = []
+        try:
+            with open(summ, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    n += 1
+                    q = (row.get("checkv_quality", "") or "").strip()
+                    if q == "Complete":
+                        complete += 1
+                    elif q == "High-quality":
+                        high += 1
+                    try:
+                        comps.append(float(row.get("completeness", "") or "nan"))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+        if n == 0:
+            return ContractResult(ok=True, score=0.3,
+                                  reason="checkv: summary found but no contig rows")
+        valid_comps = [c for c in comps if c == c]  # drop NaN
+        score = min(1.0, (complete + high) / max(1, n) + 0.3)
+        metrics = {"n_viral_contigs": n, "n_complete": complete, "n_high_quality": high,
+                   "_source_file": os.path.basename(summ)}
+        if valid_comps:
+            metrics["mean_completeness"] = round(sum(valid_comps) / len(valid_comps), 1)
+        return ContractResult(ok=True, score=score,
+                              reason=f"checkv: {n} contig(s), {complete} complete, {high} high-quality",
+                              metrics=metrics)
+
+
+class DeepVirFinderContract(_BaseContract):
+    """
+    DeepVirFinder viral scoring of contigs.
+    Output: <input>_gt<L>bp_dvfpred.txt — columns name, len, score, pvalue.
+    Source: https://github.com/jessieren/DeepVirFinder (viral = high score, low p-value).
+    """
+    KEYWORDS = ("deepvirfinder", "dvf", "viral score", "deep learning viral")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "lower --score-cutoff (0.9→0.7) or raise --pvalue-cutoff; verify the DVF model/script path",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        pred = self._glob_first(run_dir, "*dvfpred.txt", "*dvf*.txt", "*dvf*.tsv")
+        if not pred:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="deepvirfinder: *_dvfpred.txt not found",
+                retry_params={"hint": "check output dir and dvf.py path; lower --min-length if no contigs passed"},
+            )
+        total = viral = 0
+        try:
+            with open(pred, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    total += 1
+                    try:
+                        if float(row.get("score", 0) or 0) >= 0.9 and float(row.get("pvalue", 1) or 1) <= 0.05:
+                            viral += 1
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+        if total == 0:
+            return ContractResult(ok=True, score=0.3,
+                                  reason="deepvirfinder: prediction file found but no rows")
+        score = min(1.0, viral / max(1, total) + 0.3)
+        return ContractResult(ok=True, score=score,
+                              reason=f"deepvirfinder: {viral}/{total} contigs viral (score≥0.9, p≤0.05)",
+                              metrics={"n_scored": total, "n_viral": viral,
+                                       "_source_file": os.path.basename(pred)})
+
+
+class GgetVirusContract(_BaseContract):
+    """
+    gget virus — download virus genome sequences + metadata from NCBI Virus.
+    Output: <name>_sequences.fasta (genomes) + <name>_metadata.csv/.jsonl.
+    Source: https://github.com/pachterlab/gget (virus module).
+    """
+    KEYWORDS = ("gget virus", "gget_virus", "download virus genomes",
+                "ncbi virus download", "fetch virus sequences")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "narrow the query (add --host / --nuc_completeness complete / --max-seq-length) if too many/too few sequences",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        fasta = self._glob_first(run_dir, "*_sequences.fasta", "*sequences*.fasta", "*.fasta", "*.fa")
+        meta  = self._glob_first(run_dir, "*_metadata.csv", "*metadata*.csv")
+        if not fasta and not meta:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="gget_virus: no *_sequences.fasta or *_metadata.csv found",
+                retry_params={"hint": "check output dir; broaden/narrow the query or verify network access"},
+            )
+        n_seqs = 0
+        if fasta:
+            try:
+                with open(fasta, encoding="utf-8") as fh:
+                    n_seqs = sum(1 for ln in fh if ln.startswith(">"))
+            except Exception:
+                pass
+        score = min(1.0, n_seqs / 10.0) if n_seqs else 0.5
+        return ContractResult(ok=True, score=score,
+                              reason=f"gget_virus: {n_seqs} virus sequence(s) downloaded",
+                              metrics=({"n_sequences": n_seqs, "_source_file": os.path.basename(fasta)}
+                                       if fasta else {}))
+
+
+# ===========================================================================
+# SIMULATION / QC-AGGREGATION / GROWTH / PLASMIDS  (new contracts)
+# ===========================================================================
+
+class InSilicoSeqContract(_BaseContract):
+    """
+    InSilicoSeq (iss) — simulate realistic Illumina reads from reference genomes.
+    Output: <prefix>_R1.fastq + <prefix>_R2.fastq + <prefix>_abundance.txt/tsv.
+    Source: https://github.com/HadrienG/InSilicoSeq
+    """
+    KEYWORDS = ("insilicoseq", "iss generate", "in silico seq", "insilico seq")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify --genomes reference FASTA and --model (miseq|hiseq|novaseq); raise --n_reads if too few",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        r1 = self._glob_first(run_dir, "*_R1.fastq", "*_R1.fq", "*R1*.fastq")
+        abund = self._glob_first(run_dir, "*abundance*.txt", "*abundance*.tsv")
+        if not r1 and not abund:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="insilicoseq: no *_R1.fastq or *_abundance* output found",
+                retry_params={"hint": "check --output prefix; verify --genomes reference exists"},
+            )
+        metrics: Dict = {}
+        if r1:
+            try:
+                with open(r1, encoding="utf-8", errors="replace") as fh:
+                    metrics["read_pairs"] = sum(1 for _ in fh) // 4
+            except Exception:
+                pass
+        if abund:
+            try:
+                with open(abund, encoding="utf-8") as fh:
+                    metrics["n_genomes"] = sum(1 for ln in fh if ln.strip())
+            except Exception:
+                pass
+        return ContractResult(ok=True, score=1.0 if r1 else 0.6,
+                              reason=f"insilicoseq: reads simulated "
+                                     f"({metrics.get('read_pairs', '?')} pairs)",
+                              metrics=metrics)
+
+
+class MultiqcContract(_BaseContract):
+    """
+    MultiQC — aggregate per-sample QC reports into one HTML + data dir.
+    Output: multiqc_report.html + multiqc_data/multiqc_general_stats.txt (one row/sample).
+    Source: https://multiqc.info/
+    """
+    KEYWORDS = ("multiqc", "aggregate qc", "aggregate reports", "combined qc report")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "point multiqc at the directory that actually contains the tool logs/reports; add -f to overwrite",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        html  = self._glob_first(run_dir, "multiqc_report.html", "*multiqc*report*.html")
+        stats = self._glob_first(run_dir, "multiqc_general_stats.txt", "*general_stats*.txt")
+        if not html and not stats:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="multiqc: no multiqc_report.html or general stats found",
+                retry_params={"hint": "verify the input directory contains recognizable tool reports"},
+            )
+        metrics: Dict = {}
+        if stats:
+            try:
+                with open(stats, encoding="utf-8") as fh:
+                    metrics["n_samples"] = max(0, sum(1 for ln in fh if ln.strip()) - 1)
+                    metrics["_source_file"] = os.path.basename(stats)
+            except Exception:
+                pass
+        return ContractResult(ok=True, score=1.0,
+                              reason="multiqc: aggregated report produced",
+                              metrics=metrics)
+
+
+class IRepContract(_BaseContract):
+    """
+    iRep — bacterial replication rate (index of replication) from coverage trend.
+    Output: <prefix>.tsv with per-genome iRep values (needs ≥75% complete genome,
+            low contamination; unreliable results are not reported as growth rates).
+    Source: https://github.com/christophertbrown/iRep (Brown et al. 2016).
+    """
+    KEYWORDS = ("irep", "replication rate", "index of replication",
+                "growth rate", "replication index")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "iRep needs a >=75% complete, low-contamination genome and a SAM (not BAM) of reads vs that genome",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tsv = self._glob_first(run_dir, "*iRep*.tsv", "*irep*.tsv", "*.tsv")
+        if not tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="irep: no iRep .tsv output found",
+                retry_params={"hint": "check output prefix; provide a SAM (not BAM) of reads vs the genome"},
+            )
+        vals: List[float] = []
+        try:
+            with open(tsv, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    for tok in parts[1:]:
+                        try:
+                            v = float(tok)
+                            if 0.5 < v < 10:   # plausible iRep range
+                                vals.append(v)
+                                break
+                        except ValueError:
+                            continue
+        except Exception:
+            pass
+        if not vals:
+            return ContractResult(ok=True, score=0.4,
+                                  reason="irep: output found but no reliable iRep values")
+        return ContractResult(ok=True, score=min(1.0, len(vals) / 3.0),
+                              reason=f"irep: {len(vals)} genome(s) with iRep, mean={sum(vals)/len(vals):.2f}",
+                              metrics={"n_genomes": len(vals),
+                                       "mean_irep": round(sum(vals) / len(vals), 2),
+                                       "_source_file": os.path.basename(tsv)})
+
+
+class MobReconContract(_BaseContract):
+    """
+    MOB-recon — reconstruct plasmids from an assembly and classify contigs.
+    Output: contig_report.txt (per-contig chromosome/plasmid + cluster),
+            mobtyper_results.txt, plasmid_*.fasta. Source: https://github.com/phac-nml/mob-suite
+    """
+    KEYWORDS = ("mob_recon", "mob recon", "mob-recon", "plasmid reconstruction",
+                "reconstruct plasmids")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "add --force to overwrite; verify input is an assembled FASTA (not raw reads)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        contig_report = self._glob_first(run_dir, "contig_report.txt", "*contig_report*.txt")
+        plasmids = self._glob_all(run_dir, "plasmid_*.fasta", "plasmid_*.fa")
+        if not contig_report and not plasmids:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="mob_recon: no contig_report.txt or plasmid_*.fasta found",
+                retry_params={"hint": "check -o output dir; input must be an assembled FASTA"},
+            )
+        n_plasmids = len(plasmids)
+        if n_plasmids == 0 and contig_report:
+            try:
+                clusters = set()
+                with open(contig_report, encoding="utf-8") as fh:
+                    reader = csv.DictReader(fh, delimiter="\t")
+                    for row in reader:
+                        mol = (row.get("molecule_type", "") or "").lower()
+                        cid = row.get("primary_cluster_id") or row.get("cluster_id")
+                        if "plasmid" in mol and cid:
+                            clusters.add(cid)
+                n_plasmids = len(clusters)
+            except Exception:
+                pass
+        return ContractResult(ok=True, score=min(1.0, 0.5 + n_plasmids / 5.0),
+                              reason=f"mob_recon: {n_plasmids} plasmid(s) reconstructed",
+                              metrics={"n_plasmids": n_plasmids})
+
+
+class MobTyperContract(_BaseContract):
+    """
+    MOB-typer — type a plasmid FASTA (replicon/relaxase/MPF + predicted mobility).
+    Output: mobtyper report TSV — columns sample_id, ..., rep_type(s),
+            relaxase_type(s), mpf_type, predicted_mobility. Source: MOB-suite.
+    """
+    KEYWORDS = ("mob_typer", "mob typer", "mob-typer", "plasmid typing",
+                "plasmid mobility")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "input must be a single plasmid FASTA; for a whole assembly use mob_recon first",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tsv = self._glob_first(run_dir, "*mobtyper*.txt", "*mobtyper*.tsv", "*mob_typer*.txt")
+        if not tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="mob_typer: no mobtyper report found",
+                retry_params={"hint": "check --out_file path; input must be a plasmid FASTA"},
+            )
+        n = conjugative = 0
+        try:
+            with open(tsv, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    n += 1
+                    if (row.get("predicted_mobility", "") or "").strip().lower() == "conjugative":
+                        conjugative += 1
+        except Exception:
+            pass
+        if n == 0:
+            return ContractResult(ok=True, score=0.4,
+                                  reason="mob_typer: report found but no plasmid rows")
+        return ContractResult(ok=True, score=1.0,
+                              reason=f"mob_typer: {n} plasmid(s) typed, {conjugative} conjugative",
+                              metrics={"n_plasmids_typed": n, "n_conjugative": conjugative,
+                                       "_source_file": os.path.basename(tsv)})
+
+
+# ===========================================================================
+# GENOMICS / EPIGENOMICS / scRNA / NCBI  (new contracts)
+#
+# SAFETY: these domains have looser, sometimes binary (.h5ad) or off-run-dir
+# outputs, so EVERY contract here NEVER returns ok=False. When the expected file
+# is missing it returns score=-1.0 (== "no contract", defer to observer) so a
+# working step can never be broken by a false failure. Metrics are added only
+# when a recognizable output file is actually present in the run dir.
+# ===========================================================================
+
+class Macs2Contract(_BaseContract):
+    """
+    MACS2 ChIP-seq peak calling.
+    Output: <name>_peaks.narrowPeak (or .broadPeak) — BED6+ , one line per peak.
+    Source: https://github.com/macs3-project/MACS
+    """
+    KEYWORDS = ("macs2", "peak calling", "chip-seq peak", "chipseq peak",
+                "call peaks")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "adjust -q (q-value, default 0.05) or --broad for broad marks; verify -c control file",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        peaks = self._glob_first(run_dir, "*_peaks.narrowPeak", "*_peaks.broadPeak",
+                                 "*.narrowPeak", "*.broadPeak")
+        if not peaks:
+            return ContractResult(ok=True, score=-1.0, reason="macs2: no peak file (defer to observer)")
+        n_peaks = 0
+        try:
+            with open(peaks, encoding="utf-8") as fh:
+                n_peaks = sum(1 for ln in fh if ln.strip() and not ln.startswith(("#", "track")))
+        except Exception:
+            pass
+        return ContractResult(ok=True, score=min(1.0, n_peaks / 1000.0),
+                              reason=f"macs2: {n_peaks} peak(s) called",
+                              metrics={"n_peaks": n_peaks, "_source_file": os.path.basename(peaks)})
+
+
+class HomerMotifContract(_BaseContract):
+    """
+    HOMER known-motif enrichment.
+    Output: knownResults.txt — TSV; columns include 'Motif Name', 'P-value',
+            'q-value (Benjamini)'. Source: http://homer.ucsd.edu/homer/
+    """
+    KEYWORDS = ("homer", "enriched motif", "motif enrichment", "find motifs",
+                "de novo motif")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify -genome and that the peak/BED input is non-empty; adjust -size / -len",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        kr = self._glob_first(run_dir, "knownResults.txt", "*knownResults*.txt")
+        if not kr:
+            return ContractResult(ok=True, score=-1.0, reason="homer: no knownResults.txt (defer to observer)")
+        total = significant = 0
+        try:
+            with open(kr, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for row in reader:
+                    total += 1
+                    qv = row.get("q-value (Benjamini)") or row.get("P-value") or ""
+                    try:
+                        if float(qv) <= 0.05:
+                            significant += 1
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+        return ContractResult(ok=True, score=min(1.0, significant / 20.0) if significant else 0.5,
+                              reason=f"homer: {significant}/{total} motif(s) significant (q≤0.05)",
+                              metrics={"n_motifs": total, "n_significant": significant,
+                                       "_source_file": os.path.basename(kr)})
+
+
+class GseaContract(_BaseContract):
+    """
+    Gene-set enrichment analysis → a table of enriched terms/pathways.
+    Output: an enrichment table (CSV/TSV) — one row per term with a p/adj-p value.
+    """
+    KEYWORDS = ("gene set enrichment", "gsea", "pathway enrichment",
+                "enrichment analysis", "over-representation")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "try a different --database (pathway|transcription|ontology); check the input gene list is non-empty",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tab = self._glob_first(run_dir, "*enrich*.csv", "*enrich*.tsv", "*gsea*.csv",
+                               "*enrichment*.csv", "*pathway*.csv")
+        if not tab:
+            return ContractResult(ok=True, score=-1.0, reason="gsea: no enrichment table (defer to observer)")
+        n_terms = 0
+        try:
+            with open(tab, encoding="utf-8") as fh:
+                n_terms = max(0, sum(1 for ln in fh if ln.strip()) - 1)
+        except Exception:
+            pass
+        return ContractResult(ok=True, score=min(1.0, n_terms / 10.0) if n_terms else 0.5,
+                              reason=f"gsea: {n_terms} enriched term(s)",
+                              metrics={"n_terms": n_terms, "_source_file": os.path.basename(tab)})
+
+
+class RegionOverlapContract(_BaseContract):
+    """
+    Genomic region-overlap analysis (interval intersection).
+    Output: an overlap table (TSV/CSV/BED) with the intersecting intervals.
+    """
+    KEYWORDS = ("genomic region overlap", "region overlap", "interval overlap",
+                "overlap analysis")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "verify the region sets are valid BED (chrom,start,end) or coordinate tuples",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tab = self._glob_first(run_dir, "*overlap*.tsv", "*overlap*.csv", "*overlap*.bed",
+                               "*intersect*.bed")
+        if not tab:
+            return ContractResult(ok=True, score=-1.0, reason="region-overlap: no output (defer to observer)")
+        n = 0
+        try:
+            with open(tab, encoding="utf-8") as fh:
+                n = sum(1 for ln in fh if ln.strip() and not ln.startswith(("#", "track", "chrom")))
+        except Exception:
+            pass
+        return ContractResult(ok=True, score=0.7,
+                              reason=f"region-overlap: {n} overlapping interval(s)",
+                              metrics={"n_overlaps": n, "_source_file": os.path.basename(tab)})
+
+
+class ChromatinContract(_BaseContract):
+    """
+    Hi-C chromatin-interaction analysis (.cool/.hic → matrices/plots/TADs).
+    No cheap tabular metric — verifies output presence only.
+    """
+    KEYWORDS = ("chromatin", "hi-c", "hic analysis", "contact matrix",
+                "topological domain", "tad calling")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify the input is a valid .cool or .hic file and the resolution is supported",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        out = self._glob_first(run_dir, "*.cool", "*.hic", "*interaction*", "*.png", "*.pdf")
+        if not out:
+            return ContractResult(ok=True, score=-1.0, reason="chromatin: no output (defer to observer)")
+        return ContractResult(ok=True, score=0.7,
+                              reason="chromatin: interaction output produced",
+                              metrics={"output_present": True, "_source_file": os.path.basename(out)})
+
+
+class ScrnaContract(_BaseContract):
+    """
+    Single-cell RNA tools (annotation / scVI / Harmony / UCE embeddings / IMA map).
+    Output: an AnnData .h5ad object (binary HDF5). validator.py is stdlib-only, so
+    no h5ad parsing here — verifies the .h5ad output exists only.
+    """
+    KEYWORDS = ("single-cell", "single cell", "scrna", "cell type annotation",
+                "annotate celltype", "annotate cell type", "scvi", "harmony embedding",
+                "uce embedding", "cell clustering", "panhumanpy")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "verify the input AnnData (.h5ad) path and that the requested layer/embedding exists",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        h5ad = self._glob_first(run_dir, "*.h5ad")
+        if not h5ad:
+            return ContractResult(ok=True, score=-1.0, reason="scrna: no .h5ad output (defer to observer)")
+        return ContractResult(ok=True, score=0.8,
+                              reason=f"scrna: AnnData produced ({os.path.basename(h5ad)})",
+                              metrics={"h5ad_present": True, "_source_file": os.path.basename(h5ad)})
+
+
+class NcbiDownloadContract(_BaseContract):
+    """
+    NCBI genome download (ncbi-genome-download / datasets).
+    Output: one or more genome FASTA files (*_genomic.fna[.gz] / *.fna / *.fasta).
+    """
+    KEYWORDS = ("download_from_ncbi", "ncbi-genome-download", "download genome",
+                "genome from ncbi", "from ncbi", "ncbi genome", "datasets download genome")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "reference the organism BY NAME (-g \"Genus species\"); NCBI is rate-limited — retry on transient errors",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        genomes = self._glob_all(run_dir, "*_genomic.fna.gz", "*_genomic.fna",
+                                 "*.fna.gz", "*.fna", "*.fasta")
+        if not genomes:
+            return ContractResult(ok=True, score=-1.0, reason="ncbi-download: no genome FASTA (defer to observer)")
+        n = len(genomes)
+        return ContractResult(ok=True, score=min(1.0, n / 1.0),
+                              reason=f"ncbi-download: {n} genome FASTA file(s) downloaded",
+                              metrics={"n_genomes_downloaded": n,
+                                       "_source_file": os.path.basename(genomes[0])})
+
+
+class Archs4Contract(_BaseContract):
+    """
+    ARCHS4 RNA-seq expression fetch for a gene across tissues.
+    Output (when written to a file): a small table of tissue -> expression.
+    Often returned as data; contract adds a metric only when a table is present.
+    """
+    KEYWORDS = ("archs4", "rna_seq_archs4", "rna-seq expression",
+                "tissue expression", "expression across tissues")
+    RUNTIME = "fast"
+    VARIANTS = [
+        "verify the gene name is a valid HGNC symbol; adjust K (number of tissues)",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tab = self._glob_first(run_dir, "*archs4*.csv", "*archs4*.tsv", "*expression*.csv",
+                               "*tissue*.csv", "*tissue*.tsv")
+        if not tab:
+            return ContractResult(ok=True, score=-1.0, reason="archs4: no expression table (defer to observer)")
+        n_tissues = 0
+        try:
+            with open(tab, encoding="utf-8") as fh:
+                n_tissues = max(0, sum(1 for ln in fh if ln.strip()) - 1)
+        except Exception:
+            pass
+        return ContractResult(ok=True, score=0.7,
+                              reason=f"archs4: expression across {n_tissues} tissue(s)",
+                              metrics={"n_tissues": n_tissues, "_source_file": os.path.basename(tab)})
 
 
 # ===========================================================================
@@ -2082,6 +3071,9 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # QC / trimming
     FastpContract(),
     FastqcContract(),
+    # InSilicoSeq BEFORE Wgsim: an "iss / InSilicoSeq" step also says "simulate
+    # reads" (a Wgsim keyword), so it must be matched by its own contract first.
+    InSilicoSeqContract(),
     WgsimContract(),
     BbdukContract(),
     # Taxonomic
@@ -2100,6 +3092,23 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     ConcoctContract(),
     MaxBin2Contract(),
     MetaBat2Contract(),
+    # Coverage / mapping / dereplication / amplicon (added contracts — specific
+    # keywords, no overlap with existing ones; placed here so they get first match).
+    CoverMContract(),
+    Minimap2Contract(),
+    DrepContract(),
+    Dada2Contract(),
+    IRepContract(),
+    MobReconContract(),
+    MobTyperContract(),
+    MultiqcContract(),
+    # Viromics (added contracts — checked BEFORE CheckM2 so a "viral genome
+    # quality" (CheckV) step is not grabbed by CheckM2's "genome quality" keyword,
+    # and before geNomad so tool-named VirSorter2/CheckV/DVF steps resolve correctly).
+    VirSorter2Contract(),
+    CheckVContract(),
+    DeepVirFinderContract(),
+    GgetVirusContract(),
     # Bin quality
     CheckM2Contract(),
     # Resistome — MUST be checked BEFORE the generic aligner contracts (Hmmer/Diamond/
@@ -2140,6 +3149,17 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     GtdbtkContract(),
     # Long-read polishing
     MedakaContract(),
+    # Genomics / epigenomics / scRNA / NCBI — APPENDED LAST so every metagenomics
+    # contract gets first match; all of these NEVER return ok=False (defer via
+    # score=-1.0 when their output is absent) → they can't break a working step.
+    Macs2Contract(),
+    HomerMotifContract(),
+    GseaContract(),
+    RegionOverlapContract(),
+    ChromatinContract(),
+    ScrnaContract(),
+    Archs4Contract(),
+    NcbiDownloadContract(),
 ]
 
 
@@ -2218,6 +3238,7 @@ class ToolValidator:
         """
         # Post-processing steps must never inherit a tool's runtime contract.
         if ToolValidator._is_post_processing_step(step_title):
+            DISPATCH_COUNTERS["guard_skip"] += 1   # PoC bonus: cheap runtime telemetry
             return None
         import re as _re
         title_lower = (step_title or "").lower()
@@ -2227,7 +3248,9 @@ class ToolValidator:
                 # (e.g. "orf prediction") — anchor only the outer edges.
                 pattern = r'\b' + _re.escape(kw.lower()) + r'\b'
                 if _re.search(pattern, title_lower):
+                    DISPATCH_COUNTERS["contract_hit"] += 1
                     return contract
+        DISPATCH_COUNTERS["no_contract"] += 1
         return None
 
     # Patterns in stdout that indicate the execution environment never ran —

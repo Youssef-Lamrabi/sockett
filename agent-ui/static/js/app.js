@@ -882,7 +882,15 @@ async function send() {
   if (!document.getElementById('model-select')?.value) {
     notify('info', 'Add a model in Settings first'); openSettings(); return;
   }
-  const sid = getCurrentSessionId(); if (!sid) { notify('error', 'Create a session first'); return; }
+  // Auto-create a session on the fly when none exists yet (e.g. a brand-new
+  // account) instead of blocking the user with "Create a session first".
+  // createSession() returns the new id, or null if it couldn't (e.g. no model
+  // configured — it already notifies + opens Settings in that case).
+  let sid = getCurrentSessionId();
+  if (!sid) {
+    sid = await createSession(false);
+    if (!sid) return;
+  }
 
   const textarea = el('message');
   const msg = textarea?.value?.trim(); if (!msg) return;
@@ -1136,6 +1144,11 @@ function boot() {
     if (res.ok && res.count === 0) {
       notify('info', 'No models configured yet. Add one in Settings.');
       openSettings();
+    } else if (res.ok && res.count > 0 && !sessionsCache.length) {
+      // Brand-new account (no chats yet): create a session up-front so the user
+      // can type immediately, without having to click "New Chat" first. A model
+      // is guaranteed to exist here (count > 0), so createSession won't bail.
+      try { await createSession(false); } catch (_) { /* non-fatal */ }
     }
   });
 

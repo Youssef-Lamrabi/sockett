@@ -128,10 +128,40 @@ def _which_in_envs(exe: str) -> bool:
             continue
     return False
 
+def _registry_declared_bins() -> set:
+    """Lowercased set of every binary declared under any env's `provides_bins`
+    in the runtime registry (index.yaml).
+
+    These tools are INSTALLABLE ON DEMAND: the executor lazily calls `ensure_env`
+    before using them, so meta-env1 (and the other envs) may not physically exist
+    yet when this module is imported. Treating registry-declared bins as available
+    stops the planner from falsely seeing them as missing and bailing the whole
+    pipeline to QA on a fresh machine. Returns an empty set on any error → the
+    caller then falls back to physical-only detection (previous behaviour)."""
+    try:
+        import yaml
+        from genomeer.runtime.env_manager import REGISTRY_PATH
+        data = yaml.safe_load(Path(REGISTRY_PATH).read_text(encoding="utf-8")) or {}
+    except Exception:
+        return set()
+    bins = set()
+    for env in (data.get("envs") or []):
+        for b in (env.get("provides_bins") or []):
+            if isinstance(b, str) and b.strip():
+                bins.add(b.strip().lower())
+    return bins
+
 def _available_cli_tools() -> set:
-    """Return the set of CLI tool names available either on the current PATH
-    or in any of the known runtime conda env bin directories."""
-    return {name for name, exe in _CLI_TOOL_BINARIES.items() if _which_in_envs(exe)}
+    """Return the set of CLI tool NAMES considered available to the planner:
+      (a) physically present on PATH or in an installed env bin dir, OR
+      (b) declared in a registry env's provides_bins (installable on demand).
+    Case (b) fixes the false-negative where a fresh machine (meta-env1 not yet
+    installed) made the planner route every metagenomics pipeline to QA."""
+    declared = _registry_declared_bins()
+    return {
+        name for name, exe in _CLI_TOOL_BINARIES.items()
+        if _which_in_envs(exe) or str(exe).strip().lower() in declared
+    }
 
 _AVAILABLE_CLI = _available_cli_tools()  # computed once at import time
 

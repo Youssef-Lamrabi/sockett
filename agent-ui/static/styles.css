@@ -1346,10 +1346,11 @@ h2 {
     pointer-events: none;
 }
 
-/* Markdown basics */
+/* Markdown basics — light code blocks to match the white theme (was near-black) */
 .msg.assistant .bubble pre {
-    background: #0f1115;
-    color: #eaeef2;
+    background: #f6f8fa;
+    color: #24292f;
+    border: 1px solid #e1e4e8;
     padding: 10px;
     border-radius: 8px;
     overflow: auto;
@@ -2833,13 +2834,12 @@ ul {
 }
 
 
-/* dark mode */
-@media (prefers-color-scheme: dark) {
-    .exec-mode-menu {
-        background: #2a2a2a;
-        border-color: rgba(255, 255, 255, 0.12);
-    }
-}
+/* NOTE: This app uses a fixed LIGHT theme everywhere (single :root, no dark
+   variables). A previous `@media (prefers-color-scheme: dark)` override forced
+   ONLY this menu to a dark background (#2a2a2a) when the OS was in dark mode,
+   while the item text kept its light-theme dark color — making the panel look
+   black with unreadable items. Removed so the menu stays white like the rest
+   of the UI regardless of the OS color scheme. */
 
 .exec-mode-menu.open {
     display: block;

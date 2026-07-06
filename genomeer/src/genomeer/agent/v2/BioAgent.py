@@ -35,7 +35,7 @@ from genomeer.tools.registry import ToolRegistry
 from genomeer.utils.stream.shared import REGISTRY
 from genomeer.agent.v2.utils import instructions
 from genomeer.agent.v2.utils.state_graph import StateGraphHelper
-from genomeer.agent.v2.utils.validator import ToolValidator
+from genomeer.agent.v2.utils.validator import ToolValidator, format_extracted_metrics
 from genomeer.agent.v2.utils.quality_gate import check_quality, BIOLOGICAL_GATES
 from genomeer.utils.version_tracker import VersionTracker
 from genomeer.model.feedback import FeedbackParser
@@ -3014,6 +3014,10 @@ class BioAgent:
                     "score":          result.score,
                     "stdout":         last_result[:2000],
                     "files_snapshot": _dir_files,
+                    # PoC: carry the contract's typed metrics alongside stdout so
+                    # the finalizer gets structured values (empty {} for contracts
+                    # that haven't opted in yet — no behaviour change for them).
+                    "metrics":        getattr(result, "metrics", {}) or {},
                 })
                 new_manifest = self._clean_manifest(state["manifest"])
                 new_manifest["observations"]  = observations
@@ -4269,6 +4273,22 @@ class BioAgent:
                     artifacts=_artifacts_for_llm
                 ))
             ]
+
+            # PoC (metrics propagation): give the finalizer a deterministic,
+            # structured metrics block extracted by the contracts — so it cites
+            # these numbers directly instead of re-parsing the raw file previews
+            # in the ledger. Empty/opt-out steps simply don't appear here.
+            try:
+                _metrics_block = format_extracted_metrics(observations)
+                self._log("EXTRACTED METRICS", body=_metrics_block, node=node)
+                msgs.append(HumanMessage(content=(
+                    "DETERMINISTIC EXTRACTED METRICS (authoritative — these values "
+                    "were parsed from the output files by validated contracts. Cite "
+                    "them AS-IS; do NOT recompute or re-read the source files):\n"
+                    + _metrics_block
+                )))
+            except Exception as _mx_err:
+                self._log("EXTRACTED METRICS ERR", body=str(_mx_err), node=node)
 
             # Bio-hint BRIEF (advisory): 2-3 short interpretation bullets from the
             # fine-tuned 8B. Comes AFTER BioRAG so the LLM has facts first, hints
