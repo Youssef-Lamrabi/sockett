@@ -833,8 +833,31 @@ async function uploadFile() {
 }
 
 /* --------------------- while agent respond ------------------------------ */
+let _wsPollTimer = null;
 function setComposerBusy(busy) {
   composerBusy = busy;
+
+  // Live workspace sync: while a run is active, poll the file panel every few
+  // seconds so files produced mid-step appear WITHOUT a manual refresh. The
+  // previous block-event trigger alone was starved by the shared debounce and
+  // by long steps that stream no blocks. Guarded by fe-open (no fetch when the
+  // panel is closed) and refreshWorkspaceFiles no-ops when nothing changed.
+  try {
+    if (busy) {
+      if (!_wsPollTimer) {
+        _wsPollTimer = setInterval(() => {
+          try {
+            const open = document.getElementById('content-area')?.classList.contains('fe-open');
+            if (open) refreshWorkspaceFiles().catch(() => { });
+          } catch { }
+        }, 3000);
+      }
+    } else if (_wsPollTimer) {
+      clearInterval(_wsPollTimer);
+      _wsPollTimer = null;
+      try { window.refreshWorkspaceSoon?.(300); } catch { }  // final catch-up
+    }
+  } catch { }
 
   const send = el('send');
   const stop = el('stop');
@@ -1224,6 +1247,9 @@ function boot() {
   initSplitter();
   el('mdl-add')?.addEventListener('click', (e) => { e.preventDefault(); addModel(); });
   el('settings-save')?.addEventListener('click', (e) => { e.preventDefault(); addModel(); });
+  el('mdl-test')?.addEventListener('click', (e) => { e.preventDefault(); testModel(); });
+  el('mdl-source')?.addEventListener('change', () => { try { _updateModelSource(); } catch { } });
+  try { _updateModelSource(); } catch { }  // initial state
 
   // Initialize mode UI from persisted value
   updateModeUI(getAgentMode());
@@ -1365,6 +1391,10 @@ function boot() {
       const textarea = el('message');
       if (textarea && prompt) {
         textarea.value = prompt;
+        // Fire 'input' so the @tool highlight overlay refreshes. Without it the
+        // textarea text stays color:transparent (ta-hl-on) with an empty overlay
+        // → the inserted prompt looked white/invisible (only typed text showed).
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
         autoGrowTextArea(textarea);
         textarea.focus();
       }
@@ -1627,6 +1657,8 @@ function boot() {
     const t = document.getElementById('message');
     if (t) {
       t.value = msg;
+      // refresh the @tool highlight overlay (else transparent text looks invisible)
+      try { t.dispatchEvent(new Event('input', { bubbles: true })); } catch { }
       // keep your auto-grow behavior
       try { if (typeof autoGrowTextArea === 'function') autoGrowTextArea(t); } catch { }
     }
@@ -2431,6 +2463,99 @@ async function addModel() {
   notify('success', 'Model added');
   await loadModelsIntoUI();
   await refreshModelSelectFromServer(name);
+}
+
+// Test the CURRENT add-model form (source + name + url + key) against the backend so the
+// user can verify a model works BEFORE saving it. Shows ✓/✗ + the server message.
+async function testModel() {
+  const name = el('mdl-name')?.value.trim();
+  const source = el('mdl-source')?.value;
+  const base_url = el('mdl-base-url')?.value || null;
+  const api_key = el('mdl-api-key')?.value || null;
+  const st = el('mdl-test-status');
+  const setStatus = (txt, ok) => { if (st) { st.textContent = txt; st.style.color = ok === true ? '#15803d' : ok === false ? '#b91c1c' : '#64748b'; } };
+  if (!name) { setStatus('Enter a model name first', false); return; }
+  setStatus('Testing…', null);
+  const btn = el('mdl-test'); if (btn) btn.disabled = true;
+  try {
+    const res = await fetch('/api/settings/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...api.headers() },
+      body: JSON.stringify({ source, model: name, base_url, api_key })
+    });
+    const d = await res.json().catch(() => ({ ok: false, message: 'Bad response from server' }));
+    setStatus((d.ok ? '✓ ' : '✗ ') + (d.message || (d.ok ? 'OK' : 'Failed')), !!d.ok);
+  } catch (e) {
+    setStatus('✗ ' + (e?.message || 'Network error'), false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Source-aware form: show/hide/relabel base_url + api_key + a one-line hint per provider,
+// so the user knows what each source actually needs (Ollama URL / Custom URL / API key…).
+// Curated recent-model suggestions per provider. These populate the model-name
+// datalist to save the user typing/guessing exact IDs — the input stays FREE TEXT
+// (a datalist only suggests), so new/unlisted models and custom endpoints still work.
+const MODEL_SUGGESTIONS = {
+  OpenAI:      ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o3', 'o4-mini'],
+  Anthropic:   ['claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5-20251001', 'claude-fable-5'],
+  Gemini:      ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash'],
+  Groq:        ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'],
+  DeepSeek:    ['deepseek-chat', 'deepseek-reasoner'],
+  Ollama:      ['llama3.1', 'llama3.2', 'qwen2.5', 'gemma2', 'mistral', 'phi3', 'gpt-oss:20b'],
+  AzureOpenAI: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1'],
+  Bedrock:     ['anthropic.claude-3-5-sonnet-20241022-v2:0', 'meta.llama3-1-70b-instruct-v1:0'],
+  Custom:      [],  // endpoint-specific — no meaningful defaults
+};
+
+function _updateModelDatalist(source) {
+  const dl = el('mdl-name-list');
+  if (!dl) return;
+  const items = MODEL_SUGGESTIONS[source] || [];
+  dl.innerHTML = items.map(m => `<option value="${m}"></option>`).join('');
+}
+
+function _updateModelSource() {
+  const source = el('mdl-source')?.value || 'Ollama';
+  _updateModelDatalist(source);
+  const base = el('mdl-base-url'), key = el('mdl-api-key'), hint = el('mdl-source-hint');
+  const show = (elm, on) => { if (elm) elm.style.display = on ? '' : 'none'; };
+  let baseOn = true, keyOn = true, basePh = 'Base URL', keyPh = 'API key', h = '';
+  switch (source) {
+    case 'Ollama':
+      baseOn = true; keyOn = false;
+      basePh = 'Ollama URL (blank = http://localhost:11434)';
+      h = 'Local or remote Ollama. Model = the Ollama tag (e.g. llama3.1). No API key needed.';
+      break;
+    case 'Custom':
+      basePh = 'OpenAI-compatible URL — REQUIRED (e.g. http://host:8000/v1)';
+      keyPh = 'API key (optional; e.g. EMPTY for local vLLM)';
+      h = 'Any OpenAI-compatible endpoint (vLLM, SGLang, OpenRouter, DeepSeek, Together…). Base URL required.';
+      break;
+    case 'OpenAI': case 'Anthropic': case 'Gemini': case 'Groq':
+      baseOn = false; keyPh = 'API key — REQUIRED';
+      h = source + ' cloud API — provide your API key; base URL not needed.';
+      break;
+    case 'DeepSeek':
+      basePh = 'Base URL (blank = https://api.deepseek.com/v1)';
+      keyPh = 'DeepSeek API key — REQUIRED';
+      h = 'DeepSeek cloud API (OpenAI-compatible). Model = e.g. deepseek-chat / deepseek-reasoner. '
+        + 'Provide your API key; leave URL blank unless using a proxy.';
+      break;
+    case 'AzureOpenAI':
+      basePh = 'Azure endpoint URL'; keyPh = 'Azure API key';
+      h = 'Azure OpenAI: endpoint + key (deployment name = model).';
+      break;
+    case 'Bedrock':
+      baseOn = false; keyOn = false;
+      h = 'AWS Bedrock uses AWS credentials from the environment (AWS_REGION…). No key/URL here.';
+      break;
+  }
+  show(base, baseOn); show(key, keyOn);
+  if (base) base.placeholder = basePh;
+  if (key) key.placeholder = keyPh;
+  if (hint) hint.textContent = h;
 }
 
 async function deleteModel(mid) {

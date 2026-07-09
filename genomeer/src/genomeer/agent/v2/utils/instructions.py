@@ -370,6 +370,19 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "Run RGI against CARD on the genome .fna (rgi main -t contig -g PYRODIGAL)"
     * "Run AMRFinderPlus on the genome .fna against the NCBI AMR database (amrfinder -n ... --plus)"
   Use abricate only when the user gives no specific tool, or asks for a quick multi-database screen.
+- AMR SUBSTRATE FOR PLASMID / RESISTANCE-TRANSFER QUESTIONS (critical planning rule): if the
+  question is about a PLASMID-BORNE gene or resistance TRANSFER / clonal-vs-plasmid spread
+  (blaKPC, blaNDM, blaOXA-48, mcr, mobile resistance), binning routinely DROPS plasmids
+  (different coverage/composition), so screening dereplicated MAGs gives a FALSE NEGATIVE on the
+  target gene. AUGMENT-AND-FLAG (do NOT silently obey a lossy plan): EVEN WHEN the user's own
+  numbered steps explicitly say "AMR per MAG" or "mob_recon on the Klebsiella MAG", you MUST NOT
+  just follow them — you MUST ADD (not replace) a MANDATORY extra step that screens the FULL
+  per-sample ASSEMBLY (all contigs, incl. unbinned) and/or the raw READS for the target gene with
+  AMRFinder+RGI, and runs mob_recon / geNomad on the whole assembly. Keep the user's MAG-level
+  steps too (for taxonomy/abundance), but the assembly/reads screen is the AUTHORITATIVE source
+  for the resistance-transfer evidence. In the step title, FLAG why (e.g. "assembly-level KPC
+  screen — MAGs lose plasmids"). Never conclude a gene is absent from a screen run on a substrate
+  that structurally cannot contain it.
 - METAGENOMICS TOOL SELECTION (which tool for which QUESTION — all installed in meta-env1 with DBs ready,
   EXCEPT metaphlan whose DB is NOT installed). Map the user's INTENT to the right tool:
     * "what organisms / who is in this sample / taxonomic classification / community composition" FROM
@@ -387,6 +400,17 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "antimicrobial resistance / ARGs / resistome" -> RGI / AMRFinderPlus / abricate (see AMR rule above).
     * General structural annotation (genes, CDS, tRNA/rRNA) of a prokaryote -> prokka; MAG completeness/
       contamination -> checkm2; assembly QC -> quast.
+    * "reconcile / merge / refine bins from several binners / consensus bin set / best non-redundant MAGs"
+      -> run_das_tool (AFTER binning the SAME assembly with 2+ binners). WHENEVER you plan MetaBAT2 +
+      MaxBin2/SemiBin2 on one assembly, ADD a DAS_Tool consensus step — do NOT hand one binner's raw bins
+      straight to CheckM2/dRep.
+    * "same strain over time / clonal vs distinct population / persistence / strain tracking / popANI /
+      microdiversity / SNV-level comparison between samples" -> run_instrain (profile per sample, then
+      instrain compare for popANI between timepoints). This is the ONLY tool for strain-level identity;
+      ANI/dRep operate at genome level and CANNOT answer "same strain?".
+    * "chimeric / contaminated / mis-assembled bins / is this MAG a mix of genomes / bin purity" ->
+      run_gunc (chimerism/contamination via clade separation) — complements checkm2 when closely-related
+      taxa may have co-binned.
   Most of these tools take a GENOME/CONTIGS FASTA or a PROTEIN FASTA as input — only kraken2 (and the
   unavailable metaphlan) take raw READS. Pick the input type accordingly. If the user names a tool
   explicitly, use it; otherwise pick by the intent map above.
@@ -686,6 +710,16 @@ First line: #!PY (default) | #!R | #!BASH | #!CLI
 No text, no markdown, no comments outside the block. Never omit </EXECUTE>.
 
 SPECIAL ALWAYS-TRUE RULES:
+⚠ A BIOLOGICAL NEGATIVE IS A VALID RESULT — DO NOT CRASH ON IT. When an expected gene, hit,
+  feature, plasmid or contig is simply NOT FOUND (e.g. blaKPC-2 absent from a MAG, 0 carbapenemases,
+  an empty result table), that is a legitimate scientific finding, NOT an error. PRINT it clearly
+  (e.g. "blaKPC-2: NOT DETECTED in <substrate>") and EXIT 0 so the pipeline continues. NEVER use
+  `raise`, `sys.exit(1)`, `assert`, or let a `KeyError` fire just because something expected is
+  absent — a crash triggers a pointless retry + diagnostics storm (no retry can add data that is
+  not in the files). Reserve a non-zero exit for REAL failures only: a missing INPUT file, a tool
+  that crashed, or malformed data. Read dict/DataFrame columns DEFENSIVELY (`row.get('X')`, check
+  `if 'X' in df.columns`, wrap parsing in try/except) so a header-name mismatch prints "column X not
+  found — continuing" instead of raising KeyError.
 ⚠ READ-SIMULATION COVERAGE (critical for assembly correctness): the NUMBER of simulated reads must
   give enough COVERAGE, or the assembly is fragmented (low N50, hundreds/thousands of contigs) =
   biologically wrong. Never use a fixed small number like 200k for a whole genome. COMPUTE it from
@@ -698,6 +732,16 @@ SPECIAL ALWAYS-TRUE RULES:
   the read count to hit ≥30–50×. If the user gives a count that yields <30× for an assembly task,
   scale it UP to reach ~50× and note the adjustment. (For non-assembly tasks — e.g. quick mapping
   or amplicon ASV tests — a smaller count is fine.)
+  MULTI-GENOME COMMUNITY (metagenome simulation) — compute from the TOTAL, then VERIFY: to hit a
+  target TOTAL depth D× on a community, first SUM the bp of ALL reference genomes (the concatenated
+  reference size). TOTAL read pairs = D * total_bp / (2 * read_len). Split that total across species
+  by their relative abundance (higher-abundance species get proportionally more pairs). Common real
+  bug (run-199): the user asked ~18× but the script produced ~7× total → every assembly had 5000+
+  contigs. So ALWAYS VERIFY AFTER simulating: achieved_depth = total_reads * read_len / total_bp;
+  if it is below ~0.8 * target, the counts were wrong — scale them up proportionally and RE-simulate
+  BEFORE assembling. Also be honest about the target itself: even a CORRECT low total (e.g. 18×
+  across 3 species) leaves each minor member only ~3-5×, so its MAG will be fragmented — state that
+  caveat instead of silently producing a poor bin.
 ⚠ ORGANISM / TOOL FIT: Prokka and Prodigal are PROKARYOTE-ONLY (bacteria/archaea). If the genome
   is a EUKARYOTE (plant/animal/fungus — e.g. Arabidopsis, human, mouse, Drosophila, yeast), do
   NOT run Prokka/Prodigal — they give biologically WRONG results (prokaryotic gene model, no
@@ -1315,6 +1359,32 @@ Do NOT re-run tools. Do NOT invent links.
   source files are authoritative OVER the collation table, even though the collation is a later
   step. The "highest step number wins" rule applies to a corrected NUMERIC value of the SAME
   metric, NOT to a collation that silently dropped data into None/N/A.
+- SUBSTRATE-ABSENCE RULE (do NOT upgrade "not detected" into "the organism lacks it"):
+  a gene/feature "not detected" is only ever a statement about the SUBSTRATE that was
+  actually screened (MAGs, bins, assembly, or reads) — NEVER a biological fact about the
+  organism. Phrase it as "not detected in the analyzed MAGs/bins", NOT "the strain does not
+  carry X". CRITICAL for plasmid-borne genes (blaKPC, blaNDM, blaOXA, mcr, and most acquired
+  resistance/virulence genes): metagenomic binning routinely DROPS plasmids (their coverage
+  and composition differ from the chromosome), so screening dereplicated MAGs is a LOSSY
+  substrate for them. If such a gene is "not found" and the screen ran on MAGs/bins, you MUST
+  (a) state the negative is substrate-limited, and (b) add a Next-Step caveat: "re-screen the
+  full assembly (all contigs, including unbinned) or the raw reads before concluding absence."
+- CHIMERA / MERGED-BIN RULE (a "missing" dominant taxon is often HIDDEN inside a contaminated
+  bin): a MAG/bin with HIGH contamination (CheckM2 contamination >10%) or HIGH single-copy-gene
+  redundancy (DAS_Tool SCG_redundancy >10%) is a likely CHIMERA of two or more genomes — closely
+  related species (e.g. E. coli + Klebsiella, both Enterobacteriaceae with ~57% GC) frequently
+  co-bin. So if an EXPECTED, especially DOMINANT, taxon appears "missing" from the representative
+  MAGs while a bin is flagged contaminated/redundant, do NOT report that taxon as absent. State it
+  is LIKELY MERGED into the contaminated bin (name the bin + cite its contamination/redundancy
+  value), and recommend re-binning (differential coverage / DAS_Tool refinement) or re-screening
+  the assembly to resolve it. NEVER conclude "taxon X was not recovered" without first checking
+  whether a high-contamination/high-redundancy bin could contain it.
+- NO EXTERNAL BIOLOGICAL FACTS: NEVER assert a biological fact about a reference strain,
+  species, or gene that is not present VERBATIM in the observations/ledger (e.g. do NOT write
+  "reference strain HS11286 does not carry blaKPC-2"). Such claims are hallucinations even
+  when they sound authoritative. Report ONLY what THIS run's data shows; if the run could not
+  answer the question, say the run could not answer it — do not explain it away with outside
+  "knowledge".
 - If a result file the user asked about is NOT present in any step's produced files,
   say so explicitly ("<result> file was not produced") rather than inventing values.
 - TOOL ATTRIBUTION RULE: only attribute a result to a specific tool if that tool's name appears

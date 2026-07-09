@@ -1837,34 +1837,197 @@ class DasToolContract(_BaseContract):
 
         n_bins = len(bin_fas)
         scores: List[float] = []
+        max_red = 0.0  # highest SCG_redundancy across bins → chimera signal
 
         if summary:
             try:
                 with open(summary, encoding="utf-8") as fh:
                     reader = csv.DictReader(fh, delimiter="\t")
                     for row in reader:
-                        comp_str = row.get("SCG_completeness", "")
-                        cont_str = row.get("SCG_redundancy", "")
                         try:
-                            # SCG_completeness and SCG_redundancy are in 0–1 range
-                            comp = float(comp_str) * 100.0
-                            cont = float(cont_str) * 100.0
-                            scores.append(max(0.0, comp - 5.0 * cont))
+                            comp = float(row.get("SCG_completeness", ""))
+                            red  = float(row.get("SCG_redundancy", ""))
                         except (ValueError, TypeError):
-                            pass
+                            continue
+                        # DAS_Tool emits 0–1 in some versions, 0–100 in others (1.1.7) — normalize to %.
+                        if comp <= 1.0: comp *= 100.0
+                        if red  <= 1.0: red  *= 100.0
+                        max_red = max(max_red, red)
+                        scores.append(max(0.0, comp - 5.0 * red))
             except Exception:
                 pass
+
+        # A bin with high SCG_redundancy is a likely CHIMERA of >=2 genomes (closely related
+        # species co-bin). Surface it as a metric + a warning so the finalizer can flag a
+        # "missing" dominant taxon that is actually merged inside the contaminated bin.
+        _chi = (f"  [CHIMERA WARNING: a bin has SCG_redundancy={max_red:.0f}% — likely 2+ merged "
+                f"genomes; a 'missing' taxon may be hidden inside it]") if max_red > 10.0 else ""
+        _metrics = {"n_bins": n_bins, "max_scg_redundancy_pct": round(max_red, 1)}
 
         if scores:
             avg = sum(scores) / len(scores)
             return ContractResult(ok=True, score=min(1.0, avg / 100.0),
-                                  reason=f"das_tool: {n_bins} bin(s) dereplicated, avg quality={avg:.1f}",
-                                  metrics={"n_bins": n_bins})
+                                  reason=f"das_tool: {n_bins} bin(s) refined, avg quality={avg:.1f}{_chi}",
+                                  metrics=_metrics)
 
         score = min(1.0, n_bins / 5.0)  # 5 high-quality bins = 1.0
         return ContractResult(ok=True, score=score,
-                              reason=f"das_tool: {n_bins} dereplicated bin(s) produced",
-                              metrics={"n_bins": n_bins})
+                              reason=f"das_tool: {n_bins} refined bin(s) produced{_chi}",
+                              metrics=_metrics)
+
+
+class GuncContract(_BaseContract):
+    """
+    GUNC — chimerism/contamination detection for MAGs.
+    Output: <out>/GUNC.progenomes_2.1.maxCSS_level.tsv (or *.maxCSS_level.tsv)
+        key cols: genome, pass.GUNC (True/False), clade_separation_score (CSS),
+                  contamination_portion, n_effective_surplus_clades
+    Scoring: fraction of genomes that PASS (pass.GUNC True / CSS<=0.45). Empty/absent -> fail.
+    Source: Orakov et al. 2021 Genome Biology doi:10.1186/s13059-021-02393-0
+            https://grp-bork.embl-community.io/gunc/ (CSS>0.45 flags chimeras).
+    """
+    KEYWORDS = ("gunc", "chimera", "chimeric", "chimerism", "chimera detection")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "check the -r DB path (/home/workshop/gunc_db/gunc_db_progenomes2.1.dmnd) and that bins exist",
+        "for a directory of bins use --input_dir <dir> --file_suffix .fa, not -i",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        tsv = self._glob_first(run_dir, "*maxCSS_level.tsv", "GUNC*.tsv", "*GUNC*maxCSS*.tsv")
+        if not tsv:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="gunc: no GUNC.*maxCSS_level.tsv found",
+                retry_params={"hint": "gunc run --input_dir bins/ --file_suffix .fa -r <db.dmnd> -o out"},
+            )
+        n, n_chi, max_css = 0, 0, 0.0
+        chi_names: List[str] = []
+        try:
+            with open(tsv, encoding="utf-8") as fh:
+                for row in csv.DictReader(fh, delimiter="\t"):
+                    n += 1
+                    try:
+                        css = float(row.get("clade_separation_score", "") or 0)
+                        max_css = max(max_css, css)
+                    except (ValueError, TypeError):
+                        css = 0.0
+                    _pass = str(row.get("pass.GUNC", "")).strip().lower()
+                    is_chi = (_pass == "false") or (css > 0.45)
+                    if is_chi:
+                        n_chi += 1
+                        g = row.get("genome") or ""
+                        if g:
+                            chi_names.append(g)
+        except Exception:
+            pass
+        if n == 0:
+            return ContractResult(ok=False, score=0.1,
+                                  reason="gunc: maxCSS table is empty (no genome scored)")
+        _flag = (f"  [CHIMERA: {n_chi}/{n} bin(s) FAIL GUNC (max CSS={max_css:.2f}) — "
+                 f"{', '.join(chi_names[:4])} — likely 2+ merged genomes]") if n_chi else ""
+        # score = fraction clean; a clean set scores high, a chimeric set low.
+        score = max(0.05, (n - n_chi) / n)
+        return ContractResult(
+            ok=True, score=score,
+            reason=f"gunc: {n} bin(s), {n_chi} chimeric{_flag}",
+            metrics={"n_genomes": n, "n_chimeric": n_chi, "max_clade_separation_score": round(max_css, 3)},
+        )
+
+
+class InStrainContract(_BaseContract):
+    """
+    inStrain 1.10 — strain-level microdiversity.
+    profile mode -> {out}.IS/output/{name}_genome_info.tsv
+        columns: genome, coverage, breadth, nucl_diversity, reads, ...
+    compare mode -> {out}.IS/output/{name}_comparisonsTable.tsv
+        columns: genome, name1, name2, popANI, conANI, percent_genome_compared, ...
+    Scoring: profile -> presence of genome_info with real coverage/nucl_diversity;
+             compare -> popANI table present. Empty/absent output -> fail.
+    Source: Olm et al. 2021 Nature Biotechnology doi:10.1038/s41587-020-00797-0
+            https://instrain.readthedocs.io (output specification; popANI>0.99999 ~ same strain)
+    """
+    KEYWORDS = ("instrain", "in-strain", "strain-level", "strain level",
+                "microdiversity", "popani", "conani", "nucleotide diversity",
+                "same strain", "strain identity", "strain tracking")
+    RUNTIME = "medium"
+    VARIANTS = [
+        "ensure the BAM is coordinate-SORTED and indexed (samtools sort + samtools index) before inStrain profile",
+        "verify the reference FASTA matches the BAM's reference sequences; pass -p 4",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        genome_info = self._glob_first(run_dir, "*_genome_info.tsv",
+                                       "*.IS/output/*_genome_info.tsv", "*genome_info.tsv")
+        # Prefer the PER-GENOME genomeWide table (has a `genome` column + per-MAG popANI,
+        # produced only when `-s stb` is passed to compare); fall back to the per-scaffold
+        # comparisonsTable. Both expose a `popANI` column so the parse below works for either.
+        cmp_tbl = self._glob_first(run_dir, "*_genomeWide_compare.tsv",
+                                   "*.IS/output/*_genomeWide_compare.tsv",
+                                   "*_comparisonsTable.tsv",
+                                   "*.IS/output/*_comparisonsTable.tsv", "*comparisonsTable*.tsv")
+
+        if not genome_info and not cmp_tbl:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="instrain: no _genome_info.tsv (profile) or _comparisonsTable.tsv (compare) found",
+                retry_params={"hint": "inStrain profile needs a SORTED+INDEXED bam and the reference fasta; "
+                                      "inStrain compare needs 2+ .IS profile dirs"},
+            )
+
+        # ── compare mode: report popANI (same-strain evidence) ──────────────
+        if cmp_tbl:
+            popani_vals: List[float] = []
+            try:
+                with open(cmp_tbl, encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh, delimiter="\t"):
+                        try:
+                            popani_vals.append(float(row.get("popANI", "")))
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass
+            if popani_vals:
+                mx = max(popani_vals)
+                return ContractResult(
+                    ok=True, score=1.0,
+                    reason=f"instrain compare: {len(popani_vals)} pair(s), max popANI={mx:.6f}",
+                    metrics={"n_comparisons": len(popani_vals), "max_popANI": round(mx, 6)},
+                )
+            return ContractResult(ok=True, score=0.6,
+                                  reason="instrain compare: comparisonsTable produced (no popANI parsed)")
+
+        # ── profile mode: report coverage / nucleotide diversity ────────────
+        n_genomes, covs, divs = 0, [], []
+        try:
+            with open(genome_info, encoding="utf-8") as fh:
+                for row in csv.DictReader(fh, delimiter="\t"):
+                    n_genomes += 1
+                    try: covs.append(float(row.get("coverage", "")))
+                    except (ValueError, TypeError): pass
+                    try: divs.append(float(row.get("nucl_diversity", "")))
+                    except (ValueError, TypeError): pass
+        except Exception:
+            pass
+
+        if n_genomes == 0:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason="instrain profile: genome_info.tsv is empty (no genome profiled)",
+                retry_params={"hint": "check the bam actually maps reads to the reference; coverage may be ~0"},
+            )
+        mean_cov = (sum(covs) / len(covs)) if covs else 0.0
+        mean_div = (sum(divs) / len(divs)) if divs else 0.0
+        # low coverage → strain calls unreliable (mirror the iRep <5x caveat)
+        score = 1.0 if mean_cov >= 5.0 else max(0.3, mean_cov / 5.0)
+        return ContractResult(
+            ok=True, score=score,
+            reason=f"instrain profile: {n_genomes} genome(s), mean coverage={mean_cov:.1f}x, "
+                   f"mean nucl_diversity={mean_div:.4f}"
+                   + ("" if mean_cov >= 5.0 else "  [LOW COVERAGE <5x — strain metrics unreliable]"),
+            metrics={"n_genomes": n_genomes, "mean_coverage": round(mean_cov, 2),
+                     "mean_nucl_diversity": round(mean_div, 5)},
+        )
 
 
 # ===========================================================================
@@ -3087,6 +3250,12 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # Assembly
     AssemblyContract(),
     QuastContract(),
+    # Consensus / dereplication matched BEFORE the individual binners: a DAS_Tool step
+    # title names "MetaBAT2/MaxBin2" and a dRep step names "DAS_Tool", so checking Drep
+    # then DAS_Tool first stops a binner keyword (e.g. "MaxBin2") from stealing the match.
+    # DrepContract is first so a dRep step mentioning "DAS_Tool" still routes to dRep.
+    DrepContract(),
+    DasToolContract(),
     # Binning
     SemiBin2Contract(),
     ConcoctContract(),
@@ -3096,7 +3265,6 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # keywords, no overlap with existing ones; placed here so they get first match).
     CoverMContract(),
     Minimap2Contract(),
-    DrepContract(),
     Dada2Contract(),
     IRepContract(),
     MobReconContract(),
@@ -3111,6 +3279,7 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     GgetVirusContract(),
     # Bin quality
     CheckM2Contract(),
+    GuncContract(),
     # Resistome — MUST be checked BEFORE the generic aligner contracts (Hmmer/Diamond/
     # Eggnog) below: RGI/AMRFinder step titles mention "diamond"/"blast"/"hmmer" as their
     # INTERNAL aligner, so first-match ordering would otherwise hand an RGI step to
@@ -3139,8 +3308,8 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # WGS / clinical
     CnvkitContract(),
     OptitypeContract(),
-    # Bin dereplication
-    DasToolContract(),
+    # Strain-level (DAS_Tool + dRep moved up near the binners for correct matching)
+    InStrainContract(),
     # Abundance re-estimation
     BrackenContract(),
     # Marker-gene profiling

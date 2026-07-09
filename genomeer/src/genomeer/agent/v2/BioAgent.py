@@ -114,6 +114,82 @@ class AgentState(TypedDict):
     turn_id: int
 
 
+def _augment_plan_for_mobile_amr(user_prompt, steps):
+    """Deterministic enforcement (NOT a prompt rule) for plasmid-borne resistance.
+
+    For questions about a mobile / plasmid-borne resistance gene (blaKPC, blaNDM,
+    blaOXA-48, VIM, IMP, mcr) or resistance TRANSFER, screening AMR/plasmids only on
+    binned + dereplicated MAGs yields a FALSE NEGATIVE: binning drops plasmids, so
+    the target gene disappears from the MAGs. A prompt rule alone was proven
+    insufficient — the planner faithfully follows the user's explicit per-MAG steps
+    and ignores the advisory. So when (a) the question matches the mobile-gene
+    pattern, (b) the plan screens AMR on MAGs, and (c) no assembly-level screen is
+    already planned, we INJECT a mandatory assembly-level screen step in code.
+
+    Safety: idempotent (never double-adds), disableable via GENOMEER_PLASMID_AUGMENT=0,
+    and never raises — on any error the original steps are returned unchanged so plan
+    generation can never be broken by this augmentation.
+    """
+    import os, re
+    try:
+        if os.environ.get("GENOMEER_PLASMID_AUGMENT", "1") == "0" or not steps:
+            return steps
+        prompt = (user_prompt or "").lower()
+
+        # (1) Trigger: a mobile/plasmid resistance-gene token AND transfer context.
+        _gene = re.search(
+            r"\bbla[\s_-]?(kpc|ndm|oxa[\s-]?48|vim|imp)\b|\bkpc[-\s]?\d|\bndm[-\s]?\d|\bmcr[-_\s]?\d",
+            prompt,
+        )
+        _ctx = re.search(r"\b(plasmid|clonal|transfer|conjugativ|mobile|dissemin|spread)\b", prompt)
+        if not (_gene and _ctx):
+            return steps
+
+        def _t(s):
+            return str(s.get("raw_title") or s.get("title") or "").lower()
+
+        # (2) Is AMR actually screened on MAGs/bins in the plan?
+        _amr_on_mag = any(
+            re.search(r"amr|resist|amrfinder|\brgi\b|carbapenem", _t(s))
+            and re.search(r"\bmag\b|\bmags\b|\bbin\b|\bbins\b|representative", _t(s))
+            for s in steps
+        )
+        if not _amr_on_mag:
+            return steps
+
+        # (3) Idempotency: assembly-level AMR/plasmid screen already present?
+        _already = any(
+            re.search(r"assembl", _t(s))
+            and re.search(r"amr|resist|kpc|carbapenem|plasmid|mob_recon|screen", _t(s))
+            for s in steps
+        )
+        if _already:
+            return steps
+
+        # (4) Build the injected step (matches planner step schema).
+        _title = (
+            "Assembly-level resistance & plasmid screen (MAGs lose plasmids in binning): "
+            "run AMRFinderPlus + RGI on each full per-sample assembly (ALL contigs, "
+            "including unbinned) and run mob_recon on the assembly to locate the mobile "
+            "resistance gene and its plasmid — this is the AUTHORITATIVE substrate for the "
+            "resistance-transfer question; the MAG-only screen is lossy for plasmid genes"
+        )
+        inj = {"title": _title, "raw_title": _title, "status": "todo",
+               "notes": "auto-injected: plasmid-safe AMR substrate", "_injected": True}
+
+        # (5) Insert BEFORE the final integrate/verdict step if present, else append.
+        _int_idx = next(
+            (i for i, s in enumerate(steps)
+             if re.search(r"integrat|verdict|conclu|answer the|final report|evidence_summary", _t(s))),
+            None,
+        )
+        if _int_idx is None:
+            return list(steps) + [inj]
+        return list(steps[:_int_idx]) + [inj] + list(steps[_int_idx:])
+    except Exception:
+        return steps
+
+
 # -----------------------------------------------
 # CORE AGENT CLASS
 # -----------------------------------------------
@@ -566,6 +642,69 @@ class BioAgent:
         sys_prompt = base_prompt + custom_resources + env_resources
         return sys_prompt
 
+    def _scoped_system_prompt(self, state) -> str:
+        """System prompt whose TOOL catalog is filtered to just the tools the current PLAN
+        uses (+ a small always-on core: utilities/workspace/ncbi), instead of all ~118 tools.
+        This cuts the per-generation context massively. The PLANNER keeps the FULL catalog
+        (it must see everything to choose); only the GENERATOR uses this scoped prompt.
+        Deterministic (name-match on the plan), cached per plan, and SAFE: any empty/tiny
+        match or error falls back to the full self.system_prompt. Kill-switch:
+        GENOMEER_TOOL_SCOPING=0.
+        """
+        try:
+            if os.environ.get("GENOMEER_TOOL_SCOPING", "1") == "0":
+                return self.system_prompt
+            full = getattr(self, "_full_tool_desc", None)
+            if not full or not getattr(self, "_sysprompt_kwargs", None):
+                return self.system_prompt
+            plan = state.get("plan") or []
+            if not plan:
+                return self.system_prompt
+            hay = " ".join(str(s.get("raw_title") or s.get("title") or "") for s in plan).lower()
+            hay += " " + str(state.get("last_prompt") or "").lower()
+            sig = hash(hay)
+            cached = self._scoped_prompt_cache.get(sig)
+            if cached is not None:
+                return cached
+
+            import re as _re
+            _CORE = ("basic", "artifacts", "ncbi")  # substring-matched against module name
+
+            def _api_hit(api):
+                name = str(api.get("name", "") or "")
+                if not name:
+                    return False
+                core = name[4:] if name.startswith("run_") else name
+                for tok in {name.lower(), core.lower()}:
+                    if len(tok) >= 3 and _re.search(r"\b" + _re.escape(tok) + r"\b", hay):
+                        return True
+                return False
+
+            scoped = {}
+            for mod, apis in full.items():
+                if any(c in str(mod).lower() for c in _CORE):
+                    scoped[mod] = list(apis)
+                    continue
+                keep = [a for a in apis if _api_hit(a)]
+                if keep:
+                    scoped[mod] = keep
+
+            n_scoped = sum(len(v) for v in scoped.values())
+            n_full = sum(len(v) for v in full.values())
+            # Only use the scoped prompt when it meaningfully shrinks AND matched something.
+            if n_scoped < 3 or n_scoped >= n_full:
+                self._scoped_prompt_cache[sig] = self.system_prompt
+                return self.system_prompt
+
+            prompt = self._generate_system_prompt(tool_desc=scoped, **self._sysprompt_kwargs)
+            self._scoped_prompt_cache[sig] = prompt
+            self._log("TOOL SCOPING",
+                      body=f"generator sees {n_scoped}/{n_full} tools (plan-scoped)",
+                      node="generator")
+            return prompt
+        except Exception:
+            return self.system_prompt
+
     def configure(self, self_critic=False, test_time_scale_round=0):
         """Configure the agent with the initial system prompt and workflow.
         Args:
@@ -628,8 +767,9 @@ class BioAgent:
             for name, info in self._custom_software.items():
                 custom_software.append({"name": name, "description": info["description"]})
 
-        self.system_prompt = self._generate_system_prompt(
-            tool_desc=tool_desc,
+        # Keep the args so we can rebuild a TOOL-SCOPED system prompt after planning
+        # (full catalog for the planner, a plan-filtered subset for the generator).
+        self._sysprompt_kwargs = dict(
             data_lake_content=data_lake_with_desc,
             library_content_list=library_content_list,
             self_critic=self_critic,
@@ -638,7 +778,10 @@ class BioAgent:
             custom_data=custom_data if custom_data else None,
             custom_software=custom_software if custom_software else None,
         )
-        
+        self._full_tool_desc = tool_desc          # {module: [api,...]} — full catalog
+        self._scoped_prompt_cache = {}            # plan-signature -> scoped system prompt
+        self.system_prompt = self._generate_system_prompt(tool_desc=tool_desc, **self._sysprompt_kwargs)
+
         
         # Define the nodes(functions)
         # -------------------------------------------------------------------------------
@@ -858,6 +1001,22 @@ class BioAgent:
             # Keep raw_title (pre-cleaning) so the Generator receives the full instruction.
             # _clean_title is used everywhere else (routing, validator, display).
             steps = [{**s, "title": _clean_title(s["title"]), "raw_title": s["title"]} for s in steps]
+
+            # Deterministic enforcement (done here in CODE, not via a prompt rule
+            # which was proven to be ignored): for mobile / plasmid-borne
+            # resistance-gene questions whose plan screens AMR only on MAGs, inject
+            # a mandatory assembly-level screen so the plasmid gene is not missed.
+            # No-op unless the precise pattern matches; safe on any error.
+            if route != "qa":
+                _n_before = len(steps)
+                steps = _augment_plan_for_mobile_amr(user_prompt, steps)
+                if len(steps) != _n_before:
+                    self._log(
+                        "PLAN AUGMENT",
+                        body="injected assembly-level plasmid-safe AMR screen "
+                             "(mobile resistance-gene question with a MAG-only screen)",
+                        node=node,
+                    )
 
             # When routing to QA, suppress the planner's LLM draft from state messages.
             # Two reasons:
@@ -1684,6 +1843,75 @@ class BioAgent:
                     "        → reads passed filter: 0 — entire output is empty"
                 )
 
+            # wgsim / read-simulation injection — abundance MUST be mapped by species
+            # identity, never by sorted(glob) order. A positional map silently gives the
+            # wrong organism the wrong depth; for closely-related taxa (e.g. two
+            # Enterobacteriaceae) coverage is the ONLY signal that separates them at
+            # binning, so a mis-mapped abundance makes that genome the shallowest, its bin
+            # scores lowest, and DAS_Tool drops it from the consensus set — the species
+            # vanishes from the results even though it assembled fine (silent, not a crash).
+            if any(k in _step_title_ctx for k in ("wgsim", "simulate read", "simulate reads",
+                                                  "read simulation", "synthetic read",
+                                                  "synthetic commun", "mock commun", "in silico",
+                                                  "simulate a commun", "generate reads",
+                                                  "spike-in", "spike in")):
+                _injections.append(
+                    "THIS STEP SIMULATES READS FROM ONE OR MORE REFERENCE GENOMES.\n"
+                    "CRITICAL — MAP ABUNDANCE/COVERAGE BY SPECIES IDENTITY, NEVER BY FILE ORDER.\n"
+                    "A positional map like `abund = {files[0]:0.5, files[1]:0.3, files[2]:0.2}`\n"
+                    "over a `sorted(glob('*.fna'))` list assigns fractions by ACCESSION SORT\n"
+                    "ORDER, not by the species the user named — it silently gives the wrong\n"
+                    "organism the wrong depth.\n"
+                    "WHY IT MATTERS: for closely-related taxa (e.g. two Enterobacteriaceae like\n"
+                    "Klebsiella + E. coli) sequencing DEPTH is the only feature that separates\n"
+                    "them during binning. A mis-assigned (too-low) abundance makes that genome\n"
+                    "the shallowest, its bin scores lowest on single-copy genes, and DAS_Tool\n"
+                    "drops it from the consensus set. The species then disappears from the final\n"
+                    "results even though it was assembled and binned fine — a SILENT scientific\n"
+                    "error the pipeline will NOT flag as a crash.\n"
+                    "\n"
+                    "REQUIRED PATTERN — resolve each genome's accession/species from its filename\n"
+                    "and KEY THE ABUNDANCE DICT BY THAT IDENTITY; compute per-genome read PAIRS\n"
+                    "for the intended abundance, then always write a ground_truth.tsv:\n"
+                    "\n"
+                    "  import os, glob, subprocess, sys\n"
+                    "  # 1) Map the user's intended relative abundance BY ACCESSION/SPECIES.\n"
+                    "  #    Keys are substrings that uniquely identify each reference file.\n"
+                    "  abundance_by_id = {              # e.g. Klebsiella 50%, E.coli 30%, S.aureus 20%\n"
+                    "      'GCF_000240185': 0.50,       #   Klebsiella pneumoniae HS11286\n"
+                    "      'GCF_000005845': 0.30,       #   E. coli K-12 MG1655\n"
+                    "      'GCF_000013425': 0.20,       #   S. aureus NCTC 8325\n"
+                    "  }\n"
+                    "  TOTAL_PAIRS = 2_000_000          # or derive from a target mean coverage\n"
+                    "  READLEN = 150\n"
+                    "  fna_files = glob.glob(os.path.join(ref_dir, '*.fna'))\n"
+                    "  gt_rows = []\n"
+                    "  for fna in fna_files:\n"
+                    "      base = os.path.basename(fna)\n"
+                    "      frac = next((v for k, v in abundance_by_id.items() if k in base), None)\n"
+                    "      if frac is None:\n"
+                    "          sys.exit(f'No abundance mapped for {base} — refusing a positional guess.')\n"
+                    "      n_pairs = int(TOTAL_PAIRS * frac)   # depth weighted by intended abundance\n"
+                    "      r1 = fna.replace('.fna', '_R1.fastq'); r2 = fna.replace('.fna', '_R2.fastq')\n"
+                    "      subprocess.run(['wgsim', '-N', str(n_pairs), '-1', str(READLEN),\n"
+                    "                      '-2', str(READLEN), fna, r1, r2], check=True)\n"
+                    "      gt_rows.append(f'{base}\\t{frac}\\t{n_pairs}')\n"
+                    "  # 2) ALWAYS write ground_truth.tsv with ONE ROW PER GENOME so downstream\n"
+                    "  #    steps can verify EVERY intended species is present (empty file = bug).\n"
+                    "  with open(os.path.join(run_dir, 'ground_truth.tsv'), 'w') as fh:\n"
+                    "      fh.write('genome_file\\tabundance_frac\\tread_pairs\\n')\n"
+                    "      fh.write('\\n'.join(gt_rows) + '\\n')\n"
+                    "\n"
+                    "  WRONG: abund = {files[0]:0.5, files[1]:0.3, files[2]:0.2} over sorted(glob(...))\n"
+                    "         → abundance follows accession sort order, not the named species.\n"
+                    "  WRONG: identical -N for every genome when genomes differ in size → unequal\n"
+                    "         COVERAGE (a 5.7 Mb genome at the same -N as a 2.8 Mb genome is ~2x\n"
+                    "         shallower and will bin/score worse).\n"
+                    "  NOTE: if the user asked for EQUAL/even coverage (not a fixed read fraction),\n"
+                    "        weight n_pairs by genome length so every genome reaches the SAME depth\n"
+                    "        (n_pairs_i ∝ genome_bp_i), rather than the same read count."
+                )
+
             # minimap2 → samtools mapping injection — triggered on step title only.
             # The pipe pattern (minimap2 | samtools sort) FAILS in the installed samtools:
             #   samtools view -b - → "[main_samview] fail to read the header from '-'"
@@ -2394,7 +2622,9 @@ class BioAgent:
                     content += _rundir_section
 
             msgs = [
-                self.system_prompt,
+                # Plan-scoped tool catalog (only the tools the plan uses) instead of all
+                # ~118 tools — cuts generator context massively; falls back to full on any miss.
+                self._scoped_system_prompt(state),
                 HumanMessage(content=prompt),
                 HumanMessage(content=content)
             ]
@@ -3344,6 +3574,59 @@ class BioAgent:
                     "diagnostic_code": None,
                     "diagnostic_observation": None,
                 }
+
+            # ── HARD BLOCK (disk full): fail-fast to QA, do NOT retry ───────────────
+            # Real incident (run-202): the disk hit 100%, so EVERY remaining step
+            # failed with "No space left on device"; each one burned 3 retries + 2
+            # diagnostics rounds → the pipeline looped ALL NIGHT. A full disk is NOT
+            # fixable by regenerating code, so detect it deterministically and
+            # escalate ONCE to QA instead of looping. Kill-switch: GENOMEER_DISK_FAILFAST=0.
+            if not diagnostic_mode and os.environ.get("GENOMEER_DISK_FAILFAST", "1") != "0":
+                _disk_full_out = bool(re.search(
+                    r"No space left on device|\bENOSPC\b|Disk quota exceeded|write error.*no space",
+                    last_result, re.IGNORECASE))
+                _free_gb = None
+                try:
+                    import shutil as _shutil_df
+                    _free_gb = _shutil_df.disk_usage(state.get("run_temp_dir") or "/tmp").free / (1024 ** 3)
+                except Exception:
+                    pass
+                if _disk_full_out or (_free_gb is not None and _free_gb < 0.5):
+                    _done_steps = [f"  Step {i+1}: {s.get('title','')}"
+                                   for i, s in enumerate(state["plan"]) if s.get("status") == "done"]
+                    new_manifest = self._clean_manifest(state["manifest"])
+                    new_manifest["route_hint"] = "diagnostics_cap"
+                    new_manifest["qa_payload"] = (
+                        "PIPELINE BLOCKED — the disk is FULL (no space left on device).\n\n"
+                        f"Free space at {state.get('run_temp_dir') or '/tmp'}: "
+                        f"{('%.2f GB' % _free_gb) if _free_gb is not None else 'unknown'}.\n"
+                        f"Failed step (index {state['current_idx'] + 1}): {step['title']}\n\n"
+                        "A full disk makes every remaining step fail — retrying cannot help.\n"
+                        f"Steps that completed ({len(_done_steps)}):\n"
+                        + ("\n".join(_done_steps) if _done_steps else "  (none)") + "\n\n"
+                        "INSTRUCTIONS FOR YOUR REPLY (MUST FOLLOW):\n"
+                        "1. Start with '# ❌ Pipeline Blocked — Disk Full'.\n"
+                        "2. State plainly that the run ran out of disk space and cannot continue.\n"
+                        "3. Tell the user to free space (delete old /tmp/run-* dirs or large intermediates) and re-run.\n"
+                        "4. DO NOT regenerate code. DO NOT invent results. List only the completed steps.\n"
+                        "5. Keep it under ~150 words."
+                    )
+                    self._log(
+                        "HARD BLOCK disk_full",
+                        body=f"disk full/low (free={_free_gb}) at step {state['current_idx']} → QA (fail-fast, no retries)",
+                        node=node,
+                    )
+                    return {
+                        "plan": [{**p, "status": "blocked"} if i == state["current_idx"] else p
+                                 for i, p in enumerate(state["plan"])],
+                        "current_idx": state["current_idx"],
+                        "next_step": "qa",
+                        "messages": [AIMessage(content="<STATUS:blocked>\nDisk full — pipeline halted to avoid a retry loop.")],
+                        "manifest": new_manifest,
+                        "diagnostic_mode": False,
+                        "diagnostic_code": None,
+                        "diagnostic_observation": None,
+                    }
 
             # ── HARD BLOCK 1: non-zero exit code ────────────────────────────────────
             if not diagnostic_mode and _exit_code_nonzero:
@@ -6689,19 +6972,32 @@ class BioAgent:
                 raise
             finally:
                 if _fatal is not None:
-                    # Fatal error — remove generated files but preserve user uploads.
-                    try:
-                        import shutil as _sh
-                        for _entry in os.listdir(tmp):
-                            if _entry in _staged_basenames:
-                                continue  # preserve user's uploaded files
-                            _fp = os.path.join(tmp, _entry)
-                            if os.path.isfile(_fp):
-                                os.unlink(_fp)
-                            elif os.path.isdir(_fp):
-                                _sh.rmtree(_fp, ignore_errors=True)
-                    except Exception:
-                        pass
+                    # Fatal error (e.g. API failure mid-run): by DEFAULT keep every
+                    # file the already-succeeded steps produced, so the user can
+                    # inspect/judge partial results and resume instead of losing
+                    # hours of compute. The old behaviour (wipe generated files,
+                    # keep only user uploads) destroyed those outputs — opt back in
+                    # with GENOMEER_WIPE_ON_FATAL=1 for aggressive temp hygiene.
+                    if os.environ.get("GENOMEER_WIPE_ON_FATAL", "0") == "1":
+                        try:
+                            import shutil as _sh
+                            for _entry in os.listdir(tmp):
+                                if _entry in _staged_basenames:
+                                    continue  # preserve user's uploaded files
+                                _fp = os.path.join(tmp, _entry)
+                                if os.path.isfile(_fp):
+                                    os.unlink(_fp)
+                                elif os.path.isdir(_fp):
+                                    _sh.rmtree(_fp, ignore_errors=True)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self._log("PARTIAL RESULTS KEPT",
+                                      body=f"fatal error — produced files preserved in {tmp}",
+                                      node="driver")
+                        except Exception:
+                            pass
 
             return self.log, last_msg_text
     
@@ -6828,15 +7124,27 @@ class BioAgent:
                 raise
             finally:
                 if _fatal is not None:
-                    try:
-                        import shutil as _sh
-                        for _entry in os.listdir(tmp):
-                            if _entry in _staged_basenames:
-                                continue
-                            _fp = os.path.join(tmp, _entry)
-                            if os.path.isfile(_fp):
-                                os.unlink(_fp)
-                            elif os.path.isdir(_fp):
-                                _sh.rmtree(_fp, ignore_errors=True)
-                    except Exception:
-                        pass
+                    # Preserve partial results on fatal error by DEFAULT (see go()):
+                    # an API failure mid-run must NOT delete the outputs of steps
+                    # that already succeeded. Opt into the old wipe with
+                    # GENOMEER_WIPE_ON_FATAL=1.
+                    if os.environ.get("GENOMEER_WIPE_ON_FATAL", "0") == "1":
+                        try:
+                            import shutil as _sh
+                            for _entry in os.listdir(tmp):
+                                if _entry in _staged_basenames:
+                                    continue
+                                _fp = os.path.join(tmp, _entry)
+                                if os.path.isfile(_fp):
+                                    os.unlink(_fp)
+                                elif os.path.isdir(_fp):
+                                    _sh.rmtree(_fp, ignore_errors=True)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self._log("PARTIAL RESULTS KEPT",
+                                      body=f"fatal error — produced files preserved in {tmp}",
+                                      node="driver")
+                        except Exception:
+                            pass

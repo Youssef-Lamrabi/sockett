@@ -268,7 +268,9 @@ Estimate the in situ replication rates (using iRep or DEMIC) of key taxa and exp
       <div class="field">
         <label>Add a Model</label>
         <div class="grid2">
-          <input id="mdl-name" placeholder="gpt-4o-mini" class="modal-input" />
+          <input id="mdl-name" placeholder="gpt-4o-mini" class="modal-input"
+                 list="mdl-name-list" autocomplete="off" />
+          <datalist id="mdl-name-list"></datalist>
           <div class="select-wrap">
             <select id="mdl-source">
               <option>Ollama</option>
@@ -277,6 +279,7 @@ Estimate the in situ replication rates (using iRep or DEMIC) of key taxa and exp
               <option>Anthropic</option>
               <option>Gemini</option>
               <option>Groq</option>
+              <option>DeepSeek</option>
               <option>Bedrock</option>
               <option>Custom</option>
             </select>
@@ -286,7 +289,12 @@ Estimate the in situ replication rates (using iRep or DEMIC) of key taxa and exp
           <input id="mdl-base-url" placeholder="Model URL (optional)" class="modal-input" />
           <input id="mdl-api-key" placeholder="API key (optional)" class="modal-input" />
         </div>
-        <button id="mdl-add" class="button">Add Model</button>
+        <div id="mdl-source-hint" style="font-size:12px;opacity:.75;margin:2px 0 6px;"></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button id="mdl-add" class="button">Add Model</button>
+          <button id="mdl-test" class="button" type="button">Test connection</button>
+          <span id="mdl-test-status" style="font-size:12px;"></span>
+        </div>
       </div>
 
       <br>

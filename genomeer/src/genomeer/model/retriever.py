@@ -38,13 +38,18 @@ _CLI_TOOL_BINARIES = {
     # ── Binning ───────────────────────────────────────────────────────────────
     "semibin2": "SemiBin2",
     "concoct": "concoct",
-    "maxbin2": "run_MaxBin2.pl",
+    "maxbin2": "run_MaxBin.pl",
+    "das_tool": "DAS_Tool",
+    "dastool": "DAS_Tool",
     # ── Bin quality ───────────────────────────────────────────────────────────
     "checkm2": "checkm2",
+    "gunc": "gunc",
     # ── Coverage / abundance ──────────────────────────────────────────────────
     "coverm": "coverm",
     # ── Replication rate ──────────────────────────────────────────────────────
     "irep": "iRep",
+    # ── Strain-level microdiversity / SNVs ────────────────────────────────────
+    "instrain": "inStrain",
     # ── Plasmid reconstruction / mobility ─────────────────────────────────────
     "mob_recon": "mob_recon",
     "mob_typer": "mob_typer",
@@ -57,6 +62,10 @@ _CLI_TOOL_BINARIES = {
     "kraken2": "kraken2",
     "metaphlan": "metaphlan",
     "metaphlan4": "metaphlan",
+    # gtdbtk has a description but is NOT installed (needs ~80GB GTDB DB, left out
+    # of meta-env1.yaml). Listing it here lets detection flag it ABSENT so the
+    # retriever filters it out instead of falsely offering it to the planner.
+    "gtdbtk": "gtdbtk",
     "esearch": "esearch",
     "efetch": "efetch",
     "query_ncbi_entrez": "esearch",

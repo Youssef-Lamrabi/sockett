@@ -215,7 +215,9 @@ description = [
         "name": "run_maxbin2",
         "description": (
             "[CLI Tool][TIMEOUT: 3600s] MaxBin2: binning using marker gene sets and EM algorithm. "
-            "Command: run_MaxBin2.pl -contig contigs.fna -out output_prefix -abund coverage.tsv. "
+            "Command: run_MaxBin.pl -contig contigs.fna -out output_prefix -abund coverage.tsv "
+            "(NOTE: the MaxBin2 executable is named run_MaxBin.pl — NO '2' — even though the tool is "
+            "MaxBin v2.2.7). "
             "Outputs .fasta files per bin + summary."
         ),
         "required_parameters": [
@@ -231,6 +233,46 @@ description = [
             {"name": "threads", "type": "int", "default": 4},
         ],
         "returns": "dict(bins_dir, bin_count, summary_tsv)",
+    },
+    {
+        "name": "run_das_tool",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] DAS_Tool 1.1.7 (installed in meta-env1 via wrapper): "
+            "CONSENSUS / refinement of bins from MULTIPLE binners into a single, better non-redundant "
+            "bin set. Run it AFTER you have binned the SAME assembly with 2+ binners (e.g. MetaBAT2 + "
+            "MaxBin2 + SemiBin2 + CONCOCT) — it scores every candidate bin by single-copy genes and keeps "
+            "the best, de-duplicated set (usually MORE complete, LESS contaminated than any single binner). "
+            "STEP 1 build a contig-to-bin table per binner with the bundled helper: "
+            "Fasta_to_Contig2Bin.sh -i metabat_bins/ -e fa > metabat.tsv  (repeat for each binner's bin dir; "
+            "-e is the bin FASTA extension, fa/fasta). STEP 2 run DAS_Tool: "
+            "DAS_Tool -i metabat.tsv,maxbin.tsv,semibin.tsv -l metabat,maxbin,semibin -c contigs.fa "
+            "-o dastool_out/PREFIX --write_bins -t 4 [--score_threshold 0.5]. "
+            "The refined bins land in dastool_out/PREFIX_DASTool_bins/ (feed THESE to CheckM2/dRep, not the "
+            "raw per-binner bins). Uses diamond (bundled in its isolated env). "
+            "INVOKE AS CLI via subprocess — do NOT import it. Needs the SAME assembly FASTA the binners used, "
+            "and each -i table must match its -l label order. If only ONE binner was run, DAS_Tool is "
+            "optional (nothing to reconcile) — just use that binner's bins directly. "
+            "SPECIES-RECOVERY GUARD: the default --score_threshold 0.5 can DROP a real genome when two "
+            "closely-related species (same family/genus, e.g. two Enterobacteriaceae) are present at "
+            "unequal depth — the shallower one scores below 0.5 and vanishes. ALWAYS compare the refined "
+            "bin_count against the EXPECTED community richness (# species the user simulated/expects). If "
+            "fewer bins come out than species expected, lower --score_threshold to 0.3 AND/OR recover any "
+            "per-binner bin that CheckM2 rates >=90% complete and <=5% contaminated which DAS_Tool discarded "
+            "(e.g. a clean SemiBin2 bin), rather than silently reporting the smaller set."
+        ),
+        "required_parameters": [
+            {"name": "contig2bin_tables", "type": "str",
+             "description": "Comma-separated contig2bin TSVs (one per binner), built via Fasta_to_Contig2Bin.sh."},
+            {"name": "labels", "type": "str", "description": "Comma-separated binner labels, SAME order as tables."},
+            {"name": "contigs_fasta", "type": "str", "description": "The assembly FASTA the binners used."},
+            {"name": "output_prefix", "type": "str", "description": "Output prefix (…_DASTool_bins/ holds refined bins)."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "score_threshold", "type": "float", "default": 0.5,
+             "description": "Minimum bin score to keep (0-1); lower = more bins kept."},
+        ],
+        "returns": "dict(refined_bins_dir, bin_count, summary_tsv)",
     },
 
     # ── BIN QUALITY ───────────────────────────────────────────────────────────
@@ -254,6 +296,39 @@ description = [
              "description": "Filter bins below this completeness threshold."},
         ],
         "returns": "dict(quality_report_tsv, high_quality_bins, medium_quality_bins, summary)",
+    },
+    {
+        "name": "run_gunc",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] GUNC (installed in meta-env1 via wrapper): CHIMERISM & "
+            "contamination detection for MAGs/bins — the complement to CheckM2. CheckM2 uses single-copy "
+            "marker genes (can UNDER-estimate contamination when two CLOSELY-RELATED genomes co-bin, e.g. "
+            "E. coli + Klebsiella); GUNC instead maps ALL genes to a reference and flags a bin whose genes "
+            "come from MULTIPLE divergent lineages = a CHIMERA. Run it right after CheckM2 to catch merged "
+            "bins CheckM2 missed. "
+            "Command (dir of bins): gunc run --input_dir bins_dir/ --file_suffix .fa -r "
+            "/home/workshop/gunc_db/gunc_db_progenomes2.1.dmnd -o gunc_out -t 4 . "
+            "Single genome: gunc run -i mag.fa -r <db.dmnd> -o gunc_out. "
+            "OUTPUT: gunc_out/GUNC.progenomes_2.1.maxCSS_level.tsv — KEY columns per genome: "
+            "`pass.GUNC` (True=clean / False=chimeric), `clade_separation_score` (CSS; >0.45 ≈ chimeric), "
+            "`contamination_portion`, `n_effective_surplus_clades`. A bin with pass.GUNC=False or CSS>0.45 "
+            "is a likely chimera of 2+ genomes — if an expected taxon is 'missing', it may be MERGED into "
+            "that bin. Needs diamond (bundled) + the progenomes DB (~6.7GB, already downloaded). INVOKE AS "
+            "A CLI via subprocess — do NOT import it (isolated env). Runs in meta-env1 via the wrapper."
+        ),
+        "required_parameters": [
+            {"name": "input", "type": "str", "description": "A bins DIRECTORY (--input_dir) or a single genome FASTA (-i)."},
+            {"name": "output_dir", "type": "str", "description": "Output dir for GUNC.*.maxCSS_level.tsv."},
+        ],
+        "optional_parameters": [
+            {"name": "db_file", "type": "str",
+             "default": "/home/workshop/gunc_db/gunc_db_progenomes2.1.dmnd",
+             "description": "GUNC reference diamond DB (progenomes2.1)."},
+            {"name": "file_suffix", "type": "str", "default": ".fa",
+             "description": "Bin FASTA extension when using --input_dir (.fa/.fasta)."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(gunc_tsv, n_chimeric, summary)",
     },
 
     # ── TAXONOMIC CLASSIFICATION ──────────────────────────────────────────────
@@ -697,13 +772,9 @@ description = [
     },
 
     # ── BIN DEREPLICATION ─────────────────────────────────────────────────────
-    # DAS_Tool DISABLED for now (not installed — needs R deps + diamond/prodigal,
-    # heavy dependency tree). Re-enable by restoring this entry + installing it.
-    # {
-    #     "name": "run_das_tool",
-    #     "description": "[CLI Tool] DAS_Tool: bin dereplication/refinement from multiple binners.",
-    #     ... (full schema removed; reinstate when installed)
-    # },
+    # DAS_Tool is now INSTALLED (isolated dastool_env + wrapper in meta-env1/bin) and
+    # its ACTIVE run_das_tool description lives near the binners above. This old
+    # "disabled" placeholder was removed (2026-07-08). DasToolContract already validates it.
 
     # ── ABUNDANCE RE-ESTIMATION ───────────────────────────────────────────────
     {
@@ -1117,6 +1188,48 @@ description = [
         "returns": "dict(output_prefix, summary)",
     },
     {
+        "name": "run_instrain",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] inStrain 1.10 (installed in meta-env1 via wrapper): STRAIN-LEVEL "
+            "microdiversity — per-position SNVs, nucleotide diversity (pi), coverage, and popANI/conANI "
+            "between samples on the SAME reference. This is the tool for 'is it the SAME strain across "
+            "samples/timepoints?' and 'clonal vs distinct populations?' — e.g. tracking whether a "
+            "resistant lineage is one clone spreading vs several. "
+            "TWO STEPS: (1) inStrain profile mapping.bam reference.fasta -o out.IS -p 4 [-g genes.fna] "
+            "[-s scaffold2bin.stb] — needs a SORTED BAM of reads mapped to the reference (bwa/minimap2 → "
+            "samtools sort) and the reference FASTA; optionally a Prodigal genes .fna for dN/dS and a "
+            "scaffold-to-bin (.stb) file to profile per-MAG. (2) inStrain compare -i s1.IS s2.IS -o "
+            "cmp.IS -p 4 — compares two+ profiles for popANI/conANI (cross-sample strain identity). "
+            "This writes only the PER-SCAFFOLD `output/*_comparisonsTable.tsv` (columns scaffold,name1,"
+            "name2,...,popANI,conANI — NO `genome` column). "
+            "(3) TO GET PER-MAG popANI you MUST run a THIRD step: inStrain genome_wide -i cmp.IS -s "
+            "scaffold2bin.stb -p 4 — this aggregates the per-scaffold comparison into PER-GENOME and "
+            "writes `cmp.IS/output/*_genomeWide_compare.tsv` WITH a `genome` column + per-genome popANI/"
+            "conANI. IMPORTANT: on `compare`, `-s` means a scaffolds LIST (NOT the stb) — do NOT pass the "
+            "stb to compare; pass the stb to `genome_wide`. Read 'the Klebsiella MAG' popANI from the "
+            "genomeWide table, NOT from comparisonsTable (which has no `genome` column). "
+            "KEY OUTPUTS: profile -> output/*_genome_info.tsv (per-genome nucleotide_diversity, coverage, "
+            "breadth), *_SNVs.tsv. genome_wide -> output/*_genomeWide_compare.tsv (genome, popANI, conANI, "
+            "percent_compared; popANI>0.99999 ≈ same strain). "
+            "RELIABILITY: needs decent coverage/breadth per genome — flag low-coverage "
+            "genomes as unreliable, same spirit as iRep. INVOKE AS A CLI via subprocess — do NOT import "
+            "it (isolated env). Runs in meta-env1 via the wrapper."
+        ),
+        "required_parameters": [
+            {"name": "bam", "type": "str", "description": "Sorted BAM of reads mapped to the reference (profile mode)."},
+            {"name": "reference_fasta", "type": "str", "description": "Reference FASTA the reads were mapped to."},
+            {"name": "output_dir", "type": "str", "description": "Output .IS directory."},
+        ],
+        "optional_parameters": [
+            {"name": "genes_fna", "type": "str", "default": None,
+             "description": "Prodigal gene FASTA (.fna) to enable dN/dS gene-level metrics."},
+            {"name": "stb", "type": "str", "default": None,
+             "description": "scaffold-to-bin file to profile per-MAG instead of whole reference."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(output_dir, genome_info_tsv, snvs_tsv, comparison_tsv)",
+    },
+    {
         "name": "run_mob_recon",
         "description": (
             "[CLI Tool][TIMEOUT: 1800s] MOB-suite (mob_recon): reconstructs PLASMIDS from a genome "
@@ -1138,7 +1251,17 @@ description = [
             "'AC125'): the plasmid COUNT = the number of `plasmid_*.fasta` files in the output dir "
             "(each file is exactly ONE reconstructed plasmid) — equivalently, the number of DATA rows "
             "in mobtyper_results.txt (or distinct primary_cluster_id in contig_report.txt). NEVER "
-            "extract a number from a plasmid/cluster ID like 'AC125'/'AA114' — those are IDs, not counts."
+            "extract a number from a plasmid/cluster ID like 'AC125'/'AA114' — those are IDs, not counts. "
+            "GENE-NAME MATCHING (real bug: mob_recon reported 'NO blaKPC detected' while AMRFinder+RGI "
+            "had already found the gene): when you cross-reference a resistance gene from the AMR "
+            "outputs (to find which contig carries it), match the gene name FLEXIBLY — the tools spell "
+            "the SAME gene differently: AMRFinder='blaKPC-2', RGI/CARD='KPC-2' or 'kpc-2', some tables "
+            "'bla_KPC_2'. Normalize BOTH sides before comparing: lowercase, strip a leading 'bla', drop "
+            "non-alphanumerics, then substring-match on the core token (e.g. 'kpc'). NEVER require an "
+            "exact literal like 'blaKPC' — that yields a FALSE 'not detected' when the AMR file says "
+            "'kpc-2'. Same rule for blaNDM/blaOXA-48/blaVIM/blaIMP/mcr. If the AMR consensus flagged a "
+            "carbapenemase in a MAG, that gene IS present — mob_recon must then locate ITS contig, not "
+            "report absence."
         ),
         "required_parameters": [
             {"name": "input_fasta", "type": "str",

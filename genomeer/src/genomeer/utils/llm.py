@@ -4,7 +4,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 if TYPE_CHECKING:
     from genomeer.config import GenomeerConfig
 
-SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "Custom"]
+SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "DeepSeek", "Custom"]
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
 
 def get_llm(
@@ -68,6 +68,11 @@ def get_llm(
                 source = "Gemini"
             elif "groq" in model.lower():
                 source = "Groq"
+            elif base_url is None and "deepseek" in model.lower():
+                # DeepSeek cloud API (OpenAI-compatible). Only when NO base_url is given —
+                # a user-supplied base_url means they point at their own/proxy endpoint,
+                # which must fall through to Custom below and be honored as-is.
+                source = "DeepSeek"
             elif base_url is not None:
                 source = "Custom"
             elif "/" in model or any(
@@ -81,7 +86,6 @@ def get_llm(
                     "dolphin",
                     "orca",
                     "vicuna",
-                    "deepseek",
                 ]
             ):
                 source = "Ollama"
@@ -187,6 +191,17 @@ def get_llm(
             base_url="https://api.groq.com/openai/v1",
         )
 
+    elif source == "DeepSeek":
+        # DeepSeek cloud is OpenAI-compatible. Honor a caller-provided base_url (proxy /
+        # self-host) but default to the official endpoint; key from param or DEEPSEEK_API_KEY.
+        _ds_key = api_key if (api_key and api_key != "EMPTY") else os.getenv("DEEPSEEK_API_KEY")
+        return _mk_openai_like(
+            "DeepSeek",
+            model, temperature, stop_sequences,
+            api_key=_ds_key,
+            base_url=base_url or "https://api.deepseek.com/v1",
+        )
+
     elif source == "Ollama":
         try:
             from langchain_ollama import ChatOllama
@@ -194,10 +209,12 @@ def get_llm(
             raise ImportError(  # noqa: B904
                 "langchain-ollama package is required for Ollama models. Install with: pip install langchain-ollama"
             )
-        return ChatOllama(
-            model=model,
-            temperature=temperature,
-        )
+        # Honor a user-provided base_url so a REMOTE/exposed Ollama works (previously
+        # base_url was ignored → every Ollama model silently hit localhost:11434).
+        _ollama_kwargs = {"model": model, "temperature": temperature}
+        if base_url:
+            _ollama_kwargs["base_url"] = base_url
+        return ChatOllama(**_ollama_kwargs)
 
     elif source == "Bedrock":
         try:
@@ -248,5 +265,5 @@ def get_llm(
 
     else:
         raise ValueError(
-            f"Invalid source: {source}. Valid options are 'OpenAI', 'AzureOpenAI', 'Anthropic', 'Gemini', 'Groq', 'Bedrock', or 'Ollama'"
+            f"Invalid source: {source}. Valid options are 'OpenAI', 'AzureOpenAI', 'Anthropic', 'Gemini', 'Groq', 'DeepSeek', 'Bedrock', 'Custom', or 'Ollama'"
         )

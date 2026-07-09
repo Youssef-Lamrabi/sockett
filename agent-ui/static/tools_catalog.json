@@ -64,10 +64,24 @@
    "installed": true
   },
   {
+   "name": "das_tool",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "DAS_Tool 1.1.7 (installed in meta-env1 via wrapper): CONSENSUS / refinement of bins from MULTIPLE binn\u2026",
+   "installed": true
+  },
+  {
    "name": "checkm2",
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "CheckM2: rapid assessment of genome bin quality using ML.",
+   "installed": true
+  },
+  {
+   "name": "gunc",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "GUNC (installed in meta-env1 via wrapper): CHIMERISM & contamination detection for MAGs/bins \u2014 the com\u2026",
    "installed": true
   },
   {
@@ -117,7 +131,7 @@
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "HUMAnN3: functional profiling of metagenomes and metatranscriptomes.",
-   "installed": true
+   "installed": false
   },
   {
    "name": "antismash",
@@ -201,7 +215,7 @@
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "GTDB-Tk: phylogenetic classification of MAGs against the GTDB reference tree.",
-   "installed": true
+   "installed": false
   },
   {
    "name": "prokka",
@@ -271,6 +285,13 @@
    "category": "Metagenomics",
    "icon": "fa-bacteria",
    "description": "iRep: estimates the in-situ REPLICATION RATE (index of replication, iRep value) of a genome/MAG from t\u2026",
+   "installed": true
+  },
+  {
+   "name": "instrain",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "inStrain 1.10 (installed in meta-env1 via wrapper): STRAIN-LEVEL microdiversity \u2014 per-position SNVs, n\u2026",
    "installed": true
   },
   {

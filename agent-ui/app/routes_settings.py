@@ -7,7 +7,7 @@ from .models import User, ProviderConfig, UserModel, ChatSession
 from .auth import get_current_user
 from .config import system_default
 
-allowed = {"OpenAI","AzureOpenAI","Anthropic","Ollama","Gemini","Bedrock","Groq","Custom"}
+allowed = {"OpenAI","AzureOpenAI","Anthropic","Ollama","Gemini","Bedrock","Groq","DeepSeek","Custom"}
 router = APIRouter()
 
 class ProviderBody(BaseModel):
@@ -38,7 +38,7 @@ def get_provider(db: Session = Depends(get_db), user: User = Depends(get_current
 
 @router.post("/provider")
 def save_provider(body: ProviderBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    allowed = {"OpenAI","AzureOpenAI","Anthropic","Ollama","Gemini","Bedrock","Groq","Custom"}
+    allowed = {"OpenAI","AzureOpenAI","Anthropic","Ollama","Gemini","Bedrock","Groq","DeepSeek","Custom"}
     if body.source not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported source '{body.source}'")
     cfg = db.query(ProviderConfig).filter(ProviderConfig.user_id == user.id).first()
@@ -66,6 +66,40 @@ def save_provider(body: ProviderBody, db: Session = Depends(get_db), user: User 
         pass  # cache invalidation is best-effort; never fail the save
 
     return {"ok": True}
+
+
+class TestBody(BaseModel):
+    source: str
+    model: str
+    base_url: str | None = None
+    api_key: str | None = None
+
+@router.post("/test")
+def test_provider(body: TestBody, user: User = Depends(get_current_user)):
+    """Build the LLM from the given credentials and do a tiny 1-token ping so the user can
+    verify a model works BEFORE saving/using it. Never raises to the client — returns
+    {ok, message}. Bounded by a 25s timeout so a wrong/unreachable host can't hang the request."""
+    if body.source not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported source '{body.source}'")
+    if not (body.model or "").strip():
+        return {"ok": False, "message": "Model name is required."}
+    import concurrent.futures as _cf
+    try:
+        from genomeer.utils.llm import get_llm
+        llm = get_llm(
+            model=body.model.strip(),
+            source=body.source,
+            base_url=(body.base_url or None),
+            api_key=(body.api_key or None),
+            temperature=0,
+        )
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(lambda: llm.invoke("ping")).result(timeout=25)
+        return {"ok": True, "message": f"Connection OK — {body.source} / {body.model} responded."}
+    except _cf.TimeoutError:
+        return {"ok": False, "message": "Timed out after 25s — is the URL/host reachable?"}
+    except Exception as e:
+        return {"ok": False, "message": (str(e) or type(e).__name__)[:300]}
 
 
 class ModelBody(BaseModel):

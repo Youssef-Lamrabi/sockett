@@ -172,7 +172,7 @@ def run_maxbin2(
 ) -> Dict[str, Any]:
     """MaxBin2 marker-gene EM binning."""
     _mkdir(os.path.dirname(output_prefix) or ".")
-    cmd = [_which("run_MaxBin2.pl"), "-contig", contigs_fasta,
+    cmd = [_which("run_MaxBin.pl"), "-contig", contigs_fasta,
            "-out", output_prefix, "-thread", str(threads),
            "-min_contig_length", str(min_contig_length)]
     if abund_list:

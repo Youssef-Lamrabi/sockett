@@ -31,7 +31,7 @@ class User(Base):
 class ProviderConfig(Base):
     """
     One per user. Controls which backend to use and how to connect.
-    source: "OpenAI" | "AzureOpenAI" | "Anthropic" | "Ollama" | "Gemini" | "Bedrock" | "Groq" | "Custom"
+    source: "OpenAI" | "AzureOpenAI" | "Anthropic" | "Ollama" | "Gemini" | "Bedrock" | "Groq" | "DeepSeek" | "Custom"
     """
     __tablename__ = "provider_configs"
     id = Column(Integer, primary_key=True, index=True)

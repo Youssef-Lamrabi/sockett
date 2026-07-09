@@ -137,7 +137,14 @@ def publish_artifacts(run_id: str, temp_dir: str, expose_paths: Iterable[str], p
         rel_key = _safe_rel_key(rel_key.replace("\\", "/"))
         abs_dst = out_dir / rel_key
         abs_dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(abs_src, abs_dst)
+        # Prefer a hardlink (instant, no extra disk) when src/dst share a
+        # filesystem; fall back to a real copy across mounts or on any error.
+        try:
+            if abs_dst.exists():
+                abs_dst.unlink()
+            os.link(abs_src, abs_dst)
+        except OSError:
+            shutil.copy2(abs_src, abs_dst)
 
         mime = mimetypes.guess_type(abs_dst.name)[0] or "application/octet-stream"
         artifacts.append({
@@ -162,22 +169,37 @@ def publish_artifacts(run_id: str, temp_dir: str, expose_paths: Iterable[str], p
             # skip missing paths silently
             continue
 
-    # Optional bundle
+    # Optional convenience bundle. Two prior bugs made `publish` exceed the
+    # client's HTTP read timeout on large metagenomic runs (→ empty manifest,
+    # "No artifacts available"):
+    #   1) ZIP_DEFLATED compressed hundreds of MB of FASTA/BAM — data that is
+    #      already near-incompressible — burning CPU for ~zero size gain.
+    #   2) the whole bundle was re-hashed with sha256 (a second full read).
+    # Fix: use ZIP_STORED (no compression → near-copy speed) and SKIP the bundle
+    # entirely above a size guard so `publish` never blocks the response on
+    # zipping multi-GB runs. Individual per-file download_urls are unaffected —
+    # only the optional all-in-one zip is omitted for very large runs.
     if artifacts:
-        bundle_key = "bundle/all_artifacts.zip"
-        bundle_path = out_dir / bundle_key
-        bundle_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as z:
-            for a in artifacts:
-                z.write(out_dir / a["key"], arcname=a["key"])
-        artifacts.append({
-            "key": bundle_key,
-            "display_name": "all_artifacts.zip",
-            "mime_type": "application/zip",
-            "size_bytes": bundle_path.stat().st_size,
-            "sha256": _sha256_of(bundle_path),
-            "download_url": f"{public_base.rstrip('/')}/download/{run_id}/{bundle_key}",
-        })
+        _total_bytes = sum(a["size_bytes"] for a in artifacts)
+        _bundle_max = int(os.getenv("ARTIFACTS_BUNDLE_MAX_MB", "1024")) * 1024 * 1024
+        if _total_bytes <= _bundle_max:
+            bundle_key = "bundle/all_artifacts.zip"
+            bundle_path = out_dir / bundle_key
+            bundle_path.parent.mkdir(parents=True, exist_ok=True)
+            # ZIP_STORED: no CPU-heavy DEFLATE on incompressible sequence data.
+            with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_STORED) as z:
+                for a in artifacts:
+                    z.write(out_dir / a["key"], arcname=a["key"])
+            artifacts.append({
+                "key": bundle_key,
+                "display_name": "all_artifacts.zip",
+                "mime_type": "application/zip",
+                "size_bytes": bundle_path.stat().st_size,
+                # sha256 of the (now uncompressed) bundle is cheap enough, but we
+                # drop it to avoid a second full read of a large file; integrity
+                # is still covered per-file above.
+                "download_url": f"{public_base.rstrip('/')}/download/{run_id}/{bundle_key}",
+            })
 
     manifest = {
         "run_id": run_id,

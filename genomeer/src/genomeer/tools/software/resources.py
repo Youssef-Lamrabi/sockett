@@ -154,12 +154,12 @@ library_content_dict = {
     ),
     "maxbin2": (
         "[CLI Tool][TIMEOUT: 3600s] MaxBin2: binning using marker gene EM algorithm.\n"
-        "  res = subprocess.run(['run_MaxBin2.pl', '-contig', 'contigs.fna',\n"
+        "  res = subprocess.run(['run_MaxBin.pl', '-contig', 'contigs.fna',\n"
         "                        '-out', 'maxbin_out/bin', '-abund', 'coverage.tsv',\n"
         "                        '-thread', '4'],\n"
         "                       capture_output=True, text=True, timeout=3600)\n"
         "  # OR with reads directly:\n"
-        "  res = subprocess.run(['run_MaxBin2.pl', '-contig', 'contigs.fna',\n"
+        "  res = subprocess.run(['run_MaxBin.pl', '-contig', 'contigs.fna',\n"
         "                        '-out', 'maxbin_out/bin', '-reads', 'reads.fastq',\n"
         "                        '-thread', '4'], capture_output=True, text=True, timeout=3600)\n"
         "  # Bins: maxbin_out/bin.001.fasta, .002.fasta, ...\n"
