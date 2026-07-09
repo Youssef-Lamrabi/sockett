@@ -1976,17 +1976,26 @@ function _wsRenderLists(body, uploads, generated) {
     generatedHtml = '<div class="fe-empty-mini">No outputs yet — run a step to generate files</div>';
   }
 
-  body.innerHTML = `
-    <div class="fe-list-region view-${view}">
+  const listInner = `
       <div class="fe-file-list">
         ${uploadsHtml}
         ${generatedHtml}
-      </div>
-    </div>
-  `;
-  if (existingPreview) body.appendChild(existingPreview);
-  body.classList.toggle('has-preview', !!existingPreview);
-  if (existingPreview) _wsEnsurePreviewSplitter(body);  // re-insert drag handle after re-render
+      </div>`;
+  const existingListRegion = body.querySelector('.fe-list-region');
+  if (existingPreview && existingListRegion) {
+    // A document is OPEN in the preview. Update ONLY the list region IN PLACE and NEVER
+    // re-parent the preview region: re-attaching its <iframe>/<img> to the DOM forces the
+    // browser to RELOAD it — that reload is the blank/flicker the user sees on every
+    // live-sync refresh while reading a document. Leaving the preview node untouched keeps
+    // the open document perfectly stable (works for both inline and full-screen preview).
+    existingListRegion.className = `fe-list-region view-${view}`;
+    existingListRegion.innerHTML = listInner;
+  } else {
+    body.innerHTML = `<div class="fe-list-region view-${view}">${listInner}</div>`;
+    if (existingPreview) body.appendChild(existingPreview);
+    body.classList.toggle('has-preview', !!existingPreview);
+    if (existingPreview) _wsEnsurePreviewSplitter(body);  // re-insert drag handle after re-render
+  }
 
   // Wire file items
   body.querySelectorAll('.fe-file-item').forEach(btn => {
@@ -2046,8 +2055,12 @@ function openFilePreview(relPath) {
       <i class="fa ${_wsIconForFile(relPath)}" aria-hidden="true"></i>
       <span class="fe-preview-name" title="${_wsEscHtml(relPath)}">${_wsEscHtml(baseName)}</span>
       <button class="fe-preview-expand icon" type="button"
-              title="Expand preview" aria-label="Expand preview">
+              title="Expand within panel" aria-label="Expand within panel">
         <i class="fa fa-up-right-and-down-left-from-center" aria-hidden="true"></i>
+      </button>
+      <button class="fe-preview-screen-btn icon" type="button"
+              title="Full screen" aria-label="Full screen">
+        <i class="fa fa-expand" aria-hidden="true"></i>
       </button>
       <button class="fe-preview-dl icon" type="button"
               title="Download" aria-label="Download file">
@@ -2080,8 +2093,26 @@ function openFilePreview(relPath) {
     const on = body.classList.toggle('fe-preview-full');
     const ic = expBtn.querySelector('i');
     if (ic) ic.className = on ? 'fa fa-down-left-and-up-right-to-center' : 'fa fa-up-right-and-down-left-from-center';
-    expBtn.title = on ? 'Shrink preview' : 'Expand preview';
+    expBtn.title = on ? 'Shrink preview' : 'Expand within panel';
   });
+
+  // True full-viewport toggle (lifts the preview out of the side panel). Esc exits.
+  const scrBtn = region.querySelector('.fe-preview-screen-btn');
+  if (scrBtn) {
+    const syncScr = () => {
+      const on = region.classList.contains('fe-preview-screen');
+      const ic = scrBtn.querySelector('i');
+      if (ic) ic.className = on ? 'fa fa-compress' : 'fa fa-expand';
+      scrBtn.title = on ? 'Exit full screen (Esc)' : 'Full screen';
+    };
+    syncScr();  // reflect state persisted on the region across innerHTML rebuilds
+    if (region.classList.contains('fe-preview-screen')) _wsBindScreenEsc(region);
+    scrBtn.addEventListener('click', () => {
+      const on = region.classList.toggle('fe-preview-screen');
+      if (on) _wsBindScreenEsc(region); else _wsUnbindScreenEsc();
+      syncScr();
+    });
+  }
   region.querySelector('.fe-preview-dl').addEventListener('click', () => {
     _wsDownloadFile(url, baseName).catch(err => {
       try { notify('error', `Download failed: ${err?.message || err}`); } catch { }
@@ -2091,9 +2122,29 @@ function openFilePreview(relPath) {
   _wsLoadPreviewContent(url, relPath, region.querySelector('.fe-preview-content'));
 }
 
+// Full-screen (viewport) preview: bind/unbind an Esc handler that exits full screen.
+let _wsScreenEsc = null;
+function _wsBindScreenEsc(region) {
+  _wsUnbindScreenEsc();
+  _wsScreenEsc = (e) => {
+    if (e.key !== 'Escape') return;
+    region.classList.remove('fe-preview-screen');
+    const btn = region.querySelector('.fe-preview-screen-btn');
+    const ic = btn?.querySelector('i');
+    if (ic) ic.className = 'fa fa-expand';
+    if (btn) btn.title = 'Full screen';
+    _wsUnbindScreenEsc();
+  };
+  document.addEventListener('keydown', _wsScreenEsc);
+}
+function _wsUnbindScreenEsc() {
+  if (_wsScreenEsc) { document.removeEventListener('keydown', _wsScreenEsc); _wsScreenEsc = null; }
+}
+
 function closeInlinePreview() {
   const body = document.querySelector('#file-explorer .fe-body');
   if (!body) return;
+  _wsUnbindScreenEsc();  // drop the full-screen Esc handler if it was active
   // Revoke any blob URL the preview was using to avoid memory leaks
   try { _wsRevokeActiveBlobUrl?.(); } catch { }
   const region = body.querySelector('.fe-preview-region');
@@ -2439,7 +2490,63 @@ async function saveSettings() {
 async function fetchModels() {
   const res = await fetch('/api/settings/models', { headers: { ...api.headers() } });
   if (!res.ok) throw new Error('Failed to load models');
-  return res.json(); // { system_default, user_models: [...] }
+  return res.json(); // { system_default, default_model, user_models: [...] }
+}
+
+// ── Per-model test status (client-side cache — no DB schema change) ──────────────
+const TEST_CACHE_KEY = 'model_test_status';   // { [key]: {ok, msg, at} }
+function _getTestCache() { try { return JSON.parse(localStorage.getItem(TEST_CACHE_KEY) || '{}'); } catch { return {}; } }
+function _setTestStatus(key, ok, msg) {
+  const c = _getTestCache(); c[key] = { ok: !!ok, msg: msg || '', at: Date.now() };
+  try { localStorage.setItem(TEST_CACHE_KEY, JSON.stringify(c)); } catch { }
+}
+function _testBadgeHtml(key) {
+  const s = _getTestCache()[key];
+  if (!s) return `<span class="test-badge" style="font-size:11px;opacity:.55;">untested</span>`;
+  const color = s.ok ? '#15803d' : '#b91c1c';
+  const icon = s.ok ? '✓' : '✗';
+  const when = new Date(s.at).toLocaleDateString();
+  return `<span class="test-badge" title="${escapeHtml(s.msg || '')}" style="font-size:11px;color:${color};">${icon} tested ${when}</span>`;
+}
+
+// Set a model as the user's default (validated server-side against known models).
+async function setDefaultModel(name) {
+  const res = await fetch('/api/settings/models/default', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...api.headers() },
+    body: JSON.stringify({ name })
+  });
+  if (!res.ok) { notify('error', (await res.text()) || 'Failed to set default'); return; }
+  notify('success', `Default model: ${name}`);
+  await loadModelsIntoUI();
+  await refreshModelSelectFromServer(name);
+}
+
+// Test a SAVED model by id (server uses the stored key; nothing secret leaves the server).
+async function testSavedModel(id, key, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+  try {
+    const res = await fetch(`/api/settings/models/${id}/test`, {
+      method: 'POST', headers: { ...api.headers() }
+    });
+    const d = await res.json().catch(() => ({ ok: false, message: 'Bad response from server' }));
+    _setTestStatus(key, !!d.ok, d.message || '');
+    notify(d.ok ? 'success' : 'error', d.message || (d.ok ? 'OK' : 'Failed'));
+  } catch (e) {
+    _setTestStatus(key, false, e?.message || 'Network error');
+    notify('error', e?.message || 'Network error');
+  } finally {
+    await loadModelsIntoUI();  // re-render to show the fresh badge (also re-enables the button)
+  }
+}
+
+// Minimal, non-annoying validation: block only what will surely fail to build.
+// (Missing API key is NOT hard-blocked — get_llm can fall back to an env key — so we
+// let Test/Add reveal it rather than refuse a valid env-based setup.)
+function _validateModelForm(source, name, base_url) {
+  if (!name) return 'Model name is required.';
+  if (source === 'Custom' && !base_url) return 'A base URL is required for Custom (OpenAI-compatible) endpoints.';
+  return null;
 }
 
 async function addModel() {
@@ -2447,7 +2554,8 @@ async function addModel() {
   const source = el('mdl-source')?.value;
   const base_url = el('mdl-base-url')?.value || null;
   const api_key = el('mdl-api-key')?.value || null;
-  if (!name) { notify('error', 'Model name required'); return; }
+  const verr = _validateModelForm(source, name, base_url);
+  if (verr) { notify('error', verr); return; }
 
   const res = await fetch('/api/settings/models', {
     method: 'POST',
@@ -2474,7 +2582,8 @@ async function testModel() {
   const api_key = el('mdl-api-key')?.value || null;
   const st = el('mdl-test-status');
   const setStatus = (txt, ok) => { if (st) { st.textContent = txt; st.style.color = ok === true ? '#15803d' : ok === false ? '#b91c1c' : '#64748b'; } };
-  if (!name) { setStatus('Enter a model name first', false); return; }
+  const verr = _validateModelForm(source, name, base_url);
+  if (verr) { setStatus(verr, false); return; }
   setStatus('Testing…', null);
   const btn = el('mdl-test'); if (btn) btn.disabled = true;
   try {
@@ -2485,6 +2594,8 @@ async function testModel() {
     });
     const d = await res.json().catch(() => ({ ok: false, message: 'Bad response from server' }));
     setStatus((d.ok ? '✓ ' : '✗ ') + (d.message || (d.ok ? 'OK' : 'Failed')), !!d.ok);
+    // Remember the result so the model's row shows a status badge once it's added.
+    _setTestStatus('u:' + name, !!d.ok, d.message || '');
   } catch (e) {
     setStatus('✗ ' + (e?.message || 'Network error'), false);
   } finally {
@@ -2580,16 +2691,26 @@ async function loadModelsIntoUI() {
     return;
   }
 
+  const DEF = data.default_model || null;
+  const defBadge = `<span class="def-badge" style="font-size:11px;color:#15803d;border:1px solid #86efac;border-radius:6px;padding:0 6px;margin-left:6px;">✓ default</span>`;
+  const keyMark = has => has ? ' • <span title="API key stored on server">🔑</span>' : '';
+  const mkMini = (cls, label) => `<button class="${cls}" style="font-size:12px;padding:2px 9px;border-radius:6px;border:1px solid #cbd5e1;background:transparent;cursor:pointer;">${label}</button>`;
+
   if (data.system_default?.model) {
     const s = data.system_default;
+    const isDef = DEF && DEF === s.model;
     const badge = document.createElement('div');
     badge.className = 'model-chip system';
     badge.innerHTML = `
       <div class="chip-head">
-        <span class="chip-name">System default</span>
-        <span class="chip-meta">${escapeHtml(s.model)}${s.source ? ' • ' + escapeHtml(s.source) : ''}</span>
+        <span class="chip-name">System default${isDef ? defBadge : ''}</span>
+        <span class="chip-meta">${escapeHtml(s.model)}${s.source ? ' • ' + escapeHtml(s.source) : ''}${keyMark(s.has_key)}</span>
       </div>
-      <div class="chip-foot muted">${escapeHtml(s.base_url || '')}</div>`;
+      <div class="chip-foot muted">${escapeHtml(s.base_url || '')}</div>
+      <div class="chip-actions" style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+        ${isDef ? '' : mkMini('set-def', 'Set as default')}
+      </div>`;
+    const sd = badge.querySelector('.set-def'); if (sd) sd.onclick = () => setDefaultModel(s.model);
     list.appendChild(badge);
   }
 
@@ -2601,16 +2722,25 @@ async function loadModelsIntoUI() {
     return;
   }
   data.user_models.forEach(m => {
+    const key = 'u:' + m.name;
+    const isDef = DEF && DEF === m.name;
     const item = document.createElement('div');
     item.className = 'model-chip';
     item.innerHTML = `
       <div class="chip-head">
-        <span class="chip-name">${escapeHtml(m.name)}</span>
-        <span class="chip-meta">${escapeHtml(m.source || '')}</span>
+        <span class="chip-name">${escapeHtml(m.name)}${isDef ? defBadge : ''}</span>
+        <span class="chip-meta">${escapeHtml(m.source || '')}${keyMark(m.has_key)}</span>
         <button class="chip-del" title="Remove" aria-label="Remove">&times;</button>
       </div>
-        <div class="chip-foot muted">${escapeHtml(m.base_url || '')}</div>`;
+      <div class="chip-foot muted">${escapeHtml(m.base_url || '')}</div>
+      <div class="chip-actions" style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+        ${_testBadgeHtml(key)}
+        ${mkMini('test-one', 'Test')}
+        ${isDef ? '' : mkMini('set-def', 'Set as default')}
+      </div>`;
     item.querySelector('.chip-del').onclick = () => deleteModel(m.id);
+    item.querySelector('.test-one').onclick = (e) => testSavedModel(m.id, key, e.currentTarget);
+    const sd = item.querySelector('.set-def'); if (sd) sd.onclick = () => setDefaultModel(m.name);
     list.appendChild(item);
   });
 }

@@ -1813,7 +1813,7 @@ class DasToolContract(_BaseContract):
     RUNTIME = "medium"
     VARIANTS = [
         "lower --score_threshold from 0.5 to 0.35 to recover more bins at lower confidence",
-        "add --write_bins 1 to ensure bin FASTAs are written; verify scaffold-to-bin input files exist",
+        "add --write_bins (a bare flag, NO '1' value) to ensure bin FASTAs are written; verify scaffold-to-bin input files exist",
     ]
 
     def check(self, run_dir: str, stdout: str) -> ContractResult:

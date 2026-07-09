@@ -1563,6 +1563,15 @@ class BioAgent:
             _step_title_ctx = step['title'].lower()
             _injections = []
 
+            # Resource-awareness: tell the generator the REAL cpu/disk of this machine so it
+            # stops hardcoding -t 4 (wastes cores) and deletes intermediates when disk is low.
+            try:
+                _res_block = self._runtime_resources_block(state)
+                if _res_block:
+                    _injections.append(_res_block)
+            except Exception:
+                pass
+
             if any(k in _step_ctx for k in ("n50", "assembly stat", "contig stat", "scaffold stat",
                                              "sequence stat", "assembly metric", "stats")):
                 _injections.append(
@@ -2036,6 +2045,72 @@ class BioAgent:
                     "  WRONG: --minContig 200 -m 200 → boost throws 'multiple_occurrences'\n"
                     "  NOTE: If no bins are produced (very fragmented assembly), report bin_count=0\n"
                     "        and continue — this is a valid result, not a script failure."
+                )
+
+            # DAS_Tool consensus injection — TWO recurring bugs this fixes:
+            #  (1) '--write_bins 1' → DAS_Tool prints usage and exits 1 (it is a BARE flag).
+            #  (2) the default --score_threshold 0.5 silently DROPS a real genome when two
+            #      close relatives (e.g. E.coli + Klebsiella) co-bin — the shallower/relative
+            #      scores <0.5 and vanishes, or hides inside a high-SCG-redundancy chimera.
+            #      This makes the recovery guard EXECUTABLE (it was prose-only in the tool
+            #      description and the generator never implemented it).
+            if any(k in _step_title_ctx for k in ("das_tool", "dastool", "das tool",
+                                                  "consensus bin", "refine bin", "reconcile bin",
+                                                  "bin refinement", "dereplicate binner")):
+                _injections.append(
+                    "THIS STEP RUNS DAS_Tool FOR CONSENSUS BINNING.\n"
+                    "CRITICAL FLAG BUG: `--write_bins` is a BARE flag — NEVER pass it a value.\n"
+                    "  WRONG: ['DAS_Tool', ..., '--write_bins', '1']  → prints usage, exits 1.\n"
+                    "  RIGHT: ['DAS_Tool', ..., '--write_bins']\n"
+                    "Build one contig2bin table per binner first (Fasta_to_Contig2Bin.sh -i <dir> -e fa),\n"
+                    "then run DAS_Tool with matching -i tables and -l labels.\n"
+                    "\n"
+                    "MANDATORY SPECIES-RECOVERY GUARD (do NOT skip — implement it in code):\n"
+                    "After the run, COUNT the refined bins in <prefix>_DASTool_bins/ and compare to the\n"
+                    "EXPECTED number of genomes = number of reference *.fna used to simulate (or rows in\n"
+                    "ground_truth.tsv if present). If fewer refined bins than expected, a real member was\n"
+                    "dropped or merged into a relative — RE-RUN DAS_Tool with --score_threshold 0.3.\n"
+                    "\n"
+                    "  import os, glob, subprocess, sys\n"
+                    "  def _run_das(thr, outp):\n"
+                    "      cmd = ['DAS_Tool', '-i', ','.join(tables), '-l', ','.join(labels),\n"
+                    "             '-c', contigs_fa, '-o', outp, '--write_bins', '-t', '4',\n"
+                    "             '--score_threshold', str(thr)]\n"
+                    "      r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)\n"
+                    "      if r.returncode != 0:\n"
+                    "          sys.exit(f'DAS_Tool failed (thr={thr}): {r.stderr[-1500:] or r.stdout[-1500:]}')\n"
+                    "      return sorted(glob.glob(outp + '_DASTool_bins/*.fa'))\n"
+                    "  # expected richness = number of input reference genomes\n"
+                    "  expected = len(glob.glob(os.path.join(ref_dir, '*.fna'))) or 0\n"
+                    "  bins = _run_das(0.5, os.path.join(run_dir, 'dastool_out', 'dastool'))\n"
+                    "  if expected and len(bins) < expected:\n"
+                    "      print(f'DAS_Tool kept {len(bins)}/{expected} genomes at thr=0.5 — retrying at 0.3')\n"
+                    "      bins = _run_das(0.3, os.path.join(run_dir, 'dastool_out', 'dastool_t03'))\n"
+                    "  print(f'Refined bins: {len(bins)} (expected ~{expected})')\n"
+                    "\n"
+                    "  NOTE: also inspect the DAS_Tool summary SCG_redundancy per kept bin — a bin with\n"
+                    "        redundancy >10% is a likely CHIMERA hiding a second genome; report it and, if a\n"
+                    "        member is still missing after thr=0.3, recover any per-binner bin that CheckM2\n"
+                    "        rates >=90% complete / <=5% contaminated and is absent from the consensus set."
+                )
+
+            # dRep dereplication injection — subprocess does NOT expand shell globs, so a
+            # '-g bins/*.fa' or '-g <dir>' is passed literally and dRep loads nothing/crashes.
+            if any(k in _step_title_ctx for k in ("drep", "drep ", "dereplicat", "representative mag",
+                                                  "representative genome", "non-redundant mag")):
+                _injections.append(
+                    "THIS STEP RUNS dRep. TWO hard requirements:\n"
+                    "  1. `-g` needs an EXPLICIT LIST of file paths — NOT a glob or a directory. subprocess\n"
+                    "     has no shell, so '-g bins/*.fa' is a literal string → dRep fails. Expand in Python:\n"
+                    "       bins = glob.glob(os.path.join(bins_dir, '*.fa'))\n"
+                    "       if not bins: sys.exit('dRep: no input bins found')\n"
+                    "       cmd = ['dRep','dereplicate', out_dir, '-g', *bins, '-p','4',\n"
+                    "              '--genomeInfo', info_csv, '-sa','0.95','-comp','50','-con','10']\n"
+                    "  2. `--genomeInfo` IS MANDATORY (CheckM v1 is absent; without it dRep yields 0 reps).\n"
+                    "     Build genomeInfo.csv with EXACT header `genome,completeness,contamination`, one row\n"
+                    "     per bin, `genome` = bin FILE BASENAME with extension, from the CheckM2 report.\n"
+                    "  WRONG: ['dRep','dereplicate',out_dir,'-g','bins/*.fa', ...]  → loads nothing.\n"
+                    "  WRONG: ['dRep','dereplicate',out_dir,'-g',bins_dir,'-e','fa', ...] → not expanded."
                 )
 
             # Kraken2 taxonomic classification injection
@@ -2576,6 +2651,18 @@ class BioAgent:
                     "  sequences = list(SeqIO.parse(StringIO(fasta_text), 'fasta'))\n"
                     "  print(f'Parsed {len(sequences)} sequences')\n"
                 )
+
+            # Failure-memory recall: surface concrete pitfalls this SAME tool/task hit and
+            # RESOLVED in past runs (unified across all sessions). Advisory, capped, best-effort.
+            try:
+                _fl = self._load_failure_lessons(
+                    self._infer_task_type(state.get("last_prompt") or ""),
+                    step['title'],
+                )
+                if _fl:
+                    _injections.append(_fl)
+            except Exception:
+                pass
 
             if _injections:
                 content += "\n\nCODE PATTERN REMINDER (apply these in your code):\n" + "\n\n".join(_injections)
@@ -3298,6 +3385,13 @@ class BioAgent:
                     f"Observer must diagnose from stdout below."
                 )
                 new_manifest["repair_step_idx"] = state["current_idx"]
+                # Failure-memory capture: record the error + suggested fix. Survives
+                # _clean_manifest (not in its pop-list); finalizer turns resolved ones
+                # into cross-session lessons.
+                _fn = list(new_manifest.get("failure_notes", []))
+                _fn.append({"step_idx": state["current_idx"], "title": step["title"],
+                            "reason": result.reason, "hint": hint})
+                new_manifest["failure_notes"] = _fn[-50:]
                 self._log(
                     "VALIDATOR → OBSERVER (long tool)",
                     body=f"{result.reason} — long runtime, no auto-retry",
@@ -3320,6 +3414,11 @@ class BioAgent:
                     f"Parameter fix to apply: {hint}"
                 )
                 new_manifest["repair_step_idx"] = state["current_idx"]
+                # Failure-memory capture (see long-tool path above).
+                _fn = list(new_manifest.get("failure_notes", []))
+                _fn.append({"step_idx": state["current_idx"], "title": step["title"],
+                            "reason": result.reason, "hint": hint})
+                new_manifest["failure_notes"] = _fn[-50:]
                 self._log(
                     "VALIDATOR RETRY",
                     body=f"attempt {attempt}/{max_r} — hint: {hint[:120]}",
@@ -4655,6 +4754,50 @@ class BioAgent:
             except Exception as _me:
                 self._log("MEMORY WRITE ERROR", body=str(_me), node=node)
 
+            # ── Failure-memory: persist concrete failed-then-RESOLVED lessons, UNIFIED
+            # across all sessions in ~/.genomeer/failure_memory.jsonl, so a future
+            # generation of the same tool/task avoids the exact error. Only a step that
+            # FAILED (has a failure_note) AND ended 'done' becomes a lesson. ────────────
+            try:
+                import json as _json2
+                from pathlib import Path as _Path2
+                from datetime import datetime as _dt2
+                _plan_fm = state.get("plan") or []
+                _fnotes = ((state.get("manifest") or {}).get("failure_notes")) or []
+                if _fnotes:
+                    _fdir = _Path2.home() / ".genomeer"
+                    _fdir.mkdir(parents=True, exist_ok=True)
+                    _fmem = _fdir / "failure_memory.jsonl"
+                    _status_by_idx = {i: s.get("status") for i, s in enumerate(_plan_fm)}
+                    _task_type2 = self._infer_task_type(state.get("last_prompt") or "")
+                    _seen = set()
+                    _lessons = []
+                    for _n in _fnotes:
+                        if _status_by_idx.get(_n.get("step_idx")) != "done":
+                            continue  # only RESOLVED failures become lessons
+                        _title = (_n.get("title") or "")
+                        _sig = self._norm_err(_n.get("reason") or "")
+                        _key = (_title.lower(), _sig)
+                        if not _sig or _key in _seen:
+                            continue
+                        _seen.add(_key)
+                        _lessons.append({
+                            "timestamp":       _dt2.utcnow().isoformat(),
+                            "run_id":          run_id,
+                            "task_type":       _task_type2,
+                            "tool_title":      _title[:160],
+                            "error_signature": _sig,
+                            "fix":             (_n.get("hint") or "")[:300],
+                        })
+                    if _lessons:
+                        with open(_fmem, "a", encoding="utf-8") as _ffh:
+                            for _l in _lessons:
+                                _ffh.write(_json2.dumps(_l) + "\n")
+                        self._log("FAILURE MEMORY WRITE",
+                                  body=f"{len(_lessons)} lesson(s) → {_fmem}", node=node)
+            except Exception as _fme:
+                self._log("FAILURE MEMORY ERROR", body=str(_fme), node=node)
+
             return {
                 "manifest": manifest,
                 "next_step": "end",
@@ -5078,6 +5221,117 @@ class BioAgent:
             )
         lines.append("---\n")
         return "\n".join(lines)
+
+    def _runtime_resources_block(self, state) -> str:
+        """Build a RUNTIME RESOURCES block advertising the machine's REAL cpu cores and free
+        disk, plus a recommended thread count. Mirrors how batch_orchestrator splits RAM: the
+        recommendation = (cores - headroom) / batch_concurrency, so N samples running in
+        parallel don't oversubscribe the CPU. Capped by GENOMEER_MAX_THREADS (shared-host
+        politeness). Empty string on any failure (never blocks generation)."""
+        import os as _os, shutil as _shutil
+        try:
+            cores = _os.cpu_count() or 4
+        except Exception:
+            cores = 4
+        try:
+            conc = max(1, int(_os.environ.get("GENOMEER_BATCH_CONCURRENCY", "1")))
+        except Exception:
+            conc = 1
+        budget = max(1, cores - 2)          # leave 2 cores of headroom on a shared host
+        rec = max(1, budget // conc)        # split remaining cores across parallel samples
+        _cap = _os.environ.get("GENOMEER_MAX_THREADS")
+        if _cap and str(_cap).isdigit():
+            rec = max(1, min(rec, int(_cap)))
+        run_dir = (state.get("run_temp_dir")
+                   or (state.get("manifest") or {}).get("root_dir") or "/tmp")
+        free_gb = -1.0
+        try:
+            du = _shutil.disk_usage(run_dir if _os.path.isdir(run_dir) else "/tmp")
+            free_gb = du.free / (1024 ** 3)
+        except Exception:
+            pass
+        lines = [
+            "RUNTIME RESOURCES (REAL values for THIS machine — use them; do NOT hardcode -t 4):",
+            f"  • CPU: {cores} cores detected. Use -t {rec} (also written -p {rec} / --threads {rec} /"
+            f" --cpus {rec} / -@ {rec}) for multithreaded tools: MEGAHIT, SPAdes, minimap2, samtools,"
+            f" kraken2, CheckM2, DAS_Tool, dRep, SemiBin2, prokka, diamond, fastp."
+            + (f" ({rec} = leaves headroom, split across {conc} parallel samples.)" if conc > 1
+               else f" ({rec} = all cores minus a small headroom.)"),
+        ]
+        if free_gb >= 0:
+            if free_gb < 10:
+                lines.append(
+                    f"  ⚠ LOW DISK: only {free_gb:.1f} GB free on the run dir. Large intermediates"
+                    f" (SAM, unsorted BAM, k-mer temp, decompressed FASTQ) can exhaust it — DELETE each"
+                    f" intermediate the moment the next step has consumed it (rm the SAM right after"
+                    f" samtools sort; rm the unsorted BAM after sort+index; keep only what a later step reads).")
+            else:
+                lines.append(
+                    f"  • Disk: {free_gb:.1f} GB free on the run dir. Still delete big intermediates"
+                    f" (SAM after sort, unsorted BAM after index) to stay safe.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _norm_err(reason: str) -> str:
+        """Normalize a validator/executor error into a STABLE signature for dedup:
+        lowercase, drop run-specific paths/digits/hex, collapse whitespace. So the same
+        failure across different runs/paths maps to one lesson."""
+        import re as _re
+        s = (reason or "").lower()
+        s = _re.sub(r"/[^\s'\"]+", " <path> ", s)          # absolute paths
+        s = _re.sub(r"\b[0-9a-f]{8,}\b", " <hex> ", s)      # hashes/ids
+        s = _re.sub(r"\b\d+(\.\d+)?\b", " <n> ", s)         # numbers
+        s = _re.sub(r"\s+", " ", s).strip()
+        return s[:180]
+
+    def _load_failure_lessons(self, task_type: str, step_title: str, max_lessons: int = 3) -> str:
+        """Phase 5 — recall CONCRETE, RESOLVED pitfalls for this tool/task from
+        ~/.genomeer/failure_memory.jsonl (unified across all sessions) and format them as
+        an advisory 'KNOWN PITFALLS' block for the GENERATOR. Matched by task_type AND a
+        word overlap between the lesson's tool title and the current step title. Deduped by
+        (error_signature, fix), ranked by frequency then recency. Empty string on any miss."""
+        import json as _json, re as _re
+        from pathlib import Path as _Path
+
+        fmem = _Path.home() / ".genomeer" / "failure_memory.jsonl"
+        if not fmem.exists():
+            return ""
+        title_lc = (step_title or "").lower()
+        hits = {}
+        try:
+            with open(fmem, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("task_type") != task_type:
+                        continue
+                    toks = [t for t in _re.split(r"[^a-z0-9]+", (rec.get("tool_title") or "").lower()) if len(t) >= 4]
+                    if not toks or not any(t in title_lc for t in toks):
+                        continue
+                    key = (rec.get("error_signature", ""), rec.get("fix", ""))
+                    prev = hits.get(key)
+                    rec["_count"] = (prev.get("_count", 0) + 1) if prev else 1
+                    if prev is None or rec.get("timestamp", "") >= prev.get("timestamp", ""):
+                        hits[key] = rec
+        except Exception:
+            return ""
+        if not hits:
+            return ""
+        ranked = sorted(hits.values(),
+                        key=lambda r: (r.get("_count", 1), r.get("timestamp", "")),
+                        reverse=True)[:max_lessons]
+        out = ["KNOWN PITFALLS for this tool/task (learned from PAST runs — do NOT repeat these):"]
+        for r in ranked:
+            out.append(
+                f"  • Previously FAILED with: {r.get('error_signature', '')[:160]}\n"
+                f"    → APPLY THIS FIX: {r.get('fix', '')[:200]}"
+            )
+        return "\n".join(out)
 
     @staticmethod
     def _clean_manifest(manifest: dict) -> dict:

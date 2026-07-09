@@ -407,7 +407,7 @@ library_content_dict = {
         "  # Step 2: run DAS_Tool with all binners\n"
         "  res = subprocess.run(['DAS_Tool', '-i', 'metabat.s2b,maxbin.s2b',\n"
         "                        '-c', 'contigs.fna', '-o', 'dastool_out/dastool',\n"
-        "                        '--write_bins', '1', '--threads', '4',\n"
+        "                        '--write_bins', '--threads', '4',\n"
         "                        '--score_threshold', '0.5'],\n"
         "                       capture_output=True, text=True, timeout=3600)\n"
         "  # Output: dastool_out/dastool_DASTool_summary.tsv\n"

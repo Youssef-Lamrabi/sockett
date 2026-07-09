@@ -798,6 +798,13 @@ SPECIAL ALWAYS-TRUE RULES:
 - SeqIO.parse() returns a one-time generator. ALWAYS convert it to a list immediately:
     contigs = list(SeqIO.parse(fasta_path, "fasta"))
   Never call SeqIO.parse() twice or iterate its result after any other list()/loop usage.
+- NEVER use SeqIO.read() to measure a GENOME size or length. SeqIO.read() requires the file to
+  contain EXACTLY ONE record and raises "ValueError: More than one record found in handle" on any
+  multi-record FASTA — which is the NORMAL case: a complete bacterial genome has a chromosome PLUS
+  plasmids (e.g. Klebsiella pneumoniae HS11286 = 1 chromosome + 6 plasmids), and any concatenated /
+  multi-contig / assembly FASTA has many records. To compute total length, ALWAYS sum over parse():
+    total_bp = sum(len(rec.seq) for rec in SeqIO.parse(fna, "fasta"))
+  Use SeqIO.read() ONLY when you have deliberately guaranteed a single-record file (e.g. one plasmid).
 - If Bio/biopython is not available (previous error was ModuleNotFoundError: No module named 'Bio'),
   NEVER retry with Bio imports. Use the standard library only. Parse FASTA with a plain loop:
     records = []

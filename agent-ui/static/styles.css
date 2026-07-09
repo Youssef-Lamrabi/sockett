@@ -2302,6 +2302,23 @@ ul {
     flex: 1 1 100%;
 }
 
+/* True full-viewport preview — lifts the preview OUT of the side panel to cover the
+   whole window (position:fixed escapes the panel's flex layout). Toggled per-region. */
+.fe-preview-region.fe-preview-screen {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    width: 100vw;
+    height: 100vh;
+    flex: none;
+    background: #ffffff;
+    box-shadow: 0 0 0 100vmax rgba(15, 23, 42, 0.45);
+}
+.fe-preview-region.fe-preview-screen .fe-preview-content {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
 .fe-preview-unsupported {
     text-align: center;
     padding: 32px 16px;
