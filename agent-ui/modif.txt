@@ -1,0 +1,101 @@
+================================================================================
+BILAN DES CHANGEMENTS — Genomeer / BioAgent
+Date : 2026-07-13
+Env cible : meta-env1  (/home/youssef/.bioagentpkg/runtime/pkgs/envs/meta-env1)
+================================================================================
+
+--------------------------------------------------------------------------------
+1) OUTILS INSTALLÉS / AJOUTÉS (avec version + méthode, pour reproductibilité)
+--------------------------------------------------------------------------------
+
+InSilicoSeq (iss)       2.0.1     pip install InSilicoSeq
+ncbi-genome-download    0.3.3     pip install ncbi-genome-download
+                                  (ajouté à meta-env1 ; n'existait que dans bio-env
+                                   -> corrige le mismatch cross-env sur le download)
+SPAdes                  4.0.0     binaire précompilé github (PAS conda) :
+                                  github.com/ablab/spades/releases v4.0.0-Linux.tar.gz
+                                  + wrapper LD_LIBRARY_PATH=$PREFIX/lib (libgomp)
+                                  NB : tourne en dossier Linux natif (/tmp), PAS /mnt/c
+Infernal cmsearch/cmscan 1.1.5    binaire précompilé eddylab.org/infernal 1.1.5
+                                  (destiné à barrnap)
+
+Déjà présents (env léger, rappel) :
+fastANI                 1.33      binaire github v1.34 + wrapper libgomp
+NanoPlot                1.47.1    pip
+samtools                1.21      (INCHANGÉ — voir section 3, fix instruction)
++ set léger conda : python 3.12, fastp, fastqc, seqkit, bedtools, wgsim, bbmap,
+  prodigal, hmmer, diamond, megahit, minimap2, bwa, bowtie2, mafft, trimal,
+  fasttree, flye, filtlong, racon, biopython/numpy/pandas/scipy
+
+NON FONCTIONNEL :
+barrnap                 (github clone) — ABANDONNÉ : nécessite la base Rfam .cm
+                        buildée localement (modèles absents). L'agent fast-fail
+                        proprement s'il le choisit.
+NON installés (lourds) : medaka, prokka, unicycler, kraken2, quast, metabat2,
+                        checkm2, abricate, rgi  -> fast-fail gracieux si choisis.
+
+--------------------------------------------------------------------------------
+2) OUTIL RÉPARÉ (dépendance cassée, pas réinstallé)
+--------------------------------------------------------------------------------
+
+bcftools  1.6   Cassé : réclamait libcrypto.so.1.0.0 (OpenSSL 1.0.0) absent
+                (l'env a OpenSSL 3). Bioconda rot.
+                FIX : shim libcrypto.so.1.0.0 extrait du paquet conda openssl 1.0.2u,
+                placé dans .bioagentpkg/extra/openssl102/lib/ + wrapper bcftools
+                (LD_LIBRARY_PATH isolé, ne touche PAS l'OpenSSL 3 des autres outils).
+                -> bcftools marche maintenant nativement. samtools 1.21 intact.
+
+--------------------------------------------------------------------------------
+3) MODIFICATIONS DE CODE (bugs systémiques, tous vérifiés, non-cassants)
+--------------------------------------------------------------------------------
+
+FICHIER : agent/v2/utils/validator.py
+  - AJOUT  SraFetchContract (placé AVANT wgsim/InSilicoSeq dans _ALL_CONTRACTS) :
+           un step fetch_sra_reads (download de vraies reads) était noté par le
+           contrat wgsim (simulation) -> "reads_R1.fastq not found" -> faux échec
+           + re-download de 13 min. Le nouveau contrat valide "au moins un FASTQ".
+  - MODIF  WgsimContract.KEYWORDS : retiré "paired-end reads" et "generate reads"
+           (trop génériques, happaient les downloads/vraies reads).
+  - MODIF  ProdigalContract.check : grade désormais le .faa avec LE PLUS de protéines
+           (le vrai protéome) au lieu du premier trouvé. Corrige le faux négatif
+           "6 proteins / score 0.01" sur les steps marqueur/pan-génome.
+
+FICHIER : agent/v2/utils/instructions.py
+  - iss : formule de profondeur non-ambiguë (n_reads = depth*genome_bp/read_len,
+          NE PAS diviser par 2, read_len = longueur par-mate) + vérification
+          post-simulation obligatoire. Corrige la sous-couverture (~moitié).
+  - Prodigal : -p single pour un isolat unique ; même mode des deux côtés quand on
+          compare des comptes de gènes (règle le paradoxe 5532 vs 6265).
+  - ncbi-genome-download : auto-récupération du cache assembly_summary corrompu
+          ("Invalid line length ... Expected 38, got 39") -> filtrer les lignes
+          malformées (garder # et 38 colonnes) puis réessayer.
+  - ANI matrix : EXCLURE la self-comparison (diagonale ~100%) avant de choisir la
+          "référence la plus proche". Corrige le bug "isolat = SMS-3-5 à 100%".
+  - samtools sort : CAUSE = instruction périmée pour l'ancien samtools 0.x
+          (syntaxe positionnelle 'sort in.bam prefix'). L'installé est samtools 1.21.
+          CORRIGÉ vers la syntaxe moderne : samtools sort -o out.bam in.bam.
+          (+ note 'view -o' rectifiée : -o fonctionne en 1.x.)
+          -> l'outil n'a PAS changé (toujours 1.21) ; c'est l'INSTRUCTION qui a été
+             alignée sur l'outil réel.
+  - MAFFT : ajouter --anysymbol aux alignements protéiques (résidus non-standard
+          'U'/sélénocystéine -> plante "outputhat23=16") + wrapper par-cluster
+          (un échec loggé/sauté, pas d'abandon global).
+  - Règles de routing (rappel) : Nanopore->flye, décontamination hôte, couverture,
+          ANI->fastani, arbre phylo->mafft/trimal/fasttree, SRA->fetch_sra_reads.
+
+FICHIER : agent/genomeer/.../tools/description/sra.py
+  - fetch_sra_reads : instruction "appeler le helper, ne PAS réécrire le download"
+          + warning un-skippable : télécharger depuis https_urls, JAMAIS depuis les
+          ftp_urls bruts d'ENA (sans schéma) -> sinon urllib "unknown url type".
+
+--------------------------------------------------------------------------------
+4) NON CORRIGÉ (volontairement — bugs code-gen ponctuels, laissés au diagnostic)
+--------------------------------------------------------------------------------
+  - Comptage pan-génome (NA / non reproductible d'un run à l'autre) : logique
+    custom ad-hoc, pas un manque de connaissance -> auto-correction par diagnostic.
+  - Principe appliqué : n'enrichir les instructions que sur échec RÉCURRENT par
+    manque de savoir ; garder les instructions maigres.
+
+================================================================================
+FIN
+================================================================================
