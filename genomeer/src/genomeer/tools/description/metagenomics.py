@@ -898,9 +898,14 @@ description = [
         "description": (
             "[CLI Tool][TIMEOUT: 7200s] Medaka: consensus polishing for Oxford Nanopore Technology (ONT) assemblies. "
             "Uses neural network models trained on specific ONT flowcell/basecaller combinations. "
-            "Command: medaka_consensus -i reads.fastq -d assembly.fasta -o output_dir -m model -t N. "
+            "Command: medaka_consensus -i reads.fastq -d assembly.fasta -o output_dir -m model -t N -b batch_size. "
             "Common models: r941_min_hac_g507 (MinION HAC), r1041_e82_400bps_sup_v4.2.0 (R10.4.1). "
-            "Outputs consensus.fasta with polished sequences."
+            "NOTE — medaka_consensus creates its OWN 'medaka_out' subfolder under the given output_dir "
+            "(so other files can sit alongside it without collision): the polished FASTA ends up at "
+            "<output_dir>/medaka_out/consensus.fasta, not directly in output_dir. "
+            "Medaka reports polish quality in stderr as 'mean qv: X.XX' (or 'consensus qv: X.XX') — "
+            "QV20+ ≈ 99% accuracy, QV30+ ≈ 99.9%; below QV10 usually means the input reads were too "
+            "noisy or Racon polishing rounds were skipped."
         ),
         "required_parameters": [
             {"name": "assembly_fasta", "type": "str",
@@ -913,8 +918,280 @@ description = [
             {"name": "model", "type": "str", "default": "r941_min_hac_g507",
              "description": "Medaka model matching flowcell and basecaller version."},
             {"name": "threads", "type": "int", "default": 4},
+            {"name": "batch_size", "type": "int", "default": 100,
+             "description": "Inference batch size (-b); lower it on memory-constrained hosts."},
         ],
-        "returns": "dict(consensus_fasta, sequence_count, output_dir, returncode, stdout, stderr)",
+        "returns": "dict(consensus_fasta, sequence_count, mean_qv, output_dir, returncode, stdout, stderr)",
+    },
+    {
+        "name": "run_racon",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] Racon: fast long-read assembly polishing using read-to-assembly "
+            "overlaps — typically run for 1-2 rounds BEFORE run_medaka (Racon corrects most errors "
+            "cheaply; Medaka's neural model refines what's left). AVAILABLE in meta-env1. "
+            "Needs a PAF/SAM overlap file mapping the SAME reads against the SAME draft assembly first "
+            "(generate it with a long-read-capable mapper using an ONT- or PacBio-appropriate preset). "
+            "CRITICAL: Racon writes the polished FASTA to STDOUT — there is no -o flag; redirect stdout "
+            "to a file (never shell=True). "
+            "Command: racon -t N reads.fastq overlaps.paf assembly.fasta  (stdout -> polished.fasta). "
+            "Positional argument order matters: reads FIRST, overlaps SECOND, draft-assembly-being-"
+            "polished THIRD. For a second round, feed round-1's polished.fasta back in as the assembly "
+            "(re-computing fresh overlaps of the ORIGINAL reads against THIS new assembly first)."
+        ),
+        "required_parameters": [
+            {"name": "reads_fastq", "type": "str", "description": "Long reads used to generate the overlaps."},
+            {"name": "overlaps_paf", "type": "str", "description": "PAF/SAM overlap file (reads vs assembly_fasta), e.g. from minimap2."},
+            {"name": "assembly_fasta", "type": "str", "description": "Draft assembly FASTA to polish."},
+            {"name": "output_dir", "type": "str", "description": "Output directory (created if absent)."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(polished_fasta, sequence_count, output_dir, returncode, stderr)",
+    },
+    # ── HOST DECONTAMINATION / COVERAGE UTILITIES ────────────────────────────
+    {
+        "name": "run_host_decontamination",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] Remove host reads from a metagenomic sample (e.g. filter out "
+            "human reads before assembly) by aligning against a host reference index and KEEPING only "
+            "the reads that do NOT align. AVAILABLE in meta-env1. Needs a pre-built host bowtie2 index "
+            "(bowtie2-build host_reference.fasta host_index_prefix) — build this once, reuse across runs. "
+            "Command (paired-end — writes the non-host reads DIRECTLY, no separate filtering step "
+            "needed): bowtie2 -x host_index -1 R1.fastq -2 R2.fastq -p N --un-conc-gz "
+            "output_dir/clean_%.fastq.gz -S /dev/null. "
+            "--un-conc-gz with a '%' wildcard in the path produces clean_1.fastq.gz / clean_2.fastq.gz (the "
+            "pair-concordant UNALIGNED reads = the microbial fraction). Single-end: use -U reads.fastq "
+            "and --un-gz instead of -1/-2/--un-conc-gz. "
+            "-S /dev/null discards the (large, unneeded) SAM alignment stream — do NOT write it to a "
+            "real file, it is not needed downstream and wastes disk. "
+            "METRIC: bowtie2 prints 'X% overall alignment rate' to stderr — that percentage aligned to "
+            "the HOST; the retained non-host fraction is (100 - X). Print this as "
+            "'microbial_pct: <value>' to stdout so it is captured for quality assessment — a very low "
+            "microbial_pct (<1%) means the sample is dominated by host material (low microbial biomass), "
+            "and a step relying on downstream assembly/binning should flag this rather than proceed "
+            "silently on a near-empty microbial signal. "
+            "Run this BEFORE the assembly step (short- or long-read) whenever the sample source can "
+            "carry host DNA (human/animal/plant tissue, stool, saliva, environmental swabs near a host)."
+        ),
+        "required_parameters": [
+            {"name": "output_dir", "type": "str", "description": "Output directory for the cleaned FASTQ(s)."},
+            {"name": "host_index", "type": "str", "description": "Prefix path of a pre-built bowtie2 host index."},
+            {"name": "read1", "type": "str", "description": "R1 FASTQ (or the single-end FASTQ if read2 is omitted)."},
+        ],
+        "optional_parameters": [
+            {"name": "read2", "type": "str", "default": None, "description": "R2 FASTQ for paired-end input."},
+            {"name": "threads", "type": "int", "default": 8},
+        ],
+        "returns": "dict(microbial_pct, clean_r1, clean_r2, output_dir)",
+    },
+    {
+        "name": "compute_coverage_samtools",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] Per-contig and mean sequencing coverage/depth from a sorted, "
+            "indexed BAM — a fast, lightweight single-sample coverage summary. AVAILABLE "
+            "in meta-env1. Requires the BAM to be coordinate-sorted AND indexed first — running on an "
+            "unsorted/unindexed BAM either fails or silently returns wrong numbers. NOTE: this samtools "
+            "build's 'sort' does NOT take '-o <file>' as a named output flag (it is silently ignored/"
+            "misparsed on the installed version) — use the positional-prefix form instead: "
+            "samtools sort in.bam out_prefix  (creates out_prefix.bam automatically), THEN "
+            "samtools index out_prefix.bam. "
+            "Command: samtools coverage sorted.bam  — prints a TSV with columns rname, startpos, "
+            "endpos, numreads, covbases, coverage(%), meandepth, meanbaseq, meanmapq (one row per "
+            "reference/contig). "
+            "This tool averages the 'meandepth' column ACROSS CONTIGS (unweighted mean) into "
+            "mean_coverage_across_contigs — print it as 'mean_coverage: <value>' to stdout so it is "
+            "captured for quality assessment. Binning tools generally need >5X mean coverage for "
+            "reliable bins; below ~0.5X binning is essentially unusable. "
+            "For PER-SAMPLE relative abundance across MULTIPLE samples/timepoints use the dedicated "
+            "cross-sample abundance tool instead — this one is for a quick single-BAM coverage check, "
+            "not cross-sample normalization."
+        ),
+        "required_parameters": [
+            {"name": "sorted_bam", "type": "str", "description": "Coordinate-sorted, indexed BAM file."},
+        ],
+        "optional_parameters": [
+            {"name": "output_tsv", "type": "str", "default": None, "description": "Optional path to save the full per-contig coverage TSV."},
+        ],
+        "returns": "dict(mean_coverage_across_contigs, n_contigs, per_contig_depths, output_tsv)",
+    },
+    # ── GENOME COMPARISON / ADDITIONAL MAPPING ───────────────────────────────
+    {
+        "name": "run_fastani",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] FastANI: fast, alignment-free Average Nucleotide Identity (ANI) "
+            "between two (or many) genome assemblies. AVAILABLE in meta-env1. No database required. "
+            "Single pair: fastANI -q query.fasta -r reference.fasta -o output.txt. "
+            "Many-vs-many (faster than looping single pairs): fastANI --ql query_list.txt --rl "
+            "ref_list.txt -o output.txt  (each list file: one FASTA path per line). "
+            "Output: tab-separated, NO header — query_path, reference_path, ANI(%), count of "
+            "bidirectional fragment mappings, total query fragments. A pair too divergent to share any "
+            "fragments produces NO row at all for that pair — do not assume every input pair yields "
+            "one line of output. "
+            "SPECIES BOUNDARY: ANI >= 95% is the de facto prokaryotic species boundary (the same "
+            "threshold the dereplication tool applies by default). Use this tool for a QUICK targeted "
+            "'are these two SPECIFIC genomes the same species/strain' check (isolate vs reference, MAG "
+            "vs MAG); for MANY-vs-many clustering/dereplication of a whole bin set, the dedicated "
+            "dereplication tool already wraps ANI computation plus clustering and representative "
+            "selection — prefer it for that job. For "
+            "population-level (SNV-based) strain identity between timepoints on the SAME reference, "
+            "popANI from the strain-comparison tool is a different, more sensitive metric than "
+            "whole-genome ANI."
+        ),
+        "required_parameters": [
+            {"name": "query_fasta", "type": "str", "description": "Query genome/assembly FASTA."},
+            {"name": "reference_fasta", "type": "str", "description": "Reference genome/assembly FASTA."},
+            {"name": "output_path", "type": "str", "description": "Path for the ANI result TSV."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(ani_pct, query, reference, output_path) — ani_pct is None if the pair shares no fragments (too divergent to compute)",
+    },
+    {
+        "name": "run_bwa_mem",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] BWA-MEM: short-read aligner — a mapping alternative alongside "
+            "the other short-read aligner's -ax sr recipe documented elsewhere in this catalog, and "
+            "the aligner many variant-calling / strain-tracking recipes expect specifically. AVAILABLE "
+            "in meta-env1. No database required. "
+            "ONE-TIME index build (per reference, reuse across every sample mapped to it): "
+            "bwa index reference.fasta  (creates reference.fasta.{amb,ann,bwt,pac,sa} alongside the "
+            "FASTA — check for reference.fasta.bwt to know whether the index already exists before "
+            "rebuilding it). "
+            "SAME samtools pipe caveat applies here as elsewhere on this host — a piped one-liner "
+            "(aligner | samtools sort ...) FAILS on the installed samtools ('fail to read the header "
+            "from -'). ALWAYS use the SAM-file approach: "
+            "Step 1: bwa mem -t N reference.fasta R1.fastq R2.fastq  -> redirect stdout to a .sam file. "
+            "Step 2: samtools view -bS aligned.sam  -> redirect stdout (BINARY output — capture it as "
+            "raw bytes, not decoded text) to a .bam file; the -bS flags are REQUIRED, never omit -S. "
+            "Step 3: samtools sort mapped.bam sorted_prefix  (positional-prefix syntax on this samtools "
+            "build — creates sorted_prefix.bam automatically; do NOT pass '-o filename'). "
+            "Step 4: samtools index sorted_prefix.bam. "
+            "Single-end: omit R2.fastq (bwa mem -t N reference.fasta R1.fastq). "
+            "Prefer bwa mem over the other short-read aligner when a downstream tool specifically "
+            "expects BWA-style alignment (some AMR/variant-calling recipes); for general contig/read "
+            "mapping and coverage estimation the other aligner's -ax sr preset is equally valid."
+        ),
+        "required_parameters": [
+            {"name": "reference_fasta", "type": "str", "description": "Reference FASTA to align against (bwa index run once beforehand)."},
+            {"name": "read1", "type": "str", "description": "R1 FASTQ (or the single-end FASTQ if read2 is omitted)."},
+            {"name": "output_dir", "type": "str", "description": "Output directory for SAM/BAM intermediates."},
+        ],
+        "optional_parameters": [
+            {"name": "read2", "type": "str", "default": None, "description": "R2 FASTQ for paired-end input."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(sorted_bam, output_dir) — caller runs samtools index on sorted_bam per the recipe above",
+    },
+    # ── PHYLOGENETICS ─────────────────────────────────────────────────────────
+    {
+        "name": "run_barrnap",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] Barrnap: rapid ribosomal RNA (rRNA) gene prediction (16S/18S/23S/"
+            "28S/5S) from an assembled genome/contig FASTA — extracts 16S (or other rRNA) sequences FROM "
+            "assembled genomes/MAGs for phylogenetic placement or genome-vs-genome marker comparison. "
+            "AVAILABLE in meta-env1. No database required. DISTINCT from the amplicon 16S pipeline "
+            "(DADA2/phyloseq), which processes RAW amplicon sequencing reads, not assembled genomes — "
+            "use barrnap when the input is a genome/MAG/contig FASTA, use the amplicon pipeline when "
+            "the input is raw 16S amplicon reads. "
+            "Command: barrnap --kingdom bac --outseq rrna_seqs.fasta input_genome.fasta > rrna.gff. "
+            "--kingdom MUST match the organism: bac (bacteria), arc (archaea), euk (eukaryota), mito "
+            "(mitochondria) — the wrong kingdom silently yields zero or wrong hits. "
+            "--outseq is REQUIRED to get the actual rRNA gene SEQUENCES as a FASTA (needed for "
+            "downstream alignment/tree steps) — without it you only get GFF coordinates, no sequences. "
+            "Output: rrna.gff (standard 9-column GFF3, rRNA type named in the attributes column, e.g. "
+            "'16S ribosomal RNA') and, with --outseq, a FASTA of the extracted rRNA sequences. "
+            "WORKFLOW: run_barrnap (--outseq) on each genome -> concatenate the 16S sequences across "
+            "genomes into one FASTA -> run_mafft to align them -> run_trimal to clean the alignment -> "
+            "run_fasttree (-nt) to build the tree. This is the standard '16S phylogenetic tree from "
+            "assembled genomes' pipeline."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str", "description": "Assembled genome/contig FASTA to scan for rRNA genes."},
+            {"name": "output_gff", "type": "str", "description": "Path to write the rRNA GFF3 annotation."},
+        ],
+        "optional_parameters": [
+            {"name": "kingdom", "type": "str", "default": "bac", "description": "One of: bac, arc, euk, mito — MUST match the organism."},
+            {"name": "outseq_fasta", "type": "str", "default": None, "description": "If set, also write the extracted rRNA sequences here."},
+        ],
+        "returns": "dict(output_gff, outseq_fasta, n_rrna_features)"
+    },
+    {
+        "name": "run_mafft",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] MAFFT: multiple sequence alignment (MSA) — aligns a set of "
+            "related nucleotide or protein sequences (e.g. 16S genes from run_barrnap, or orthologous "
+            "protein sequences) as the first step before phylogenetic tree building. AVAILABLE in "
+            "meta-env1. No database required. "
+            "CRITICAL: MAFFT writes the aligned FASTA to STDOUT — there is no -o flag; redirect stdout "
+            "to a file (never shell=True). "
+            "Command: mafft --auto input.fasta  (stdout -> aligned.fasta). --auto picks an algorithm "
+            "based on input size/count — a safe default for most cases. For HIGH accuracy on a SMALL "
+            "set (<200 sequences), prefer --localpair (L-INS-i; much slower, more accurate) over --auto. "
+            "For a LARGE set (thousands of sequences), --retree 1 or --retree 2 trade some accuracy for "
+            "speed. "
+            "WORKFLOW: run_mafft -> run_trimal (clean the alignment) -> run_fasttree (-nt for "
+            "nucleotide, default for protein) to build the tree."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str", "description": "Unaligned FASTA of related sequences (nucleotide or protein)."},
+            {"name": "output_fasta", "type": "str", "description": "Path to write the aligned FASTA."},
+        ],
+        "optional_parameters": [
+            {"name": "mode", "type": "str", "default": "auto", "description": "'auto' (default), 'localpair' (high accuracy, <200 seqs), or 'retree2' (large sets)."},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(output_fasta, sequence_count)"
+    },
+    {
+        "name": "run_trimal",
+        "description": (
+            "[CLI Tool][TIMEOUT: 300s] trimAl: trims poorly-aligned columns/excess gaps from a multiple "
+            "sequence alignment BEFORE tree-building — improves signal-to-noise for phylogenetic "
+            "inference. AVAILABLE in meta-env1. No database required. Input must already be ALIGNED "
+            "(run_mafft output), not raw unaligned sequences. "
+            "Command: trimal -in aligned.fasta -out trimmed.fasta -automated1. "
+            "-automated1 is trimAl's own recommended default heuristic for phylogenetics — prefer it "
+            "unless a specific gap/similarity threshold is required (alternatives: -gt 0.8 for a fixed "
+            "gap-fraction threshold, -strictplus for more aggressive trimming on noisy alignments). "
+            "WORKFLOW: this step sits BETWEEN run_mafft and run_fasttree: align -> trim -> build tree."
+        ),
+        "required_parameters": [
+            {"name": "input_fasta", "type": "str", "description": "Aligned FASTA (from run_mafft)."},
+            {"name": "output_fasta", "type": "str", "description": "Path to write the trimmed alignment."},
+        ],
+        "optional_parameters": [
+            {"name": "mode", "type": "str", "default": "automated1", "description": "Trimming heuristic: 'automated1' (recommended default), 'gt' (fixed gap threshold), or 'strictplus'."},
+        ],
+        "returns": "dict(output_fasta, columns_kept, columns_total)"
+    },
+    {
+        "name": "run_fasttree",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] FastTree: builds an approximate maximum-likelihood phylogenetic "
+            "tree from a TRIMMED, ALIGNED multiple sequence alignment (run_trimal output) — NOT from "
+            "unaligned sequences. AVAILABLE in meta-env1. No database required. "
+            "CRITICAL — alphabet flag (common silent bug): FastTree defaults to PROTEIN input. For a "
+            "NUCLEOTIDE alignment (e.g. 16S rRNA genes) you MUST pass -nt, otherwise it misinterprets "
+            "the alphabet and silently produces a meaningless tree. Also add -gtr with -nt for a more "
+            "accurate nucleotide substitution model. "
+            "Command (nucleotide, e.g. 16S): FastTree -nt -gtr trimmed_alignment.fasta > tree.nwk. "
+            "Command (protein, e.g. orthologous proteins): FastTree trimmed_alignment.fasta > tree.nwk. "
+            "CRITICAL: FastTree writes the Newick tree to STDOUT — there is no -o flag; redirect stdout "
+            "to a file (never shell=True). "
+            "Output: a single Newick-format tree string (parenthesized, semicolon-terminated) — read it "
+            "with any standard tree library (e.g. Bio.Phylo) or report leaf count / branch lengths "
+            "directly from the text for a quick sanity check."
+        ),
+        "required_parameters": [
+            {"name": "aligned_fasta", "type": "str", "description": "Trimmed, aligned FASTA (from run_trimal)."},
+            {"name": "output_tree", "type": "str", "description": "Path to write the Newick tree."},
+        ],
+        "optional_parameters": [
+            {"name": "nucleotide", "type": "bool", "default": False, "description": "Set True for a nucleotide alignment (adds -nt -gtr); False for protein."},
+        ],
+        "returns": "dict(output_tree, leaf_count)"
     },
 
     # ── RESISTOME ─────────────────────────────────────────────────────────────

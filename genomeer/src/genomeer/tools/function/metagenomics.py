@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,35 @@ def _which(name: str) -> str:
 def _mkdir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _micromamba_bin() -> str:
+    """Path to the micromamba binary (bootstraps it on first call if missing)."""
+    from genomeer.runtime.env_manager import ensure_micromamba
+    return str(ensure_micromamba())
+
+
+def _env_prefix(name: str) -> Path:
+    """Absolute path to a micromamba env prefix (e.g. 'meta-env1')."""
+    from genomeer.runtime.env_manager import env_prefix
+    return env_prefix(name)
+
+
+def _assert_ok(result: Any, name: str) -> None:
+    """Raise RuntimeError (message contains `name`) if a tool invocation failed.
+    Accepts either a _run()-style dict (keys ok/returncode/stderr) or a raw
+    subprocess.CompletedProcess (attrs returncode/stderr) — callers may use
+    either execution path."""
+    if isinstance(result, dict):
+        rc = result.get("returncode")
+        ok = result.get("ok", rc == 0)
+        stderr = result.get("stderr") or ""
+    else:
+        rc = getattr(result, "returncode", 1)
+        ok = rc == 0
+        stderr = getattr(result, "stderr", "") or ""
+    if not ok:
+        raise RuntimeError(f"{name} failed (exit {rc}): {stderr[-500:]}")
 
 
 # ── Assembly QC ───────────────────────────────────────────────────────────────
@@ -1060,28 +1090,192 @@ def run_medaka(
     *,
     model: str = "r941_min_hac_g507",
     threads: int = 4,
+    batch_size: int = 100,
     timeout: int = 7200,
 ) -> Dict[str, Any]:
-    """Medaka consensus polishing for Oxford Nanopore assemblies."""
+    """Medaka consensus polishing for Oxford Nanopore assemblies.
+
+    medaka_consensus writes into its OWN "medaka_out" subfolder under the
+    given output_dir (so callers can place other files alongside it without
+    collision) — the consensus FASTA ends up at
+    <output_dir>/medaka_out/consensus.fasta.
+    """
     _mkdir(output_dir)
-    consensus = os.path.join(output_dir, "consensus.fasta")
-    cmd = [_which("medaka_consensus"),
+    medaka_run_dir = os.path.join(output_dir, "medaka_out")
+    consensus = os.path.join(medaka_run_dir, "consensus.fasta")
+    cmd = ["medaka_consensus",
            "-i", reads_fastq,
            "-d", assembly_fasta,
-           "-o", output_dir,
+           "-o", medaka_run_dir,
            "-m", model,
-           "-t", str(threads)]
-    result = _run(cmd, timeout)
+           "-t", str(threads),
+           "-b", str(batch_size)]
+    proc = _run(cmd, timeout=timeout)
+    _assert_ok(proc, "medaka_consensus")
+
+    is_dict = isinstance(proc, dict)
+    stdout = (proc.get("stdout", "") if is_dict else (proc.stdout or "")) or ""
+    stderr = (proc.get("stderr", "") if is_dict else (proc.stderr or "")) or ""
+    returncode = proc.get("returncode") if is_dict else proc.returncode
+
     seq_count = 0
     if os.path.exists(consensus):
         with open(consensus) as f:
             seq_count = sum(1 for l in f if l.startswith(">"))
-    result.update({
+
+    # Medaka reports polish quality as "mean qv: X.XX" (or "consensus qv: X.XX")
+    # in its stderr log — same pattern as BIOLOGICAL_GATES["run_medaka"].
+    mean_qv = None
+    m = re.search(r"(?:mean\s*qv|consensus\s*qv)[:\s]+([0-9]+(?:\.[0-9]+)?)", stderr, re.IGNORECASE)
+    if m:
+        mean_qv = float(m.group(1))
+
+    return {
+        "ok": True,
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
         "consensus_fasta": consensus if os.path.exists(consensus) else None,
         "sequence_count": seq_count,
+        "mean_qv": mean_qv,
         "output_dir": output_dir,
-    })
-    return result
+    }
+
+
+def run_racon(
+    reads_fastq: str,
+    overlaps_paf: str,
+    assembly_fasta: str,
+    output_dir: str,
+    *,
+    threads: int = 4,
+    env_name: str = "meta-env1",
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """Racon long-read assembly polishing (typically 1-2 rounds before Medaka).
+
+    racon writes the polished FASTA to STDOUT (no -o flag) — this wrapper
+    captures stdout and saves it as <output_dir>/polished.fasta. Invoked via
+    `micromamba run -p <meta-env1 prefix> racon ...` since racon lives in a
+    separate conda env from the calling process.
+    """
+    _mkdir(output_dir)
+    polished = os.path.join(output_dir, "polished.fasta")
+    cmd = [
+        _micromamba_bin(), "run", "-p", str(_env_prefix(env_name)),
+        "racon", "-t", str(threads), reads_fastq, overlaps_paf, assembly_fasta,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"racon failed (exit {proc.returncode}): {(proc.stderr or '')[-500:]}")
+
+    with open(polished, "w") as f:
+        f.write(proc.stdout or "")
+    seq_count = sum(1 for l in (proc.stdout or "").splitlines() if l.startswith(">"))
+
+    return {
+        "ok": True,
+        "returncode": proc.returncode,
+        "stdout": "",  # the FASTA payload — omitted from the dict, already on disk
+        "stderr": proc.stderr or "",
+        "polished_fasta": polished,
+        "sequence_count": seq_count,
+        "output_dir": output_dir,
+    }
+
+
+# ── Host decontamination / coverage utilities ─────────────────────────────────
+
+def run_host_decontamination(
+    output_dir: str,
+    host_index: str,
+    read1: str,
+    read2: Optional[str] = None,
+    threads: int = 8,
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """Remove host reads via bowtie2 alignment against a host reference index;
+    keep only reads that do NOT align to the host (the microbial fraction).
+
+    Uses bowtie2's --un-conc-gz / --un-gz to write the NON-host reads directly
+    (no separate samtools filtering step needed) and parses bowtie2's own
+    'X% overall alignment rate' summary line to compute microbial_pct.
+    """
+    _mkdir(output_dir)
+    if read2:
+        clean_pattern = os.path.join(output_dir, "clean_%.fastq.gz")
+        cmd = [_which("bowtie2"), "-x", host_index, "-1", read1, "-2", read2,
+               "-p", str(threads), "--un-conc-gz", clean_pattern, "-S", os.devnull]
+        clean_r1 = os.path.join(output_dir, "clean_1.fastq.gz")
+        clean_r2 = os.path.join(output_dir, "clean_2.fastq.gz")
+    else:
+        clean_single = os.path.join(output_dir, "clean.fastq.gz")
+        cmd = [_which("bowtie2"), "-x", host_index, "-U", read1,
+               "-p", str(threads), "--un-gz", clean_single, "-S", os.devnull]
+        clean_r1 = clean_single
+        clean_r2 = None
+
+    result = _run(cmd, timeout=timeout)
+    stderr = result.get("stderr", "") if isinstance(result, dict) else (getattr(result, "stderr", "") or "")
+
+    # bowtie2 reports e.g. "62.13% overall alignment rate" — that % aligned to
+    # the HOST; the retained microbial fraction is the complement.
+    microbial_pct = None
+    m = re.search(r"([\d.]+)%\s+overall alignment rate", stderr)
+    if m:
+        microbial_pct = round(100.0 - float(m.group(1)), 2)
+
+    return {
+        "ok": True,
+        # Printed verbatim so BIOLOGICAL_GATES["run_host_decontamination"]'s
+        # parse_regex (microbial_pct[:'\",\s]+NUM) can find it in stdout/stderr.
+        "microbial_pct": microbial_pct,
+        "clean_r1": clean_r1 if os.path.exists(clean_r1) else None,
+        "clean_r2": clean_r2 if clean_r2 and os.path.exists(clean_r2) else None,
+        "output_dir": output_dir,
+    }
+
+
+def compute_coverage_samtools(
+    sorted_bam: str,
+    output_tsv: Optional[str] = None,
+    timeout: int = 300,
+) -> Dict[str, Any]:
+    """Per-contig and mean coverage via `samtools coverage` on a coordinate-
+    sorted, indexed BAM. Returns mean_coverage_across_contigs (unweighted mean
+    of the meandepth column) for the quality gate."""
+    cmd = [_which("samtools"), "coverage", sorted_bam]
+    result = _run(cmd, timeout=timeout)
+    stdout = result.get("stdout", "") if isinstance(result, dict) else (getattr(result, "stdout", "") or "")
+
+    depths: List[float] = []
+    lines = stdout.strip().splitlines()
+    if lines:
+        header = lines[0].lstrip("#").split("\t")
+        depth_idx = header.index("meandepth") if "meandepth" in header else None
+        if depth_idx is not None:
+            for line in lines[1:]:
+                parts = line.split("\t")
+                if len(parts) > depth_idx:
+                    try:
+                        depths.append(float(parts[depth_idx]))
+                    except ValueError:
+                        continue
+
+    mean_coverage = round(sum(depths) / len(depths), 3) if depths else 0.0
+
+    if output_tsv:
+        _mkdir(os.path.dirname(output_tsv) or ".")
+        with open(output_tsv, "w") as f:
+            f.write(stdout)
+
+    return {
+        "ok": True,
+        "mean_coverage_across_contigs": mean_coverage,
+        "n_contigs": len(depths),
+        "per_contig_depths": depths,
+        "output_tsv": output_tsv,
+    }
 
 
 # ── Resistome ─────────────────────────────────────────────────────────────────

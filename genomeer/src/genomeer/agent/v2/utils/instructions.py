@@ -67,6 +67,24 @@ SPECIAL ALWAYS-TRUE RULES:
      WRONG : ncbi-genome-download -A GCF_000006945.2 -l complete -s refseq -F fasta ... bacteria
      CORRECT: ncbi-genome-download -A GCF_000006945.2 -s refseq -F fasta --flat-output -o dir bacteria
 
+   RESILIENCE — corrupt assembly_summary cache ("Invalid line length in summary file line N.
+   Expected 38, got 39"): NCBI intermittently ships a handful of MALFORMED rows (39 columns
+   instead of the expected 38) in its assembly_summary, and ncbi-genome-download ABORTS the WHOLE
+   download on the FIRST bad row — even though your target accessions are perfectly fine. This is
+   an NCBI DATA glitch, NOT your code and NOT the network, so retrying as-is fails identically
+   every time (it re-reads the same cached file). RECOVERY (do this in Python BEFORE downloading —
+   or catch the failure, sanitize, then retry once): keep only comment lines and rows with the
+   expected 38 tab-separated columns (= 37 tabs) in the cached summary, which lives at
+   ~/.cache/ncbi-genome-download/<section>_<kingdom>_assembly_summary.txt (e.g.
+   refseq_bacteria_assembly_summary.txt):
+       import os, glob
+       for f in glob.glob(os.path.expanduser("~/.cache/ncbi-genome-download/*_assembly_summary.txt")):
+           rows = [ln for ln in open(f, encoding="utf-8", errors="replace")
+                   if ln.startswith("#") or ln.count("\t") == 37]   # 38 columns = 37 tabs
+           open(f, "w", encoding="utf-8").writelines(rows)
+   Then run ncbi-genome-download normally. Do NOT delete the whole cache (a fresh re-download just
+   re-fetches the same corrupt rows); only filter out the malformed lines.
+
    ASSEMBLY SELECTION — download EXACTLY ONE genome by name (CRITICAL, do not skip):
    A bare -g "<species>" with NO category filter matches EVERY RefSeq assembly of that species.
    For common bacteria this is TENS OF THOUSANDS (real failure: "Klebsiella pneumoniae" matched
@@ -411,9 +429,50 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "chimeric / contaminated / mis-assembled bins / is this MAG a mix of genomes / bin purity" ->
       run_gunc (chimerism/contamination via clade separation) — complements checkm2 when closely-related
       taxa may have co-binned.
-  Most of these tools take a GENOME/CONTIGS FASTA or a PROTEIN FASTA as input — only kraken2 (and the
-  unavailable metaphlan) take raw READS. Pick the input type accordingly. If the user names a tool
-  explicitly, use it; otherwise pick by the intent map above.
+    * "Nanopore / ONT / PacBio / long reads / long-read sequencing" mentioned anywhere (even without the
+      word "assemble") -> use run_flye (meta=True for a community/metagenome sample; meta=False, or
+      prefer run_unicycler, for a single bacterial isolate) INSTEAD OF run_megahit/run_spades — those
+      are short-read-only and silently produce garbage on long-read input. Standard long-read pipeline:
+      run_nanoplot (QC the raw reads) -> run_filtlong (drop short/low-quality reads) -> run_flye/
+      run_unicycler (assemble) -> for raw/nano-hq ONT only: 1-2 rounds of run_racon then run_medaka to
+      polish (SKIP polishing for PacBio HiFi input — already >99.9% accurate).
+    * Sample source can carry HOST DNA (human/animal/plant tissue, stool, saliva, clinical/environmental
+      swabs near a host) -> run_host_decontamination BEFORE assembly (run_megahit/run_spades/run_flye),
+      even if the user did not explicitly ask to remove host reads — a low microbial_pct is itself a
+      finding worth reporting (low-biomass sample), not a failure to hide.
+    * "coverage / depth of THIS assembly or THIS BAM" (single sample, quick check) -> compute_coverage_samtools
+      (needs a coordinate-sorted, indexed BAM). For RELATIVE ABUNDANCE across MULTIPLE samples/timepoints
+      use CoverM instead — that is a different question (cross-sample normalization vs single-BAM depth).
+    * "are these two genomes/MAGs the same species or strain / ANI between X and Y / compare this isolate
+      to a reference genome" (a SPECIFIC pair) -> run_fastani (ANI >= 95% ≈ same species). For MANY-vs-many
+      clustering/dereplication of a whole bin set use dRep instead (already wraps ANI + clustering). For
+      SNV-level same-STRAIN-over-time questions use run_instrain popANI, not fastANI (see the strain-
+      tracking rule above) — ANI operates at genome/species resolution, not strain resolution.
+      ⚠ ANI MATRIX — EXCLUDE THE SELF-MATCH when picking a "closest reference": in a many-vs-many
+      ANI matrix a genome vs itself (or a query vs its own assembly) is ~100%, so a naive max()
+      over the row picks the DIAGONAL and reports the wrong closest match (observed real bug: an
+      integrated report claimed the isolate matched SMS-3-5 at 100% because it read a diagonal
+      self-hit). Before taking the maximum, DROP any pair where query == reference (same file
+      path/basename) or ANI >= 99.99 against itself; take the max over the remaining OFF-diagonal
+      references only.
+    * "phylogenetic tree / evolutionary relationship / build a tree / 16S tree from these genomes" ->
+      run_barrnap with outseq_fasta set (extract 16S/rRNA sequences from each genome/MAG) -> concatenate
+      across genomes -> run_mafft (align) -> run_trimal (clean the alignment) -> run_fasttree (nucleotide=True
+      for 16S/rRNA, nucleotide=False for a protein/ortholog tree). This 4-step chain IS the "build a
+      phylogenetic tree" recipe — do not stop after run_mafft, an alignment is not a tree.
+      ⚠ MAFFT on PROTEINS — use --anysymbol: real proteomes contain non-standard residues
+      (selenocysteine 'U', pyrrolysine 'O', or 'J'/'Z'/'B'), and plain MAFFT aborts on them with
+      "outputhat23=16" (observed: 3 core-ortholog alignments dropped from a core-genome tree). Add
+      --anysymbol to every protein MAFFT call so those clusters align instead of being skipped. When
+      aligning MANY per-ortholog clusters, also wrap each MAFFT call so a single cluster's failure is
+      logged and skipped rather than aborting the whole concatenation.
+    * "download the reads for accession SRR.../ERR.../DRR... / analyze this SRA/ENA run / get the raw
+      sequencing data for this experiment" -> fetch_sra_reads (downloads REAL experimental FASTQ via ENA
+      — distinct from ncbi-genome-download, which fetches assembled genome FASTA, not raw reads).
+  Most of these tools take a GENOME/CONTIGS FASTA or a PROTEIN FASTA as input; kraken2, run_host_decontamination,
+  run_flye/run_unicycler/run_filtlong/run_nanoplot, run_bwa_mem, and fetch_sra_reads instead take (or
+  produce) raw READS — pick the input type accordingly. If the user names a tool explicitly, use it;
+  otherwise pick by the intent map above.
 - Each output file must be the target of EXACTLY ONE step — the LAST step that touches it.
   NEVER write a summary/report file in an intermediate step and then rewrite it later.
   The ONE step that writes summary.txt must collect ALL required metrics ITSELF (by reading
@@ -724,8 +783,16 @@ SPECIAL ALWAYS-TRUE RULES:
   give enough COVERAGE, or the assembly is fragmented (low N50, hundreds/thousands of contigs) =
   biologically wrong. Never use a fixed small number like 200k for a whole genome. COMPUTE it from
   the genome size for a target depth of ~50× (minimum 30×):
-    • InSilicoSeq: --n_reads counts TOTAL reads → n_reads ≈ 50 * genome_bp / read_len
-        e.g. 5 Mb genome, 150 bp → ~1,600,000 reads  (200k ≈ 6× → fragmented; WRONG)
+    • InSilicoSeq: --n_reads counts TOTAL reads (R1+R2 COMBINED, even in paired mode — do NOT
+        halve it "because they are pairs"; and read_len is the PER-MATE length e.g. 150, NOT the
+        300 bp fragment). n_reads ≈ target_depth * genome_bp / read_len.
+        e.g. 5 Mb genome, 150 bp, 50× → n_reads = 50*5e6/150 ≈ 1,670,000 reads (≈ 835k pairs).
+        THE #1 BUG (observed, run K.pneumoniae): dividing by 2 for pairs, or using 300 as read_len
+        → you get HALF the depth (~25× instead of 50×) → 2000+ contigs, N50 ~2 kb, ~75% recovery.
+        iss 2.x has NO numeric --coverage (only distribution names: uniform/halfnormal/…), so
+        --n_reads is the correct lever. ALWAYS VERIFY after simulating: achieved_depth =
+        reads_generated * read_len / genome_bp; if achieved < 0.8 * target, the count was wrong —
+        scale --n_reads up proportionally and RE-simulate BEFORE assembling.
     • wgsim: -N counts read PAIRS → N ≈ 50 * genome_bp / (2 * read_len)
         e.g. 5 Mb, 150 bp → ~830,000 pairs
   In the script, read the reference genome length first (sum of FASTA sequence lengths), then set
@@ -790,6 +857,17 @@ SPECIAL ALWAYS-TRUE RULES:
   GFF parsers will find 0 CDS. This applies to every mode: -p meta, -p single, -p ab initio.
   WRONG : ["prodigal", "-i", fa, "-a", prot, "-o", gff, "-p", "single"]
   CORRECT: ["prodigal", "-i", fa, "-a", prot, "-o", gff, "-f", "gff", "-p", "single"]
+⚠ PRODIGAL MODE (-p) — affects gene-count accuracy: for a SINGLE organism (a complete genome OR a
+  draft assembly of ONE isolate) use -p single (the DEFAULT: it trains a genome-specific model →
+  accurate calls). Use -p meta ONLY for a true mixed-community metagenome, or when contigs are so
+  short/few that single-mode training fails ("Sequence too short"). Running -p meta on a single
+  isolate OVER-predicts partial ORFs — and on a FRAGMENTED assembly the many contig ends produce
+  truncated gene fragments each counted as a gene, INFLATING the count (observed: 5,532 genes on
+  the complete reference vs 6,265 on the fragmented assembly, same organism). When COMPARING gene
+  counts between two assemblies of the SAME organism (reference vs de-novo), use the SAME mode on
+  BOTH — prefer -p single — otherwise the comparison is not apples-to-apples. Partial genes at
+  contig ends (Prodigal marks them partial=10/01 in the GFF attributes) can also be filtered out
+  before counting for a cleaner completeness comparison.
 ⚠ QUAST: binary is quast.py, NOT quast. quast does not exist in this environment.
   WRONG : ["quast",    "-o", quast_dir, fasta]
   CORRECT: ["quast.py", "-o", quast_dir, fasta]
@@ -992,8 +1070,9 @@ SPECIAL ALWAYS-TRUE RULES:
             stdout=_sam_f, stderr=subprocess.PIPE, timeout=600)
     if res.returncode != 0: sys.exit(f"minimap2 failed: {res.stderr.decode()}")
     # Step 2: SAM → BAM (-bS: -b=output BAM, -S=input is SAM)
-    # CRITICAL: -o flag is ignored in this samtools version — BAM goes to stdout.
-    # BAM is binary (gzip). NEVER use text=True or capture_output here. Redirect stdout to file.
+    # BAM is binary (gzip). NEVER use text=True or capture_output here — capturing binary
+    # BAM as text corrupts it. Redirect stdout to a file (below), OR use the explicit
+    # `samtools view -b -o out.bam in.sam` form (samtools 1.x honors -o). Either works.
     with open(bam_path, "wb") as _bam_f:
         res = subprocess.run(
             ["samtools", "view", "-bS", sam_path],
@@ -1001,11 +1080,11 @@ SPECIAL ALWAYS-TRUE RULES:
     if res.returncode != 0: sys.exit(f"samtools view failed: {res.stderr.decode(errors='replace')}")
     if not os.path.exists(bam_path) or os.path.getsize(bam_path) == 0:
         sys.exit("samtools view produced empty BAM")
-    # Step 3: sort BAM — OLD samtools (v0.x) positional-prefix syntax.
-    # Usage: samtools sort <in.bam> <out.prefix>   → creates <out.prefix>.bam automatically
-    # -o is a FLAG with NO argument (= 'output to stdout'), NOT '-o filename'. Never use -o.
-    sorted_prefix = sorted_bam[:-4] if sorted_bam.endswith(".bam") else sorted_bam
-    res = subprocess.run(["samtools", "sort", bam_path, sorted_prefix],
+    # Step 3: sort BAM — modern samtools (v1.x; installed = 1.21) REQUIRES -o <file>.
+    # Usage: samtools sort -o <out.bam> <in.bam>. The OLD positional form
+    # `samtools sort <in.bam> <out.prefix>` was REMOVED in samtools 1.x and now ERRORS
+    # with "Use -T PREFIX / -o FILE to specify temporary and final output files".
+    res = subprocess.run(["samtools", "sort", "-o", sorted_bam, bam_path],
         stderr=subprocess.PIPE, timeout=300)
     if res.returncode != 0: sys.exit(f"samtools sort failed: {res.stderr.decode(errors='replace')}")
     if not os.path.exists(sorted_bam) or os.path.getsize(sorted_bam) == 0:
@@ -1020,9 +1099,9 @@ SPECIAL ALWAYS-TRUE RULES:
     if res.returncode != 0: sys.exit(f"jgi failed: {res.stderr.decode(errors='replace')}")
   NOTE: samtools --version exits with code 1 on some versions — NORMAL (tool IS present).
   NOTE: jgi_summarize_bam_contig_depths --version segfaults — NEVER call with --version.
-  WRONG: samtools sort bam -o sorted.bam → in old samtools, -o is a STDOUT FLAG with no arg
-  WRONG: samtools sort bam (no output target) → 'Usage: samtools sort <in.bam> <out.prefix>'
-  WRONG: samtools view -bS sam -o bam (with -o) → -o ignored, binary BAM goes to stdout
+  CORRECT (samtools 1.x, installed): samtools sort -o sorted.bam in.bam   ← -o TAKES the filename
+  WRONG: samtools sort in.bam out.prefix (old 0.x positional) → 'Use -T PREFIX / -o FILE' error
+  WRONG: samtools sort in.bam (no -o at all)               → same 'Use -T PREFIX / -o FILE' error
   WRONG: capture_output=True / text=True on any samtools command that outputs BAM
   WRONG: Popen pipe minimap2 | samtools sort → SIGPIPE
 - MetaBAT2 binning rules (v2.12.1):

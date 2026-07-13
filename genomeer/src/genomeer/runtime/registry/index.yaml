@@ -124,6 +124,13 @@ envs:
       - inStrain
       - mash
       - fastani
+      - bedtools
+      - medaka_consensus
+      - racon
+      - unicycler
+      - flye
+      - filtlong
+      - NanoPlot
     provides_py:
       - biopython
       - numpy

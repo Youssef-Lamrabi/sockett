@@ -534,6 +534,12 @@ def read_module2api():
         "metagenomics",
         "viromics",
         "genomics",
+        "sra",           # fetch_sra_reads only — the other 13 metagenomics_db.py
+                         # tools stay unwired (duplicates of local run_rgi/run_gtdbtk/
+                         # run_dbcan, or live-network dependent); see sra.py docstring.
+        "longread",      # run_flye, run_unicycler, run_filtlong, run_nanoplot —
+                         # completes the long-read assembly/QC/polishing pipeline
+                         # (run_medaka/run_racon already live in metagenomics).
         # "artifacts",
         # "literature",
         # "biochemistry",

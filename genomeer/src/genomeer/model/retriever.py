@@ -98,6 +98,18 @@ _CLI_TOOL_BINARIES = {
     # ── QC aggregation / read simulation (pip-installed in meta-env1) ──────────
     "multiqc": "multiqc",
     "insilicoseq": "iss",
+    # ── Long-read assembly / QC / polishing ───────────────────────────────────
+    "flye": "flye",
+    "unicycler": "unicycler",
+    "filtlong": "filtlong",
+    "nanoplot": "NanoPlot",
+    "medaka": "medaka_consensus",
+    "racon": "racon",
+    # ── Phylogenetics ──────────────────────────────────────────────────────────
+    "mafft": "mafft",
+    "trimal": "trimal",
+    "fasttree": "FastTree",
+    "barrnap": "barrnap",
 }
 
 # ─── Multi-env bin path discovery ─────────────────────────────────────────

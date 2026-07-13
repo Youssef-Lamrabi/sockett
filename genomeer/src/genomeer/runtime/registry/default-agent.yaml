@@ -12,6 +12,12 @@ dependencies:
       - scipy
       - statsmodels
       - scikit-learn
+      # biopython + ncbi-genome-download: lightweight pure-Python/CLI (no DB) so
+      # the common "download a genome and compute FASTA stats in Python" task runs
+      # entirely in bio-agent-env1 — without falling through to the multi-GB
+      # meta-env1 just to get Bio.SeqIO or the downloader.
+      - biopython
+      - ncbi-genome-download
       - langchain
       - langgraph==0.3.18
       - langchain-openai

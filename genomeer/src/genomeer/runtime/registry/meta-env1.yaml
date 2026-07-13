@@ -68,6 +68,63 @@ dependencies:
   - lefse=1.1.2            # lefse_run.py → LEfSe (linear discriminant analysis)
   - nonpareil              # nonpareil → sequencing depth / diversity estimation
 
+  # ── Genome comparison / short-read utilities (conda-solvable — light) ──────
+  - bedtools                # run_barrnap dep (rRNA GFF post-processing)
+  - bcftools                # VCF/BCF utilities alongside samtools
+
+  # ── Phylogenetics (conda-solvable — light) ─────────────────────────────────
+  - mafft                  # run_mafft    → multiple sequence alignment
+  - trimal                 # run_trimal   → MSA trimming pre-tree
+  - fasttree               # run_fasttree → FastTree (approximate ML phylogenetic tree)
+
+  # ── Long-read assembly / filtering / polishing (conda-solvable — light) ────
+  - flye                   # run_flye      → long-read de-novo assembler (metagenome-capable)
+  - filtlong                # run_filtlong  → long-read length/quality filtering pre-assembly
+  - racon                  # run_racon     → long-read polishing (pre-medaka)
+
+  # ── CONDA-UNSOLVABLE in current bioconda (broken/removed dep pins) — install
+  # NOT via conda (a single unsolvable spec makes the WHOLE `micromamba create`
+  # fail atomically). Verified & INSTALLED 2026-07-11 with the EXACT commands below
+  # (E=$env prefix, e.g. ~/.bioagentpkg/runtime/pkgs/envs/meta-env1). Same manual
+  # pattern as rgi/bracken/amrfinder further down.
+  #
+  # REPRODUCIBILITY NOTES (learned the hard way on WSL/micromamba 2.7):
+  #   - `micromamba install` is BROKEN here (sharded-repodata json parse error:
+  #     "type must be string, but is number"). Use `micromamba create` (works) to
+  #     build the env in one shot; do NOT rely on incremental `install`.
+  #   - If common packages report "does not exist (perhaps a missing channel)",
+  #     first `rm -rf <root>/pkgs/cache/*` (stale repodata) and add base deps
+  #     EXPLICITLY to the create spec — notably `perl` (bowtie2/prokka need it and
+  #     the solver won't pull a compatible perl unless it is named explicitly).
+  #   - `unzip` is NOT on the base system → extract zips with python's zipfile.
+  #
+  #   * fastani (run_fastani): conda builds pin removed gsl 2.7 / boost 1.67-1.70.
+  #     GitHub static binary + a libgomp wrapper (the binary needs libgomp.so.1,
+  #     which lives in $E/lib but is not on the default loader path):
+  #       curl -L https://github.com/ParBLiSS/FastANI/releases/download/v1.34/fastANI-linux64-v1.34.zip -o /tmp/f.zip
+  #       python3 -c "import zipfile; zipfile.ZipFile('/tmp/f.zip').extractall('/tmp/fx')"
+  #       cp /tmp/fx/fastANI $E/bin/fastANI.real && chmod +x $E/bin/fastANI.real
+  #       printf '#!/bin/bash\nexport LD_LIBRARY_PATH="%s/lib:$LD_LIBRARY_PATH"\nexec "%s/bin/fastANI.real" "$@"\n' "$E" "$E" > $E/bin/fastANI
+  #       chmod +x $E/bin/fastANI ; ln -sf fastANI $E/bin/fastani   # lowercase alias
+  #   * barrnap (run_barrnap): newer conda builds pin perl==5.22.0 / make / bats-core.
+  #     GitHub clone (self-contained perl script) + symlink; uses nhmmer (hmmer) +
+  #     bedtools (both conda deps above). IT ALSO NEEDS 3 non-core perl modules that
+  #     the conda `barrnap` pkg would normally pull — add these to the create spec so
+  #     barrnap resolves them under the env perl (run barrnap via `micromamba run` so
+  #     `#!/usr/bin/env perl` picks the ENV perl, not the system one):
+  #         perl-path-tiny  perl-file-which  perl-list-moreutils
+  #       git clone --depth 1 https://github.com/tseemann/barrnap.git ~/.bioagentpkg/extra/barrnap
+  #       ln -sf ~/.bioagentpkg/extra/barrnap/bin/barrnap $E/bin/barrnap
+  #     (2026-07-11: perl-path-tiny + a manually-dropped File/Which.pm got barrnap to
+  #     the List::MoreUtils step; List::MoreUtils is XS so drop the perl-list-moreutils
+  #     conda pkg in — do NOT hand-copy it.)
+  #   * nanoplot (run_nanoplot): conda builds pin removed plotly/joypy/nanoplotter. pip:
+  #       $E/bin/pip install NanoPlot
+  #   * medaka (run_medaka): heavy (pulls torch); conda solve is huge. pip when needed:
+  #       $E/bin/pip install medaka   (ONT long-read consensus polishing)
+  #   * unicycler (run_unicycler): conda builds pin removed blast/boost/openjdk. pip:
+  #       $E/bin/pip install git+https://github.com/rrwick/Unicycler.git  (needs spades, already a conda dep)
+
   # ── COMMENTÉ — nécessite grandes bases de données externes ────────────────
   # These tools ARE registered in the framework (tool descriptions exist) but are
   # left UNINSTALLED on purpose: each needs a multi-GB external database. The

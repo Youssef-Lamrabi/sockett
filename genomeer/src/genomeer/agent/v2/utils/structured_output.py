@@ -185,14 +185,28 @@ _AMPLICON_SIGNALS = (
 
 
 def _resolve_env_from_code(code: str) -> str:
-    """Déduit l'environnement micromamba depuis le contenu du code."""
+    """Déduit l'environnement micromamba depuis le contenu du code.
+
+    CRITICAL — WORD-BOUNDARY matching: meta-env1 binary names include very short
+    tokens (e.g. 'iss' = InSilicoSeq, 'rgi', 'bwa'). A plain substring test
+    (`signal in code`) FALSELY matched these inside ordinary English words that
+    appear constantly in generated code — 'iss' inside "m**iss**ing", 'rgi'
+    inside "me**rgi**ng" — so almost every download/file-handling script (which
+    routinely prints "... is missing ...") was wrongly routed to meta-env1,
+    triggering a multi-GB env install for a pure-Python task. Match each signal
+    only when it stands alone (not glued to an alphanumeric/underscore on either
+    side), the same rule the validator's contract dispatcher already uses.
+    """
     code_lower = (code or "").lower()
     # Amplicon R stack first (most specific).
     for sig in _AMPLICON_SIGNALS:
         if sig in code_lower:
             return "amplicon-env1"
     for signal in _get_meta_signals():
-        if signal.lower() in code_lower:
+        s = signal.lower().strip()
+        if not s:
+            continue
+        if re.search(r'(?<![a-z0-9_])' + re.escape(s) + r'(?![a-z0-9_])', code_lower):
             return "meta-env1"
     return "bio-agent-env1"
 
@@ -236,10 +250,18 @@ class LLMOutputValidator:
         if cls._DESTRUCTIVE.search(normalized_code):
             return False, ["[SECURITY] Code contains potentially destructive commands (rm -rf, dd, etc.)"]
 
+        # WORD-BOUNDARY match: short binary names ('iss', 'rgi') must not match
+        # inside ordinary words ("missing", "merging"). Same rule as
+        # _resolve_env_from_code — a plain `signal in code` gave false ENV-MISMATCH
+        # warnings and wrongly auto-corrected pure-Python code to meta-env1.
+        def _uses_meta_tool(signal: str) -> bool:
+            s = signal.strip()
+            return bool(s) and re.search(r'(?<![A-Za-z0-9_])' + re.escape(s) + r'(?![A-Za-z0-9_])', code) is not None
+
         # 2. Env mismatch — outil meta-env1 dans bio-agent-env1
         declared_env = parsed.env or _resolve_env_from_code(code)
         for signal in _get_meta_signals():
-            if signal in code and declared_env == "bio-agent-env1":
+            if _uses_meta_tool(signal) and declared_env == "bio-agent-env1":
                 warnings.append(
                     f"[ENV-MISMATCH] Tool '{signal}' requires meta-env1 but declared env is bio-agent-env1. "
                     "Auto-correcting to meta-env1."
@@ -250,7 +272,7 @@ class LLMOutputValidator:
         # 3. BASH sans shebang ou micromamba prefix pour tools CLI
         if parsed.lang == CodeLang.BASH:
             for signal in _get_meta_signals():
-                if signal in code and "micromamba run" not in code and "conda run" not in code:
+                if _uses_meta_tool(signal) and "micromamba run" not in code and "conda run" not in code:
                     warnings.append(
                         f"[ENV-HINT] BASH code uses '{signal}' but no 'micromamba run -n meta-env1' prefix found. "
                         "Ensure the shell is in the correct env."

@@ -616,6 +616,12 @@ function renderNextCardFromRaw(raw = "") {
 
 /* -------------------- RUNNING + DESCRIPTION (pair) ---------------------- */
 let currentRun = null;              // { id, step, desc, logsEl, chatEl }
+// Set the instant a <STATUS> arrives (holds the middle Step card + status), so the
+// observer's summary — which streams as the very next `message` event — can be
+// attached as a short explanatory phrase ONTO that card. Consumed by the next
+// message event; invalidated by any other event. Live path only (renderAssistantEvent);
+// reload replay is untouched.
+let pendingStepResult = null;       // { card: HTMLElement, status: string } | null
 let runSeqCounter = 0;
 const runMap = new Map();           // id -> currentRun
 
@@ -696,6 +702,38 @@ function updateRunCards(desc) {
 
   const chatDesc = currentRun.chatEl?.querySelector('.run-desc');
   if (chatDesc) chatDesc.innerHTML = md;
+}
+
+// Collapse whitespace, strip stray tags, keep the first sentence, and cap the
+// length — turns the observer's (sometimes long) summary into ONE short line.
+function _shortResultPhrase(text) {
+  let s = String(text || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  const firstSentence = s.split(/(?<=[.!?])\s+/)[0] || s;
+  return firstSentence.length > 180 ? firstSentence.slice(0, 179) + '…' : firstSentence;
+}
+
+// Attach a short explanatory result phrase onto the MIDDLE (chat) Step card,
+// tinted by outcome. Purely additive — does not touch the sidebar or any tag.
+function attachStepResultPhrase(chatEl, status, phrase) {
+  if (!chatEl || !phrase) return;
+  const card = chatEl.querySelector('.run-card');
+  if (!card) return;
+  const isFail = /(block|fail|error|abort|stop|cancel)/i.test(String(status || ''));
+  const color  = isFail ? '#8b0000' : '#0B6B0B';
+  const border = isFail ? '#F5B7B7' : '#9BD09B';
+  const bg     = isFail ? '#FFF0F0' : '#F1FBF1';
+  let line = card.querySelector('.run-result');
+  if (!line) {
+    line = document.createElement('div');
+    line.className = 'run-result';
+    card.appendChild(line);
+  }
+  line.style.cssText =
+    `margin-top:8px;padding:6px 10px;border:1px solid ${border};background:${bg};` +
+    `color:${color};border-radius:8px;font-size:13px;line-height:1.4;`;
+  line.textContent = phrase;
+  const chat = $('chat'); if (chat) chat.scrollTop = chat.scrollHeight;
 }
 
 export function renderAssistantMarkdownStatic(md = "") {
@@ -1206,6 +1244,19 @@ export function renderAssistantEvent(evt) {
   }
 
   if (evt.type === 'message') {
+    // If a <STATUS> just arrived, THIS immediate message is the observer's
+    // per-step summary → attach it as a short phrase onto the middle Step card
+    // (synchronized with the status, no waiting) instead of dumping it loose.
+    if (pendingStepResult) {
+      const p = pendingStepResult;
+      pendingStepResult = null;
+      const phrase = _shortResultPhrase(evt.text || '');
+      if (p.card && phrase) {
+        attachStepResultPhrase(p.card, p.status, phrase);
+        return;
+      }
+      // no card/phrase → fall through to normal rendering below
+    }
     let t = (evt.text || '');
     const remaining = processInlineSystemTagsInOrder(t);
 
@@ -1221,6 +1272,12 @@ export function renderAssistantEvent(evt) {
 
     if (tag === 'STATUS' || tag.startsWith('STATUS:')) {
       const val = tag.includes(':') ? tag.split(':', 2)[1] : parseStatusValue(raw);
+      // Capture the middle Step card NOW — before markRunInactive() nulls
+      // currentRun — so the observer summary (next message event) can attach
+      // its short phrase onto it. Sidebar rendering below stays untouched.
+      pendingStepResult = (currentRun && currentRun.chatEl)
+        ? { card: currentRun.chatEl, status: String(val).trim().toLowerCase() }
+        : null;
       renderStatusBox(val);
       // if (/^done$/i.test(String(val || '').trim())) clearLiveSpinner();
       const v = String(val).trim().toLowerCase();
@@ -1230,6 +1287,10 @@ export function renderAssistantEvent(evt) {
       }
       return;
     }
+
+    // Any non-STATUS block closes the "summary window" (the observer summary,
+    // if any, always streams immediately after its STATUS — never after another block).
+    pendingStepResult = null;
 
     if (tag === 'OK' || tag === 'PRESENT') return;
 

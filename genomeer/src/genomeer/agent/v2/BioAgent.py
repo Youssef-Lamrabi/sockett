@@ -4176,26 +4176,58 @@ class BioAgent:
             rc = {int(k): int(v) for k, v in (state.get("retry_counts") or {}).items() if str(k).isdigit()}
             diag_rounds = dict(state["manifest"].get("diagnostics_rounds") or {})
             if status == "blocked":
-                rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
-                new_manifest["retry_count"] = rc[state["current_idx"]]
                 _raw_output = (last_result or "").strip()
-                new_manifest["repair_feedback"] = (
-                    f"{summary}\n\nEXECUTION OUTPUT:\n{_raw_output[:1000]}"
-                    if _raw_output else summary
-                )
-                new_manifest["repair_step_idx"] = state["current_idx"]
-                
-                # routing
-                if rc[state["current_idx"]] > self.MAX_STEP_RETRIES:
-                    next_step = "diagnostics"
-                    next_idx = state["current_idx"]
-                else:
+
+                # ── POST-DIAGNOSTIC ROUTING FIX ─────────────────────────────────
+                # When this observation is of a DIAGNOSTIC PROBE (diagnostic_mode
+                # was True on entry), we MUST feed the probe findings into a REAL
+                # code repair (generator, is_diagnostic=False) — NOT loop back into
+                # another read-only diagnostics round.
+                #
+                # Root cause this guards against: the step retry counter is already
+                # above MAX_STEP_RETRIES (that is the very condition that triggered
+                # diagnostics) and is never reset. The plain
+                # `rc > MAX_STEP_RETRIES → diagnostics` rule below therefore sends
+                # EVERY post-probe observation straight back to diagnostics, so the
+                # corrected step code is never generated. The pipeline just runs
+                # MAX_DIAG_ROUNDS_PER_STEP rounds of probes and escalates to QA
+                # with the fix identified but never applied.
+                if diagnostic_mode:
+                    _diag_obs = (state.get("diagnostic_observation") or "").strip()
+                    new_manifest["repair_feedback"] = (
+                        f"{summary}\n\nDIAGNOSTIC PROBE OUTPUT:\n{_diag_obs[:1500]}"
+                        if _diag_obs else
+                        (f"{summary}\n\nEXECUTION OUTPUT:\n{_raw_output[:1000]}"
+                         if _raw_output else summary)
+                    )
+                    new_manifest["repair_step_idx"] = state["current_idx"]
+                    # Do NOT increment rc: a probe is not a step attempt. Preserve the
+                    # current count so the diag_rounds cap (not rc) bounds the loop.
+                    new_manifest["retry_count"] = rc.get(state["current_idx"], 0)
                     next_step = "generator"
                     next_idx = state["current_idx"]
-                    
-                # logs
-                self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
-                self._log("EXIT NODE", body="next_step=input_guard (retry same step)", node=node)
+                    self._log("STATUS", body=f"blocked=True (post-diagnostic → REAL repair)\nnotes=\n{summary}", node=node)
+                    self._log("EXIT NODE", body="next_step=generator (apply diagnostic findings to real code)", node=node)
+                else:
+                    rc[state["current_idx"]] = rc.get(state["current_idx"], 0) + 1
+                    new_manifest["retry_count"] = rc[state["current_idx"]]
+                    new_manifest["repair_feedback"] = (
+                        f"{summary}\n\nEXECUTION OUTPUT:\n{_raw_output[:1000]}"
+                        if _raw_output else summary
+                    )
+                    new_manifest["repair_step_idx"] = state["current_idx"]
+
+                    # routing
+                    if rc[state["current_idx"]] > self.MAX_STEP_RETRIES:
+                        next_step = "diagnostics"
+                        next_idx = state["current_idx"]
+                    else:
+                        next_step = "generator"
+                        next_idx = state["current_idx"]
+
+                    # logs
+                    self._log("STATUS", body=f"blocked=True\nnotes=\n{summary}", node=node)
+                    self._log("EXIT NODE", body="next_step=input_guard (retry same step)", node=node)
             else:
                 new_manifest.pop("repair_feedback", None)
                 new_manifest.pop("repair_step_idx", None)
@@ -4910,6 +4942,10 @@ class BioAgent:
             {
                 "validator": "validator",
                 "generator": "generator",
+                # The executor's security-block cap path (repeated SECURITY BLOCK on
+                # the same step) returns next_step="qa" — without this target the
+                # graph raised KeyError('qa') and crashed the whole stream.
+                "qa": "qa",
             },
         )
         workflow.add_conditional_edges(
@@ -6436,27 +6472,76 @@ class BioAgent:
 
         # ── subprocess.run without timeout ──────────────────────────────────────
         # Any subprocess.run call without timeout= can block forever on network I/O.
-        # Inject timeout=300 deterministically. 300s covers typical genome downloads;
-        # the outer run_with_timeout wrapper adds a second layer of protection.
+        # Inject timeout=300 deterministically when — and ONLY when — the call has
+        # no timeout= already. 300s covers typical genome downloads; the outer
+        # run_with_timeout wrapper adds a second layer of protection.
+        #
+        # CRITICAL: this MUST be paren-aware. A naive `subprocess\.run\([^)]+\)`
+        # regex stops at the FIRST ')' — which, for a call whose argument list
+        # contains a nested call like `os.path.join(run_dir, 'x.IS')`, is the
+        # inner join's paren, NOT the call's own. That truncation (a) hides an
+        # already-present `timeout=3600` sitting after the inner call, and
+        # (b) makes the injector append `, timeout=300)` INSIDE os.path.join(...),
+        # producing `os.path.join(run_dir, 'x.IS', timeout=300)` → TypeError before
+        # the tool ever runs. Because the fixer runs on EVERY generation (incl. every
+        # repair), it re-corrupts correct LLM output identically on each retry — the
+        # step then fails 3× the same way and escalates. Scan for the matching close
+        # paren with a depth counter (string-literal aware) instead.
         if "subprocess.run(" in code:
-            def _add_timeout(m: re.Match) -> str:
-                call = m.group(0)
-                # Skip if timeout= already present
-                if "timeout=" in call:
-                    return call
-                # Find the closing paren — add timeout before it
-                # Simple approach: add before the last ) of the call
-                # We match the entire subprocess.run(...) call up to the first closing paren
-                # that balances the opening paren after "subprocess.run"
-                return call.rstrip(")") + ", timeout=300)"
-
-            code = re.sub(
-                r"subprocess\.run\([^)]+\)",
-                _add_timeout,
-                code,
-            )
+            code = self._inject_subprocess_timeout(code, default_timeout=300)
 
         return code
+
+    @staticmethod
+    def _inject_subprocess_timeout(code: str, default_timeout: int = 300) -> str:
+        """Insert `timeout=<default_timeout>` into every subprocess.run(...) call
+        that does not already specify a timeout. Paren- and string-literal-aware so
+        nested calls in the argument list are never corrupted."""
+        marker = "subprocess.run("
+        out = []
+        i = 0
+        n = len(code)
+        while True:
+            j = code.find(marker, i)
+            if j == -1:
+                out.append(code[i:])
+                break
+            out.append(code[i:j])
+            # Scan from the opening paren to its matching close, tracking string state.
+            start = j + len(marker)          # index just after the '('
+            depth = 1
+            k = start
+            quote = None                     # active string delimiter or None
+            while k < n and depth > 0:
+                ch = code[k]
+                if quote is not None:
+                    if ch == "\\":
+                        k += 2
+                        continue
+                    if ch == quote:
+                        quote = None
+                elif ch in ("'", '"'):
+                    quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if depth != 0:
+                # Unbalanced (truncated code) — leave the rest untouched.
+                out.append(code[j:])
+                break
+            call_body = code[start:k]        # everything between the outer ( )
+            if "timeout=" in call_body:
+                out.append(code[j:k + 1])    # already has a timeout — leave as-is
+            else:
+                sep = "" if call_body.strip().endswith(",") or not call_body.strip() else ", "
+                out.append(f"{marker}{call_body}{sep}timeout={default_timeout}")
+                out.append(")")
+            i = k + 1
+        return "".join(out)
 
     def _fix_gc_formula(self, code: str) -> str:
         """
@@ -7107,7 +7192,14 @@ class BioAgent:
             from genomeer.runtime.env_resolver import get_meta_env_signals
             signals = get_meta_env_signals()
             prompt_lower = prompt.lower()
-            if any(sig in prompt_lower for sig in signals):
+            # WORD-BOUNDARY match: short binary names ('iss', 'rgi', 'bwa') must not
+            # match inside ordinary words ("missing", "merging") or a plain-English
+            # prompt gets wrongly routed to the heavy meta-env1. Same rule as
+            # _resolve_env_from_code.
+            if any(
+                re.search(r'(?<![a-z0-9_])' + re.escape(sig.lower().strip()) + r'(?![a-z0-9_])', prompt_lower)
+                for sig in signals if sig.strip()
+            ):
                 return "meta-env1"
         except Exception:
             pass

@@ -1,6 +1,349 @@
 {
  "tools": [
   {
+   "name": "create_run",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Create a staging run to upload inputs and produce downloadable artifacts.",
+   "installed": true
+  },
+  {
+   "name": "upload_files",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Upload one or more files into a run (multipart/form-data).",
+   "installed": true
+  },
+  {
+   "name": "list_run_files",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "List files currently staged in a run directory.",
+   "installed": true
+  },
+  {
+   "name": "publish_run",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Publish selected paths (files or folders) from the run to artifact storage and get a manifest with per\u2026",
+   "installed": true
+  },
+  {
+   "name": "get_manifest",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Fetch a previously published manifest for a run.",
+   "installed": true
+  },
+  {
+   "name": "build_download_url",
+   "category": "Workspace",
+   "icon": "fa-folder-open",
+   "description": "Utility to build the direct download URL for a known artifact key (not needed if you already use 'down\u2026",
+   "installed": true
+  },
+  {
+   "name": "load_sequences",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Load FASTA/FASTQ files into lightweight line-delimited TSVs (id, seq[, qual]).",
+   "installed": true
+  },
+  {
+   "name": "write_sequences",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Write sequences to FASTA/FASTQ (optionally gz).",
+   "installed": true
+  },
+  {
+   "name": "subsample_reads",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Randomly subsample reads from FASTA/FASTQ.",
+   "installed": true
+  },
+  {
+   "name": "convert_format",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Convert FASTA<->FASTQ (dummy qualities for FASTA->FASTQ).",
+   "installed": true
+  },
+  {
+   "name": "read_quality_report",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Compute simple QC metrics (read count, avg length, GC%, Ns).",
+   "installed": true
+  },
+  {
+   "name": "trim_filter_reads",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Adapter/quality trimming (toy) and min length filter.",
+   "installed": true
+  },
+  {
+   "name": "kmer_profile",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Count k-mers across reads/contigs and write a TSV spectrum.",
+   "installed": true
+  },
+  {
+   "name": "translate_orfs",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Find ORFs and translate to proteins.",
+   "installed": true
+  },
+  {
+   "name": "gc_content_windows",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Sliding-window GC% over FASTA sequences.",
+   "installed": true
+  },
+  {
+   "name": "deduplicate_sequences",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Collapse identical sequences and output uniques.",
+   "installed": true
+  },
+  {
+   "name": "align_reads_minimap2_like",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Toy alignment wrapper that emits a placeholder BAM (replace in prod).",
+   "installed": true
+  },
+  {
+   "name": "compute_coverage",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Compute per-base/window coverage from BAM (toy: zero coverage).",
+   "installed": true
+  },
+  {
+   "name": "call_variants_simple",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Heuristic pileup-based variant calling (toy: empty VCF header).",
+   "installed": true
+  },
+  {
+   "name": "classify_reads_kmer",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Naive k-mer\u2013style taxonomic assignment against a toy DB.",
+   "installed": true
+  },
+  {
+   "name": "bin_contigs_basic",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Simple binning by length threshold (toy baseline).",
+   "installed": true
+  },
+  {
+   "name": "estimate_complexity",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Alpha diversity estimate (Shannon or richness) from assignments.",
+   "installed": true
+  },
+  {
+   "name": "contamination_screen",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Screen sequences vs contaminant reference (toy: passthrough).",
+   "installed": true
+  },
+  {
+   "name": "predict_genes_baseline",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Toy gene finder using ORFs as CDS features.",
+   "installed": true
+  },
+  {
+   "name": "annotate_functions_hmm",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Use run_prokka() or run_hmmer() instead for real functional annotation.",
+   "installed": true
+  },
+  {
+   "name": "analyze_genomic_region_overlap",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Pairwise overlap metrics for multiple region sets (pure-Python baseline).",
+   "installed": true
+  },
+  {
+   "name": "merge_regions",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Merge overlapping/adjacent intervals per chromosome.",
+   "installed": true
+  },
+  {
+   "name": "intersect_regions",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Intersect two BED-like sets with -wa/-wb/-wo behaviors (baseline).",
+   "installed": true
+  },
+  {
+   "name": "assemble_greedy_baseline",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Very simple greedy baseline assembler (toy concat).",
+   "installed": true
+  },
+  {
+   "name": "scaffold_gc_link",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Crude scaffolding (toy passthrough).",
+   "installed": true
+  },
+  {
+   "name": "multi_sample_summary_report",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Collate artifacts into a small HTML/Markdown report.",
+   "installed": true
+  },
+  {
+   "name": "plot_stackbar_taxa",
+   "category": "Utilities",
+   "icon": "fa-screwdriver-wrench",
+   "description": "Prepare a TSV for stacked bar taxonomic composition (no plotting libs).",
+   "installed": true
+  },
+  {
+   "name": "annotate_celltype_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Annotate cell types based on gene markers and transferred labels using LLM.",
+   "installed": true
+  },
+  {
+   "name": "annotate_celltype_with_panhumanpy",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform cell type annotation of single-cell RNA-seq data using Panhuman Azimuth Neural Network.",
+   "installed": true
+  },
+  {
+   "name": "create_scvi_embeddings_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Create scVI and scANVI embeddings for single-cell RNA-seq data, saving the results to an AnnData object.",
+   "installed": true
+  },
+  {
+   "name": "create_harmony_embeddings_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Performs batch integration on single-cell RNA-seq data using Harmony and saves the integrated embeddings.",
+   "installed": true
+  },
+  {
+   "name": "get_uce_embeddings_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Generate UCE embeddings for single-cell RNA-seq data and map them to a reference dataset for cell type\u2026",
+   "installed": true
+  },
+  {
+   "name": "map_to_ima_interpret_scRNA",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Map cell embeddings from the input dataset to the Integrated Megascale Atlas reference dataset using U\u2026",
+   "installed": true
+  },
+  {
+   "name": "get_rna_seq_archs4",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Given a gene name, fetch RNA-seq expression data showing the top K tissues with highest transcripts-pe\u2026",
+   "installed": true
+  },
+  {
+   "name": "get_gene_set_enrichment_analysis_supported_database_list",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Returns a list of supported databases for gene set enrichment analysis.",
+   "installed": true
+  },
+  {
+   "name": "gene_set_enrichment_analysis",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform enrichment analysis for a list of genes, with optional background gene set and plotting functi\u2026",
+   "installed": true
+  },
+  {
+   "name": "analyze_chromatin_interactions",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Analyze chromatin interactions from Hi-C data to identify enhancer-promoter interactions and TADs.",
+   "installed": true
+  },
+  {
+   "name": "analyze_comparative_genomics_and_haplotypes",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform comparative genomics and haplotype analysis on multiple genome samples.",
+   "installed": true
+  },
+  {
+   "name": "perform_chipseq_peak_calling_with_macs2",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Perform ChIP-seq peak calling using MACS2 to identify genomic regions with significant binding.",
+   "installed": true
+  },
+  {
+   "name": "find_enriched_motifs_with_homer",
+   "category": "Genomics",
+   "icon": "fa-dna",
+   "description": "Find DNA sequence motifs enriched in genomic regions using the HOMER motif discovery software.",
+   "installed": true
+  },
+  {
+   "name": "flye",
+   "category": "longread",
+   "icon": "fa-flask",
+   "description": "Flye: de-novo assembler for long reads (Oxford Nanopore / PacBio), including METAGENOME mode for uneve\u2026",
+   "installed": true
+  },
+  {
+   "name": "unicycler",
+   "category": "longread",
+   "icon": "fa-flask",
+   "description": "Unicycler: bacterial genome assembler optimized for a SINGLE ISOLATE (NOT a metagenome \u2014 use run_flye\u2026",
+   "installed": true
+  },
+  {
+   "name": "filtlong",
+   "category": "longread",
+   "icon": "fa-flask",
+   "description": "Filtlong: quality/length filtering for long reads (Nanopore/PacBio) BEFORE assembly \u2014 removes short an\u2026",
+   "installed": true
+  },
+  {
+   "name": "nanoplot",
+   "category": "longread",
+   "icon": "fa-flask",
+   "description": "NanoPlot: QC report for long reads (Nanopore/PacBio) \u2014 the long-read equivalent of the standard short-\u2026",
+   "installed": true
+  },
+  {
    "name": "fastqc",
    "category": "Metagenomics",
    "icon": "fa-bacteria",
@@ -232,6 +575,69 @@
    "installed": true
   },
   {
+   "name": "racon",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Racon: fast long-read assembly polishing using read-to-assembly overlaps \u2014 typically run for 1-2 round\u2026",
+   "installed": true
+  },
+  {
+   "name": "host_decontamination",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Remove host reads from a metagenomic sample (e.g.",
+   "installed": true
+  },
+  {
+   "name": "compute_coverage_samtools",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Per-contig and mean sequencing coverage/depth from a sorted, indexed BAM \u2014 a fast, lightweight single-\u2026",
+   "installed": true
+  },
+  {
+   "name": "fastani",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "FastANI: fast, alignment-free Average Nucleotide Identity (ANI) between two (or many) genome assemblies.",
+   "installed": true
+  },
+  {
+   "name": "bwa_mem",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "BWA-MEM: short-read aligner \u2014 a mapping alternative alongside the other short-read aligner's -ax sr re\u2026",
+   "installed": true
+  },
+  {
+   "name": "barrnap",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Barrnap: rapid ribosomal RNA (rRNA) gene prediction (16S/18S/23S/28S/5S) from an assembled genome/cont\u2026",
+   "installed": true
+  },
+  {
+   "name": "mafft",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MAFFT: multiple sequence alignment (MSA) \u2014 aligns a set of related nucleotide or protein sequences (e.g.",
+   "installed": true
+  },
+  {
+   "name": "trimal",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "trimAl: trims poorly-aligned columns/excess gaps from a multiple sequence alignment BEFORE tree-buildi\u2026",
+   "installed": true
+  },
+  {
+   "name": "fasttree",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "FastTree: builds an approximate maximum-likelihood phylogenetic tree from a TRIMMED, ALIGNED multiple\u2026",
+   "installed": true
+  },
+  {
    "name": "rgi",
    "category": "Metagenomics",
    "icon": "fa-bacteria",
@@ -351,188 +757,6 @@
    "installed": true
   },
   {
-   "name": "load_sequences",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Load FASTA/FASTQ files into lightweight line-delimited TSVs (id, seq[, qual]).",
-   "installed": true
-  },
-  {
-   "name": "write_sequences",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Write sequences to FASTA/FASTQ (optionally gz).",
-   "installed": true
-  },
-  {
-   "name": "subsample_reads",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Randomly subsample reads from FASTA/FASTQ.",
-   "installed": true
-  },
-  {
-   "name": "convert_format",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Convert FASTA<->FASTQ (dummy qualities for FASTA->FASTQ).",
-   "installed": true
-  },
-  {
-   "name": "read_quality_report",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Compute simple QC metrics (read count, avg length, GC%, Ns).",
-   "installed": true
-  },
-  {
-   "name": "trim_filter_reads",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Adapter/quality trimming (toy) and min length filter.",
-   "installed": true
-  },
-  {
-   "name": "kmer_profile",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Count k-mers across reads/contigs and write a TSV spectrum.",
-   "installed": true
-  },
-  {
-   "name": "translate_orfs",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Find ORFs and translate to proteins.",
-   "installed": true
-  },
-  {
-   "name": "gc_content_windows",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Sliding-window GC% over FASTA sequences.",
-   "installed": true
-  },
-  {
-   "name": "deduplicate_sequences",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Collapse identical sequences and output uniques.",
-   "installed": true
-  },
-  {
-   "name": "align_reads_minimap2_like",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Toy alignment wrapper that emits a placeholder BAM (replace in prod).",
-   "installed": true
-  },
-  {
-   "name": "compute_coverage",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Compute per-base/window coverage from BAM (toy: zero coverage).",
-   "installed": true
-  },
-  {
-   "name": "call_variants_simple",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Heuristic pileup-based variant calling (toy: empty VCF header).",
-   "installed": true
-  },
-  {
-   "name": "classify_reads_kmer",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Naive k-mer\u2013style taxonomic assignment against a toy DB.",
-   "installed": true
-  },
-  {
-   "name": "bin_contigs_basic",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Simple binning by length threshold (toy baseline).",
-   "installed": true
-  },
-  {
-   "name": "estimate_complexity",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Alpha diversity estimate (Shannon or richness) from assignments.",
-   "installed": true
-  },
-  {
-   "name": "contamination_screen",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Screen sequences vs contaminant reference (toy: passthrough).",
-   "installed": true
-  },
-  {
-   "name": "predict_genes_baseline",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Toy gene finder using ORFs as CDS features.",
-   "installed": true
-  },
-  {
-   "name": "annotate_functions_hmm",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Use run_prokka() or run_hmmer() instead for real functional annotation.",
-   "installed": true
-  },
-  {
-   "name": "analyze_genomic_region_overlap",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Pairwise overlap metrics for multiple region sets (pure-Python baseline).",
-   "installed": true
-  },
-  {
-   "name": "merge_regions",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Merge overlapping/adjacent intervals per chromosome.",
-   "installed": true
-  },
-  {
-   "name": "intersect_regions",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Intersect two BED-like sets with -wa/-wb/-wo behaviors (baseline).",
-   "installed": true
-  },
-  {
-   "name": "assemble_greedy_baseline",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Very simple greedy baseline assembler (toy concat).",
-   "installed": true
-  },
-  {
-   "name": "scaffold_gc_link",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Crude scaffolding (toy passthrough).",
-   "installed": true
-  },
-  {
-   "name": "multi_sample_summary_report",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Collate artifacts into a small HTML/Markdown report.",
-   "installed": true
-  },
-  {
-   "name": "plot_stackbar_taxa",
-   "category": "Utilities",
-   "icon": "fa-screwdriver-wrench",
-   "description": "Prepare a TSV for stacked bar taxonomic composition (no plotting libs).",
-   "installed": true
-  },
-  {
    "name": "query_ncbi_taxonomy",
    "category": "Database",
    "icon": "fa-database",
@@ -631,174 +855,6 @@
    "installed": true
   },
   {
-   "name": "virsorter2",
-   "category": "Viromics",
-   "icon": "fa-virus",
-   "description": "Run VirSorter2 to identify viral sequences in metagenomic contigs.",
-   "installed": true
-  },
-  {
-   "name": "checkv",
-   "category": "Viromics",
-   "icon": "fa-virus",
-   "description": "Run CheckV to assess quality and completeness of viral genomes/contigs.",
-   "installed": true
-  },
-  {
-   "name": "deepvirfinder",
-   "category": "Viromics",
-   "icon": "fa-virus",
-   "description": "Run DeepVirFinder for virus identification using deep learning.",
-   "installed": true
-  },
-  {
-   "name": "gget_virus",
-   "category": "Viromics",
-   "icon": "fa-virus",
-   "description": "gget virus (gget v0.30.6): DETERMINISTIC RETRIEVAL of viral genome sequences + GenBank metadata from t\u2026",
-   "installed": true
-  },
-  {
-   "name": "annotate_celltype_scRNA",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Annotate cell types based on gene markers and transferred labels using LLM.",
-   "installed": true
-  },
-  {
-   "name": "annotate_celltype_with_panhumanpy",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Perform cell type annotation of single-cell RNA-seq data using Panhuman Azimuth Neural Network.",
-   "installed": true
-  },
-  {
-   "name": "create_scvi_embeddings_scRNA",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Create scVI and scANVI embeddings for single-cell RNA-seq data, saving the results to an AnnData object.",
-   "installed": true
-  },
-  {
-   "name": "create_harmony_embeddings_scRNA",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Performs batch integration on single-cell RNA-seq data using Harmony and saves the integrated embeddings.",
-   "installed": true
-  },
-  {
-   "name": "get_uce_embeddings_scRNA",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Generate UCE embeddings for single-cell RNA-seq data and map them to a reference dataset for cell type\u2026",
-   "installed": true
-  },
-  {
-   "name": "map_to_ima_interpret_scRNA",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Map cell embeddings from the input dataset to the Integrated Megascale Atlas reference dataset using U\u2026",
-   "installed": true
-  },
-  {
-   "name": "get_rna_seq_archs4",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Given a gene name, fetch RNA-seq expression data showing the top K tissues with highest transcripts-pe\u2026",
-   "installed": true
-  },
-  {
-   "name": "get_gene_set_enrichment_analysis_supported_database_list",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Returns a list of supported databases for gene set enrichment analysis.",
-   "installed": true
-  },
-  {
-   "name": "gene_set_enrichment_analysis",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Perform enrichment analysis for a list of genes, with optional background gene set and plotting functi\u2026",
-   "installed": true
-  },
-  {
-   "name": "analyze_chromatin_interactions",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Analyze chromatin interactions from Hi-C data to identify enhancer-promoter interactions and TADs.",
-   "installed": true
-  },
-  {
-   "name": "analyze_comparative_genomics_and_haplotypes",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Perform comparative genomics and haplotype analysis on multiple genome samples.",
-   "installed": true
-  },
-  {
-   "name": "perform_chipseq_peak_calling_with_macs2",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Perform ChIP-seq peak calling using MACS2 to identify genomic regions with significant binding.",
-   "installed": true
-  },
-  {
-   "name": "find_enriched_motifs_with_homer",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Find DNA sequence motifs enriched in genomic regions using the HOMER motif discovery software.",
-   "installed": true
-  },
-  {
-   "name": "analyze_genomic_region_overlap",
-   "category": "Genomics",
-   "icon": "fa-dna",
-   "description": "Analyze overlaps between two or more sets of genomic regions.",
-   "installed": true
-  },
-  {
-   "name": "create_run",
-   "category": "Workspace",
-   "icon": "fa-folder-open",
-   "description": "Create a staging run to upload inputs and produce downloadable artifacts.",
-   "installed": true
-  },
-  {
-   "name": "upload_files",
-   "category": "Workspace",
-   "icon": "fa-folder-open",
-   "description": "Upload one or more files into a run (multipart/form-data).",
-   "installed": true
-  },
-  {
-   "name": "list_run_files",
-   "category": "Workspace",
-   "icon": "fa-folder-open",
-   "description": "List files currently staged in a run directory.",
-   "installed": true
-  },
-  {
-   "name": "publish_run",
-   "category": "Workspace",
-   "icon": "fa-folder-open",
-   "description": "Publish selected paths (files or folders) from the run to artifact storage and get a manifest with per\u2026",
-   "installed": true
-  },
-  {
-   "name": "get_manifest",
-   "category": "Workspace",
-   "icon": "fa-folder-open",
-   "description": "Fetch a previously published manifest for a run.",
-   "installed": true
-  },
-  {
-   "name": "build_download_url",
-   "category": "Workspace",
-   "icon": "fa-folder-open",
-   "description": "Utility to build the direct download URL for a known artifact key (not needed if you already use 'down\u2026",
-   "installed": true
-  },
-  {
    "name": "download_from_ncbi",
    "category": "NCBI / Web",
    "icon": "fa-globe",
@@ -824,6 +880,34 @@
    "category": "NCBI / Web",
    "icon": "fa-globe",
    "description": "Keyless general-knowledge web lookup via the Wikipedia REST API \u2014 use ONLY to ENRICH INTERPRETATION/RE\u2026",
+   "installed": true
+  },
+  {
+   "name": "virsorter2",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "Run VirSorter2 to identify viral sequences in metagenomic contigs.",
+   "installed": true
+  },
+  {
+   "name": "checkv",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "Run CheckV to assess quality and completeness of viral genomes/contigs.",
+   "installed": true
+  },
+  {
+   "name": "deepvirfinder",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "Run DeepVirFinder for virus identification using deep learning.",
+   "installed": true
+  },
+  {
+   "name": "gget_virus",
+   "category": "Viromics",
+   "icon": "fa-virus",
+   "description": "gget virus (gget v0.30.6): DETERMINISTIC RETRIEVAL of viral genome sequences + GenBank metadata from t\u2026",
    "installed": true
   }
  ],

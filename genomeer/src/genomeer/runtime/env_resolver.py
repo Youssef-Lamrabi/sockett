@@ -240,6 +240,65 @@ def get_meta_env_signals() -> set[str]:
         return set()
 
 
+# Wrapper-function names (as they'd appear referencing genomeer's own recipe
+# modules) that imply meta-env1, paired with their raw CLI binary name. Kept
+# explicit (not solely reliant on registry provides_bins) so routing works
+# even before/without an index.yaml update — belt-and-suspenders consistency
+# with get_meta_env_signals().
+_LONGREAD_SIGNALS = (
+    "run_medaka", "medaka_consensus",
+    "run_racon", "racon",
+    "run_flye", "flye",
+    "run_filtlong", "filtlong",
+    "run_nanoplot", "nanoplot",
+    "run_unicycler", "unicycler",
+)
+
+
+def resolve_env_for_code(
+    code: str,
+    lang: str = "PY",
+    env_hint: "str | None" = None,
+    default_env: str = "bio-agent-env1",
+) -> str:
+    """
+    Decide which micromamba env a code block should run in.
+
+      1. An explicit env_hint (e.g. attached upstream by the generator/caller)
+         always wins — the caller has already made the routing decision.
+      2. Otherwise scan the code for a meta-env1 signal: either a known
+         long-read wrapper/CLI name (_LONGREAD_SIGNALS) or any binary declared
+         in the registry (get_meta_env_signals()).
+      3. Fall back to default_env.
+
+    `lang` is accepted for interface symmetry with callers that carry a code
+    language tag alongside the snippet; it does not affect routing (env
+    choice depends on which TOOL the code invokes, not the language it's
+    written in — this mirrors _resolve_env_from_code's existing behaviour).
+    """
+    if env_hint:
+        return env_hint
+
+    code_lower = (code or "").lower()
+
+    # WORD-BOUNDARY matching (see _resolve_env_from_code): short binary names like
+    # 'iss'/'rgi' must NOT match inside ordinary words ("missing", "merging") or
+    # every file-handling script gets mis-routed to meta-env1.
+    def _mentions(token: str) -> bool:
+        t = token.lower().strip()
+        return bool(t) and re.search(r'(?<![a-z0-9_])' + re.escape(t) + r'(?![a-z0-9_])', code_lower) is not None
+
+    for signal in _LONGREAD_SIGNALS:
+        if _mentions(signal):
+            return "meta-env1"
+
+    for signal in get_meta_env_signals():
+        if _mentions(signal):
+            return "meta-env1"
+
+    return default_env
+
+
 # --- tiny CLI for debugging (optional) ---
 if __name__ == "__main__":
     import sys

@@ -221,14 +221,58 @@ class FastqcContract(_BaseContract):
                               reason=f"fastqc: report found ({os.path.basename(found)})")
 
 
+class SraFetchContract(_BaseContract):
+    """
+    fetch_sra_reads — DOWNLOAD of REAL experimental FASTQ from ENA/SRA (single-end:
+    <acc>.fastq[.gz]; paired-end: _1/_2 or R1/R2 .fastq[.gz]).
+
+    This is a DOWNLOAD step, NOT read simulation. It must be matched BEFORE the
+    WgsimContract, otherwise a title like "Fetch raw paired-end reads … decompress
+    to R1.fastq and R2.fastq" was graded by wgsim's contract, which globs for the
+    simulation-specific name reads_R1.fastq, fails on the real name R1.fastq, and
+    forces a spurious retry + a costly multi-GB RE-DOWNLOAD (observed on DRR102584).
+
+    Lenient on purpose: fetch_sra_reads already verifies each file's size against the
+    ENA-reported fastq_bytes internally, so the contract only needs to confirm that at
+    least one non-empty FASTQ was produced — never to reject on exact naming.
+    """
+    KEYWORDS = ("fetch_sra_reads", "fetch_sra", "fetch raw", "sra accession",
+                "ena accession", "sra/ena", "sra run", "ena run",
+                "download the reads", "download raw reads", "download reads for",
+                "retrieve the raw", "retrieve raw", "retrieve the paired",
+                "retrieve the reads", "fetch reads", "fetch the reads")
+    RUNTIME = "fast"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        fqs = self._glob_all(run_dir, "*.fastq.gz", "*.fq.gz", "*.fastq", "*.fq")
+        nonempty = [f for f in fqs if os.path.isfile(f) and os.path.getsize(f) > 0]
+        if not nonempty:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="fetch_sra_reads: no non-empty FASTQ produced",
+                retry_params={"hint": "fetch_sra_reads pulls FASTQ from ENA over HTTPS; confirm the RUN accession (SRR/ERR/DRR, not a study/BioProject) is valid and the network is reachable."},
+            )
+        total = sum(os.path.getsize(f) for f in nonempty)
+        return ContractResult(
+            ok=True, score=1.0,
+            reason=f"fetch_sra_reads: {len(nonempty)} FASTQ file(s), {total // (1024 * 1024)}MB present",
+            metrics={"fastq_files": len(nonempty), "total_mb": total // (1024 * 1024)},
+        )
+
+
 class WgsimContract(_BaseContract):
     """
     Output: reads_R1.fastq + reads_R2.fastq — both must exist AND be non-empty.
     An empty file (size 0) means the LLM created a placeholder to bypass failure.
     Score 0.0 if either file is missing or empty — forces retry with correct tool.
     """
+    # SIMULATION-specific keywords only. "paired-end reads" / "generate reads" were
+    # removed: they matched DOWNLOAD steps ("Fetch raw paired-end reads …") and real
+    # experimental-read steps, mis-grading them on wgsim's reads_R1.fastq naming and
+    # forcing spurious retries. Real wgsim steps still match via "wgsim" / "simulate …".
     KEYWORDS = ("wgsim", "simulate reads", "simulated reads", "read simulation",
-                "paired-end reads", "simulate illumina", "generate reads")
+                "simulate illumina", "simulate paired-end", "simulate short-read",
+                "generate simulated")
     RUNTIME = "fast"
     VARIANTS = [
         "ensure wgsim is available: it is bundled with samtools in meta-env1",
@@ -553,6 +597,122 @@ class KaijuContract(_BaseContract):
                               reason=f"kaiju: {score*100:.1f}% reads classified",
                               metrics={"pct_classified": round(score * 100, 2),
                                        "_source_file": os.path.basename(kaiju_summ or kaiju_out)})
+
+
+# ===========================================================================
+# LONG-READ POLISHING (Racon, Medaka) — checked BEFORE AssemblyContract.
+# Both a Racon and a Medaka step's title routinely says "...on the draft
+# ASSEMBLY" (that IS what polishing operates on) and AssemblyContract's
+# KEYWORDS include the bare word "assembly" plus a "*.fasta" catch-all glob
+# that would find polished.fasta/consensus.fasta too — so without this
+# ordering a polishing step gets silently mis-scored under assembly-N50
+# semantics instead of its own (Medaka: consensus.fasta/QV; Racon:
+# polished.fasta) criteria. Same rationale as the ProdigalContract/
+# ProkkaContract-before-Assembly ordering below.
+# ===========================================================================
+
+class MedakaContract(_BaseContract):
+    """
+    Output: {output_dir}/consensus.fasta  (primary output)
+            calls_to_draft.bam + .bai     (intermediate alignment files)
+    Scoring: presence + size of consensus.fasta; 5 Mb = score 1.0
+             (5 Mb ≈ median bacterial genome; Mira et al. 2001 PMID 11782624).
+    Source: https://github.com/nanoporetech/medaka
+            https://medaka.readthedocs.io/en/latest/
+    No peer-reviewed threshold; consensus.fasta present and non-empty = success.
+    Typical Nanopore polishing reduces raw error rate ~5% → <1% (ONT tech note).
+    """
+    KEYWORDS = ("medaka", "medaka_consensus", "nanopore polishing",
+                "ont polishing", "medaka consensus", "medaka -i")
+    RUNTIME = "long"
+    VARIANTS = [
+        "run 'medaka tools list_models' to find the correct model for your flowcell/basecaller",
+        "reduce -t (threads) to lower memory usage; split assembly into smaller chunks if OOM",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        consensus = self._glob_first(run_dir,
+                                     "consensus.fasta", "consensus.fa",
+                                     "*consensus*.fasta", "*polished*.fasta")
+
+        if not consensus:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="medaka: consensus.fasta not found",
+                retry_params={"hint": "check -d (draft FASTA), -i (reads), -m (model); run 'medaka tools list_models' to verify model name"},
+            )
+
+        size = os.path.getsize(consensus)
+        if size < 1000:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason=f"medaka: consensus.fasta nearly empty ({size} bytes)",
+                retry_params={"hint": "verify draft assembly -d is non-empty and reads -i map to the assembly"},
+            )
+
+        seq_count = 0
+        try:
+            with open(consensus, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        seq_count += 1
+        except Exception:
+            pass
+
+        score = min(1.0, size / 5_000_000)  # 5 Mb = 1.0
+        return ContractResult(ok=True, score=score,
+                              reason=f"medaka: {seq_count} polished sequence(s), {size:,} bytes",
+                              metrics={"polished_sequences": seq_count})
+
+
+class RaconContract(_BaseContract):
+    """
+    Output: {output_dir}/polished.fasta (run_racon's own naming convention —
+            racon itself writes the polished FASTA to STDOUT; the wrapper
+            redirects it to this file).
+    Scoring: presence + size, same file-size heuristic as MedakaContract
+            (racon has no analogous single QV-style summary metric in its
+            own stderr to parse deterministically).
+    Source: https://github.com/lbcb-sci/racon
+    """
+    KEYWORDS = ("racon", "racon polishing", "racon -t")
+    RUNTIME = "long"
+    VARIANTS = [
+        "verify the overlaps PAF/SAM was generated from the SAME reads against the SAME draft assembly being polished",
+        "reduce -t (threads) to lower memory usage on a large assembly",
+    ]
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        polished = self._glob_first(run_dir, "polished.fasta", "*polished*.fasta", "*racon*.fasta")
+
+        if not polished:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="racon: polished.fasta not found",
+                retry_params={"hint": "racon writes to STDOUT (no -o flag) — verify the caller redirected stdout to a file"},
+            )
+
+        size = os.path.getsize(polished)
+        if size < 1000:
+            return ContractResult(
+                ok=False, score=0.1,
+                reason=f"racon: polished.fasta nearly empty ({size} bytes)",
+                retry_params={"hint": "verify the overlaps file and draft assembly are both non-empty and correctly paired"},
+            )
+
+        seq_count = 0
+        try:
+            with open(polished, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        seq_count += 1
+        except Exception:
+            pass
+
+        score = min(1.0, size / 5_000_000)  # 5 Mb = 1.0, same scale as MedakaContract
+        return ContractResult(ok=True, score=score,
+                              reason=f"racon: {seq_count} polished sequence(s), {size:,} bytes",
+                              metrics={"polished_sequences": seq_count})
 
 
 # ===========================================================================
@@ -1373,12 +1533,21 @@ class ProdigalContract(_BaseContract):
     ]
 
     def check(self, run_dir: str, stdout: str) -> ContractResult:
-        faa   = self._glob_first(run_dir, "*.faa", "proteins.faa", "prodigal.faa")
+        # Grade the LARGEST proteome, not the first .faa found. A step that runs
+        # Prodigal AND THEN builds a marker tree / pan-genome leaves several .faa in
+        # the run dir: the real proteome(s) with thousands of proteins PLUS tiny
+        # helper files (a 6-sequence concatenated-marker FASTA, a 4-sequence marker
+        # DB). Grading the first .faa (arbitrary glob order) could grade a tiny helper
+        # → "6 proteins" → score 0.01 FALSE NEGATIVE (observed on the marker/pan-genome
+        # steps). Counting the .faa with the MOST proteins fixes it: if Prodigal
+        # produced any real proteome, the step passes. Single-proteome steps are
+        # unaffected (their one .faa is trivially the max).
+        faa_files = self._glob_all(run_dir, "*.faa")
         fasta = self._glob_first(
             run_dir, "contigs.fasta", "assembly.fasta", "*.fasta", "*.fa",
         )
 
-        if not faa:
+        if not faa_files:
             if fasta:
                 return ContractResult(
                     ok=False, score=0.1,
@@ -1404,28 +1573,29 @@ class ProdigalContract(_BaseContract):
                 },
             )
 
-        size = os.path.getsize(faa)
-        if size < 100:
+        # Pick the .faa with the MOST protein records (the real proteome).
+        best_faa, n_proteins = None, -1
+        for f in faa_files:
+            try:
+                n = sum(1 for line in open(f, encoding="utf-8", errors="replace")
+                        if line.startswith(">"))
+            except Exception:
+                n = 0
+            if n > n_proteins:
+                best_faa, n_proteins = f, n
+
+        if best_faa is None or os.path.getsize(best_faa) < 100:
             return ContractResult(
                 ok=False, score=0.1,
-                reason=f"prodigal: .faa exists but nearly empty ({size} bytes) — no ORFs predicted",
+                reason="prodigal: .faa exists but nearly empty — no ORFs predicted",
                 retry_params={
                     "hint": "check assembly quality; confirm contigs are >100 bp; add -p meta"
                 },
             )
 
-        try:
-            n_proteins = sum(1 for line in open(faa, encoding="utf-8") if line.startswith(">"))
-        except Exception:
-            n_proteins = None
-
         score = min(1.0, (n_proteins or 0) / 1000)
-        reason = (
-            f"prodigal: {n_proteins:,} proteins predicted"
-            if n_proteins is not None
-            else f"prodigal: .faa found ({size:,} bytes)"
-        )
-        _metrics = {"orfs_predicted": n_proteins} if n_proteins is not None else {}
+        reason = f"prodigal: {n_proteins:,} proteins predicted"
+        _metrics = {"orfs_predicted": n_proteins}
         return ContractResult(ok=True, score=score, reason=reason, metrics=_metrics)
 
 
@@ -2223,64 +2393,6 @@ class GtdbtkContract(_BaseContract):
                               reason=f"gtdbtk: {reliable}/{total} genome(s) with ≥50% MSA completeness",
                               metrics={"genomes_classified": total, "genomes_reliable_msa": reliable,
                                        "_source_file": os.path.basename(bac_summary or arc_summary)})
-
-
-# ===========================================================================
-# LONG-READ POLISHING
-# ===========================================================================
-
-class MedakaContract(_BaseContract):
-    """
-    Output: {output_dir}/consensus.fasta  (primary output)
-            calls_to_draft.bam + .bai     (intermediate alignment files)
-    Scoring: presence + size of consensus.fasta; 5 Mb = score 1.0
-             (5 Mb ≈ median bacterial genome; Mira et al. 2001 PMID 11782624).
-    Source: https://github.com/nanoporetech/medaka
-            https://medaka.readthedocs.io/en/latest/
-    No peer-reviewed threshold; consensus.fasta present and non-empty = success.
-    Typical Nanopore polishing reduces raw error rate ~5% → <1% (ONT tech note).
-    """
-    KEYWORDS = ("medaka", "medaka_consensus", "nanopore polishing",
-                "ont polishing", "medaka consensus", "medaka -i")
-    RUNTIME = "long"
-    VARIANTS = [
-        "run 'medaka tools list_models' to find the correct model for your flowcell/basecaller",
-        "reduce -t (threads) to lower memory usage; split assembly into smaller chunks if OOM",
-    ]
-
-    def check(self, run_dir: str, stdout: str) -> ContractResult:
-        consensus = self._glob_first(run_dir,
-                                     "consensus.fasta", "consensus.fa",
-                                     "*consensus*.fasta", "*polished*.fasta")
-
-        if not consensus:
-            return ContractResult(
-                ok=False, score=0.0,
-                reason="medaka: consensus.fasta not found",
-                retry_params={"hint": "check -d (draft FASTA), -i (reads), -m (model); run 'medaka tools list_models' to verify model name"},
-            )
-
-        size = os.path.getsize(consensus)
-        if size < 1000:
-            return ContractResult(
-                ok=False, score=0.1,
-                reason=f"medaka: consensus.fasta nearly empty ({size} bytes)",
-                retry_params={"hint": "verify draft assembly -d is non-empty and reads -i map to the assembly"},
-            )
-
-        seq_count = 0
-        try:
-            with open(consensus, encoding="utf-8") as fh:
-                for line in fh:
-                    if line.startswith(">"):
-                        seq_count += 1
-        except Exception:
-            pass
-
-        score = min(1.0, size / 5_000_000)  # 5 Mb = 1.0
-        return ContractResult(ok=True, score=score,
-                              reason=f"medaka: {seq_count} polished sequence(s), {size:,} bytes",
-                              metrics={"polished_sequences": seq_count})
 
 
 # ===========================================================================
@@ -3234,6 +3346,11 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # QC / trimming
     FastpContract(),
     FastqcContract(),
+    # SraFetch BEFORE the simulation contracts: a real read-DOWNLOAD step
+    # ("Fetch raw paired-end reads … with fetch_sra_reads") must be graded as a
+    # download (any FASTQ present), NOT by wgsim's reads_R1.fastq naming rule
+    # which caused a spurious retry + full re-download on DRR102584.
+    SraFetchContract(),
     # InSilicoSeq BEFORE Wgsim: an "iss / InSilicoSeq" step also says "simulate
     # reads" (a Wgsim keyword), so it must be matched by its own contract first.
     InSilicoSeqContract(),
@@ -3247,6 +3364,12 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # aren't absorbed by AssemblyContract (which also matches "assembly statistics")
     ProdigalContract(),
     ProkkaContract(),
+    # Long-read polishing (Racon, Medaka) — MUST be checked BEFORE AssemblyContract:
+    # both tools' step titles routinely say "...on the draft ASSEMBLY", and
+    # AssemblyContract's "assembly" keyword + "*.fasta" catch-all glob would
+    # otherwise silently mis-score a polishing step under assembly-N50 semantics.
+    MedakaContract(),
+    RaconContract(),
     # Assembly
     AssemblyContract(),
     QuastContract(),
@@ -3316,8 +3439,6 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     MetaPhlAn4Contract(),
     # Phylogenetic classification
     GtdbtkContract(),
-    # Long-read polishing
-    MedakaContract(),
     # Genomics / epigenomics / scRNA / NCBI — APPENDED LAST so every metagenomics
     # contract gets first match; all of these NEVER return ok=False (defer via
     # score=-1.0 when their output is absent) → they can't break a working step.
