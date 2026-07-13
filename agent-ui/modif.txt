@@ -1,100 +1,114 @@
 ================================================================================
-BILAN DES CHANGEMENTS — Genomeer / BioAgent
-Date : 2026-07-13
-Env cible : meta-env1  (/home/youssef/.bioagentpkg/runtime/pkgs/envs/meta-env1)
+CHANGELOG SYSTÈME — Genomeer / BioAgent  (code, contrats, routing)
+Portée : changements du CODE faits durant la conversation
 ================================================================================
 
 --------------------------------------------------------------------------------
-1) OUTILS INSTALLÉS / AJOUTÉS (avec version + méthode, pour reproductibilité)
+A) NOUVEAUX OUTILS AJOUTÉS (fonction + description)
 --------------------------------------------------------------------------------
+CRÉÉS (nouvelle fonction + nouvelle description) :
+  tools/function/sra.py + tools/description/sra.py
+    - fetch_sra_reads         télécharge des reads réels SRA/ENA via l'API ENA
+                              filereport (HTTPS), sans sra-tools.
+  tools/function/longread.py + tools/description/longread.py
+    - run_flye                assemblage long-read (ONT/PacBio)
+    - run_unicycler           assemblage isolat (hybride/short/long)
+    - run_filtlong            filtrage qualité/longueur des reads long-read
+    - run_nanoplot            QC des reads Nanopore
+  tools/function/metagenomics.py + description/metagenomics.py
+    - run_racon               polissage d'assemblage (long-read)
+    - run_host_decontamination retrait des reads hôte (bowtie2/bwa + samtools)
+    - compute_coverage_samtools couverture/profondeur depuis un BAM
+    - run_medaka              (complété : batch_size, parse mean_qv, dir imbriqué)
 
-InSilicoSeq (iss)       2.0.1     pip install InSilicoSeq
-ncbi-genome-download    0.3.3     pip install ncbi-genome-download
-                                  (ajouté à meta-env1 ; n'existait que dans bio-env
-                                   -> corrige le mismatch cross-env sur le download)
-SPAdes                  4.0.0     binaire précompilé github (PAS conda) :
-                                  github.com/ablab/spades/releases v4.0.0-Linux.tar.gz
-                                  + wrapper LD_LIBRARY_PATH=$PREFIX/lib (libgomp)
-                                  NB : tourne en dossier Linux natif (/tmp), PAS /mnt/c
-Infernal cmsearch/cmscan 1.1.5    binaire précompilé eddylab.org/infernal 1.1.5
-                                  (destiné à barrnap)
-
-Déjà présents (env léger, rappel) :
-fastANI                 1.33      binaire github v1.34 + wrapper libgomp
-NanoPlot                1.47.1    pip
-samtools                1.21      (INCHANGÉ — voir section 3, fix instruction)
-+ set léger conda : python 3.12, fastp, fastqc, seqkit, bedtools, wgsim, bbmap,
-  prodigal, hmmer, diamond, megahit, minimap2, bwa, bowtie2, mafft, trimal,
-  fasttree, flye, filtlong, racon, biopython/numpy/pandas/scipy
-
-NON FONCTIONNEL :
-barrnap                 (github clone) — ABANDONNÉ : nécessite la base Rfam .cm
-                        buildée localement (modèles absents). L'agent fast-fail
-                        proprement s'il le choisit.
-NON installés (lourds) : medaka, prokka, unicycler, kraken2, quast, metabat2,
-                        checkm2, abricate, rgi  -> fast-fail gracieux si choisis.
+DESCRIPTIONS AJOUTÉES/REBRANCHÉES (outils rendus visibles au routeur) :
+  description/metagenomics.py
+    - run_fastani, run_bwa_mem, run_barrnap, run_mafft, run_trimal, run_fasttree
 
 --------------------------------------------------------------------------------
-2) OUTIL RÉPARÉ (dépendance cassée, pas réinstallé)
+B) CONTRATS (agent/v2/utils/validator.py)
 --------------------------------------------------------------------------------
+AJOUTÉS :
+  - SraFetchContract     valide un step fetch_sra_reads (≥1 FASTQ non-vide).
+                         Placé AVANT wgsim/InSilicoSeq dans _ALL_CONTRACTS.
+                         Corrige : le download de reads était noté par le contrat
+                         wgsim (simulation) -> "reads_R1.fastq not found" -> faux
+                         échec + re-download inutile.
+  - RaconContract        valide le polissage racon (séquences polies présentes).
+  - MedakaContract       déplacé AVANT AssemblyContract (dispatch : évite que le
+                         step medaka soit happé par le contrat assembly).
 
-bcftools  1.6   Cassé : réclamait libcrypto.so.1.0.0 (OpenSSL 1.0.0) absent
-                (l'env a OpenSSL 3). Bioconda rot.
-                FIX : shim libcrypto.so.1.0.0 extrait du paquet conda openssl 1.0.2u,
-                placé dans .bioagentpkg/extra/openssl102/lib/ + wrapper bcftools
-                (LD_LIBRARY_PATH isolé, ne touche PAS l'OpenSSL 3 des autres outils).
-                -> bcftools marche maintenant nativement. samtools 1.21 intact.
+MODIFIÉS :
+  - WgsimContract.KEYWORDS  retiré "paired-end reads" / "generate reads"
+                            (trop génériques : happaient downloads/vraies reads).
+  - ProdigalContract.check  note désormais le .faa avec LE PLUS de protéines
+                            (le vrai protéome) au lieu du premier trouvé.
+                            Corrige le faux négatif "6 proteins / score 0.01" sur
+                            les steps marqueur/pan-génome (plusieurs .faa présents).
+  - _ALL_CONTRACTS          registre mis à jour (ordre + nouveaux contrats).
 
 --------------------------------------------------------------------------------
-3) MODIFICATIONS DE CODE (bugs systémiques, tous vérifiés, non-cassants)
+C) MODIFICATIONS DU MOTEUR (bugs / robustesse)
 --------------------------------------------------------------------------------
+agent/v2/BioAgent.py
+  - _observer : après un diagnostic, router vers 'generator' (vraie réparation),
+                pas de retour en boucle diagnostics ; ne pas incrémenter
+                retry_counts sur les observations de sonde.
+  - _fix_cli_commands : remplacé l'injection de timeout inline par
+                @staticmethod _inject_subprocess_timeout (scanner paren/string-aware
+                -> ne corrompt jamais os.path.join(..., ...)).
+  - _select_env : matching par frontière de mot (regex \b) -> corrige le faux
+                positif "iss" dans "missing" (sélection env erronée).
+  - edges executor : ajout de "qa": "qa" -> corrige KeyError('qa').
 
-FICHIER : agent/v2/utils/validator.py
-  - AJOUT  SraFetchContract (placé AVANT wgsim/InSilicoSeq dans _ALL_CONTRACTS) :
-           un step fetch_sra_reads (download de vraies reads) était noté par le
-           contrat wgsim (simulation) -> "reads_R1.fastq not found" -> faux échec
-           + re-download de 13 min. Le nouveau contrat valide "au moins un FASTQ".
-  - MODIF  WgsimContract.KEYWORDS : retiré "paired-end reads" et "generate reads"
-           (trop génériques, happaient les downloads/vraies reads).
-  - MODIF  ProdigalContract.check : grade désormais le .faa avec LE PLUS de protéines
-           (le vrai protéome) au lieu du premier trouvé. Corrige le faux négatif
-           "6 proteins / score 0.01" sur les steps marqueur/pan-génome.
+agent/v2/utils/structured_output.py
+  - _resolve_env_from_code : matching par frontière de mot -> corrige "toujours
+                meta-env" (signal court matché en sous-chaîne).
+  - LLMOutputValidator.validate : helper _uses_meta_tool avec frontières de mot.
 
-FICHIER : agent/v2/utils/instructions.py
+runtime/env_resolver.py
+  - resolve_env_for_code() + _LONGREAD_SIGNALS, matching par frontière de mot.
+
+--------------------------------------------------------------------------------
+D) ROUTING & INSTRUCTIONS (agent/v2/utils/instructions.py)
+--------------------------------------------------------------------------------
+  - Règles d'intention (l'agent sait QUAND utiliser chaque nouvel outil sans qu'on
+    le nomme) : Nanopore->flye, décontamination hôte, couverture->compute_coverage,
+    ANI->fastani, arbre phylo->mafft/trimal/fasttree, SRA->fetch_sra_reads.
   - iss : formule de profondeur non-ambiguë (n_reads = depth*genome_bp/read_len,
-          NE PAS diviser par 2, read_len = longueur par-mate) + vérification
-          post-simulation obligatoire. Corrige la sous-couverture (~moitié).
-  - Prodigal : -p single pour un isolat unique ; même mode des deux côtés quand on
-          compare des comptes de gènes (règle le paradoxe 5532 vs 6265).
+          ne pas diviser par 2) + vérification post-simulation.
+  - Prodigal : -p single pour isolat ; même mode des deux côtés pour comparer.
   - ncbi-genome-download : auto-récupération du cache assembly_summary corrompu
-          ("Invalid line length ... Expected 38, got 39") -> filtrer les lignes
-          malformées (garder # et 38 colonnes) puis réessayer.
-  - ANI matrix : EXCLURE la self-comparison (diagonale ~100%) avant de choisir la
-          "référence la plus proche". Corrige le bug "isolat = SMS-3-5 à 100%".
-  - samtools sort : CAUSE = instruction périmée pour l'ancien samtools 0.x
-          (syntaxe positionnelle 'sort in.bam prefix'). L'installé est samtools 1.21.
-          CORRIGÉ vers la syntaxe moderne : samtools sort -o out.bam in.bam.
-          (+ note 'view -o' rectifiée : -o fonctionne en 1.x.)
-          -> l'outil n'a PAS changé (toujours 1.21) ; c'est l'INSTRUCTION qui a été
-             alignée sur l'outil réel.
-  - MAFFT : ajouter --anysymbol aux alignements protéiques (résidus non-standard
-          'U'/sélénocystéine -> plante "outputhat23=16") + wrapper par-cluster
-          (un échec loggé/sauté, pas d'abandon global).
-  - Règles de routing (rappel) : Nanopore->flye, décontamination hôte, couverture,
-          ANI->fastani, arbre phylo->mafft/trimal/fasttree, SRA->fetch_sra_reads.
-
-FICHIER : agent/genomeer/.../tools/description/sra.py
-  - fetch_sra_reads : instruction "appeler le helper, ne PAS réécrire le download"
-          + warning un-skippable : télécharger depuis https_urls, JAMAIS depuis les
-          ftp_urls bruts d'ENA (sans schéma) -> sinon urllib "unknown url type".
+          ("Invalid line length ... Expected 38, got 39") : filtrer les lignes
+          malformées puis réessayer (au lieu de tout abandonner).
+  - ANI matrix : exclure la self-comparison (diagonale ~100%) avant de choisir la
+          référence la plus proche (corrige "isolat = SMS-3-5 à 100%").
+  - samtools sort : instruction alignée sur la syntaxe moderne 'sort -o out.bam
+          in.bam' (l'ancienne doc positionnelle 0.x faisait échouer le step).
+  - MAFFT : --anysymbol pour les résidus non-standard ('U') + wrapper par-cluster
+          (un échec sauté, pas d'abandon global).
 
 --------------------------------------------------------------------------------
-4) NON CORRIGÉ (volontairement — bugs code-gen ponctuels, laissés au diagnostic)
+E) CÂBLAGE (activation des outils dans le système)
 --------------------------------------------------------------------------------
-  - Comptage pan-génome (NA / non reproductible d'un run à l'autre) : logique
-    custom ad-hoc, pas un manque de connaissance -> auto-correction par diagnostic.
-  - Principe appliqué : n'enrichir les instructions que sur échec RÉCURRENT par
-    manque de savoir ; garder les instructions maigres.
+  - model/retriever.py : ajout des binaires CLI (flye, unicycler, filtlong,
+        nanoplot, medaka, racon, mafft, trimal, fasttree, barrnap) à _CLI_TOOL_BINARIES.
+  - utils/helper.py : ajout de "sra" et "longread" dans read_module2api()
+        (les nouveaux modules deviennent chargeables).
+
+--------------------------------------------------------------------------------
+F) UI (agent/agent-ui)
+--------------------------------------------------------------------------------
+  - static/js/agent_render.js : phrase de résultat courte par step, synchronisée
+        avec le STATUS de l'observer (sidebar/panneaux intouchés).
+  - regen_tools_catalog.py : dédup par nom + crash emoji corrigé ->
+        static/tools_catalog.json régénéré (sans doublons).
+
+--------------------------------------------------------------------------------
+G) TESTS
+--------------------------------------------------------------------------------
+  - tests/unit/agent/test_timeout_injection.py : tests pour
+        _inject_subprocess_timeout + le routing de l'observer.
 
 ================================================================================
 FIN
