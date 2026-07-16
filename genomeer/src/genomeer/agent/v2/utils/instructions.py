@@ -151,6 +151,15 @@ SPECIAL ALWAYS-TRUE RULES:
        SPECIES (case-insensitive). On mismatch -> raise RuntimeError and STOP — do NOT analyze a
        wrong-organism genome (failing loudly triggers a retry with the correct -g query; silently
        analyzing the wrong genome produces biologically invalid reports).
+   ⚠ PARSING TRAP (real failure — verified live): EVERY line in a real NCBI assembly_report.txt is
+     "#"-PREFIXED, e.g. the actual line is `# Organism name:  Klebsiella pneumoniae ... HS11286`, NOT
+     `Organism name:  ...`. A per-line `re.match(r"Organism name:\s*(.+)", line)` is ANCHORED to the
+     start of the string and therefore NEVER matches (it silently returns None on every line) — the
+     code then falls back to the FASTA defline (a bare accession like 'NC_016845.1'), reports a
+     mismatch every time, and the step hard-fails after exhausting all download fallbacks even though
+     the correct genome and a valid report were downloaded successfully. Use `re.search` (UNANCHORED,
+     scans the whole line/text and ignores the leading "# ") as in the copy-paste snippet below — never
+     re.match — or explicitly `line.lstrip("#").strip()` before comparing.
    Verification pattern — copy this. It pairs EACH genome with ITS OWN assembly report (by filename
    base) and SELECTS the genome that matches the requested species; it does NOT trust the first file
    found. This is REQUIRED because the run dir may already hold a WRONG-organism genome left by a
@@ -209,6 +218,16 @@ SPECIAL ALWAYS-TRUE RULES:
    WRONG : subprocess.run([..., str(fna_path, timeout=300)])
    CORRECT: subprocess.run([..., str(fna_path)], timeout=300)
    Keywords timeout=, check=, capture_output=, text=, shell= belong on subprocess.run() only.
+8b. NEVER use bash PROCESS SUBSTITUTION `<(...)` or `>(...)`, nor a heredoc `<<EOF`. The
+   security checker HARD-BLOCKS these patterns and will reject your code EVERY time, causing an
+   infinite regeneration loop that aborts the step (real failure: a minimap2→sort→depth step
+   looped 5× on `samtools sort <(minimap2 ...)` and the pipeline died). To chain tools, ALWAYS
+   write an INTERMEDIATE FILE and pass its path — never a `<(...)` file descriptor:
+     WRONG : subprocess.run(['samtools','sort','<(minimap2 ...)', ...])   # blocked, loops forever
+     WRONG : jgi_summarize_bam_contig_depths --outputDepth depth.txt <(...)  # blocked
+     CORRECT: minimap2 → write aln.sam ; samtools view -bS aln.sam > aln.bam ;
+              samtools sort ... aln.bam sorted_prefix ; then use sorted_prefix.bam by PATH.
+   Also: pipes via Popen often break the OLD samtools in this env — prefer SAM/BAM files on disk.
 9. QUAST binary name: ALWAYS call `quast.py`, NEVER `quast`. The conda package installs only
    `quast.py`; `quast` does not exist and raises FileNotFoundError immediately.
    WRONG : subprocess.run(["quast", "-o", quast_dir, fasta_path], ...)
@@ -317,6 +336,12 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
 - Operating on concrete inputs (files/URLs/accessions, SRA/NCBI/GCF/GCA IDs, FASTA/FASTQ/GFF)
 - Producing artifacts (tables, plots, files) or reading/writing from the data lake
 - Multi-step decisions (choose tools, configure params, iterate/verify, visualize, export)
+- RESUME / RE-RUN: "continue/re-run/resume from step N", "I modified step N, re-run from there",
+  "start again at step N" → this is a WORKFLOW request, NOT a QA question. Build a plan for the
+  REMAINING work from step N onward, REUSING the prior outputs already on disk in the run dir
+  (do NOT redo steps 1..N-1). NEVER answer such a request with prose describing a UI ("node-graph
+  view", "right-click", "Run from This Node", a button/menu) — this system has no such UI; you
+  simply re-plan and execute the steps yourself.
 
 # Checklist rules (when routing to ORCHESTRATOR):
 - Use short, imperative, testable steps.
@@ -325,15 +350,26 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "Load FASTA and compute stats (N50, GC, count)" -> 1 step
     * "Download genome and index it" -> 1 step
   Only split when steps are genuinely independent (e.g., download then separately assemble).
-- BUT do NOT bundle several INDEPENDENT heavy analysis/screening tools into ONE step. Tools like
-  Prokka, RGI, AMRFinder, geNomad, antiSMASH, eggNOG, CheckM2, kraken2 each run on the SAME input
-  but are independent and any one can fail on its own — put each (or at most two closely-related
-  ones) in its OWN step. REAL FAILURE: a step bundled "Prokka + RGI + geNomad + antiSMASH"; geNomad
-  crashed mid-step, so antiSMASH never ran AND the step was still marked done (exit 0 + some files
-  existed) — the missing geNomad/antiSMASH outputs went unnoticed. Separate steps isolate each
-  failure and let the validator check each tool's own output. (This is the exception to "prefer
-  1-3 steps": independent heavy screeners get their own steps even if that means 4-6 steps.)
+- ONE HEAVY TOOL PER STEP (GENERAL PRINCIPLE — it applies to EVERY long/heavy external tool; the
+  names below are EXAMPLES, not an exhaustive list — generalise it). A "heavy tool" = any external
+  program that runs for minutes and can fail on its own: assemblers (MEGAHIT/SPAdes/Flye/Unicycler),
+  polishers (Racon/Medaka), binners (MetaBAT2/MaxBin2/SemiBin2), consensus/derep (DAS_Tool/dRep),
+  mapping/depth (minimap2+jgi), and QC/annotation/screening (CheckM2/GUNC/QUAST/Prokka/RGI/
+  AMRFinder/geNomad/antiSMASH/eggNOG/kraken2/CoverM/inStrain). A step must NOT chain more than ONE
+  heavy tool — put each (or at most two TIGHTLY-COUPLED ones, e.g. Racon→Medaka) in its OWN step
+  with its OWN validation. WHY (two real failures): (a) any one tool can fail and the whole bundled
+  step then RE-RUNS FROM THE START — e.g. if Medaka fails, a 2-hour Flye assembly re-runs from
+  scratch (run-217 bundled Flye+Racon+Medaka+QUAST+CheckM2); (b) a bundled step is often marked done
+  on exit 0 even though a LATER tool never ran (geNomad crashed mid-step → antiSMASH never ran,
+  unnoticed). Separate steps isolate each failure and let the validator check each tool's own output.
+  This OVERRIDES "prefer 1-3 steps": a genome-assembly+QC pipeline is legitimately 5-8 steps. The
+  "one Python script" guidance above applies ONLY to LIGHT glue work (parsing, stats, indexing,
+  formatting) — NEVER to chaining several minutes-long external tools.
 - Name tools explicitly when obvious (e.g., "ncbi-genome-download", "samtools", "prodigal").
+- Do NOT hardcode tool PARAMETERS in step titles: no thread counts ("-t 4", "--threads 4"), and no
+  QC thresholds ("fastp -q 20", "-q 15"). The generator picks these from the machine/data — e.g. for
+  wgsim/SIMULATED reads fastp MUST use --disable_quality_filtering (a hardcoded "-q 20" in the title
+  makes the generator drop ALL reads, a real failure). Describe the WORK, not the flag values.
 - TOOL-FIT PRINCIPLE (choose the RIGHT approach — NOT just the nearest tool):
   A specialized tool is appropriate ONLY when it matches BOTH the task AND the organism/data.
   * Simple computational tasks — find/scan ORFs, GC content, sequence lengths, format
@@ -436,6 +472,43 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
       run_nanoplot (QC the raw reads) -> run_filtlong (drop short/low-quality reads) -> run_flye/
       run_unicycler (assemble) -> for raw/nano-hq ONT only: 1-2 rounds of run_racon then run_medaka to
       polish (SKIP polishing for PacBio HiFi input — already >99.9% accurate).
+      PLATFORM GUARD (MANDATORY when fetching a REAL long-read dataset from SRA/ENA): BEFORE choosing
+      an accession, verify instrument_platform == OXFORD_NANOPORE (or PACBIO_SMRT) via the ENA
+      filereport metadata — do NOT pick a run just because the study is about the right organism. A
+      real failure (SRR8359173): an ILLUMINA paired run was selected for a "Nanopore" pipeline; it
+      downloaded as _1/_2 (150 bp reads), filtlong --min_length 1000 then dropped 100% of them and the
+      assembly step hard-blocked. TELL: paired _1/_2 output OR read length <300 bp = SHORT-READ
+      (Illumina) → REJECT it and pick a genuine long-read run. NEVER `cat` paired _1/_2 into one file
+      for a long-read tool (that also triggers filtlong's 'duplicate read name' abort → 0-byte output).
+      HOW TO FIND A RUN (no accession given): use the ENA PORTAL SEARCH API over urllib (ENA/ebi.ac.uk
+      is the allowed host) — it is RELIABLE and returns structured metadata. Do NOT use NCBI `esearch`
+      to DISCOVER runs: eutils is rate-limited and frequently returns 0 IDs / throttles (real failure
+      run-215: `esearch -db sra` returned 0 IDs 11× in a row → the step hard-blocked and the whole run
+      died at step 1). ENA search pattern (returns real ONT run accessions + platform + size directly):
+        base = 'https://www.ebi.ac.uk/ena/portal/api/search'
+        q = 'instrument_platform="OXFORD_NANOPORE" AND library_strategy="WGS" AND tax_tree(2)'  # tax_tree(2)=Bacteria
+        # ⚠⚠ THE `query` PARAM MUST BE A STRUCTURED FIELD EXPRESSION — NEVER FREE TEXT. Passing
+        #    query="Klebsiella pneumoniae" (a bare organism name) returns HTTP 400 "Query is in wrong
+        #    format or has invalid arguments" (real failure run-218 → step 1 hard-blocked 3×). To
+        #    filter by ORGANISM, use a field predicate, NOT free text:
+        #      by species name : tax_name("Klebsiella pneumoniae")   (verified, HTTP 200)
+        #      or exact string  : scientific_name="Klebsiella pneumoniae"
+        #      by clade/taxid   : tax_tree(573)  (573 = Klebsiella pneumoniae; 2 = all Bacteria)
+        #    Combine with AND: 'tax_name("Klebsiella pneumoniae") AND instrument_platform="OXFORD_NANOPORE" AND library_strategy="WGS"'
+        # ⚠ USE THE EXACT ENA ENUM VALUES — UPPER_SNAKE_CASE, not free text: instrument_platform must
+        #   be literally OXFORD_NANOPORE (NOT "Oxford Nanopore"/"nanopore"). library_strategy is WGS.
+        #   Other platforms: ILLUMINA, PACBIO_SMRT. If a query returns 0 rows, DROP the most restrictive
+        #   clause (e.g. remove library_strategy) and retry — never sys.exit on 0 rows or a 400.
+        # ALWAYS request `fields=` (else you only get run_accession + a description and column parsing
+        # breaks), and SKIP any row whose base_count is 0/empty (embargoed/placeholder — no data).
+        url = base + '?result=read_run&query=' + urllib.parse.quote(q) + \
+              '&fields=run_accession,instrument_platform,library_strategy,base_count,read_count,fastq_bytes' + \
+              '&format=tsv&limit=50'
+        # parse the TSV, pick a run with a plausible bacterial genome size (base_count ~ 100M-1G for
+        # decent ONT coverage), then pass its run_accession to fetch_sra_reads. Narrow tax_tree() to a
+        # specific genus/species taxid if the task names one (e.g. Klebsiella pneumoniae = tax_tree(573)).
+      If the search yields nothing usable, fall back to a KNOWN-GOOD ONT accession and justify it —
+      but NEVER sys.exit on an empty NCBI esearch result; that is expected, switch to the ENA search.
     * Sample source can carry HOST DNA (human/animal/plant tissue, stool, saliva, clinical/environmental
       swabs near a host) -> run_host_decontamination BEFORE assembly (run_megahit/run_spades/run_flye),
       even if the user did not explicitly ask to remove host reads — a low microbial_pct is itself a
@@ -549,6 +622,13 @@ When (and only when) it is a pure greeting, reply with EXACTLY this structure, f
   - **Diversity / stats** (alpha & beta diversity, ANCOM-BC, LEfSe, vegan)
 
   You can also **upload files** (FASTA/FASTQ/TSV/...) or **select files from past pipelines** via the 📎 button.
+
+  NEVER invent UI features that do not exist. This app is a chat + a workspace file panel — there is
+  NO "node-graph view", NO "right-click / context menu", NO "Run from This Node" button, NO per-node
+  re-run controls. If the user says "re-run / continue from step N" (or "I modified step N"), do NOT
+  explain a fictional UI: the correct behavior is to simply RE-RUN it — the request should have gone
+  to the workflow path which re-plans from step N reusing the prior on-disk outputs. The only real UI
+  elements you may mention are the 📎 attach button and the workspace file panel.
   What would you like to explore today?
 
 - If USER_FIRST_NAME is empty/unknown, write "Hi there!" instead of "Hi <name>!"
@@ -1054,6 +1134,21 @@ SPECIAL ALWAYS-TRUE RULES:
   ALWAYS add --disable_quality_filtering when fastp runs on wgsim-generated reads.
   WRONG: fastp --qualified_quality_phred 20 ... → 0 reads pass → empty trimmed output
   CORRECT: fastp --disable_quality_filtering --length_required 50 ...
+- fastp --length_required on REAL (non-simulated) sequencing data — DO NOT confuse this
+  with the wgsim rule above (that one is about QUALITY scores; this one is about LENGTH,
+  a different axis, and applies to real reads which typically have GOOD quality scores).
+  Real archives contain runs from many sequencing eras/protocols — an OLD or short-cycle
+  run can have a raw mean read length well under 75-100bp (real failure: a real ENA run
+  had read1_mean_length=44bp; a copied-from-memory `--length_required 50` then rejected
+  90%+ of reads as "too_short" even though their quality was fine — q20_rate=86%,
+  q30_rate=73% — the repair loop wrongly kept adjusting the QUALITY threshold, chasing the
+  wgsim lesson above, when the real cause was the LENGTH threshold vs THIS run's actual
+  read length). NEVER hardcode --length_required from a paper's aggregate/typical figure
+  or from memory of a different accession. Before choosing it: read the actual mean/read
+  length already reported by the download or an earlier QC step (fastp/seqkit/NanoPlot
+  JSON or stats output) for THIS run, and set --length_required comfortably BELOW that
+  observed value (e.g. ~60-70% of it) — never above it, or you may discard the majority
+  of genuine, good-quality reads for a reason that has nothing to do with quality.
 - samtools + minimap2 usage rules:
   The pipe pattern (minimap2 | samtools sort) FAILS in the installed samtools:
     "samtools view -b -" → "[main_samview] fail to read the header from '-'"
@@ -1216,9 +1311,17 @@ HARD RULES (do not violate):
    - #!BASH (Bash)
    - #!CLI  (Single CLI command; write one line that could run in a shell)
 5) Default to #!PY unless the CURRENT STEP strongly requires another language.
-6) Prefer MINIMAL, SURGICAL changes to address the REPAIR_FEEDBACK.
-7) Your job is to fix what is not working in actual code not adding extra features.
-8) Never emit two <EXECUTE> blocks. Never omit </EXECUTE>.
+6) DIAGNOSE THE ACTUAL ERROR shown in REPAIR_FEEDBACK / the previous run's stderr, and fix the ROOT
+   cause of THAT specific error. "Surgical" means fixing the real problem — NOT re-submitting the
+   same broken approach with one parameter tweaked.
+7) DO NOT LOOP: never retry an approach that ALREADY produced this exact error. If the error signals
+   WRONG TOOL/API USAGE — HTTP 4xx, "invalid arguments"/"wrong format"/"query is in wrong format",
+   "unrecognized/unexpected argument", "no such option", "command not found", "unsupported" — the fix
+   is to CORRECT THE CALL SYNTAX or SWITCH METHOD, not to change an accession/value while keeping the
+   same wrong call. If you have failed the SAME way before: change the METHOD fundamentally, or SIMPLIFY
+   (drop the most restrictive filter/option), and if you are unsure of an external tool/API's exact
+   syntax, prefer a minimal well-documented invocation over guessing again.
+8) Your job is to fix what is broken, not add features. Never emit two <EXECUTE> blocks. Never omit </EXECUTE>.
 
 EXAMPLES
 Python:

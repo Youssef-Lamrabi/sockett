@@ -141,8 +141,8 @@ class FastpContract(_BaseContract):
                 "read trimming", "filter reads")
     RUNTIME = "fast"
     VARIANTS = [
-        "lower --qualified_quality_phred to 15 (default is 20) to retain more reads",
-        "disable quality trimming flags --disable_quality_filtering; only trim adapters",
+        "add --disable_quality_filtering (do NOT pass -q at all) — for wgsim/simulated reads q20 AND q15 drop all/most reads; disable quality filtering entirely, keep only --length_required",
+        "if reads are REAL (not simulated), lower --qualified_quality_phred to 15 to retain more reads",
         "reduce --length_required to 30 and --average_qual to 10",
     ]
     THRESHOLD = 0.40
@@ -253,10 +253,81 @@ class SraFetchContract(_BaseContract):
                 retry_params={"hint": "fetch_sra_reads pulls FASTQ from ENA over HTTPS; confirm the RUN accession (SRR/ERR/DRR, not a study/BioProject) is valid and the network is reachable."},
             )
         total = sum(os.path.getsize(f) for f in nonempty)
+        # PAIRED-END SANITY CHECK (real failure — verified): a real ENA run that returns
+        # THREE fastq_ftp entries (two real mates + an orphan/singleton file, common on
+        # older archived runs) can trip download code that only special-cases exactly-2-
+        # vs-else — the else branch + a zip() over mismatched-length lists silently
+        # truncates to downloading ONLY the tiny orphan file, yet still prints "SUCCESS:
+        # downloaded paired-end reads". The old lenient check ("at least 1 non-empty
+        # file") scored this ok=True/1.0 despite only ~38KB present when ENA itself
+        # reported ~950MB expected. If the step explicitly calls for PAIRED-END data,
+        # require the actual _1/_2 (or R1/R2) pair to both be present and non-trivial —
+        # a lone unsuffixed/orphan file does not satisfy "paired-end".
+        _title = (stdout or "").lower()  # best-effort; real title check happens via caller context
+        _has_pair_names = any(
+            re.search(r'(_1|_R1)\.f(ast)?q(\.gz)?$', os.path.basename(f), re.I) for f in nonempty
+        ) and any(
+            re.search(r'(_2|_R2)\.f(ast)?q(\.gz)?$', os.path.basename(f), re.I) for f in nonempty
+        )
+        if len(nonempty) == 1 and total < 1_000_000:
+            # A single file under 1MB is far too small to be a real paired-end mate for
+            # any non-trivial WGS run — almost certainly the orphan-file mixup above.
+            return ContractResult(
+                ok=False, score=0.1,
+                reason=(
+                    f"fetch_sra_reads: only 1 FASTQ file ({total} bytes) present — too small "
+                    "for a real WGS run; likely downloaded only an orphan/singleton file "
+                    "while silently dropping the real _1/_2 paired mates (check ENA's own "
+                    "fastq_bytes for this accession — if it lists 2-3 files, the real pair "
+                    "was probably skipped by a length-mismatched zip())"
+                ),
+                retry_params={"hint": "re-query ENA fastq_ftp/fastq_bytes for this accession; if 3 entries are returned, identify the two LARGEST as the real _1/_2 pair (or match by '_1'/'_2' suffix) and download those explicitly — do not zip() a url list against a shorter output-name list."},
+            )
         return ContractResult(
             ok=True, score=1.0,
             reason=f"fetch_sra_reads: {len(nonempty)} FASTQ file(s), {total // (1024 * 1024)}MB present",
-            metrics={"fastq_files": len(nonempty), "total_mb": total // (1024 * 1024)},
+            metrics={"fastq_files": len(nonempty), "total_mb": total // (1024 * 1024),
+                     "paired_names_detected": _has_pair_names},
+        )
+
+
+class FiltlongContract(_BaseContract):
+    """
+    filtlong — long-read length/quality filtering. filtlong writes kept reads to STDOUT
+    (there is NO -o flag); the generated code MUST redirect stdout to a file. Recurring
+    failure (run-214): the output file exists but is EMPTY (0 bytes) because filtlong
+    aborted with 'duplicate read name' (paired _1/_2 FASTQs were concatenated), or every
+    read was shorter than --min_length (e.g. Illumina 125 bp reads through --min_length
+    1000 → wrong platform). A generic contract reported ok=True WITHOUT checking output
+    size, so the empty file slipped through and hard-blocked the downstream assembler.
+    This contract REQUIRES a NON-EMPTY filtered FASTQ. Matched BEFORE FastpContract.
+    """
+    KEYWORDS = ("filtlong", "filter long reads", "long-read filter", "long read filter",
+                "length/quality filter", "quality-filter the ont", "filter the ont reads",
+                "filter reads by length", "filter the long reads")
+    RUNTIME = "fast"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        fqs = self._glob_all(run_dir, "*filt*.fastq.gz", "*filt*.fastq", "*filt*.fq.gz",
+                             "*filt*.fq", "*filtered*.fastq*", "*keep*.fastq*")
+        if not fqs:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="filtlong: no filtered FASTQ found",
+                retry_params={"hint": "filtlong writes kept reads to STDOUT (no -o flag) — redirect it: subprocess.run([...], stdout=open(out,'wb')). Check returncode==0."},
+            )
+        nonempty = [f for f in fqs if os.path.isfile(f) and os.path.getsize(f) > 0]
+        if not nonempty:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="filtlong: filtered FASTQ is EMPTY (0 bytes) — filtlong aborted (duplicate read names from cat _1/_2, or all reads < --min_length). The reads may be short-read Illumina, NOT ONT.",
+                retry_params={"hint": "Do NOT concatenate paired _1/_2 files for long-read (their presence means the run is Illumina — WRONG platform for Flye). Use the single ONT FASTQ, verify filtlong returncode==0, and if reads are genuinely <1000bp lower --min_length."},
+            )
+        total = sum(os.path.getsize(f) for f in nonempty)
+        return ContractResult(
+            ok=True, score=1.0,
+            reason=f"filtlong: filtered FASTQ present ({total // (1024 * 1024)}MB)",
+            metrics={"filtered_mb": total // (1024 * 1024)},
         )
 
 
@@ -2007,7 +2078,12 @@ class DasToolContract(_BaseContract):
 
         n_bins = len(bin_fas)
         scores: List[float] = []
-        max_red = 0.0  # highest SCG_redundancy across bins → chimera signal
+        max_red = 0.0        # highest SCG_redundancy across bins → chimera signal
+        max_red_bin = None   # WHICH bin that redundancy belongs to (was previously discarded)
+
+        # Basenames (no extension) of bins DAS_Tool actually WROTE to disk — the ground truth
+        # for "kept vs dropped", available right here at check() time.
+        _kept_bin_names = {os.path.splitext(os.path.basename(p))[0] for p in bin_fas}
 
         if summary:
             try:
@@ -2022,7 +2098,9 @@ class DasToolContract(_BaseContract):
                         # DAS_Tool emits 0–1 in some versions, 0–100 in others (1.1.7) — normalize to %.
                         if comp <= 1.0: comp *= 100.0
                         if red  <= 1.0: red  *= 100.0
-                        max_red = max(max_red, red)
+                        if red > max_red:
+                            max_red = red
+                            max_red_bin = row.get("bin") or row.get("bin_ID") or row.get("bin_id")
                         scores.append(max(0.0, comp - 5.0 * red))
             except Exception:
                 pass
@@ -2030,9 +2108,25 @@ class DasToolContract(_BaseContract):
         # A bin with high SCG_redundancy is a likely CHIMERA of >=2 genomes (closely related
         # species co-bin). Surface it as a metric + a warning so the finalizer can flag a
         # "missing" dominant taxon that is actually merged inside the contaminated bin.
-        _chi = (f"  [CHIMERA WARNING: a bin has SCG_redundancy={max_red:.0f}% — likely 2+ merged "
-                f"genomes; a 'missing' taxon may be hidden inside it]") if max_red > 10.0 else ""
-        _metrics = {"n_bins": n_bins, "max_scg_redundancy_pct": round(max_red, 1)}
+        # NAME + RESOLVE "kept vs dropped" HERE (real failure this fixes): the contract has
+        # both the summary row AND the actual bin FASTA list in hand right now — resolving
+        # "is this bin in the final kept set?" here, with certainty, and stating it explicitly
+        # in the reason text, is far more reliable than passing a bare unnamed percentage
+        # downstream and letting the finalizer LLM guess which bin it belongs to (it guessed
+        # wrong in practice: it described a KEPT bin with 24% redundancy as "a raw bin not
+        # carried forward", when the bin was in fact one of the final representative MAGs).
+        _chi = ""
+        if max_red > 10.0:
+            _kept = (max_red_bin in _kept_bin_names) if max_red_bin else None
+            _who = max_red_bin or "an unnamed bin"
+            _status = "KEPT in the final bin set" if _kept else (
+                "NOT in the final bin set (excluded)" if _kept is False else "kept-status unresolved"
+            )
+            _chi = (f"  [CHIMERA WARNING: bin '{_who}' has SCG_redundancy={max_red:.0f}% — likely "
+                    f"2+ merged genomes; a 'missing' taxon may be hidden inside it. This bin is "
+                    f"{_status} — do not contradict this when describing it.]")
+        _metrics = {"n_bins": n_bins, "max_scg_redundancy_pct": round(max_red, 1),
+                    "max_scg_redundancy_bin": max_red_bin}
 
         if scores:
             avg = sum(scores) / len(scores)
@@ -3343,6 +3437,10 @@ class Archs4Contract(_BaseContract):
 # ===========================================================================
 
 _ALL_CONTRACTS: List[_BaseContract] = [
+    # Filtlong BEFORE Fastp: a "filter reads with filtlong" step must be graded by the
+    # non-empty-output filtlong contract, not by the generic fastp contract (which never
+    # checked output size and let a 0-byte filtered FASTQ pass as ok=True, blocking Flye).
+    FiltlongContract(),
     # QC / trimming
     FastpContract(),
     FastqcContract(),
@@ -3370,6 +3468,13 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     # otherwise silently mis-score a polishing step under assembly-N50 semantics.
     MedakaContract(),
     RaconContract(),
+    # Read-mapping / depth — MUST be checked BEFORE AssemblyContract: a mapping step title
+    # says "Map reads ... to the CO-ASSEMBLY with minimap2 ... jgi_summarize_bam_contig_depths",
+    # and AssemblyContract's "co-assembly" keyword + "*.fasta" catch-all would otherwise steal
+    # it and score it 1.00 off the (previous) contig file — passing the step as "done" WITHOUT
+    # ever producing the sorted BAMs / depth.txt, so the next (binning) step has no depth file
+    # and fails. Checking Minimap2Contract first requires the real depth/BAM output.
+    Minimap2Contract(),
     # Assembly
     AssemblyContract(),
     QuastContract(),
@@ -3384,10 +3489,10 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     ConcoctContract(),
     MaxBin2Contract(),
     MetaBat2Contract(),
-    # Coverage / mapping / dereplication / amplicon (added contracts — specific
-    # keywords, no overlap with existing ones; placed here so they get first match).
+    # Coverage / dereplication / amplicon (added contracts — specific keywords,
+    # no overlap with existing ones; placed here so they get first match).
+    # (Minimap2Contract moved up before AssemblyContract — see note above.)
     CoverMContract(),
-    Minimap2Contract(),
     Dada2Contract(),
     IRepContract(),
     MobReconContract(),

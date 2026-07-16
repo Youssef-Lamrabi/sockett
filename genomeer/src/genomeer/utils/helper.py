@@ -396,7 +396,79 @@ def run_python_code(code: str, *, env_name: Optional[str] = None, log_cb=None, t
     """
     path = None  # must be initialised before try so finally never hits NameError
     code = code.strip("```").strip()
-    try: 
+
+    # --- Pre-execution GENOMEER-IMPORT GUARD (GENERAL, tool-agnostic) -------------------------
+    # Executable scripts run in an ISOLATED micromamba env (e.g. meta-env1) that does NOT have
+    # the genomeer package or its deps (langchain_core, etc.) installed. Any `import genomeer` /
+    # `from genomeer ...` therefore crashes deep inside genomeer's own __init__ chain with a
+    # MISLEADING error like "ModuleNotFoundError: No module named 'langchain_core'", which sends
+    # the repair loop chasing a phantom missing-dependency instead of the real mistake (importing
+    # the package at all). Catch it here for EVERY tool with a precise, actionable message so the
+    # model rewrites the logic inline (subprocess/CLI call) instead of importing the package.
+    if env_name:  # only relevant when running in a separate env, never for the in-process REPL
+        for _raw in code.split("\n"):
+            _s = _raw.lstrip()
+            if _s.startswith("from genomeer") or _s.startswith("import genomeer"):
+                return (
+                    "Error running this script\nExit code: 1\n"
+                    "--- IMPORT GUARD (the code was NOT executed) ---\n"
+                    f"Forbidden import detected: {_s.strip()!r}\n"
+                    "The `genomeer` package is NOT installed in the execution environment "
+                    f"({env_name}); importing it fails with a misleading 'No module named "
+                    "langchain_core' error. Do NOT import genomeer.* in an executable script.\n"
+                    "FIX: implement the needed action INLINE — call the underlying CLI tool via "
+                    "subprocess (e.g. prefetch/fasterq-dump, or an ENA/EBI download URL with "
+                    "urllib/requests), or inline the plain-Python logic. Keep the rest of the "
+                    "working script; only replace the genomeer import + its usage."
+                )
+
+    # --- Pre-execution SYNTAX CHECK + safe auto-fix (GENERAL: catches ANY IndentationError/
+    # SyntaxError BEFORE spawning a process, so a broken script never wastes a full micromamba
+    # run + timeout, and the repair loop gets a PRECISE line-anchored error instead of a slow
+    # runtime traceback that the model kept re-introducing across retries). ---
+    import ast as _ast
+    def _syn_err(_src):
+        try:
+            _ast.parse(_src); return None
+        except (SyntaxError, IndentationError) as _e:
+            return _e
+    _se = _syn_err(code)
+    if _se is not None:
+        # Safe deterministic fix: convert LEADING tabs (only) to 4 spaces — the #1 cause of
+        # IndentationError — without touching tabs inside string literals. Re-check.
+        def _fix_leading_tabs(_src):
+            _out = []
+            for _l in _src.split("\n"):
+                _i = 0
+                while _i < len(_l) and _l[_i] in " \t":
+                    _i += 1
+                _out.append(_l[:_i].replace("\t", "    ") + _l[_i:])
+            return "\n".join(_out)
+        _fixed = _fix_leading_tabs(code)
+        if _syn_err(_fixed) is None:
+            code = _fixed  # auto-fixed a tab/space indentation problem → proceed to run
+        else:
+            _se2 = _syn_err(code)
+            # BLOCK ONLY on IndentationError — whitespace structure is IDENTICAL across Python
+            # versions, so this is safe. A plain SyntaxError is NOT blocked: it may be perfectly
+            # valid syntax in the TARGET env (e.g. Python 3.12 f-strings / PEP 695 generics) that
+            # THIS backend interpreter (an older Python) simply cannot parse — false-blocking it
+            # would fail steps that used to pass. Let such code run in its real env instead.
+            if isinstance(_se2, IndentationError):
+                _ln = getattr(_se2, "lineno", 0) or 0
+                _rows = code.split("\n")
+                _ctx = f">>> offending line {_ln}: {_rows[_ln - 1]!r}" if 1 <= _ln <= len(_rows) else ""
+                return (
+                    "Error running this script\nExit code: 1\n"
+                    "--- SYNTAX PRE-CHECK (the code was NOT executed) ---\n"
+                    f"IndentationError: {getattr(_se2, 'msg', _se2)} (line {_ln})\n{_ctx}\n"
+                    "FIX: correct ONLY the indentation of that exact line and keep the rest of the "
+                    "working script — do not regenerate everything from scratch."
+                )
+            # non-indentation SyntaxError → do not block (possible version-specific valid syntax);
+            # fall through and execute in the target env exactly as before this pre-check existed.
+
+    try:
         # --- Case 1: run in a micromamba environment ---
         if env_name:
             try:

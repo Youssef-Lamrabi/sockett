@@ -13,6 +13,9 @@ import {
   hideAssistantTyping,
   renderUserMessageWithAttachments,
   renderAssistantMarkdownStatic,
+  attachReloadStepSummary,
+  _resetReloadStepResult,
+  scrollChatSticky,
 } from './agent_render.js';
 
 const api = {
@@ -286,6 +289,10 @@ async function loadSessionMessages(sid) {
         // ── ORDERED replay: reproduce the EXACT live interleaving of chat text and
         // Step cards (fixes Step cards being dumped below the report after refresh). ──
         let _buf = '';
+        // status value ('done'/'blocked'/...) if the IMMEDIATELY preceding log was STATUS.
+        // A TEXT right after a STATUS is the observer's per-step summary → attach it onto
+        // the Step card (like live), not as a loose middle bubble.
+        let _prevStatus = null;
         const _flush = () => {
           if (_buf.trim()) renderAssistantMarkdownStatic(_buf);
           _buf = '';
@@ -294,15 +301,38 @@ async function loadSessionMessages(sid) {
           const _t = String(L.tag || '').toUpperCase();
           const _body = L.body || '';
           if (_t === 'TEXT') {
+            if (_prevStatus !== null) {
+              // observer step-result summary → attach onto the current Step card (mirrors
+              // live; stops "Exit code 1 — execution failed" appearing as a loose bubble on refresh)
+              _flush();
+              const consumed = attachReloadStepSummary(_prevStatus, _body);
+              _prevStatus = null;
+              if (consumed) continue;   // handled — do not also render a bubble
+            }
             // accumulate consecutive chat text into one bubble (mirrors live grouping)
             _buf += (_buf ? '\n\n' : '') + _body;
           } else if (_CHAT_CARD.has(_t)) {
             // a chat card breaks the current text bubble, exactly like live
             _flush();
+            _prevStatus = null;
+            // a NEW step (RUNNING) starts a fresh result box (so its retries replace, not stack)
+            if (_t === 'RUNNING') _resetReloadStepResult();
             renderAssistantEvent({ type: 'block', tag: _t, text: _body });
           } else {
             // right-pane logs (EXECUTE/OBSERVE/LOGS/THINK/STATUS) — do NOT break chat flow
             renderLogBlock(_t, _body);
+            if (_t === 'STATUS' && L.note) {
+              // Preferred: the observer's report text was saved directly on this STATUS
+              // log entry (see routes_chat.py) — attach the colored result line now,
+              // synchronously, instead of waiting for a TEXT log that no longer follows
+              // (that text now streams as 'think', which isn't persisted to saved_logs).
+              _flush();
+              attachReloadStepSummary(_body, L.note);
+              _prevStatus = null;
+            } else {
+              // Fallback for older saved sessions without a `note` field.
+              _prevStatus = (_t === 'STATUS') ? _body : null;
+            }
           }
         }
         _flush();
@@ -834,28 +864,31 @@ async function uploadFile() {
 
 /* --------------------- while agent respond ------------------------------ */
 let _wsPollTimer = null;
+let _wsAutoOpenedThisRun = false;   // panel already auto-opened once during the current run?
+let _wsLastGeneratedCount = 0;      // # of generated files seen by the last file-list fetch
 function setComposerBusy(busy) {
   composerBusy = busy;
 
-  // Live workspace sync: while a run is active, poll the file panel every few
-  // seconds so files produced mid-step appear WITHOUT a manual refresh. The
-  // previous block-event trigger alone was starved by the shared debounce and
-  // by long steps that stream no blocks. Guarded by fe-open (no fetch when the
-  // panel is closed) and refreshWorkspaceFiles no-ops when nothing changed.
+  // Live workspace sync: while a run is active, poll the file list every few
+  // seconds so files produced mid-step appear WITHOUT a manual refresh, AND
+  // auto-open the panel the first time any file appears. The previous version
+  // gated the poll on the panel already being open (`if (open) ...`) — but the
+  // panel only auto-opened on an OBSERVE block, which for a long single step
+  // never streams until the step ends (hours later). So nothing ever opened and
+  // nothing ever synced. Now the poll runs regardless of open state (the fetch
+  // is cheap and refreshWorkspaceFiles no-ops its re-render when nothing changed
+  // via its signature check), and it opens the panel once per run when files
+  // first exist. Auto-open is one-shot per run (respects a manual close).
   try {
     if (busy) {
       if (!_wsPollTimer) {
-        _wsPollTimer = setInterval(() => {
-          try {
-            const open = document.getElementById('content-area')?.classList.contains('fe-open');
-            if (open) refreshWorkspaceFiles().catch(() => { });
-          } catch { }
-        }, 3000);
+        _wsAutoOpenedThisRun = false;   // new run → allow one auto-open when files first appear
+        _wsPollTimer = setInterval(() => { _wsPollTick(); }, 3000);
       }
     } else if (_wsPollTimer) {
       clearInterval(_wsPollTimer);
       _wsPollTimer = null;
-      try { window.refreshWorkspaceSoon?.(300); } catch { }  // final catch-up
+      try { _wsPollTick(); } catch { }  // final catch-up after the run ends
     }
   } catch { }
 
@@ -1131,7 +1164,7 @@ function renderAssistantHistoryPlain(text) {
   div.className = 'msg assistant';
   div.innerHTML = `<div class="bubble">${escapeHtml(text || '').replace(/\n/g, '<br>')}</div>`;
   chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
 }
 
 
@@ -1359,16 +1392,10 @@ function boot() {
   // also scroll when renderers signal that logs changed
   window.addEventListener('logs:changed', () => scrollLogsSmooth());
 
-  // Auto-open workspace panel when agent produces a file (detected via OBSERVE block)
+  // Auto-open workspace panel when agent produces a file (detected via OBSERVE block).
+  // Shared with the live poll-tick path (_wsPollTick) via _autoOpenWorkspace().
   window.addEventListener('workspace:file-detected', () => {
-    const contentArea = el('content-area');
-    const feEl = el('file-explorer');
-    const feBtn = el('btn-file-explorer');
-    if (!contentArea || contentArea.classList.contains('fe-open')) return; // already open
-    contentArea.classList.add('fe-open');
-    feEl?.setAttribute('aria-hidden', 'false');
-    feBtn?.classList.add('active');
-    feBtn?.setAttribute('aria-expanded', 'true');
+    if (_autoOpenWorkspace()) _wsAutoOpenedThisRun = true;
     // Refresh file list with a short delay so the server has time to flush the file
     try { window.refreshWorkspaceSoon?.(600); } catch { }
   });
@@ -1882,6 +1909,10 @@ async function refreshWorkspaceFiles() {
     const data = await res.json();
     const uploads = Array.isArray(data?.uploads) ? data.uploads : [];
     const generated = Array.isArray(data?.generated) ? data.generated : [];
+    // Track the count BEFORE the signature early-return below, so the live poll
+    // tick can decide to auto-open even on a poll where the list is unchanged.
+    // Count generated + uploads: a run's first artifact may land in either.
+    _wsLastGeneratedCount = generated.length + uploads.length;
     _wsLastHiddenCount = Number(data?.hidden_count || 0);
     // Signature includes hidden_count so toggling show=success<->all forces re-render.
     const sig = JSON.stringify([uploads.map(f => [f.rel_path, f.size, f.mtime]),
@@ -2425,6 +2456,37 @@ function refreshWorkspaceSoon(delay = 800) {
   clearTimeout(_wsDebounceTimer);
   _wsDebounceTimer = setTimeout(() => { refreshWorkspaceFiles().catch(() => { }); }, delay);
 }
+// Open the workspace panel (idempotent). Returns true only if it actually
+// transitioned from closed -> open (so callers can record the one-shot flag).
+// Shared by the OBSERVE 'workspace:file-detected' listener and the live poll.
+function _autoOpenWorkspace() {
+  const contentArea = el('content-area');
+  const feEl = el('file-explorer');
+  const feBtn = el('btn-file-explorer');
+  if (!contentArea || contentArea.classList.contains('fe-open')) return false; // already open
+  contentArea.classList.add('fe-open');
+  feEl?.setAttribute('aria-hidden', 'false');
+  feBtn?.classList.add('active');
+  feBtn?.setAttribute('aria-expanded', 'true');
+  return true;
+}
+
+// One poll cycle (runs every 3s while a run is active, regardless of panel state).
+// Always fetches the current file list (cheap; refreshWorkspaceFiles no-ops its
+// re-render when unchanged), then auto-opens the panel the FIRST time any file
+// exists this run — decoupled from OBSERVE-block timing so it works for long
+// single-step runs too. One-shot per run: if the user then closes the panel we
+// do not fight them by re-opening (the 3s sync into the hidden panel continues).
+async function _wsPollTick() {
+  try {
+    await refreshWorkspaceFiles();
+    const open = document.getElementById('content-area')?.classList.contains('fe-open');
+    if (!open && !_wsAutoOpenedThisRun && _wsLastGeneratedCount > 0) {
+      if (_autoOpenWorkspace()) _wsAutoOpenedThisRun = true;
+    }
+  } catch { /* never break the run on a workspace poll */ }
+}
+
 // Expose globally so other modules can trigger refreshes without imports
 window.refreshWorkspaceFiles = refreshWorkspaceFiles;
 window.refreshWorkspaceSoon = refreshWorkspaceSoon;
@@ -3158,6 +3220,22 @@ window.addEventListener('DOMContentLoaded', () => { _amInstallLabelIntercept(); 
     let activeTab = 'tools';
     let loaded = false;
 
+    // Display order of categories in the panel (bio-relevant first, generic last).
+    // Any category not listed falls to the end, keeping its original relative order.
+    const CATEGORY_ORDER = [
+      'Metagenomics', 'Genomics', 'Viromics', 'longread',
+      'NCBI / Web', 'Database', 'Utilities', 'Workspace',
+    ];
+    const _catRank = (c) => {
+      const i = CATEGORY_ORDER.indexOf(c || '');
+      return i === -1 ? 999 : i;
+    };
+    // Stable sort by category rank (preserves within-category order via original index).
+    const _orderByCategory = (arr) =>
+      arr.map((it, i) => [it, i])
+         .sort((a, b) => (_catRank(a[0].category) - _catRank(b[0].category)) || (a[1] - b[1]))
+         .map((x) => x[0]);
+
     async function ensureCatalog() {
       if (loaded) return;
       loaded = true;
@@ -3173,10 +3251,12 @@ window.addEventListener('DOMContentLoaded', () => { _amInstallLabelIntercept(); 
       if (!CATALOG) return;
       const items = (activeTab === 'databases' ? CATALOG.databases : CATALOG.tools) || [];
       const q = (search.value || '').trim().toLowerCase();
-      const filt = q ? items.filter(it =>
+      const filtRaw = q ? items.filter(it =>
         (it.name || '').toLowerCase().includes(q) ||
         (it.category || '').toLowerCase().includes(q) ||
         (it.description || '').toLowerCase().includes(q)) : items;
+      // Impose the category display order (Metagenomics → Genomics → Viromics → …).
+      const filt = _orderByCategory(filtRaw);
       list.innerHTML = '';
       if (!filt.length) {
         const d = document.createElement('div');

@@ -1,5 +1,26 @@
 const $ = (id) => document.getElementById(id);
 
+// --- Sticky chat auto-scroll -------------------------------------------------
+// Only auto-scroll the chat to the bottom when the user is ALREADY near the bottom.
+// If they scroll UP (e.g. to re-read while the agent is streaming), leave them there
+// instead of yanking them back down on every token. Scrolling back near the bottom
+// re-engages follow mode; sending a message calls resetChatStick() to re-follow.
+let _chatStick = true;
+function _bindChatScroll() {
+  const c = $('chat');
+  if (!c || c.__stickBound) return;
+  c.__stickBound = true;
+  c.addEventListener('scroll', () => {
+    _chatStick = (c.scrollHeight - c.scrollTop - c.clientHeight) <= 80;
+  }, { passive: true });
+}
+export function scrollChatSticky() {
+  const c = $('chat'); if (!c) return;
+  _bindChatScroll();
+  if (_chatStick) c.scrollTop = c.scrollHeight;
+}
+export function resetChatStick() { _chatStick = true; }
+
 /* -------------------- toggle: live typing or instant paste -------------- */
 const CHAT_SIMULATE_TYPING = true;
 const CHAT_TYPING_TICK_MS = 5;
@@ -170,7 +191,7 @@ function beginAssistantMessage() {
   div.innerHTML = `<div class="bubble"><div class="live"></div></div>`;
   chat.appendChild(div);
   currentAssistantEl = div;
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
   return div;
 }
 function liveContainer() {
@@ -192,7 +213,7 @@ function appendAssistantMarkdown(mdChunk = "") {
   frag.innerHTML = html;
   container.appendChild(frag);
   highlightIn(container);
-  const chat = $('chat'); if (chat) chat.scrollTop = chat.scrollHeight;
+  const chat = $('chat'); if (chat) scrollChatSticky();
 }
 
 // create a standalone system bubble in chat (separate from streaming)
@@ -202,17 +223,18 @@ function renderChatCard(html) {
   div.className = 'msg assistant';
   div.innerHTML = `<div class="bubble">${html}</div>`;
   chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
   return div;
 }
 
 export function renderUserMessage(content) {
   const chat = $('chat'); if (!chat) return;
+  resetChatStick();   // sending a message re-engages follow-to-bottom
   const item = document.createElement('div');
   item.className = 'msg user';
   item.innerHTML = `<div class="bubble user-bubble">${escapeHtml(content).replace(/\n/g, '<br>')}</div>`;
   chat.appendChild(item);
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
   if (inFeedbackMode()) retireActiveReview('');
 }
 export function renderAssistantMessage(content) {
@@ -228,7 +250,7 @@ export function showAssistantTyping() {
   div.innerHTML = `<div class="bubble"><span class="dots"><span></span><span></span><span></span></span></div>`;
   chat.appendChild(div);
   typingEl = div;
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
 }
 export function hideAssistantTyping() {
   if (typingEl?.parentNode) typingEl.parentNode.removeChild(typingEl);
@@ -237,6 +259,7 @@ export function hideAssistantTyping() {
 
 export function renderUserMessageWithAttachments(content, attachments = []) {
   const chat = $('chat'); if (!chat) return;
+  resetChatStick();   // sending a message re-engages follow-to-bottom
 
   const grid = attachments && attachments.length ? `
     <div class="att-grid" style="display:flex;flex-wrap:wrap;gap:10px;margin:0 0 10px 0;">
@@ -271,7 +294,7 @@ export function renderUserMessageWithAttachments(content, attachments = []) {
       <div>${escapeHtml(content || '').replace(/\n/g, '<br>')}</div>
     </div>`;
   chat.appendChild(item);
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
 }
 
 /* --------- live typing (only when CHAT_SIMULATE_TYPING = true) ---------- */
@@ -300,7 +323,7 @@ function tickTypewriter() {
     c.innerHTML += escapeHtml(take).replace(/\n/g, '<br>');
   }
 
-  const chat = $('chat'); if (chat) chat.scrollTop = chat.scrollHeight;
+  const chat = $('chat'); if (chat) scrollChatSticky();
 }
 
 
@@ -733,7 +756,54 @@ function attachStepResultPhrase(chatEl, status, phrase) {
     `margin-top:8px;padding:6px 10px;border:1px solid ${border};background:${bg};` +
     `color:${color};border-radius:8px;font-size:13px;line-height:1.4;`;
   line.textContent = phrase;
-  const chat = $('chat'); if (chat) chat.scrollTop = chat.scrollHeight;
+  const chat = $('chat'); if (chat) scrollChatSticky();
+}
+
+// Reload-replay helper: attach an observer step-result summary onto the CURRENT step
+// card, exactly like the LIVE path does via pendingStepResult (which the static reload
+// replay skips). Without this, on refresh the per-step summaries — especially a failed
+// attempt's "Exit code 1 — execution failed" — were dumped as LOOSE middle bubbles that
+// don't appear in the live view, so the green/red step results looked different after a
+// refresh. Returns true if it consumed the text (caller must NOT also render a bubble).
+// Tracks the standalone result box of the CURRENT step during reload, so successive
+// summaries for the SAME step (a failed retry then the final success) REPLACE it instead
+// of stacking — mirroring live, where the card's single .run-result line is overwritten
+// and only the FINAL outcome shows. Reset to null whenever a new Step (RUNNING) card starts.
+let _reloadStepResultEl = null;
+export function _resetReloadStepResult() { _reloadStepResultEl = null; }
+
+export function attachReloadStepSummary(statusVal, summaryText) {
+  const chat = $('chat'); if (!chat) return false;
+  const phrase = _shortResultPhrase(summaryText || '');
+  if (!phrase) return false;
+  const status = String(statusVal || '').trim().toLowerCase();
+  // 1) Preferred: attach onto the current Step card (matches live exactly; auto-replaces).
+  if (currentRun && currentRun.chatEl && currentRun.chatEl.querySelector('.run-card')) {
+    attachStepResultPhrase(currentRun.chatEl, status, phrase);
+    _reloadStepResultEl = null;   // card path owns the result; drop any standalone box
+    return true;
+  }
+  // 2) Fallback (robust): card ref gone by reload time — use a STANDALONE colored box, but
+  //    UPDATE the SAME box for this step (rather than stacking) so only the FINAL outcome
+  //    shows (green=success / red=fail), never both the failed retry AND the final success.
+  const isFail = /(block|fail|error|abort|stop|cancel)/i.test(status);
+  const color  = isFail ? '#8b0000' : '#0B6B0B';
+  const border = isFail ? '#F5B7B7' : '#9BD09B';
+  const bg     = isFail ? '#FFF0F0' : '#F1FBF1';
+  const css = `margin:4px 0;padding:6px 10px;border:1px solid ${border};background:${bg};` +
+    `color:${color};border-radius:8px;font-size:13px;line-height:1.4;`;
+  if (_reloadStepResultEl && _reloadStepResultEl.isConnected) {
+    const inner = _reloadStepResultEl.querySelector('.run-result');
+    if (inner) { inner.style.cssText = css; inner.textContent = phrase; }
+    return true;   // replaced this step's box with the newer outcome
+  }
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.innerHTML = `<div class="run-result" style="${css}">${escapeHtml(phrase)}</div>`;
+  chat.appendChild(div);
+  _reloadStepResultEl = div;
+  chat.scrollTop = chat.scrollHeight;
+  return true;
 }
 
 export function renderAssistantMarkdownStatic(md = "") {
@@ -743,7 +813,7 @@ export function renderAssistantMarkdownStatic(md = "") {
   div.innerHTML = `<div class="bubble">${mdToHtml(md)}</div>`;
   chat.appendChild(div);
   highlightIn(div);
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatSticky();
 }
 
 /* ------------------------- MISSING -> red list -------------------------- */
@@ -1272,11 +1342,19 @@ export function renderAssistantEvent(evt) {
 
     if (tag === 'STATUS' || tag.startsWith('STATUS:')) {
       const val = tag.includes(':') ? tag.split(':', 2)[1] : parseStatusValue(raw);
-      // Capture the middle Step card NOW — before markRunInactive() nulls
-      // currentRun — so the observer summary (next message event) can attach
-      // its short phrase onto it. Sidebar rendering below stays untouched.
-      pendingStepResult = (currentRun && currentRun.chatEl)
-        ? { card: currentRun.chatEl, status: String(val).trim().toLowerCase() }
+      const statusVal = String(val).trim().toLowerCase();
+      // Preferred: the observer's report text now arrives ON the STATUS event itself
+      // (evt.note — see BioAgent.go_stream), so attach the colored result line RIGHT NOW,
+      // synchronously — no need to wait for (or guess at) a following message event.
+      if (currentRun && currentRun.chatEl && evt.note) {
+        const phrase = _shortResultPhrase(evt.note);
+        if (phrase) attachStepResultPhrase(currentRun.chatEl, statusVal, phrase);
+      }
+      // Fallback kept for any STATUS that carries no note: capture the middle Step card
+      // NOW — before markRunInactive() nulls currentRun — so a message that happens to
+      // follow can still attach its short phrase onto it. Sidebar rendering untouched.
+      pendingStepResult = (currentRun && currentRun.chatEl && !evt.note)
+        ? { card: currentRun.chatEl, status: statusVal }
         : null;
       renderStatusBox(val);
       // if (/^done$/i.test(String(val || '').trim())) clearLiveSpinner();
@@ -1331,8 +1409,15 @@ export function renderAssistantEvent(evt) {
       const body = raw.replace(/^<[^>]+>/, '').replace(/<\/[^>]+>$/, '');
       renderCollapsibleLog(tag, body);
       if (tag === 'OBSERVE') {
-        // Fire if the observation mentions any file path (absolute or relative with extension)
-        const hasFilePath = /(?:\/[\w.\-/]+\.[\w]{1,10}|[\w.\-]+\/[\w.\-]+\.[\w]{1,10})/i.test(body);
+        // Fire if the observation mentions any file path (absolute or relative with extension),
+        // OR a bare filename with a known data-file extension — the ORIGINAL path-only regex
+        // missed the single most common phrasing a step actually prints, e.g. "Downloaded
+        // ERR011087.fastq.gz (38945 bytes)" or "SUCCESS: ... reads for ERR011087." (no leading
+        // directory), so the workspace panel silently never auto-opened for those steps even
+        // though a real file was created. Bare-filename check is extension-gated (not just
+        // "any word.word") to avoid false positives on things like "e.g." or "v1.2".
+        const hasFilePath = /(?:\/[\w.\-/]+\.[\w]{1,10}|[\w.\-]+\/[\w.\-]+\.[\w]{1,10})/i.test(body)
+          || /\b[\w\-]+\.(?:fastq|fq|fasta|fa|fna|faa|gff3?|bam|sam|vcf|bed|tsv|csv|txt|json|html|pdf|png|gz)\b/i.test(body);
         if (hasFilePath) {
           window.dispatchEvent(new CustomEvent('workspace:file-detected'));
         }

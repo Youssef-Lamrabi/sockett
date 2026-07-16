@@ -2931,24 +2931,45 @@ ul {
     display: block;
 }
 /* ===== Tools & Databases panel (additive — opened by Tools button or "@" in chat) ===== */
+/* Matches the width of the visible chat column — same 82%-centered box as
+   #composer (the search/send bar), so its left/right edges line up with
+   the chat content instead of either a tiny fixed-cap popup (old bug: a
+   760px max-width made it much narrower than the chat column on a large
+   screen) or the full #right container edge-to-edge (overshoots past the
+   visible chat/composer content). z-index raised so it reliably renders
+   ON TOP of the chat area when open, instead of appearing to sit behind it. */
 .tools-panel {
     position: absolute;
     left: 50%;
-    transform: translateX(-50%);
+    transform: translate(-50%, 0);
     bottom: 64px;
     width: 82%;
-    max-width: 760px;
-    max-height: 380px;
+    max-width: none;
+    max-height: min(70vh, 560px);
     display: flex;
     flex-direction: column;
     background: var(--panel, #fff);
     border: 1px solid var(--border, #e2e8f0);
     border-radius: 12px;
     box-shadow: var(--shadow, 0 10px 25px rgba(2,6,23,.12));
-    z-index: 60;
+    z-index: 200;
     overflow: hidden;
 }
 .tools-panel[hidden] { display: none; }
+/* Reveal animation: on every open (the JS only toggles the `hidden` attribute,
+   so this fires purely from the [hidden] -> not-[hidden] attribute switch,
+   no JS change needed) the panel starts slightly BELOW and behind the chat
+   (as if emerging from underneath it) and rises + fades into its resting
+   spot, ending elevated ON TOP of the chat (already given by z-index +
+   box-shadow above) — giving the "comes up from behind, lands superimposed
+   on the chat" feel that a plain display:none/flex swap can't convey. */
+.tools-panel:not([hidden]) {
+    animation: tools-panel-rise 240ms cubic-bezier(.16, 1, .3, 1) both;
+}
+@keyframes tools-panel-rise {
+    from { opacity: 0; transform: translate(-50%, 22px) scale(.98); box-shadow: none; }
+    to   { opacity: 1; transform: translate(-50%, 0) scale(1); box-shadow: var(--shadow, 0 10px 25px rgba(2,6,23,.12)); }
+}
 .tools-panel-head { display: flex; align-items: center; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border, #e2e8f0); }
 .tools-panel-search {
     flex: 1; border: 1px solid var(--border, #e2e8f0); border-radius: 8px;

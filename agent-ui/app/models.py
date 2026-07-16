@@ -63,6 +63,8 @@ class MessageLog(Base):
     message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
     tag = Column(String, nullable=False)      # EXECUTE | OBSERVE | LOGS | THINK | STATUS | NEXT
     body = Column(Text, nullable=False)       # inner content only (see router)
+    note = Column(Text, nullable=True)        # STATUS-only: observer report text for the
+                                               # colored step-result line (see routes_chat.py)
     ord = Column(Integer, default=0)          # order within the message
     created_at = Column(DateTime, default=datetime.utcnow)
 

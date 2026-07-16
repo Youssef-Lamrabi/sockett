@@ -341,7 +341,17 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                                         # NEXT / RUNNING / DESCRIPTION / MISSING → keep RAW tagged text
                                         # so the frontend can replay them through the live card renderer.
                                         body_txt = raw
-                                    saved_logs.append({"tag": tag, "body": body_txt})
+                                    _log_entry = {"tag": tag, "body": body_txt}
+                                    if tag == "STATUS":
+                                        # carry the observer's report text (see BioAgent.go_stream)
+                                        # so history replay can attach the same colored step-result
+                                        # line as the live view, without depending on a separate
+                                        # TEXT log arriving right after (it doesn't — the report is
+                                        # routed to 'think' and is never saved as its own log entry).
+                                        _note = evt.get("note")
+                                        if _note:
+                                            _log_entry["note"] = _note
+                                    saved_logs.append(_log_entry)
 
                         except Exception:
                             pass
@@ -385,7 +395,8 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                     db.add(m); db.commit(); db.refresh(m)
                     # persist logs in original order
                     for i, L in enumerate(saved_logs):
-                        db.add(MessageLog(message_id=m.id, tag=L["tag"], body=L["body"], ord=i))
+                        db.add(MessageLog(message_id=m.id, tag=L["tag"], body=L["body"],
+                                           note=L.get("note"), ord=i))
                     db.commit()
                 # ------------------------------------------------------------
 
@@ -541,7 +552,10 @@ def get_messages(session_id: int, db: Session = Depends(get_db), user: User = De
             "created_at": m.created_at.isoformat(),
         }
         if m.role == "assistant":
-            item["logs"] = [{"tag": L.tag, "body": L.body} for L in (m.logs or [])]
+            item["logs"] = [
+                {"tag": L.tag, "body": L.body, **({"note": L.note} if L.note else {})}
+                for L in (m.logs or [])
+            ]
         out.append(item)
     return out
 

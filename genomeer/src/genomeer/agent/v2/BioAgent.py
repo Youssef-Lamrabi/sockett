@@ -913,7 +913,15 @@ class BioAgent:
             # English like "(number of contigs, total length)" and would wrongly strip
             # the entire step description down to just "Step N".
             _CODE_SIGNALS = re.compile(
-                r'[;=]|'                               # assignment or semicolon
+                # NOTE: a bare '[;=]' used to be one of these alternatives — removed
+                # (real failure): ordinary English step descriptions routinely use a
+                # semicolon to join clauses ("download X; verify Y; report Z") or an
+                # '=' in prose ("min_length=1000"); that alone is NOT a reliable sign
+                # of leftover code, and it falsely triggered rule 6 below into wiping
+                # an entire step's title down to just its leading label (e.g. "Step 1: <full description>"
+                # became bare "Step 1") whenever the description also had a ': ' earlier.
+                # The remaining three patterns are much more specific to ACTUAL code
+                # syntax and don't false-positive on normal prose.
                 r'\bimport\s|\bfrom\s+\w+\s+import\b|'  # import statements
                 r'\bdef\s+\w+\s*\(|'                   # function definitions
                 r'\w+\.\w+\s*\('                       # method calls like SeqIO.parse(
@@ -1839,7 +1847,10 @@ class BioAgent:
                 _injections.append(
                     "IMPORTANT — WGSIM READS + FASTP: wgsim assigns quality scores of ~10-15.\n"
                     "Using --qualified_quality_phred 20 (fastp default) will discard ALL reads.\n"
-                    "ALWAYS add --disable_quality_filtering when running fastp on wgsim-simulated reads.\n"
+                    "MANDATORY: use --disable_quality_filtering. This OVERRIDES the step title —\n"
+                    "even if the plan/title says '-q 20' or '-q 15', DO NOT pass -q at all: for wgsim\n"
+                    "reads ANY -q value drops most/all reads (q15 still fails ~half). Keep -l/--length_required\n"
+                    "for length trimming, but quality filtering MUST be disabled entirely.\n"
                     "\n"
                     "  cmd = ['fastp',\n"
                     "         '-i', r1_path, '-I', r2_path,\n"
@@ -1922,10 +1933,9 @@ class BioAgent:
                 )
 
             # minimap2 → samtools mapping injection — triggered on step title only.
-            # The pipe pattern (minimap2 | samtools sort) FAILS in the installed samtools:
-            #   samtools view -b - → "[main_samview] fail to read the header from '-'"
-            #   Popen pipe → samtools sort exits early → minimap2 gets SIGPIPE → "minimap2 failed"
-            # The only reliable approach is: minimap2 → SAM file → samtools view -bS → BAM → sort → index
+            # samtools is now 1.23.1 (upgraded from 0.1.19). The SAM-file approach stays the
+            # most RELIABLE path (a Popen pipe can still SIGPIPE, and process substitution `<(...)`
+            # is hard-blocked by the security checker): minimap2 → SAM file → view -bS → sort -o → index.
             if any(k in _step_title_ctx for k in ("minimap2", "map reads", "read mapping",
                                                    "read alignment", "coverage depth",
                                                    "bam", "samtools", "jgi_summarize")):
@@ -1949,10 +1959,9 @@ class BioAgent:
                     "  if res.returncode != 0:\n"
                     "      sys.exit(f'minimap2 failed: {res.stderr.decode()}')\n"
                     "\n"
-                    "  # Step 2: SAM → BAM  (-bS: -b=output BAM, -S=input is SAM — required here)\n"
-                    "  # CRITICAL: -o flag may not work in this samtools version — it outputs BAM to stdout.\n"
-                    "  # BAM is binary (gzip-compressed); NEVER use text=True or capture_output=True here.\n"
-                    "  # Redirect stdout to the bam file using stdout=open(bam_path, 'wb').\n"
+                    "  # Step 2: SAM → BAM  (-b=output BAM, -S=input is SAM). samtools 1.x accepts\n"
+                    "  # `-o bam_path`, but redirecting stdout to a binary file also works and is robust.\n"
+                    "  # BAM is gzip-compressed binary; NEVER use text=True or capture_output=True here.\n"
                     "  with open(bam_path, 'wb') as _bam_f:\n"
                     "      res = subprocess.run(\n"
                     "          ['samtools', 'view', '-bS', sam_path],\n"
@@ -1962,14 +1971,12 @@ class BioAgent:
                     "  if not os.path.exists(bam_path) or os.path.getsize(bam_path) == 0:\n"
                     "      sys.exit('samtools view produced empty BAM')\n"
                     "\n"
-                    "  # Step 3: sort BAM — this is the OLD samtools (v0.x) syntax:\n"
-                    "  #   samtools sort <in.bam> <out.prefix>  →  creates <out.prefix>.bam\n"
-                    "  # In this old version, -o is a FLAG with NO argument (means 'output to stdout'),\n"
-                    "  # NOT '-o output.bam' like modern samtools. NEVER use -o here.\n"
-                    "  # Pass the prefix WITHOUT the .bam extension; samtools appends .bam automatically.\n"
-                    "  sorted_prefix = sorted_bam[:-4] if sorted_bam.endswith('.bam') else sorted_bam\n"
+                    "  # Step 3: sort BAM — samtools 1.x syntax: -o TAKES the output filename.\n"
+                    "  #   samtools sort -o <out.bam> <in.bam>\n"
+                    "  # (The old 0.x positional form 'samtools sort in.bam prefix' was REMOVED and now\n"
+                    "  #  errors 'Use -T PREFIX / -o FILE'. This env now ships samtools 1.23.1.)\n"
                     "  res = subprocess.run(\n"
-                    "      ['samtools', 'sort', bam_path, sorted_prefix],\n"
+                    "      ['samtools', 'sort', '-o', sorted_bam, bam_path],\n"
                     "      stderr=subprocess.PIPE, timeout=300)\n"
                     "  if res.returncode != 0:\n"
                     "      sys.exit(f'samtools sort failed: {res.stderr.decode(errors=\"replace\")}')\n"
@@ -1993,11 +2000,10 @@ class BioAgent:
                     "      sys.exit(f'jgi_summarize_bam_contig_depths failed: {res.stderr.decode(errors=\"replace\")}')\n"
                     "  print(f'Depth file: {depth_path}')\n"
                     "\n"
-                    "  WRONG: samtools sort bam -o sorted.bam → in old samtools, -o = stdout flag (no arg) → fails\n"
-                    "  WRONG: samtools sort bam (no output) → 'Usage: samtools sort <in.bam> <out.prefix>'\n"
-                    "  WRONG: samtools view -bS sam -o bam + capture_output=True/text=True\n"
-                    "         → -o flag ignored, BAM written to stdout, UnicodeDecodeError (0x8b = gzip)\n"
-                    "  WRONG: Popen pipe minimap2 | samtools sort → SIGPIPE, minimap2 fails\n"
+                    "  CORRECT (samtools 1.23.1): samtools sort -o sorted.bam in.bam   (-o TAKES the filename)\n"
+                    "  WRONG: samtools sort in.bam out.prefix (old 0.x positional) → 'Use -T PREFIX / -o FILE'\n"
+                    "  WRONG: reading a BAM with capture_output=True/text=True → BAM is gzip binary → UnicodeDecodeError (0x8b)\n"
+                    "  WRONG: bash process substitution samtools sort <(minimap2 ...) → security checker blocks it → infinite loop\n"
                     "  WRONG: omitting -S in samtools view -bS → samtools may reject SAM input\n"
                     "  NOTE: samtools --version exits with code 1 on some versions — NORMAL, not missing.\n"
                     "  NOTE: jgi_summarize_bam_contig_depths --version segfaults — never call it."
@@ -2091,7 +2097,16 @@ class BioAgent:
                     "  NOTE: also inspect the DAS_Tool summary SCG_redundancy per kept bin — a bin with\n"
                     "        redundancy >10% is a likely CHIMERA hiding a second genome; report it and, if a\n"
                     "        member is still missing after thr=0.3, recover any per-binner bin that CheckM2\n"
-                    "        rates >=90% complete / <=5% contaminated and is absent from the consensus set."
+                    "        rates >=90% complete / <=5% contaminated and is absent from the consensus set.\n"
+                    "  ⚠ DO NOT CONFLATE 'flagged' WITH 'dropped' (real failure): a bin with elevated "
+                    "SCG_redundancy that appears in <prefix>_DASTool_bins/ (or whichever threshold's bin "
+                    "list you kept) IS one of your final representative bins — it was KEPT, just flagged "
+                    "for review. Never describe it as 'a raw bin not carried forward' or 'excluded' — that "
+                    "claim is only true for bins that are ABSENT from the final bins directory (e.g. very "
+                    "low-completeness raw bins from a single binner that never made it into the DAS_Tool "
+                    "output at all). Before writing ANY sentence about a bin being dropped/excluded/not "
+                    "carried forward, check its name against the actual filenames in the final bins dir — "
+                    "if it's there, describe it as a KEPT bin with a caveat, not a dropped one."
                 )
 
             # dRep dereplication injection — subprocess does NOT expand shell globs, so a
@@ -4990,9 +5005,14 @@ class BioAgent:
         
         # Compile the workflow
         # --------------------------------------------------------------------------------
-        self.app = workflow.compile()
+        # The checkpointer MUST be passed to .compile() — LangGraph only persists/restores
+        # per-thread state (the plan, current_idx, completed steps, run_temp_dir) across
+        # separate .stream() calls when it is wired in at COMPILE time. Setting
+        # `self.app.checkpointer = ...` AFTER compile does NOT enable checkpointing, so a
+        # follow-up turn (e.g. "continue from step 2") started with an empty state and the
+        # agent had lost the whole plan → it asked the user for context instead of resuming.
         self.checkpointer = MemorySaver()
-        self.app.checkpointer = self.checkpointer
+        self.app = workflow.compile(checkpointer=self.checkpointer)
 
 
     # OTHER UTILS
@@ -7454,14 +7474,72 @@ class BioAgent:
                     out = pretty_print(message)
                     self.log.append(out)
 
-                    for seg in self.extract_tagged_blocks(text):
+                    _segs = self.extract_tagged_blocks(text)
+                    # If this message carries generated CODE (an <EXECUTE> block), the
+                    # untagged prose around it is the generator's code-writing REASONING —
+                    # route it to 'think' (right-pane logs), NOT to the middle chat as a
+                    # 'message'. Without this a verbose backbone (e.g. deepseek) dumps its
+                    # full monologue into the chat, most visibly on a FAILED step's repair
+                    # regeneration. User-facing text (qa answer, finalizer report) carries
+                    # no EXECUTE block, so it still streams to the chat normally.
+                    _has_code = any(
+                        seg["kind"] != "text"
+                        and str(seg.get("tag", "")).upper() in ("EXECUTE", "CODE")
+                        for seg in _segs
+                    )
+                    # Same routing for the OBSERVER's per-step report: it always ends its
+                    # response with <STATUS:done|blocked>, and the STATUS tag is EXCLUSIVE
+                    # to the observer (never emitted by qa/finalizer, which carry the real
+                    # user-facing answer) — so untagged text sharing a message with a STATUS
+                    # tag is always the observer's internal "Summary / Root cause / Instruction
+                    # for CODE_GENERATOR" report, not chat prose. It streams to the frontend
+                    # as a 'message' BEFORE its own STATUS block arrives, so the existing
+                    # pendingStepResult shortener (which only fires on a message AFTER a
+                    # STATUS) never catches it — the full raw report was dumped as a chat
+                    # bubble on every failed step. Route it to 'think' instead, same as code
+                    # reasoning; the short step-result phrase is attached separately once
+                    # STATUS is parsed.
+                    _has_status = any(
+                        seg["kind"] != "text"
+                        and str(seg.get("tag", "")).upper() == "STATUS"
+                        for seg in _segs
+                    )
+                    # Carry the observer's report text ALONG WITH its own STATUS block (as an
+                    # extra "note" field) instead of relying on it arriving as a separate later
+                    # 'message' event — the old pendingStepResult mechanism assumed a message
+                    # would follow STATUS, but the report is emitted BEFORE its own STATUS tag
+                    # in the SAME response, so that consumption never fired and the green/red
+                    # per-step result line silently stopped appearing once the report text was
+                    # routed to 'think' above. Attaching it directly to the STATUS event makes
+                    # the frontend's colored result line synchronous and order-independent.
+                    # NOTE: only text BEFORE the STATUS tag is the observer's verbose report —
+                    # some paths (e.g. the deterministic FAST-DONE shortcut, which builds
+                    # "<STATUS:done>\nStep done. (N files)" directly, with NO LLM call) put a
+                    # short, intentionally user-facing phrase AFTER the STATUS tag instead. A
+                    # blanket "any text sharing a message with STATUS -> think" (as this used to
+                    # do) silently swallowed that FAST-DONE phrase too, since neither the
+                    # pendingStepResult fallback (needs a 'message' AFTER the block) nor the
+                    # 'note' field (only captures PRE-status text) ever received it — the
+                    # green/red result line stopped appearing entirely for fast-done steps. Track
+                    # whether STATUS has already been yielded and only suppress text BEFORE it.
+                    _pre_status_text = None
+                    _status_seen = False
+                    for seg in _segs:
                         if seg["kind"] == "text":
                             if seg["text"].strip():
-                                yield {"type": "message", "text": seg["text"]}
+                                if _has_code or (_has_status and not _status_seen):
+                                    if _has_status and not _status_seen and _pre_status_text is None:
+                                        _pre_status_text = seg["text"]
+                                    yield {"type": "think", "tag": "THINK", "text": seg["text"]}
+                                else:
+                                    yield {"type": "message", "text": seg["text"]}
                         else:
                             tag = seg.get("tag", "BLOCK").upper()
                             if tag == "THINK":
                                 yield {"type": "think", "tag": tag, "text": seg["text"]}
+                            elif tag == "STATUS":
+                                _status_seen = True
+                                yield {"type": "block", "tag": tag, "text": seg["text"], "note": _pre_status_text}
                             else:
                                 yield {"type": "block", "tag": tag, "text": seg["text"]}
 
