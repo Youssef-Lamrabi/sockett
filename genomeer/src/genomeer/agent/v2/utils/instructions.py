@@ -542,6 +542,32 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "download the reads for accession SRR.../ERR.../DRR... / analyze this SRA/ENA run / get the raw
       sequencing data for this experiment" -> fetch_sra_reads (downloads REAL experimental FASTQ via ENA
       — distinct from ncbi-genome-download, which fetches assembled genome FASTA, not raw reads).
+    * "annotate gene/protein function / assign functions / functional annotation" -> run_eggnog or
+      run_diamond for a FAST single-source pass; use run_mantis when you want a CONSENSUS annotation that
+      integrates SEVERAL reference DBs (Pfam/KOfam/TIGRFAM/NCBI…) — it recovers functions a single annotator
+      misses, giving a MORE ACCURATE known/unknown split. Prefer run_mantis specifically when a LATER step
+      depends on which proteins are GENUINELY unknown (e.g. the dark-matter chain below), because a false
+      "unknown" from eggNOG-only would pollute that step.
+    * "cluster proteins / group genes into families / dereplicate a gene or protein catalog / collapse
+      redundant sequences / fast protein search" -> run_mmseqs (easy-cluster for families, easy-search for a
+      BLAST-like search). This groups MANY proteins by similarity — do NOT use a binner (binners cluster
+      CONTIGS into genomes, a different task) and do NOT use dRep (that dereplicates whole GENOMES/MAGs, not
+      proteins).
+    * "predict the 3D structure of a protein / fold this protein / get a structure for an unknown protein"
+      -> run_esmfold (single-sequence, no MSA; best on proteins <400 aa). GPU-ONLY — if no GPU/weights are
+      provisioned it is unavailable: say so, do NOT retry. Use it mainly on proteins with NO sequence
+      homology (hypothetical/unknown), since structure is conserved far beyond sequence.
+    * "structural search / find proteins with a similar FOLD / annotate by structure when sequence homology
+      fails / what known structure does this resemble" -> run_foldseek (easy-search against a PDB/AlphaFold
+      structure DB). Run it AFTER run_esmfold on the predicted .pdb files — a fold-level match (TM-score
+      >0.5) gives a functional clue for a protein that BLAST/eggNOG/mantis could not annotate by sequence.
+    * DARK-MATTER / UNKNOWN-PROTEIN characterisation (many 'hypothetical protein' genes after annotation and
+      the user wants to interpret/characterise them): the correct CHAIN is (1) run_mantis (or run_eggnog) to
+      fix the known/unknown boundary, (2) run_mmseqs easy-cluster on the UNANNOTATED proteins to group them
+      into families, (3) run_esmfold on each family REPRESENTATIVE only (never every gene — too costly),
+      (4) run_foldseek on those structures against a fold DB, (5) combine the structural hit with the
+      genomic-NEIGHBOUR (operon) context to propose a putative function. Always CLUSTER first so structure
+      prediction runs on a handful of representatives, not thousands of genes.
   Most of these tools take a GENOME/CONTIGS FASTA or a PROTEIN FASTA as input; kraken2, run_host_decontamination,
   run_flye/run_unicycler/run_filtlong/run_nanoplot, run_bwa_mem, and fetch_sra_reads instead take (or
   produce) raw READS — pick the input type accordingly. If the user names a tool explicitly, use it;

@@ -463,6 +463,34 @@
    "installed": true
   },
   {
+   "name": "mantis",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Mantis (mantis_pfa): CONSENSUS protein function annotation.",
+   "installed": true
+  },
+  {
+   "name": "mmseqs",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MMseqs2: ultra-fast protein/nucleotide sequence search & CLUSTERING.",
+   "installed": true
+  },
+  {
+   "name": "esmfold",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "ESMFold (fair-esm): single-sequence protein STRUCTURE PREDICTION from amino-acid sequence alone (no MSA).",
+   "installed": true
+  },
+  {
+   "name": "foldseek",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "Foldseek: ultra-fast STRUCTURAL search & clustering \u2014 finds proteins with a similar FOLD even at ~0% s\u2026",
+   "installed": true
+  },
+  {
    "name": "diamond",
    "category": "Metagenomics",
    "icon": "fa-bacteria",

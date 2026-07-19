@@ -1243,6 +1243,144 @@ class EggnogContract(_BaseContract):
                               metrics={"queries_annotated": annotated, "queries_total": total})
 
 
+class MantisContract(_BaseContract):
+    """
+    Mantis (mantis_pfa) CONSENSUS protein annotation. Key output: consensus_annotation.tsv
+    (per-query consensus functional hits integrated across many reference sources). A protein
+    listed there got a consensus annotation; a gene ABSENT is genuinely unannotated (this is
+    the cleaner known/unknown boundary that feeds the dark-matter memory).
+    Keywords intentionally SPECIFIC ('mantis' / 'consensus annotation') and this contract is
+    registered BEFORE EggnogContract so a mantis-titled step is not stolen by eggNOG's generic
+    'functional annotation' keyword. Bare 'consensus' is avoided (would collide with DAS_Tool).
+    Source: Queirós et al., GigaScience 2021, doi:10.1093/gigascience/giab042
+    """
+    KEYWORDS = ("mantis", "consensus annotation", "consensus-driven annotation",
+                "consensus protein annotation", "multi-source annotation")
+    RUNTIME = "medium"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        annot = self._glob_first(run_dir, "consensus_annotation.tsv",
+                                 "*consensus_annotation.tsv", "integrated_annotation.tsv",
+                                 "*integrated_annotation.tsv")
+        if not annot:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="mantis: consensus_annotation.tsv not found",
+                retry_params={"hint": "mantis run -i <proteins.faa> -o <out_dir> -c N; needs the reference DBs provisioned via 'mantis setup'. Read <out_dir>/consensus_annotation.tsv."},
+            )
+        n = 0
+        try:
+            with open(annot, encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#") or s.lower().startswith("query"):
+                        continue
+                    n += 1
+        except Exception:
+            pass
+        return ContractResult(
+            ok=True, score=1.0 if n > 0 else 0.5,
+            reason=f"mantis: {n} proteins with a consensus annotation",
+            metrics={"proteins_annotated": n},
+        )
+
+
+class MmseqsContract(_BaseContract):
+    """MMseqs2 clustering/search. easy-cluster → <prefix>_cluster.tsv (representative<TAB>member)
+    + <prefix>_rep_seq.fasta; easy-search → BLAST-tab .m8. Success = a non-empty cluster/rep
+    output (metric n_clusters = distinct representatives) or an alignment table (n_hits).
+    Keywords are mmseqs/clustering-specific — 'dereplicate' is intentionally NOT used (dRep owns it)."""
+    KEYWORDS = ("mmseqs", "mmseqs2", "protein clustering", "cluster proteins",
+                "sequence clustering", "cluster the proteins")
+    RUNTIME = "fast"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        clust = self._glob_first(run_dir, "*_cluster.tsv")
+        rep = self._glob_first(run_dir, "*_rep_seq.fasta")
+        if clust or rep:
+            n = 0
+            try:
+                if clust:
+                    reps = set()
+                    with open(clust, encoding="utf-8") as fh:
+                        for line in fh:
+                            if line.strip():
+                                reps.add(line.split("\t", 1)[0])
+                    n = len(reps)
+                elif rep:
+                    with open(rep, encoding="utf-8") as fh:
+                        n = sum(1 for l in fh if l.startswith(">"))
+            except Exception:
+                pass
+            if n > 0:
+                return ContractResult(ok=True, score=1.0,
+                                      reason=f"mmseqs: {n} clusters",
+                                      metrics={"n_clusters": n})
+        m8 = self._glob_first(run_dir, "*.m8")
+        if m8:
+            n = 0
+            try:
+                with open(m8, encoding="utf-8") as fh:
+                    n = sum(1 for l in fh if l.strip() and not l.startswith("#"))
+            except Exception:
+                pass
+            return ContractResult(ok=True, score=1.0 if n > 0 else 0.5,
+                                  reason=f"mmseqs: {n} search hits", metrics={"n_hits": n})
+        return ContractResult(
+            ok=False, score=0.0,
+            reason="mmseqs: no _cluster.tsv/_rep_seq.fasta or .m8 output found",
+            retry_params={"hint": "mmseqs easy-cluster <faa> <prefix> <tmp> --min-seq-id 0.5 -c 0.8 → <prefix>_cluster.tsv; or easy-search → .m8"},
+        )
+
+
+class EsmFoldContract(_BaseContract):
+    """ESMFold single-sequence structure prediction → one <id>.pdb per input protein (per-residue
+    pLDDT in the B-factor column). Success = at least one non-empty PDB produced."""
+    KEYWORDS = ("esmfold", "esm-fold", "esm fold", "structure prediction",
+                "predict structure", "predict the structure", "protein structure prediction",
+                "fold the protein", "fold proteins")
+    RUNTIME = "medium"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        pdbs = [p for p in self._glob_all(run_dir, "*.pdb") if self._file_nonempty(p)]
+        if not pdbs:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="esmfold: no non-empty .pdb structures produced",
+                retry_params={"hint": "esm-fold -i <faa> -o <out_dir>; needs a GPU + provisioned model weights. Check the .pdb output files."},
+            )
+        return ContractResult(ok=True, score=1.0,
+                              reason=f"esmfold: {len(pdbs)} structure(s) predicted",
+                              metrics={"n_structures": len(pdbs)})
+
+
+class FoldseekContract(_BaseContract):
+    """Foldseek structural search/clustering. easy-search → an alignment TSV (query<TAB>target…
+    with a TM-score/prob column) = fold-level homology, the key dark-matter signal. Success = a
+    non-empty alignment/cluster table (metric n_hits). Foldseek-specific names are tried first."""
+    KEYWORDS = ("foldseek", "structural search", "structure search", "structural homolog",
+                "structural alignment", "fold search", "structural clustering")
+    RUNTIME = "fast"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        aln = self._glob_first(run_dir, "*foldseek*.tsv", "*foldseek*.m8",
+                               "*aln*.tsv", "*.m8")
+        if not aln:
+            return ContractResult(
+                ok=False, score=0.0,
+                reason="foldseek: no alignment/cluster output found",
+                retry_params={"hint": "foldseek easy-search <pdb_or_dir> <targetDB> <aln.tsv> <tmp>; needs a structure DB provisioned via 'foldseek databases'."},
+            )
+        n = 0
+        try:
+            with open(aln, encoding="utf-8") as fh:
+                n = sum(1 for l in fh if l.strip() and not l.startswith("#"))
+        except Exception:
+            pass
+        return ContractResult(ok=True, score=1.0 if n > 0 else 0.5,
+                              reason=f"foldseek: {n} structural hit(s)", metrics={"n_hits": n})
+
+
 class DiamondContract(_BaseContract):
     """
     Output: user-specified TSV (outfmt 6) or .m8 file.
@@ -3437,6 +3575,16 @@ class Archs4Contract(_BaseContract):
 # ===========================================================================
 
 _ALL_CONTRACTS: List[_BaseContract] = [
+    # Clustering / structure tools FIRST: their keywords are tool-specific (mmseqs / esmfold /
+    # foldseek / "protein clustering" / "structure prediction" / "structural search") and match
+    # NOTHING else, but a title like "predict protein structure with ESMFold" WOULD otherwise be
+    # stolen by ProdigalContract's gene-prediction keywords (first-match wins). Placing them at the
+    # top guarantees a structure/clustering step is graded by the right contract. Verified: no bare
+    # 'cluster'/'structure'/'search'/'fold' keyword exists on any other contract, so these never
+    # capture a legitimate gene-prediction / annotation / binning step.
+    MmseqsContract(),
+    EsmFoldContract(),
+    FoldseekContract(),
     # Filtlong BEFORE Fastp: a "filter reads with filtlong" step must be graded by the
     # non-empty-output filtlong contract, not by the generic fastp contract (which never
     # checked output size and let a 0-byte filtered FASTQ pass as ok=True, blocking Flye).
@@ -3518,6 +3666,11 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     AmrFinderContract(),
     # Functional annotation
     HmmerContract(),
+    # Mantis BEFORE Eggnog: a mantis/consensus-annotation step must be graded by the
+    # consensus_annotation.tsv contract, not stolen by eggNOG's generic 'functional
+    # annotation' keyword (first-match wins). Mantis keywords are specific ('mantis',
+    # 'consensus annotation'), so a plain eggNOG step is never captured by Mantis.
+    MantisContract(),
     EggnogContract(),
     DiamondContract(),
     EggnogHumannContract(),

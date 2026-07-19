@@ -260,7 +260,16 @@ async def chat(session_id: int, body: ChatBody, request: Request,
 
     if body.stream:
         cancel_event = threading.Event()
-        INFLIGHT[(user.id, sess.id)] = cancel_event
+        # Capture plain int PKs up-front. user/sess are request-scoped ORM objects:
+        # their attributes get EXPIRED after the first db.commit() below, and the
+        # request's Session is torn down when the response ends. The producer runs in
+        # a THREAD and touches these in its finally AFTER both events, so reading
+        # user.id/sess.id there triggers a lazy reload on a now-detached instance →
+        # DetachedInstanceError ("Future exception was never retrieved"). Using the
+        # captured ints keeps all off-main-coroutine access ORM-free. Same values, so
+        # the cancel endpoint's (user.id, session_id) lookup still matches exactly.
+        _uid, _sid = user.id, sess.id
+        INFLIGHT[(_uid, _sid)] = cancel_event
 
         assistant_parts: list[str] = []   # ← collect what the user actually sees
         saved_logs: list[dict] = []       # ← blocks for the right pane (tag/body)
@@ -279,13 +288,13 @@ async def chat(session_id: int, body: ChatBody, request: Request,
             def _producer():
                 try:
                     if new_title:
-                        _send({"type": "meta", "session_id": sess.id, "session_title": new_title})
+                        _send({"type": "meta", "session_id": _sid, "session_title": new_title})
 
                     for evt in agent.go_stream(
                         body.message,
                         mode="prod",
                         attachments=attachments,
-                        session_id=str(sess.id),
+                        session_id=str(_sid),
                         cancel_event=cancel_event,
                         selected_tools=body.selected_tools,
                     ):
@@ -362,9 +371,51 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                     _send({"type": "error", "text": str(e)})
                 finally:
                     _send({"type": "done"})
-                    INFLIGHT.pop((user.id, sess.id), None)
+                    INFLIGHT.pop((_uid, _sid), None)
 
             loop.run_in_executor(None, _producer)
+
+            # ── Incremental persistence ────────────────────────────────────────────
+            # Save the assistant Message + its logs AS THEY STREAM (not only at the end),
+            # so returning to this session mid-run shows the steps-so-far instead of a
+            # BLANK panel. Previously the logs were written only in the finally (i.e. at
+            # the END of the run), so the DB was empty for an in-flight run and the left
+            # panel came back empty on session switch. The Message is created LAZILY on the
+            # first content (no ghost rows for empty / instantly-cancelled runs). ALL db
+            # writes happen HERE in the async context — never in the producer thread — so
+            # the request-scoped db session stays single-threaded. Each log is written
+            # exactly once (tracked by logs_written) → no duplication vs the final flush.
+            _persist = {"msg": None, "logs_written": 0}
+            def _flush_partial(final=False):
+                try:
+                    _changed = False
+                    if _persist["msg"] is None and (saved_logs or assistant_parts):
+                        _txt = "\n".join(p for p in assistant_parts if p).strip()
+                        _m = Message(session_id=_sid, role="assistant", content=_txt)
+                        db.add(_m); db.commit(); db.refresh(_m)
+                        _persist["msg"] = _m
+                        _changed = True
+                    m = _persist["msg"]
+                    if m is None:
+                        return
+                    _cur = len(saved_logs)   # snapshot: never read past this index this pass
+                    if _cur > _persist["logs_written"]:
+                        for i in range(_persist["logs_written"], _cur):
+                            L = saved_logs[i]
+                            db.add(MessageLog(message_id=m.id, tag=L["tag"], body=L["body"],
+                                              note=L.get("note"), ord=i))
+                        _persist["logs_written"] = _cur
+                        _changed = True
+                    if final:
+                        m.content = "\n".join(p for p in assistant_parts if p).strip()
+                        _changed = True
+                    if _changed:
+                        db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
 
             try:
                 while True:
@@ -373,6 +424,7 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                         break
                     chunk = await queue.get()
                     yield chunk
+                    _flush_partial()   # persist new logs so a returning view isn't blank
 
                     # stop when producer says "done"
                     try:
@@ -386,19 +438,10 @@ async def chat(session_id: int, body: ChatBody, request: Request,
                 raise
             finally:
                 cancel_event.set()
-                # ------------ persist assistant reply for history ------------
-                final_text = "\n".join(p for p in assistant_parts if p).strip()
-                if final_text:
-                    # db.add(Message(session_id=sess.id, role="assistant", content=final_text))
-                    # db.commit()
-                    m = Message(session_id=sess.id, role="assistant", content=final_text)
-                    db.add(m); db.commit(); db.refresh(m)
-                    # persist logs in original order
-                    for i, L in enumerate(saved_logs):
-                        db.add(MessageLog(message_id=m.id, tag=L["tag"], body=L["body"],
-                                           note=L.get("note"), ord=i))
-                    db.commit()
-                # ------------------------------------------------------------
+                # Finalize: write the full assistant text + any remaining logs. Same net
+                # result as the old end-of-stream bulk save, but the rows already exist
+                # (created incrementally above) so there is NO duplication.
+                _flush_partial(final=True)
 
         return StreamingResponse(_streamer(), media_type="application/x-ndjson")
 
@@ -416,6 +459,15 @@ def cancel_run(session_id: int, user: User = Depends(get_current_user)):
         ev.set()
         return {"ok": True, "canceled": True}
     return {"ok": True, "canceled": False}
+
+
+@router.get("/sessions/{session_id}/running")
+def is_session_running(session_id: int, user: User = Depends(get_current_user)):
+    """Whether this session currently has an IN-FLIGHT run (server-side INFLIGHT map).
+    The frontend calls this on reload: the last persisted STATUS is the last COMPLETED
+    step's 'done', so a session that is still executing would otherwise LOOK finished.
+    When running=True the UI shows an 'in-progress' indicator instead of the stale 'done'."""
+    return {"running": (user.id, session_id) in INFLIGHT}
 
 
 # ─── Rename a session (PATCH for an idempotent partial update) ──────────────

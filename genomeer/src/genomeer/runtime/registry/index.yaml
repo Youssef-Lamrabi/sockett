@@ -63,6 +63,10 @@ envs:
       - hmmpress
       - emapper.py
       - diamond
+      - mantis
+      - mmseqs
+      - esm-fold
+      - foldseek
       # humann / humann_renorm_table intentionally NOT declared: the binary is
       # commented-out in meta-env1.yaml (needs multiple large DBs, not installed).
       # Declaring it here falsely marked humann3 as "available" to the planner.

@@ -1162,6 +1162,13 @@ class BioAgent:
                 clean_manifest.pop("route_hint", None)
                 clean_manifest.pop("qa_payload", None)
 
+            # Coverage fix: a run BLOCKED here never reaches the finalizer, so persist the
+            # failed-then-resolved lessons it already earned before blocking. ONLY on the
+            # TERMINAL FAILURE routes — NOT await_user (a pause that may resume and reach the
+            # finalizer, which would double-write) nor ask_for_missing (a normal question).
+            if route_hint in ("tool_unavailable", "diagnostics_cap"):
+                self._persist_failure_lessons(state, node)
+
             updates = {
                 "next_step": next_step,
                 "manifest": clean_manifest,
@@ -4722,6 +4729,21 @@ class BioAgent:
             except Exception as _mx_err:
                 self._log("EXTRACTED METRICS ERR", body=str(_mx_err), node=node)
 
+            # Dark-matter cross-sample memory (opt-in, GENOMEER_DARKMATTER_MEMORY=1):
+            # updates the store from this run's unknown proteins and injects a BOUNDED
+            # top-K hypotheses block. Returns "" when off/no hypothesis → nothing added.
+            try:
+                _dm_block = self._darkmatter_hypotheses_block(state)
+                if _dm_block:
+                    msgs.append(HumanMessage(content=(
+                        "CROSS-SAMPLE DARK-MATTER HYPOTHESES (deterministic, accumulated "
+                        "from PAST samples — for unknown/hypothetical proteins in this run. "
+                        "Present these as HYPOTHESES with their confidence, never as facts):\n"
+                        + _dm_block
+                    )))
+            except Exception as _dm_err:
+                self._log("DARK-MATTER BLOCK ERR", body=str(_dm_err), node=node)
+
             # Bio-hint BRIEF (advisory): 2-3 short interpretation bullets from the
             # fine-tuned 8B. Comes AFTER BioRAG so the LLM has facts first, hints
             # second. Marked clearly as "verify against actual data; RAG wins".
@@ -4804,46 +4826,10 @@ class BioAgent:
             # ── Failure-memory: persist concrete failed-then-RESOLVED lessons, UNIFIED
             # across all sessions in ~/.genomeer/failure_memory.jsonl, so a future
             # generation of the same tool/task avoids the exact error. Only a step that
-            # FAILED (has a failure_note) AND ended 'done' becomes a lesson. ────────────
-            try:
-                import json as _json2
-                from pathlib import Path as _Path2
-                from datetime import datetime as _dt2
-                _plan_fm = state.get("plan") or []
-                _fnotes = ((state.get("manifest") or {}).get("failure_notes")) or []
-                if _fnotes:
-                    _fdir = _Path2.home() / ".genomeer"
-                    _fdir.mkdir(parents=True, exist_ok=True)
-                    _fmem = _fdir / "failure_memory.jsonl"
-                    _status_by_idx = {i: s.get("status") for i, s in enumerate(_plan_fm)}
-                    _task_type2 = self._infer_task_type(state.get("last_prompt") or "")
-                    _seen = set()
-                    _lessons = []
-                    for _n in _fnotes:
-                        if _status_by_idx.get(_n.get("step_idx")) != "done":
-                            continue  # only RESOLVED failures become lessons
-                        _title = (_n.get("title") or "")
-                        _sig = self._norm_err(_n.get("reason") or "")
-                        _key = (_title.lower(), _sig)
-                        if not _sig or _key in _seen:
-                            continue
-                        _seen.add(_key)
-                        _lessons.append({
-                            "timestamp":       _dt2.utcnow().isoformat(),
-                            "run_id":          run_id,
-                            "task_type":       _task_type2,
-                            "tool_title":      _title[:160],
-                            "error_signature": _sig,
-                            "fix":             (_n.get("hint") or "")[:300],
-                        })
-                    if _lessons:
-                        with open(_fmem, "a", encoding="utf-8") as _ffh:
-                            for _l in _lessons:
-                                _ffh.write(_json2.dumps(_l) + "\n")
-                        self._log("FAILURE MEMORY WRITE",
-                                  body=f"{len(_lessons)} lesson(s) → {_fmem}", node=node)
-            except Exception as _fme:
-                self._log("FAILURE MEMORY ERROR", body=str(_fme), node=node)
+            # FAILED (has a failure_note) AND ended 'done' becomes a lesson. Extracted to
+            # _persist_failure_lessons so a run BLOCKED before the finalizer (routed to QA)
+            # can persist the same way — and it drops incoherent mis-dispatched lessons.
+            self._persist_failure_lessons(state, node)
 
             return {
                 "manifest": manifest,
@@ -5328,6 +5314,83 @@ class BioAgent:
         return "\n".join(lines)
 
     @staticmethod
+    def _lesson_is_coherent(title: str, reason: str) -> bool:
+        """POLLUTION GUARD for failure-memory. A DOWNLOAD step whose title contains
+        'assembly' (e.g. 'Download the RefSeq assembly GCF_...') gets mis-graded by
+        AssemblyContract → an 'assembly: no contig' reason + a SPAdes-memory 'fix' that
+        is nonsense for a download, then saved as a lesson that would later mislead every
+        download step. This drops ONLY clearly-incoherent lessons (download step + an
+        assembly/binning error); it NEVER drops a plausible one — a real download error
+        says 'No downloads matched' / 'not found', none of the assembly markers below."""
+        t = (title or "").strip().lower()
+        r = (reason or "").lower()
+        _w = t.split()
+        lead = _w[0].rstrip(":") if _w else ""
+        is_download = (lead in {"download", "fetch", "retrieve", "acquire", "obtain"}
+                       or "ncbi-genome-download" in t or "fetch_sra_reads" in t)
+        reason_is_assembly = any(k in r for k in (
+            "no contig", "no scaffold", "contig/scaffold", "assembly:", "no bins",
+            "checkm", "megahit", "spades", "n50"))
+        return not (is_download and reason_is_assembly)
+
+    def _persist_failure_lessons(self, state, node: str = "finalizer") -> int:
+        """Write failed-then-RESOLVED steps as cross-session lessons to
+        ~/.genomeer/failure_memory.jsonl. Called at BOTH the finalizer AND a TERMINAL
+        FAILURE exit of QA, so a run BLOCKED partway still persists the lessons it already
+        earned (previously only the finalizer wrote → a blocked run lost them all). Skips
+        incoherent lessons from a mis-dispatched contract (see _lesson_is_coherent).
+        Returns the number of lessons written. Fully guarded — never raises."""
+        try:
+            import json as _json2
+            from pathlib import Path as _Path2
+            from datetime import datetime as _dt2
+            _plan_fm = state.get("plan") or []
+            _fnotes = ((state.get("manifest") or {}).get("failure_notes")) or []
+            if not _fnotes:
+                return 0
+            run_id = state.get("run_id") or str(state.get("run_temp_dir") or "")[-24:]
+            _fdir = _Path2.home() / ".genomeer"
+            _fdir.mkdir(parents=True, exist_ok=True)
+            _fmem = _fdir / "failure_memory.jsonl"
+            _status_by_idx = {i: s.get("status") for i, s in enumerate(_plan_fm)}
+            _task_type2 = self._infer_task_type(state.get("last_prompt") or "")
+            _seen = set()
+            _lessons = []
+            for _n in _fnotes:
+                if _status_by_idx.get(_n.get("step_idx")) != "done":
+                    continue  # only RESOLVED failures become lessons
+                _title = (_n.get("title") or "")
+                _reason = _n.get("reason") or ""
+                if not self._lesson_is_coherent(_title, _reason):
+                    self._log("FAILURE MEMORY SKIP",
+                              body=f"incoherent (mis-dispatched contract): "
+                                   f"{_title[:60]!r} / {_reason[:60]!r}", node=node)
+                    continue
+                _sig = self._norm_err(_reason)
+                _key = (_title.lower(), _sig)
+                if not _sig or _key in _seen:
+                    continue
+                _seen.add(_key)
+                _lessons.append({
+                    "timestamp":       _dt2.utcnow().isoformat(),
+                    "run_id":          run_id,
+                    "task_type":       _task_type2,
+                    "tool_title":      _title[:160],
+                    "error_signature": _sig,
+                    "fix":             (_n.get("hint") or "")[:300],
+                })
+            if _lessons:
+                with open(_fmem, "a", encoding="utf-8") as _ffh:
+                    for _l in _lessons:
+                        _ffh.write(_json2.dumps(_l) + "\n")
+                self._log("FAILURE MEMORY WRITE",
+                          body=f"{len(_lessons)} lesson(s) → {_fmem}", node=node)
+            return len(_lessons)
+        except Exception as _fme:
+            self._log("FAILURE MEMORY ERROR", body=str(_fme), node=node)
+            return 0
+
+    @staticmethod
     def _norm_err(reason: str) -> str:
         """Normalize a validator/executor error into a STABLE signature for dedup:
         lowercase, drop run-specific paths/digits/hex, collapse whitespace. So the same
@@ -5388,6 +5451,186 @@ class BioAgent:
                 f"    → APPLY THIS FIX: {r.get('fix', '')[:200]}"
             )
         return "\n".join(out)
+
+    # ── DARK-MATTER cross-sample biological memory (opt-in) ─────────────────────
+    # Accumulates evidence about recurring UNKNOWN protein families across samples so a
+    # gene that eggNOG/DRAM call 'hypothetical_protein' can get an evidence-backed
+    # functional hypothesis no single sample could produce. 100% deterministic + SQLite;
+    # the LLM only ever sees a bounded top-K block (constant size regardless of store size),
+    # so growing memory never grows the LLM context. OFF by default: enable with
+    # GENOMEER_DARKMATTER_MEMORY=1. Fully try/except-wrapped → can never break a run.
+    @staticmethod
+    def _parse_gff_neighbors(run_dir: str) -> dict:
+        """Return {gene_id: [neighbor_product, ...]} from a prokka-style GFF: the products
+        of the CDS immediately up/downstream on the SAME contig that carry a REAL product
+        (not 'hypothetical protein'). This is the cheap operon-adjacency signal. Empty dict
+        on any miss (no GFF, prodigal-only GFF without products, parse error) — DEFENSIVE."""
+        import os as _os, glob as _glob, re as _re
+        result: dict = {}
+        try:
+            gffs = (_glob.glob(_os.path.join(run_dir, "**", "*.gff"), recursive=True)
+                    + _glob.glob(_os.path.join(run_dir, "**", "*.gff3"), recursive=True))
+            if not gffs:
+                return {}
+            gff = max(gffs, key=lambda p: _os.path.getsize(p) if _os.path.isfile(p) else 0)
+            # per contig: ordered list of (start, gene_id, product)
+            by_contig: dict = {}
+            with open(gff, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("#") or "\t" not in line:
+                        continue
+                    c = line.rstrip("\n").split("\t")
+                    if len(c) < 9 or c[2] != "CDS":
+                        continue
+                    attrs = c[8]
+                    m_id = _re.search(r"ID=([^;]+)", attrs)
+                    if not m_id:
+                        continue
+                    gid = m_id.group(1).strip()
+                    m_pr = _re.search(r"product=([^;]+)", attrs)
+                    product = (m_pr.group(1).strip() if m_pr else "")
+                    try:
+                        start = int(c[3])
+                    except Exception:
+                        start = 0
+                    by_contig.setdefault(c[0], []).append((start, gid, product))
+            _HYP = ("hypothetical protein", "hypothetical_protein", "", "putative protein")
+            for genes in by_contig.values():
+                genes.sort(key=lambda t: t[0])
+                for i, (_s, gid, _p) in enumerate(genes):
+                    nb = []
+                    for j in (i - 1, i + 1):           # immediate neighbors only
+                        if 0 <= j < len(genes):
+                            prod = genes[j][2]
+                            if prod and prod.lower() not in _HYP:
+                                nb.append(prod)
+                    if nb:
+                        result[gid] = nb
+        except Exception:
+            return {}
+        return result
+
+    @staticmethod
+    def _find_single_taxon(run_dir: str) -> str:
+        """Return a coarse genus (g__…) if a gtdbtk summary declares a SINGLE classification
+        (isolate/one-genome run), else '' — conservative, never mislabels a multi-bin run."""
+        import os as _os, glob as _glob
+        try:
+            sums = _glob.glob(_os.path.join(run_dir, "**", "*summary.tsv"), recursive=True)
+            genera: set = set()
+            for f in sums:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    header = fh.readline().rstrip("\n").split("\t")
+                    if "classification" not in header:
+                        continue
+                    ci = header.index("classification")
+                    for line in fh:
+                        cols = line.rstrip("\n").split("\t")
+                        if len(cols) <= ci:
+                            continue
+                        for tok in cols[ci].split(";"):
+                            tok = tok.strip()
+                            if tok.startswith("g__") and len(tok) > 3:
+                                genera.add(tok)
+            return next(iter(genera)) if len(genera) == 1 else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_unknowns_for_darkmatter(run_dir: str):
+        """Best-effort, DEFENSIVE extraction of unannotated proteins from a run dir.
+        Returns (dataset_hash, unknowns) or (None, []) when the needed outputs aren't
+        cleanly present (so nothing garbage is ever recorded). Only fires when BOTH a
+        protein FASTA (.faa) AND an eggNOG/diamond annotation table are found — the
+        conservative signal for 'we can actually tell known from unknown here'."""
+        import os as _os, glob as _glob, hashlib as _hl, re as _re
+        if not run_dir or not _os.path.isdir(run_dir):
+            return None, []
+        faas = _glob.glob(_os.path.join(run_dir, "**", "*.faa"), recursive=True)
+        if not faas:
+            return None, []
+        # annotated gene IDs: eggNOG emapper.annotations (col0) or diamond/blast .tsv (col0)
+        annotated: set = set()
+        for pat in ("*.emapper.annotations", "*.annotations", "*diamond*.tsv", "*blast*.tsv", "*.m8"):
+            for f in _glob.glob(_os.path.join(run_dir, "**", pat), recursive=True):
+                try:
+                    with open(f, encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if line.startswith("#") or not line.strip():
+                                continue
+                            annotated.add(line.split("\t", 1)[0].strip())
+                except Exception:
+                    continue
+        if not annotated:
+            return None, []   # can't distinguish known/unknown → do not record
+        # parse the largest .faa; unknown = header id absent from the annotated set
+        faa = max(faas, key=lambda p: _os.path.getsize(p) if _os.path.isfile(p) else 0)
+        seqs = {}
+        try:
+            _cur = None
+            with open(faa, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        _cur = line[1:].strip().split()[0]
+                        seqs[_cur] = []
+                    elif _cur is not None:
+                        seqs[_cur].append(line.strip())
+        except Exception:
+            return None, []
+        # dataset identity = content hash of the protein set (same data → same hash →
+        # re-running the SAME sample never inflates n_datasets; anti-pollution guard).
+        _joined = "".join("".join(v) for v in seqs.values())
+        dataset_hash = _hl.sha256(_joined.encode("utf-8", "replace")).hexdigest()[:16] if _joined else None
+        if not dataset_hash:
+            return None, []
+        # Enrich with the cheap, no-new-tool signals: operon neighbors (prokka GFF) +
+        # a coarse taxon (gtdbtk summary). Both DEFENSIVE → {} / '' when absent, so the
+        # extractor still works (just with weaker signal) on prodigal-only / no-gtdbtk runs.
+        neighbors_by_gene = BioAgent._parse_gff_neighbors(run_dir)
+        taxon = BioAgent._find_single_taxon(run_dir)
+        unknowns = []
+        for gid, parts in seqs.items():
+            if gid in annotated:
+                continue
+            seq = "".join(parts)
+            if len(seq) < 30:   # skip tiny fragments
+                continue
+            unknowns.append({
+                "gene_id": gid,
+                "seq": seq,
+                "bin_taxon": taxon,
+                "neighbors": neighbors_by_gene.get(gid, []),
+            })
+        return dataset_hash, unknowns
+
+    def _darkmatter_hypotheses_block(self, state, sample_type: str = "unknown") -> str:
+        """Opt-in: update the cross-sample dark-matter memory from this run's unknown
+        proteins and return a BOUNDED top-K hypotheses block for the finalizer. Empty
+        string unless GENOMEER_DARKMATTER_MEMORY=1 AND there are hypothesized clusters."""
+        import os as _os
+        if _os.environ.get("GENOMEER_DARKMATTER_MEMORY") != "1":
+            return ""
+        try:
+            run_dir = state.get("run_temp_dir") or (state.get("manifest") or {}).get("root_dir") or ""
+            dataset_hash, unknowns = self._extract_unknowns_for_darkmatter(run_dir)
+            if not dataset_hash or not unknowns:
+                return ""
+            from genomeer.memory.dark_matter import DarkMatterMemory
+            mem = DarkMatterMemory()
+            run_id = str(state.get("run_temp_dir") or "")[-24:]
+            touched = mem.record_run(
+                dataset_hash=dataset_hash, run_id=run_id, unknowns=unknowns,
+                sample_type=sample_type,
+            )
+            block = mem.lookup(touched, k=10)
+            self._log("DARK-MATTER MEMORY",
+                      body=f"{len(unknowns)} unknowns → {len(touched)} clusters; "
+                           f"{'hypotheses injected' if block else 'no hypothesis yet'}",
+                      node="finalizer")
+            return block
+        except Exception as _dm_err:
+            self._log("DARK-MATTER MEMORY ERROR", body=str(_dm_err), node="finalizer")
+            return ""
 
     @staticmethod
     def _clean_manifest(manifest: dict) -> dict:

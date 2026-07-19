@@ -135,6 +135,24 @@ dependencies:
   #     to build on py3.12; uses existing biopython). DB v5.0.2 at /home/workshop/eggnog_db —
   #     downloaded MANUALLY from http://eggnog5.embl.de (the tool's hardcoded eggnogdb.embl.de is
   #     DEAD/DNS-fails). Run: emapper.py -i <faa> -o <pfx> --data_dir /home/workshop/eggnog_db -m diamond.
+  #   * mantis (mantis_pfa): `pip install mantis_pfa`, then `mantis setup` to build the multi-source
+  #     reference DBs (Pfam/KOfam/TIGRFAM/NCBI — multi-GB; provisions to the MANTIS.cfg default path).
+  #     CONSENSUS annotator (integrates many DBs) — used to get a cleaner known/unknown boundary than
+  #     eggNOG alone (feeds the dark-matter memory). Declared in index.yaml provides_bins (binary `mantis`).
+  #     Run: mantis run -i <faa> -o <out_dir> -c N  →  <out_dir>/consensus_annotation.tsv. If the reference
+  #     DBs are not provisioned the run errors → planner gates it as tool-unavailable (like the others here).
+  #   * mmseqs2 (binary `mmseqs`): `conda install -c bioconda mmseqs2` OR the static binary from
+  #     github.com/soedinglab/MMseqs2 (no database to install — you build one from your own sequences).
+  #     Fast protein search/clustering. Run: mmseqs easy-cluster <faa> <out_prefix> <tmp> --min-seq-id 0.5 -c 0.8
+  #     → <out_prefix>_cluster.tsv + _rep_seq.fasta. Declared in index.yaml provides_bins (binary `mmseqs`).
+  #   * ESMFold (binary `esm-fold`): `pip install "fair-esm[esmfold]"` (+ torch with CUDA). GPU REQUIRED;
+  #     first run downloads ~2.5 GB of weights. Single-sequence structure prediction (no MSA). Run:
+  #     esm-fold -i <faa> -o <out_dir> → one <id>.pdb per sequence (pLDDT in the B-factor column). On a
+  #     CPU-only host it is impractical → planner gates it as tool-unavailable (like the DB tools above).
+  #   * foldseek (binary `foldseek`): `conda install -c bioconda foldseek` OR the static binary from
+  #     github.com/steineggerlab/foldseek. Structural search DB (PDB/AlphaFold) via `foldseek databases`.
+  #     Run: foldseek easy-search <pdb_or_dir> <targetDB> <aln.tsv> <tmp> → fold-level homology (TM-score),
+  #     the key signal for annotating dark-matter proteins. Declared in index.yaml provides_bins.
   #   * antismash 8.0.4: `pip install https://dl.secondarymetabolites.org/releases/8.0.4/antismash-8.0.4.tar.gz`
   #     (NOT on PyPI). DB at /home/workshop/antismash_db via download-antismash-databases. Binary deps
   #     (prodigal/diamond/hmmer/fasttree/blast/muscle/glimmerhmm) already present; only hmmpfam2(hmmer2)

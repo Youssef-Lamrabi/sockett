@@ -486,6 +486,106 @@ description = [
         "returns": "dict(annotations_tsv, summary_tsv, cog_counts, go_terms, kegg_pathways, summary)",
     },
     {
+        "name": "run_mantis",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] Mantis (mantis_pfa): CONSENSUS protein function annotation. "
+            "Unlike a single-source annotator (eggNOG/diamond), Mantis runs SEVERAL reference sources "
+            "(Pfam, KOfam, TIGRFAM, NCBI, eggNOG HMMs…) and produces a CONSENSUS annotation per protein "
+            "via a domain-specific depth-first-search algorithm — so a protein missed by one database can "
+            "still be annotated by another, giving a MORE ACCURATE known/unknown boundary than eggNOG alone. "
+            "AVAILABLE in meta-env1 only when its reference DBs have been provisioned (multi-GB; `mantis setup`); "
+            "if the DBs are absent the step fails with a 'reference not found' error → treat as tool-unavailable, "
+            "do NOT retry. EXACT command (run via meta-env1; needs a PROTEIN FASTA — use Prokka/Prodigal .faa): "
+            "mantis run -i <proteins.faa> -o <output_dir> -c N. "
+            "Key output: <output_dir>/consensus_annotation.tsv (TSV; first column = Query gene id, plus the "
+            "consensus reference hits + functional description links). Also writes integrated_annotation.tsv and "
+            "output_annotation.tsv. Use consensus_annotation.tsv as the authoritative per-gene functional call; "
+            "a gene ABSENT from it (or with no consensus hit) is genuinely unannotated."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str", "description": "Protein FASTA (Prokka/Prodigal .faa)."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "cores", "type": "int", "default": 4},
+        ],
+        "returns": "dict(consensus_tsv, integrated_tsv, output_tsv, n_annotated, summary)",
+    },
+    {
+        "name": "run_mmseqs",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] MMseqs2: ultra-fast protein/nucleotide sequence search & CLUSTERING. "
+            "AVAILABLE in meta-env1 (single static binary `mmseqs`, NO database to install — you build one "
+            "from your own sequences). Primary use here: cluster a protein set into families (e.g. group "
+            "UNKNOWN/hypothetical proteins by similarity, or dereplicate a gene catalog). "
+            "EXACT command (run via meta-env1): "
+            "mmseqs easy-cluster <proteins.faa> <out_prefix> <tmp_dir> --min-seq-id 0.5 -c 0.8 --threads N. "
+            "Outputs: <out_prefix>_cluster.tsv (2 columns: representative_id<TAB>member_id — one row per "
+            "sequence), <out_prefix>_rep_seq.fasta (one representative per cluster), <out_prefix>_all_seqs.fasta. "
+            "For a search instead of clustering: mmseqs easy-search <query.faa> <target.faa> <aln.m8> <tmp> "
+            "(BLAST-tab m8 output). Count clusters = distinct representative IDs in _cluster.tsv (or records in "
+            "_rep_seq.fasta). Fast and memory-frugal; safe default --min-seq-id 0.3–0.5 for remote homologs."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str", "description": "Protein/nucleotide FASTA to cluster or search."},
+            {"name": "output_prefix", "type": "str"},
+            {"name": "tmp_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "min_seq_id", "type": "float", "default": 0.5},
+            {"name": "coverage", "type": "float", "default": 0.8},
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(cluster_tsv, rep_seq_fasta, n_clusters, summary)",
+    },
+    {
+        "name": "run_esmfold",
+        "description": (
+            "[CLI Tool][TIMEOUT: 3600s] ESMFold (fair-esm): single-sequence protein STRUCTURE PREDICTION from "
+            "amino-acid sequence alone (no MSA). Use it to fold UNKNOWN/hypothetical proteins so their structure "
+            "can be searched against known folds (→ Foldseek) for a functional clue when sequence homology fails. "
+            "AVAILABLE in meta-env1 ONLY on a GPU machine with the model weights provisioned (first run downloads "
+            "~2.5 GB; needs a CUDA GPU — on a CPU-only/low-RAM host it fails or is impractically slow → treat as "
+            "tool-unavailable, do NOT retry). Best on proteins <400 aa. EXACT command (run via meta-env1): "
+            "esm-fold -i <proteins.faa> -o <output_dir>. Outputs one <sequence_id>.pdb per input sequence; the "
+            "per-residue pLDDT confidence is written in the B-factor column of each PDB (mean pLDDT >70 = "
+            "confident fold). Feed the resulting PDBs to Foldseek for structural homology search."
+        ),
+        "required_parameters": [
+            {"name": "proteins_faa", "type": "str", "description": "Protein FASTA (short unknowns work best)."},
+            {"name": "output_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "max_tokens_per_batch", "type": "int", "default": 1024},
+        ],
+        "returns": "dict(pdb_dir, n_structures, mean_plddt, summary)",
+    },
+    {
+        "name": "run_foldseek",
+        "description": (
+            "[CLI Tool][TIMEOUT: 1800s] Foldseek: ultra-fast STRUCTURAL search & clustering — finds proteins with "
+            "a similar FOLD even at ~0% sequence identity (the key signal for annotating dark-matter / hypothetical "
+            "proteins). AVAILABLE in meta-env1 (binary `foldseek`); for a search you need a target structure DB "
+            "(e.g. PDB or AlphaFold DB, provisioned via `foldseek databases`). "
+            "EXACT command (structural search of predicted structures against a target DB, run via meta-env1): "
+            "foldseek easy-search <query_pdb_or_dir> <targetDB> <aln.tsv> <tmp_dir> --threads N. "
+            "Output aln.tsv is BLAST-tab-like: query<TAB>target<TAB>...<TAB>bits, with an alntmscore/prob column "
+            "(a TM-score / probability of the same fold — >0.5 ≈ same fold family). For de-novo structural "
+            "grouping without a reference: foldseek easy-cluster <pdb_dir> <out_prefix> <tmp>. Read the top target "
+            "per query from aln.tsv to assign a putative fold/function to an otherwise unannotated protein."
+        ),
+        "required_parameters": [
+            {"name": "query_structures", "type": "str", "description": "A PDB file or directory of PDBs (e.g. ESMFold output)."},
+            {"name": "target_db", "type": "str", "description": "Foldseek structure database (PDB / AlphaFold DB)."},
+            {"name": "output_tsv", "type": "str"},
+            {"name": "tmp_dir", "type": "str"},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+        ],
+        "returns": "dict(alignment_tsv, n_hits, best_hit_per_query, summary)",
+    },
+    {
         "name": "run_diamond",
         "description": (
             "[CLI Tool][TIMEOUT: 1800s] DIAMOND: fast protein alignment (100x faster than BLAST). "

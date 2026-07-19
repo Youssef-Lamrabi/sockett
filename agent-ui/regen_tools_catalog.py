@@ -92,6 +92,19 @@ def main():
             tools.append({"name": pretty(name), "category": cat, "icon": ICON_MAP.get(cat, "fa-flask"),
                           "description": short(t.get("description", "")), "installed": installed})
 
+    # Dedupe by name (keep first occurrence, preserve order). A tool can be
+    # declared in more than one description module (e.g. fetch_sra_reads lives in
+    # the isolated sra.py AND the dormant metagenomics_db.py) — the panel must
+    # never list the same tool twice.
+    _seen = set()
+    _deduped = []
+    for t in tools:
+        if t["name"] in _seen:
+            continue
+        _seen.add(t["name"])
+        _deduped.append(t)
+    tools = _deduped
+
     databases = [{"name": n, "category": "Database", "icon": "fa-database", "description": d, "installed": True}
                  for n, d in DATABASES]
 
@@ -111,11 +124,11 @@ def main():
     deps = sorted(k for k in _CLI_TOOL_BINARIES if k in avail and k in DEP_DENYLIST)
     print("\n=== COVERAGE REPORT ===")
     if missing:
-        print(f"⚠ INSTALLED + retriever-known but NO description (invisible in panel) — add a description if user-facing:")
+        print("[!] INSTALLED + retriever-known but NO description (invisible in panel) - add a description if user-facing:")
         print("   " + ", ".join(missing))
     else:
-        print("✓ Every installed retriever-known tool has a description (no gap).")
-    print(f"ℹ Intentionally hidden internal dependencies: {', '.join(deps) or '(none)'}")
+        print("[ok] Every installed retriever-known tool has a description (no gap).")
+    print(f"[i] Intentionally hidden internal dependencies: {', '.join(deps) or '(none)'}")
 
 
 if __name__ == "__main__":

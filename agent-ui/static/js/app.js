@@ -265,6 +265,14 @@ async function loadSessionMessages(sid) {
   const res = await fetch(`/api/sessions/${sid}/messages`, { headers: { ...api.headers() } });
   if (!res.ok) return;
   const msgs = await res.json();
+  // Is this session's run STILL in flight? If so, a still-executing pipeline must NOT be
+  // rendered as finished just because the last SAVED step shows 'done' (see the status
+  // emit below). Non-fatal: on any error treat it as not-running (previous behaviour).
+  let _isRunning = false;
+  try {
+    const _rr = await fetch(`/api/sessions/${sid}/running`, { headers: { ...api.headers() } });
+    if (_rr.ok) _isRunning = !!(((await _rr.json()) || {}).running);
+  } catch (_) { /* treat as not running */ }
   const chat = el('chat');
   if (chat) {
     Array.from(chat.children).forEach(child => {
@@ -354,10 +362,20 @@ async function loadSessionMessages(sid) {
       // Use the last saved STATUS block's value (done / blocked / ...); default to done
       // only if no STATUS was ever recorded.
       if (savedLogs.length) {
-        const _statuses = savedLogs.filter(L => String(L.tag || '').toUpperCase() === 'STATUS');
-        const _last = _statuses.length
-          ? String(_statuses[_statuses.length - 1].body || 'done').trim().toLowerCase()
-          : 'done';
+        // If the run is STILL executing and this is the LAST (in-flight) message, the last
+        // saved STATUS is only the last COMPLETED step's 'done'; emitting it would stop the
+        // spinner (clearLiveSpinner + markRunInactive) and make a running pipeline LOOK
+        // finished. Emit 'running' instead → an in-progress indicator (amber + spinner).
+        const _isLastMsg = (m === msgs[msgs.length - 1]);
+        let _last;
+        if (_isRunning && _isLastMsg) {
+          _last = 'running';
+        } else {
+          const _statuses = savedLogs.filter(L => String(L.tag || '').toUpperCase() === 'STATUS');
+          _last = _statuses.length
+            ? String(_statuses[_statuses.length - 1].body || 'done').trim().toLowerCase()
+            : 'done';
+        }
         renderAssistantEvent({ type: 'block', tag: 'STATUS', text: `<status:${_last}>` });
       }
     }

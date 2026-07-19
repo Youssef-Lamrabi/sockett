@@ -78,6 +78,11 @@ _CLI_TOOL_BINARIES = {
     "prokka": "prokka",
     "hmmer": "hmmscan",
     "eggnog-mapper": "emapper.py",
+    "mantis": "mantis",          # consensus multi-DB annotation (only offered if physically present)
+    "mmseqs": "mmseqs",          # fast protein search/clustering (no DB; static binary)
+    "mmseqs2": "mmseqs",
+    "esmfold": "esm-fold",       # single-seq structure prediction (GPU; weights provisioned on dev machine)
+    "foldseek": "foldseek",      # structural search — fold-level homology for dark-matter proteins
     "humann3": "humann",
     # ── Specialized annotation ────────────────────────────────────────────────
     "antismash": "antismash",
@@ -190,6 +195,13 @@ _AVAILABLE_CLI = _available_cli_tools()  # computed once at import time
 class ToolRetriever:
     """Retrieve tools from the tool registry, filtering stubs and unavailable CLIs."""
 
+    # Hard backstop on top of the prompt's own "select at most N" instruction: the
+    # LLM doing the selection can still ignore that instruction (models routinely
+    # over-select "just in case"), so this cap is enforced in code regardless of
+    # what the LLM returns. Keeps the per-step system prompt from ballooning with
+    # dozens of full tool descriptions on long pipelines.
+    MAX_SELECTED_TOOLS = 7
+
     def __init__(self):
         pass
 
@@ -241,13 +253,16 @@ class ToolRetriever:
 
         # Create a prompt for the LLM to select relevant resources
         prompt = f"""
-            You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.
+            You are an expert biomedical research assistant. Your task is to select ONLY the resources
+            truly needed to help answer a user's query — precision over recall.
 
             USER QUERY: {query}
 
-            Below are the available resources. For each category, select items that are directly or indirectly relevant to answering the query.
-            Be generous in your selection - include resources that might be useful for the task, even if they're not explicitly mentioned in the query.
-            It's better to include slightly more resources than to miss potentially useful ones.
+            Below are the available resources. For each category, select ONLY the items that are
+            directly needed to carry out THIS query. A short, precise list is much more useful than a
+            long one padded with "might be handy" items — every extra tool you include gets its full
+            description injected into the assistant's context, so unnecessary picks cost real context
+            budget and dilute focus.
 
             AVAILABLE TOOLS:
             {self._format_resources_for_prompt(resources.get("tools", []))}
@@ -271,14 +286,18 @@ class ToolRetriever:
             If a category has no relevant items, use an empty list, e.g., DATA_LAKE: []
 
             IMPORTANT GUIDELINES:
-            1. Be generous but not excessive - aim to include all potentially relevant resources
-            2. ALWAYS prioritize database tools for general queries - include as many database tools as possible
-            3. Include all literature search tools
-            4. For wet lab sequence type of queries, ALWAYS include molecular biology tools
-            5. For data lake items, include datasets that could provide useful information
-            6. For libraries, include those that provide functions needed for analysis
-            7. Don't exclude resources just because they're not explicitly mentioned in the query
-            8. When in doubt about a database tool or molecular biology tool, include it rather than exclude it
+            1. TOOLS: select AT MOST {self.MAX_SELECTED_TOOLS} tools total — the ones this specific
+               query actually needs, ranked by relevance. Never pad the list "just in case".
+            2. For general/database queries, include only the 1-2 most relevant database tools, not
+               every database tool available
+            3. Include literature search tools only if the query is itself a literature/background lookup
+            4. For wet-lab sequence queries, include only the molecular biology tool(s) the query calls for
+            5. For data lake items, include only datasets directly relevant to this query
+            6. For libraries, include only those providing functions this query's analysis actually needs
+            7. You MAY include a tool that is clearly implied by the task even if not named explicitly,
+               but do not add speculative "might be useful someday" tools
+            8. When genuinely unsure whether a tool is needed, EXCLUDE it — a later step can always
+               request more tools; it cannot easily recover from a bloated, unfocused context now
         """
 
         # Use the provided LLM or create a new one
@@ -321,6 +340,12 @@ class ToolRetriever:
                 if i < len(resources.get("libraries", []))
             ],
         }
+
+        # Hard cap (code-level, not just a prompt instruction): keep the first
+        # MAX_SELECTED_TOOLS in the LLM's own ranked order. This is the backstop
+        # for when the model ignores the "select at most N" instruction above.
+        if len(selected_resources["tools"]) > self.MAX_SELECTED_TOOLS:
+            selected_resources["tools"] = selected_resources["tools"][: self.MAX_SELECTED_TOOLS]
 
         return selected_resources
 
