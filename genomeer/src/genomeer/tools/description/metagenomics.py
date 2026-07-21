@@ -586,6 +586,37 @@ description = [
         "returns": "dict(alignment_tsv, n_hits, best_hit_per_query, summary)",
     },
     {
+        "name": "run_microbecensus",
+        "description": (
+            "[CLI Tool][TIMEOUT: 900s] MicrobeCensus: estimates the AVERAGE GENOME SIZE (AGS) of a "
+            "microbial community directly from raw shotgun metagenomic reads (maps reads to 30 universal "
+            "single-copy marker genes; no assembly or classification needed). AVAILABLE in meta-env1 "
+            "(lightweight — small bundled marker-gene set, no external database to install). Use it as a "
+            "confounder check alongside ARG/resistome abundance comparisons (a community with a larger "
+            "average genome size can shift gene-abundance metrics like RPKM independently of true gene "
+            "content) — NOT a replacement for taxonomic classification. "
+            "EXACT command (run via meta-env1; the binary is `run_microbe_census.py`, paired-end reads "
+            "are comma-separated, NOT space-separated): "
+            "run_microbe_census.py -t N -v reads_1.fastq.gz,reads_2.fastq.gz microbecensus_output.txt "
+            "(single-end: just one file path, no comma). "
+            "ALWAYS name the output file '<sample>_microbecensus_output.txt' (or similar ending in "
+            "'_microbecensus_output.txt') for consistent downstream parsing. "
+            "Output is a small text report with 'key<TAB>value' or 'key: value' lines including "
+            "average_genome_size (in bp), total_bases, and genome_equivalents (total microbial genome "
+            "coverage in the sample) — parse these three keys, do not assume a fixed column layout. "
+            "Accepts gzip/bzip2-compressed FASTQ/FASTA directly (no need to decompress first)."
+        ),
+        "required_parameters": [
+            {"name": "reads", "type": "str", "description": "FASTQ path(s); comma-separated for paired-end (R1,R2)."},
+            {"name": "output_file", "type": "str", "description": "Path to write the AGS report; end the name in '_microbecensus_output.txt'."},
+        ],
+        "optional_parameters": [
+            {"name": "threads", "type": "int", "default": 4},
+            {"name": "reads_sampled", "type": "int", "default": 2000000, "description": "-n flag; number of reads subsampled to estimate AGS."},
+        ],
+        "returns": "dict(average_genome_size_bp, total_bases, genome_equivalents, summary)",
+    },
+    {
         "name": "run_diamond",
         "description": (
             "[CLI Tool][TIMEOUT: 1800s] DIAMOND: fast protein alignment (100x faster than BLAST). "

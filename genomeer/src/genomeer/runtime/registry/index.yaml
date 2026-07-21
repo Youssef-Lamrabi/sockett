@@ -67,6 +67,7 @@ envs:
       - mmseqs
       - esm-fold
       - foldseek
+      - run_microbe_census.py
       # humann / humann_renorm_table intentionally NOT declared: the binary is
       # commented-out in meta-env1.yaml (needs multiple large DBs, not installed).
       # Declaring it here falsely marked humann3 as "available" to the planner.

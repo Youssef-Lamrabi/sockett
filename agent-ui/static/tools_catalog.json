@@ -491,6 +491,13 @@
    "installed": true
   },
   {
+   "name": "microbecensus",
+   "category": "Metagenomics",
+   "icon": "fa-bacteria",
+   "description": "MicrobeCensus: estimates the AVERAGE GENOME SIZE (AGS) of a microbial community directly from raw shot\u2026",
+   "installed": true
+  },
+  {
    "name": "diamond",
    "category": "Metagenomics",
    "icon": "fa-bacteria",

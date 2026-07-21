@@ -83,6 +83,7 @@ _CLI_TOOL_BINARIES = {
     "mmseqs2": "mmseqs",
     "esmfold": "esm-fold",       # single-seq structure prediction (GPU; weights provisioned on dev machine)
     "foldseek": "foldseek",      # structural search — fold-level homology for dark-matter proteins
+    "microbecensus": "run_microbe_census.py",   # avg genome size confounder check (lightweight, no DB)
     "humann3": "humann",
     # ── Specialized annotation ────────────────────────────────────────────────
     "antismash": "antismash",

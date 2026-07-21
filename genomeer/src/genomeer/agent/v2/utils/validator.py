@@ -1381,6 +1381,46 @@ class FoldseekContract(_BaseContract):
                               reason=f"foldseek: {n} structural hit(s)", metrics={"n_hits": n})
 
 
+class MicrobeCensusContract(_BaseContract):
+    """MicrobeCensus average-genome-size (AGS) report. Output filename is user-chosen (no fixed
+    convention), so glob for the naming pattern the description mandates ('*microbecensus_output*')
+    AND verify the CONTENT carries 'average_genome_size' — a filename-only check could false-match
+    an unrelated text file. Extracts average_genome_size (bp) and genome_equivalents when present."""
+    KEYWORDS = ("microbecensus", "microbe census", "microbe_census", "average genome size",
+                "mean genome size", "genome size estimation", "estimate genome size")
+    RUNTIME = "fast"
+
+    def check(self, run_dir: str, stdout: str) -> ContractResult:
+        cands = self._glob_all(run_dir, "*microbecensus_output*", "*microbe_census*.txt")
+        for f in cands:
+            if not self._file_nonempty(f):
+                continue
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    txt = fh.read()
+            except Exception:
+                continue
+            if "average_genome_size" not in txt.lower():
+                continue
+            ags = self._parse_float_stdout(txt, r"average_genome_size\D+([\d.]+)")
+            ge = self._parse_float_stdout(txt, r"genome_equivalents\D+([\d.]+)")
+            metrics = {}
+            if ags is not None:
+                metrics["average_genome_size_bp"] = ags
+            if ge is not None:
+                metrics["genome_equivalents"] = ge
+            return ContractResult(
+                ok=True, score=1.0,
+                reason=f"microbecensus: average_genome_size={ags if ags is not None else '?'} bp",
+                metrics=metrics,
+            )
+        return ContractResult(
+            ok=False, score=0.0,
+            reason="microbecensus: no report with 'average_genome_size' found",
+            retry_params={"hint": "run_microbe_census.py -t N -v reads_1.fq.gz,reads_2.fq.gz <name>_microbecensus_output.txt; check the output file actually contains 'average_genome_size'."},
+        )
+
+
 class DiamondContract(_BaseContract):
     """
     Output: user-specified TSV (outfmt 6) or .m8 file.
@@ -3585,6 +3625,7 @@ _ALL_CONTRACTS: List[_BaseContract] = [
     MmseqsContract(),
     EsmFoldContract(),
     FoldseekContract(),
+    MicrobeCensusContract(),
     # Filtlong BEFORE Fastp: a "filter reads with filtlong" step must be graded by the
     # non-empty-output filtlong contract, not by the generic fastp contract (which never
     # checked output size and let a 0-byte filtered FASTQ pass as ok=True, blocking Flye).

@@ -542,6 +542,12 @@ and (2) if it's a workflow, produce a crisp, executable checklist.
     * "download the reads for accession SRR.../ERR.../DRR... / analyze this SRA/ENA run / get the raw
       sequencing data for this experiment" -> fetch_sra_reads (downloads REAL experimental FASTQ via ENA
       — distinct from ncbi-genome-download, which fetches assembled genome FASTA, not raw reads).
+    * "compare antibiotic resistance gene (ARG) abundance between groups / resistome comparison /
+      is the ARG difference confounded by community composition" -> after computing ARG abundance
+      (abricate/rgi/amrfinder or mmseqs+ResFinder), run_microbecensus on the SAME reads as a
+      confounder check (a group with a larger average genome size can shift abundance metrics like
+      RPKM independently of true ARG content). Report it alongside the main ARG comparison, not as
+      a replacement for it — it explains/rules out an artifact, it does not measure resistance itself.
     * "annotate gene/protein function / assign functions / functional annotation" -> run_eggnog or
       run_diamond for a FAST single-source pass; use run_mantis when you want a CONSENSUS annotation that
       integrates SEVERAL reference DBs (Pfam/KOfam/TIGRFAM/NCBI…) — it recovers functions a single annotator

@@ -153,6 +153,11 @@ dependencies:
   #     github.com/steineggerlab/foldseek. Structural search DB (PDB/AlphaFold) via `foldseek databases`.
   #     Run: foldseek easy-search <pdb_or_dir> <targetDB> <aln.tsv> <tmp> → fold-level homology (TM-score),
   #     the key signal for annotating dark-matter proteins. Declared in index.yaml provides_bins.
+  #   * MicrobeCensus (binary `run_microbe_census.py`): `pip install MicrobeCensus` OR
+  #     `conda install -c bioconda microbecensus`. Lightweight — small bundled marker-gene set (30
+  #     universal single-copy genes), NO external database to provision. Estimates average genome
+  #     size directly from reads. Run: run_microbe_census.py -t N -v r1.fq.gz,r2.fq.gz out.txt.
+  #     Declared in index.yaml provides_bins.
   #   * antismash 8.0.4: `pip install https://dl.secondarymetabolites.org/releases/8.0.4/antismash-8.0.4.tar.gz`
   #     (NOT on PyPI). DB at /home/workshop/antismash_db via download-antismash-databases. Binary deps
   #     (prodigal/diamond/hmmer/fasttree/blast/muscle/glimmerhmm) already present; only hmmpfam2(hmmer2)
